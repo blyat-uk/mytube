@@ -165,6 +165,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
   }
 
   return (
+    <>
     <div className="modal-backdrop" onClick={onClose}>
       <div
         className="modal"
@@ -272,14 +273,18 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
         )}
       </div>
 
-      {takeout && (
-        <TakeoutDialog
-          rows={takeout.rows}
-          importing={importing}
-          onImport={(ids) => void runImport(ids)}
-          onCancel={() => setTakeout(null)}
-        />
-      )}
     </div>
+
+    {/* A sibling, not a child: nesting it inside the backdrop above meant every
+        click inside it bubbled to that backdrop's onClose and shut everything. */}
+    {takeout && (
+      <TakeoutDialog
+        rows={takeout.rows}
+        importing={importing}
+        onImport={(ids) => void runImport(ids)}
+        onCancel={() => setTakeout(null)}
+      />
+    )}
+    </>
   );
 }

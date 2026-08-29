@@ -64,7 +64,11 @@ export default function TakeoutDialog({ rows, importing, onImport, onCancel }: P
         role="dialog"
         aria-modal="true"
         aria-label="Choose subscriptions to import"
+        // Both handlers matter: a surrounding modal may close on click rather
+        // than mousedown, and stopping only one lets the other bubble out and
+        // tear this dialog down mid-interaction.
         onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-head">
           <h2 className="modal-title">Import subscriptions</h2>
