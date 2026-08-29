@@ -12,13 +12,21 @@
   "app": {
     "windows": [
       {
-        "title": "mytube",
-        "width": 800,
-        "height": 600
+        "title": "MyTube",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 720,
+        "minHeight": 480
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$HOME/.config/mytube/thumbs/**"
+        ]
+      }
     }
   },
   "bundle": {
