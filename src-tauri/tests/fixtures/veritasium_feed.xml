@@ -1,0 +1,634 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+ <link rel="self" href="http://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA"/>
+ <id>yt:channel:HnyfMqiRRG1u-2MsSQLbXA</id>
+ <yt:channelId>HnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+ <title>Veritasium</title>
+ <link rel="alternate" href="https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA"/>
+ <author>
+  <name>Veritasium</name>
+  <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+ </author>
+ <published>2010-07-21T07:18:02+00:00</published>
+ <entry>
+  <id>yt:video:b3KpFdb1pW8</id>
+  <yt:videoId>b3KpFdb1pW8</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>We Took $10,000 From @mkbhd's Locked iPhone</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/b3KpFdb1pW8"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-08-26T15:00:02+00:00</published>
+  <updated>2026-08-29T15:17:30+00:00</updated>
+  <media:group>
+   <media:title>We Took $10,000 From @mkbhd's Locked iPhone</media:title>
+   <media:content url="https://www.youtube.com/v/b3KpFdb1pW8?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i3.ytimg.com/vi/b3KpFdb1pW8/hqdefault.jpg" width="480" height="360"/>
+   <media:description>There's a flaw in some virtual wallets.
+
+We exploited this flaw to steal $10,000 from @mkbhd.
+
+Watch the full video to find out how we did it...</media:description>
+   <media:community>
+    <media:starRating count="41839" average="5.00" min="1" max="5"/>
+    <media:statistics views="1875589"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:5U-V0y-fkSw</id>
+  <yt:videoId>5U-V0y-fkSw</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>It's impossible to choose a number at random</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/5U-V0y-fkSw"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-08-24T13:08:34+00:00</published>
+  <updated>2026-08-25T06:27:11+00:00</updated>
+  <media:group>
+   <media:title>It's impossible to choose a number at random</media:title>
+   <media:content url="https://www.youtube.com/v/5U-V0y-fkSw?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i2.ytimg.com/vi/5U-V0y-fkSw/hqdefault.jpg" width="480" height="360"/>
+   <media:description>In math you can't truly pick things at random because formulas always give the same result.
+
+So if we can't pick randomly, how do we select anything in math?</media:description>
+   <media:community>
+    <media:starRating count="41142" average="5.00" min="1" max="5"/>
+    <media:statistics views="1259245"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:nHAFnH3xRl4</id>
+  <yt:videoId>nHAFnH3xRl4</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>Could identical twins commit the perfect crime?</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/nHAFnH3xRl4"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-08-18T11:33:08+00:00</published>
+  <updated>2026-08-18T11:33:08+00:00</updated>
+  <media:group>
+   <media:title>Could identical twins commit the perfect crime?</media:title>
+   <media:content url="https://www.youtube.com/v/nHAFnH3xRl4?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i3.ytimg.com/vi/nHAFnH3xRl4/hqdefault.jpg" width="480" height="360"/>
+   <media:description>The DNA in twins is (almost) exactly the same. 
+
+So how could a team of forensic scientists tell which twin committed the crime?
+
+There is a way but it has some issues...</media:description>
+   <media:community>
+    <media:starRating count="25817" average="5.00" min="1" max="5"/>
+    <media:statistics views="781832"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:J1WoNuemKOg</id>
+  <yt:videoId>J1WoNuemKOg</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>We sent a balloon to space to film the solar eclipse</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=J1WoNuemKOg"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-08-17T14:30:16+00:00</published>
+  <updated>2026-08-26T06:44:54+00:00</updated>
+  <media:group>
+   <media:title>We sent a balloon to space to film the solar eclipse</media:title>
+   <media:content url="https://www.youtube.com/v/J1WoNuemKOg?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i3.ytimg.com/vi/J1WoNuemKOg/hqdefault.jpg" width="480" height="360"/>
+   <media:description>What does an eclipse look like from the edge of space? We travelled to Spain for the 2026 total solar eclipse to find out. Sponsored by 80,000 Hours - Head to http://80000hours.org/veritasium to start planning a career that can help change the world for the better. By joining their newsletter, you’ll get a free copy of their in-depth career guide sent to your inbox.
+
+If you’re looking for a molecular modelling kit, try Snatoms, a kit I invented where the atoms snap together magnetically - https://ve42.co/SnatomsV
+
+Sign up for the Veritasium newsletter for weekly science updates - https://ve42.co/Newsletter
+
+To be in with a chance of getting a NASA sticker that went to the edge of space during the eclipse and for early access to work-in-progress videos, join our Patreon https://ve42.co/VePatreon
+
+Last year, we launched Elements of Truth on Kickstarter and were thrilled by the response. We’re now in the final stages of production, with Kickstarter rewards shipping soon. If you missed the campaign, you can now pre-order the retail edition through our new website here - https://ve42.co/YTDEcl  
+If you backed us on Kickstarter, don’t worry, your game will ship before any pre-orders are fulfilled.
+
+▀▀▀
+00:00 The 2026 Total Solar Eclipse
+02:00 Why there are more total solar eclipses in the Northern Hemisphere
+03:30 How we get 5 solar eclipses a year
+06:20 Why the Sun turns white only during totality
+09:27 How the eclipse faked an element
+11:10 The weird shadows during the eclipse
+14:06 Shadow band effect
+17:00 Filming the eclipse from space
+▀▀▀
+Special thanks to the experts and collaborators who made this video possible: 
+
+The Montana State University NASA Ballooning Team, for working with us on this video and for the incredible footage of the eclipse from the edge of space. 
+Project Leads: Angela Des Jardins and Michael Walach 
+Students: Ava Arbogast, Isabel Besel, Ryder Cole, Daniel Graves, Mari Greene, Mikael Savage, Gabriel Sova, Addison Zumwalt
+
+The Exploratorium Team, for providing their insights and footage from their livestream
+© The Exploratorium
+All rights reserved. Used and adapted with authorization.
+The Exploratorium® is a registered trademark of The Exploratorium®.
+http://www.exploratorium.edu  
+
+Michael Kirk for taking the time to chat with us and sharing his expertise. 
+
+NASA's Goddard Space Flight Center for speaking with us and for sharing details of their WB-57 aircraft eclipse mission.
+
+The team at @astrumspace for their help and support on this video. Check out their video on how ESA’s Proba-3 mission uses satellites to create artificial eclipses in space and reveal the inner corona for the first time:
+https://youtu.be/fv5lJjR6DmQ
+
+Also, very glad we ran into https://www.youtube.com/@UCyC3HkaEzr7PBNuE2oPvQKg during totality! Check out his channel!
+
+▀▀▀
+References: https://ve42.co/EclipseReferences
+
+▀▀▀
+Special thanks to our Patreon supporters:
+Adam Foreman, Albert Wenger, Alex Porter, Alexander Tamas, André Powell, Anton Ragin, Balkrishna Heroor, Bertrand Serlet, Blake Byers, Bruce, Bryan Ackermann, Chris Brewer, Data Don, Dave Kircher, David Johnston, David Tseng, EJ Alexandra, Evgeny Skvortsov, Garrett Mueller, Gnare, gpoly, Hayden Christensen, Hong Thai Le, Hybrid Minds, Ibby Hadeed, Jeromy Johnson, Juan Benet, Kelcey Steele, KeyWestr, Kyi, Lee Redden, Marinus Kuivenhoven, Mark Heising, Martin Paull, Meekay, meg noah, Michael Krugman, Orlando Bassotto, Parsee Health, Paul Peijzel, Robson, Sam Lutfi, Shalva Bukia, Sinan Taifour, Sweet_Nemo, Tj Steyn, Ubiquity Ventures, wolfee
+
+▀▀▀
+Credits
+Writers: Emilia Gyles, Gregor Čavlović and Henry van Dyck,
+Producer and Director: Emilia Gyles, Gregor Čavlović and Henry van Dyck
+Presenter: Emilia Gyles, Gregor Čavlović and Henry van Dyck
+Editors: Peter Nelson and Trenton Oliver 
+Assistant Editor: James Stuart
+Animators: Archie Crofton and Emma Wright 
+Researchers: Sophia Rose, Aakash Singh Bagga, Shourya Shrivastava and Gabe Strong
+Camera Operators: Archie Crofton, Emilia Gyles, Gregor Čavlović, Henry van Dyck, James Stuart and Peter Nelson 
+Thumbnail Designers: Abdallah Rabah, Daniel Ellacott &amp; Ben Powell
+Production Team: Jess Bishop-Laggett, Glen Griffiths, Matthew Cavanagh, Anna Milkovic, Justin St Laurent and James Dowse
+Executive Producers: Emilia Gyles, Gregor Čavlović &amp; Henry van Dyck</media:description>
+   <media:community>
+    <media:starRating count="60602" average="5.00" min="1" max="5"/>
+    <media:statistics views="1890159"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:_1G8nrmBKeY</id>
+  <yt:videoId>_1G8nrmBKeY</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>How do submarines know where they are?</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/_1G8nrmBKeY"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-08-06T13:00:34+00:00</published>
+  <updated>2026-08-10T01:07:27+00:00</updated>
+  <media:group>
+   <media:title>How do submarines know where they are?</media:title>
+   <media:content url="https://www.youtube.com/v/_1G8nrmBKeY?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i4.ytimg.com/vi/_1G8nrmBKeY/hqdefault.jpg" width="480" height="360"/>
+   <media:description>How does a submarine find its way 600m deep in the ocean?
+
+Surfacing is obviously the easiest way but not when you want to stay hidden.
+
+So how do a crew balance concealment and pathfinding?</media:description>
+   <media:community>
+    <media:starRating count="72913" average="5.00" min="1" max="5"/>
+    <media:statistics views="2261728"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:wt4p2oalmRY</id>
+  <yt:videoId>wt4p2oalmRY</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>Is spider web really stronger than steel?</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=wt4p2oalmRY"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-08-02T13:21:11+00:00</published>
+  <updated>2026-08-24T23:48:49+00:00</updated>
+  <media:group>
+   <media:title>Is spider web really stronger than steel?</media:title>
+   <media:content url="https://www.youtube.com/v/wt4p2oalmRY?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i4.ytimg.com/vi/wt4p2oalmRY/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Can you really swing from spider silk? Sponsored by Henson Shaving - Head to https://hensonshaving.com/veritasium and use code “veritasium” for 100 free blades with any razor purchase. Just add both the razor and blades to your cart.
+
+Last year, we launched the Elements of Truth game on Kickstarter and were thrilled by the response. We’re now in the final stages of production, with Kickstarter rewards shipping soon. Pre-order the retail edition here: https://ve42.co/YTSpiderSilk
+
+If you’re looking for a molecular modelling kit, try Snatoms, a kit I invented where the atoms snap together magnetically - https://ve42.co/SnatomsV
+
+For weekly science news, and an exclusive Q&amp;A where writer/director Vibhor Pandey discusses the making of this video, sign up to the Veritasium newsletter  - https://ve42.co/Newsletter
+
+For early access to work-in-progress videos, join our Patreon - https://ve42.co/VePatreon
+
+▀▀▀
+00:00 Could Spider Silk Let You Swing Like Spider-Man?
+00:44 Is Spider Silk Really Stronger Than Steel? 
+02:29 Testing Spider Silk's Tensile Strength
+03:48 The Strongest Silk on Earth
+05:34 Spider Silk vs Kevlar vs Steel
+07:37 The Nanostructure Behind Spider Silk's Strength
+08:42 Why We Can't Farm Spiders 
+10:16 Engineering Fake Spider Silk
+15:04 From the Silk Road to CRISPR
+21:31 Real-World Uses and the Ultimate Swing Test
+
+▀▀▀
+Special thanks to the experts and collaborators who made this video possible:
+
+Professor Todd Blackledge and the Blackledge Spider Lab at the University of Akron, for welcoming us into the lab, walking us through how spiders make and use silk, and letting us put the real material to the test.
+
+Jon Rice and the team at Kraig Biocraft Laboratories, for opening their doors, sharing their transgenic silk, patiently explaining how their engineered silkworms work, and helping make the spider-silk swing possible.
+
+Professors Keiji Numata, Chris Holland, Sara Goodacre and Greg Holland, for generously sharing their time and expertise in our research conversations helping us understand the extraordinary diversity of spider silks, how they are spun, and how structure, water and chemistry shape their properties.
+
+Professors Ingi Agnarsson and Thomas Scheibel, for their guidance that helped sharpen our explanation.
+
+▀▀▀
+References: https://ve42.co/SpiderSilkRefs
+
+▀▀▀
+Special thanks to our Patreon supporters:
+
+Adam Foreman, Albert Wenger, Alex Porter, Alexander Tamas, André Powell, Anton Ragin, Balkrishna Heroor, Bertrand Serlet, Blake Byers, Bruce, Bryan Ackermann, Chris Brewer, Data Don, Dave Kircher, David Johnston, David Tseng, EJ Alexandra, Evgeny Skvortsov, Garrett Mueller, Gnare, gpoly, Hayden Christensen, Hong Thai Le, Ibby Hadeed, Jeromy Johnson, Jesse Brandsoy, Juan Benet, Kelcey Steele, KeyWestr, Kyi, Lee Redden, Marinus Kuivenhoven, Mark Heising, Martin Paull, Meekay, meg noah, Michael Krugman, Moebiusol - Cristian, Orlando Bassotto, Parsee Health, Paul Peijzel, Robson, Sam Lutfi, Shalva Bukia, Sinan Taifour, Sweet_Nemo, Tj Steyn, Ubiquity Ventures, Vahe Andonians, wolfee
+
+▀▀▀
+Writers - Vibhor Pandey &amp; Henry van Dyck
+Producer &amp; Director - Vibhor Pandey &amp; Henry van Dyck
+Presenters &amp; Narration - Henry van Dyck &amp; Derek Muller
+Editors- Trenton Oliver, Axel Oliver, James Stuart &amp; George Reynolds
+Animators - Alex Drakoulis, Andrew Neet, Domonkos Józsa, Emma Wright &amp; Fabio Albertelli
+Illustrator - Jakub Misiek
+Researchers - Aakash Singh Bagga, Gabe Strong &amp; Sophia Rose
+Camera Operators: Henry van Dyck, Petr Lebedev, Casper Mebius and Ben Curtis-Dyck
+Thumbnail Designers - Abdallah Rabah, Daniel Ellacott &amp; Ben Powell
+Production Team - Matthew Cavanagh, Jess Bishop-Laggett, Glen Griffiths, Josh Pitt, Luke Lewis, Anna Milkovic &amp; Justin St-Laurent
+Executive Producers - Henry van Dyck, Emilia Gyles, Casper Mebius &amp; Derek Muller
+
+Additional video/photos supplied by Getty Images, Pond5 and Storyblocks
+Music from Epidemic Sound</media:description>
+   <media:community>
+    <media:starRating count="134198" average="5.00" min="1" max="5"/>
+    <media:statistics views="7527162"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:3HQkVfZ4DNY</id>
+  <yt:videoId>3HQkVfZ4DNY</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>The World's Heaviest Weight</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/3HQkVfZ4DNY"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-30T13:00:16+00:00</published>
+  <updated>2026-08-05T05:44:50+00:00</updated>
+  <media:group>
+   <media:title>The World's Heaviest Weight</media:title>
+   <media:content url="https://www.youtube.com/v/3HQkVfZ4DNY?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i4.ytimg.com/vi/3HQkVfZ4DNY/hqdefault.jpg" width="480" height="360"/>
+   <media:description>How do you measure big forces accurately? 
+
+By calibrating your force transducer on the world's biggest weight - 1,000,000 pounds of force. 
+
+This machine ensures planes don't break apart, jets provide required thrust, and rockets make it to their destination.</media:description>
+   <media:community>
+    <media:starRating count="60234" average="5.00" min="1" max="5"/>
+    <media:statistics views="2559525"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:tL9Lw250spc</id>
+  <yt:videoId>tL9Lw250spc</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>Why does every mammal get 1 billion heartbeats in their life?</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=tL9Lw250spc"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-25T17:29:09+00:00</published>
+  <updated>2026-08-11T12:08:06+00:00</updated>
+  <media:group>
+   <media:title>Why does every mammal get 1 billion heartbeats in their life?</media:title>
+   <media:content url="https://www.youtube.com/v/tL9Lw250spc?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i1.ytimg.com/vi/tL9Lw250spc/hqdefault.jpg" width="480" height="360"/>
+   <media:description>The hidden math that governs life. Sponsored by Brilliant - Try Brilliant for free, plus get 20% off an annual Premium subscription at https://brilliant.org/veritasium
+
+Last year, we launched the Elements of Truth game on Kickstarter and were thrilled by the response. We’re now in the final stages of production, with Kickstarter rewards shipping soon. Pre-order the retail edition here: https://elementsoftruth.game/
+
+If you’re looking for a molecular modelling kit, try Snatoms, a kit I invented where the atoms snap together magnetically - https://ve42.co/SnatomsV
+
+For weekly science news, and an exclusive Q&amp;A where writer/director Daniel Leonard discusses the making of this video, sign up to the Veritasium newsletter - https://ve42.co/Newsletter 
+
+For early access to work in progress videos join our Patreon - https://ve42.co/VePatreon 
+
+▀▀▀
+0:00 How much LSD should you give an elephant?
+3:09 Metabolic Rate In Animals
+5:27 The Surface Law
+8:04 What is Kleiber’s Law?
+10:49 Why is ¼ everywhere in biology?
+13:33 WBE Theory
+19:53 Every animal has 1,000,000,000 heartbeats
+23:11 Why Humans Live Longer
+24:31 Is it better to live in a city or a small town?
+30:12 Is there really a universal scaling exponent for life?
+
+▀▀▀
+Much of this video was inspired by Geoffrey West’s book: Scale. Check it out here - https://ve42.co/ScaleBook
+
+▀▀▀
+Special thanks to the experts who helped make this video possible:
+Brian Enquist, whose work helped inspire this video, for sharing the story behind WBE theory and helping us make its key assumptions and derivation more accurate.
+
+Van Savage, for the generous and detailed feedback that sharpened our explanation of WBE theory, self-similarity, and the current state of the field.
+
+Steven Strogatz, for the insightful conversations, on-camera contribution, and careful reviews that helped us keep the mathematics clear and the story scientifically honest.
+
+Peter Sheridan Dodds, for helping us understand the objections to WBE theory and the debate over three-quarter-power scaling.
+
+And the many other experts who discussed this topic with us as we were developing the script, for their invaluable contributions: Luis Bettencourt, Jayanth Banavar, Aaron Clauset, Juan Rubalcaba, and Douglas Glazier.
+
+▀▀▀
+References: https://ve42.co/ScaleRefs
+
+▀▀▀
+Special thanks to our Patreon supporters:
+
+Adam Foreman, Albert Wenger, Alex Porter, Alexander Tamas, André Powell, Anton Ragin, Balkrishna Heroor, Bertrand Serlet, Blake Byers, Bruce, Bryan Ackermann, Chris Brewer, Data Don, Dave Kircher, David Johnston, David Tseng, EJ Alexandra, Evgeny Skvortsov, Garrett Mueller, Gnare, gpoly, Hayden Christensen, Hong Thai Le, Ibby Hadeed, Jeromy Johnson, Jesse Brandsoy, Juan Benet, Kelcey Steele, KeyWestr, Kyi, Lee Redden, Marinus Kuivenhoven, Mark Heising, Martin Paull, Meekay, meg noah, Michael Krugman, Moebiusol - Cristian, Orlando Bassotto, Parsee Health, Paul Peijzel, Robson, Sam Lutfi, Shalva Bukia, Sinan Taifour, Sweet_Nemo, Tj Steyn, Ubiquity Ventures, Vahe Andonians, wolfee
+
+
+▀▀▀
+Writers - Daniel Leonard, Casper Mebius &amp; Derek Muller
+Producer &amp; Director - Daniel Leonard
+Presenters &amp; Narration - Derek Muller &amp; Henry van Dyck
+Editors - Trenton Oliver, Axel Oliver &amp; Jonny Lennard
+Assistant Editor - James Stuart
+Animators - Alex Drakoulis, Andrew Neet, Domonkos Józsa, Emma Wright &amp; Fabio Albertelli
+Illustrators - Jakub Misiek &amp; Raphael Aubry
+Camera Operator - Chris Anstis
+Simulations - Callum Cuttle &amp; Aakash Singh Bagga
+Researchers - Aakash Singh Bagga, Callum Cuttle &amp; Gabe Strong
+Thumbnail Designers - Abdallah Rabah &amp; Daniel Ellacott
+Thumbnail Design Direction - Ben Powell
+Production Team - Jess Bishop-Laggett, Glen Griffiths, Matthew Cavanagh, Luke Lewis, Anna Milkovic &amp; Justin St-Laurent
+Executive Producers - Casper Mebius &amp; Derek Muller
+
+Additional video/photos supplied by Getty Images, Pond5 and Storyblocks
+Music from Epidemic Sound</media:description>
+   <media:community>
+    <media:starRating count="146126" average="5.00" min="1" max="5"/>
+    <media:statistics views="5634676"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:2_VB-oc_pmk</id>
+  <yt:videoId>2_VB-oc_pmk</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>The Most Controversial Thought Experiment In Physics</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/2_VB-oc_pmk"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-21T15:31:18+00:00</published>
+  <updated>2026-07-25T06:26:37+00:00</updated>
+  <media:group>
+   <media:title>The Most Controversial Thought Experiment In Physics</media:title>
+   <media:content url="https://www.youtube.com/v/2_VB-oc_pmk?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i3.ytimg.com/vi/2_VB-oc_pmk/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Put a cat in a box with a radioactive atom. Add a radiation detector that triggers the release of poisonous cyanide gas.
+
+Schrödinger's thought experiment was supposed to be a criticism of quantum mechanics and is now one of it's best explainers.
+
+Here's why and what happens to the cat...</media:description>
+   <media:community>
+    <media:starRating count="49927" average="5.00" min="1" max="5"/>
+    <media:statistics views="1372870"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:RmHcX5oVzvs</id>
+  <yt:videoId>RmHcX5oVzvs</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>Why Waves Travel Faster At The Top</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/RmHcX5oVzvs"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-17T13:28:38+00:00</published>
+  <updated>2026-08-25T11:57:53+00:00</updated>
+  <media:group>
+   <media:title>Why Waves Travel Faster At The Top</media:title>
+   <media:content url="https://www.youtube.com/v/RmHcX5oVzvs?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i3.ytimg.com/vi/RmHcX5oVzvs/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Why do objects travel with waves?
+
+We're taught waves only transfer energy, not material, but objects wash ashore all the time.
+
+How does this work?
+
+#veritasium #science #physics</media:description>
+   <media:community>
+    <media:starRating count="164763" average="5.00" min="1" max="5"/>
+    <media:statistics views="4895100"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:GK2pZ_oVU1o</id>
+  <yt:videoId>GK2pZ_oVU1o</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>The Scariest Chart in Electrical Engineering</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=GK2pZ_oVU1o"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-14T18:03:28+00:00</published>
+  <updated>2026-08-27T08:35:37+00:00</updated>
+  <media:group>
+   <media:title>The Scariest Chart in Electrical Engineering</media:title>
+   <media:content url="https://www.youtube.com/v/GK2pZ_oVU1o?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i4.ytimg.com/vi/GK2pZ_oVU1o/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Why is the Smith Chart one of the scariest charts in electrical engineering? Sponsored by Incogni - use code veritasium at https://incogni.com/veritasium to get an exclusive 60% off your annual subscription.
+
+Last year, we launched the Elements of Truth game on Kickstarter and were thrilled by the response. We’re now in the final stages of production, with Kickstarter rewards shipping soon. Pre-order the retail edition here: https://elementsoftruth.game/
+
+If you’re looking for a molecular modelling kit, try Snatoms, a kit I invented where the atoms snap together magnetically - https://ve42.co/SnatomsV
+
+For weekly science news, and an exclusive Q&amp;A where Writer/Director Henry discusses the making of this video, sign up to the Veritasium newsletter - https://ve42.co/Newsletter 
+
+For early access to work in progress videos join our Patreon https://ve42.co/VePatreon 
+
+▀▀▀
+0:00 The Scariest Chart In Engineering
+3:24 Standing Waves And Reflections
+7:24 Why does a wave bounce back?
+10:15 How to stop a wave from bouncing back
+17:06 The Smith Chart
+25:53 How To Read The Smith Chart
+30:42 This Circuit Gets Better When You Break It
+35:22 Why were we slow to use it?
+37:06 Is it still useful?
+
+▀▀▀
+A big shout out to Imperial College London for letting us use their screened RF anechoic chamber. In particular, a massive thanks to Prof. Stepan Lucyszyn and Ian Rossuck for helping us set up the demos seen in this video.
+
+Also special thanks to Zach Star, Dr. Cynthia Furse, Dr James Nagel, and Ralph Gable for their invaluable expertise!
+
+Check out @zachstar 's video on the Smith Chart here: https://www.youtube.com/watch?v=pXWbdxOAuDs 
+
+Check out @3blue1brown 's video to learn more about transformations and conformal maps: https://www.youtube.com/watch?v=ldxFjLJ3rVY 
+
+▀▀▀
+References: https://ve42.co/SmithChartsRefs
+
+▀▀▀
+Special thanks to our Patreon supporters:
+Adam Foreman, Albert Wenger, Alex Porter, Alexander Tamas, André Powell, Anton Ragin, Balkrishna Heroor, Bertrand Serlet, Blake Byers, Bruce, Bryan Ackermann, Chris Brewer, Data Don, Dave Kircher, David Johnston, David Tseng, EJ Alexandra, Evgeny Skvortsov, Garrett Mueller, Gnare, gpoly, Hayden Christensen, Hong Thai Le, Ibby Hadeed, Jeromy Johnson, Jesse Brandsoy, Juan Benet, Kelcey Steele, KeyWestr, Kyi, Lee Redden, Marinus Kuivenhoven, Mark Heising, Martin Paull, Meekay, meg noah, Michael Krugman, Moebiusol - Cristian, Orlando Bassotto, Parsee Health, Paul Peijzel, Richard Sundvall, Robson, Sam Lutfi, Shalva Bukia, Sinan Taifour, Tj Steyn, Ubiquity Ventures, Vahe Andonians, wolfee
+
+
+▀▀▀
+Writer, Producer &amp; Director: Henry van Dyck
+Presenter: Henry van Dyck
+Editors: Trenton Oliver, Axel Oliver &amp; Peter Nelson
+Animators: Emma Wright, Alex Drakoulis, Andrew Neet &amp; Fabio Albertelli
+Illustrator: Jakub Misiek
+Researchers: Darius Garewal &amp; Gabe Strong
+Asst. Editors: James Stuart &amp; Jonny Leonard
+Simulations: Darius Garewal &amp; Henry van Dyck
+Camera/Drone Operators: Robert Newman &amp; Xavier Bussière
+Additional Writing: Darius Garewal
+Thumbnail Designers: Abdallah Rabah &amp; Daniel Ellacott
+Production Team: Jess Bishop-Laggett, Glen Griffiths, Matthew Cavanagh, Luke Lewis &amp; Anna Milkovic
+Executive Producers: Casper Mebius
+
+Additional video/photos supplied by Getty Images and Storyblocks
+Music from Epidemic Sound</media:description>
+   <media:community>
+    <media:starRating count="140377" average="5.00" min="1" max="5"/>
+    <media:statistics views="5212671"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:kP7l1agsTzQ</id>
+  <yt:videoId>kP7l1agsTzQ</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>The Google Interview Question Everyone Gets Wrong</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/kP7l1agsTzQ"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-13T13:57:42+00:00</published>
+  <updated>2026-08-27T02:25:11+00:00</updated>
+  <media:group>
+   <media:title>The Google Interview Question Everyone Gets Wrong</media:title>
+   <media:content url="https://www.youtube.com/v/kP7l1agsTzQ?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i4.ytimg.com/vi/kP7l1agsTzQ/hqdefault.jpg" width="480" height="360"/>
+   <media:description>The blender problem. Do you think you know the answer? Comment below!</media:description>
+   <media:community>
+    <media:starRating count="208749" average="5.00" min="1" max="5"/>
+    <media:statistics views="10365677"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:h1YeIE0vEIs</id>
+  <yt:videoId>h1YeIE0vEIs</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>How does light 'know' the shortest path?</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/h1YeIE0vEIs"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-09T13:00:07+00:00</published>
+  <updated>2026-07-12T22:30:25+00:00</updated>
+  <media:group>
+   <media:title>How does light 'know' the shortest path?</media:title>
+   <media:content url="https://www.youtube.com/v/h1YeIE0vEIs?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i1.ytimg.com/vi/h1YeIE0vEIs/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Light is the fastest thing in the universe. 
+
+In order to be this fast it always needs to take the shortest path (as it's speed cannot change).
+
+So how does it always know what the shortest path is?</media:description>
+   <media:community>
+    <media:starRating count="131990" average="5.00" min="1" max="5"/>
+    <media:statistics views="3848963"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:Xhl5TzKZbpw</id>
+  <yt:videoId>Xhl5TzKZbpw</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>AD - Why are plants colder than their surroundings?</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/Xhl5TzKZbpw"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-07-07T13:04:35+00:00</published>
+  <updated>2026-08-02T19:18:25+00:00</updated>
+  <media:group>
+   <media:title>AD - Why are plants colder than their surroundings?</media:title>
+   <media:content url="https://www.youtube.com/v/Xhl5TzKZbpw?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i1.ytimg.com/vi/Xhl5TzKZbpw/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Plants can stay cooler than the air around them, even in full sun. How is that possible? We partnered with Anker to find out…
+
+Pick up your Anker Prime Charger here:
+https://ankerfast.club/noagy5
+
+#AnkerTech #Anker #AnkerPrime</media:description>
+   <media:community>
+    <media:starRating count="15360" average="5.00" min="1" max="5"/>
+    <media:statistics views="2109234"/>
+   </media:community>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:dquI8khH1Zk</id>
+  <yt:videoId>dquI8khH1Zk</yt:videoId>
+  <yt:channelId>UCHnyfMqiRRG1u-2MsSQLbXA</yt:channelId>
+  <title>AD - Why do I get this spark when I unplug my hair dryer?</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/dquI8khH1Zk"/>
+  <author>
+   <name>Veritasium</name>
+   <uri>https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA</uri>
+  </author>
+  <published>2026-06-30T14:00:19+00:00</published>
+  <updated>2026-08-02T08:20:59+00:00</updated>
+  <media:group>
+   <media:title>AD - Why do I get this spark when I unplug my hair dryer?</media:title>
+   <media:content url="https://www.youtube.com/v/dquI8khH1Zk?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i1.ytimg.com/vi/dquI8khH1Zk/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Why does a charger sometimes spark when you unplug it, even when it's switched off at the wall? We partnered with Anker to find out…
+
+Pick up your Anker Prime Charger here:
+
+https://ankerfast.club/noagy5
+
+#AnkerTech #Anker #AnkerPrime</media:description>
+   <media:community>
+    <media:starRating count="79901" average="5.00" min="1" max="5"/>
+    <media:statistics views="3784868"/>
+   </media:community>
+  </media:group>
+ </entry>
+</feed>
