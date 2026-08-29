@@ -1,0 +1,312 @@
+use std::sync::Arc;
+use tauri::{AppHandle, State};
+
+use crate::models::*;
+use crate::poll::{self, AppState};
+use crate::{config, player, resolve, ytdlp};
+
+type R<T> = Result<T, String>;
+fn e<E: std::fmt::Display>(err: E) -> String {
+    err.to_string()
+}
+
+#[tauri::command]
+pub fn get_settings() -> R<config::Settings> {
+    config::load().map_err(e)
+}
+
+#[tauri::command]
+pub async fn save_settings(
+    settings: config::Settings,
+    state: State<'_, Arc<AppState>>,
+) -> R<()> {
+    config::save(&settings).map_err(e)?;
+    state
+        .queue
+        .set_concurrency(settings.max_concurrent_downloads)
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_channels(state: State<'_, Arc<AppState>>) -> R<Vec<Channel>> {
+    // Only subscriptions: ad-hoc uploaders are not part of the user's channel list.
+    state.db.list_subscribed_channels().map_err(e)
+}
+
+/// Tells the UI whether the Add box holds a channel, a video, or a rejected Short.
+#[tauri::command]
+pub fn classify_add_input(input: String) -> R<AddKind> {
+    match resolve::parse_add_input(&input).map_err(e)? {
+        resolve::AddTarget::Channel(_) => Ok(AddKind::Channel),
+        resolve::AddTarget::Video(_) => Ok(AddKind::Video),
+        resolve::AddTarget::Short(_) => Ok(AddKind::Short),
+    }
+}
+
+/// Adds one video without subscribing, then downloads it immediately.
+/// It sorts to the top of the grid by `sort_at`, while its card still shows
+/// the real upload date.
+#[tauri::command]
+pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Video> {
+    let video_id = match resolve::parse_add_input(&input).map_err(e)? {
+        resolve::AddTarget::Video(id) => id,
+        resolve::AddTarget::Short(_) => {
+            return Err("MyTube does not handle YouTube Shorts.".into())
+        }
+        resolve::AddTarget::Channel(_) => {
+            return Err("That is a channel link. Use Add channel to subscribe.".into())
+        }
+    };
+    let s = config::load().map_err(e)?;
+
+    if state.db.get_video(&video_id).map_err(e)?.is_none() {
+        let probe = ytdlp::probe(
+            &ytdlp::watch_url(&video_id),
+            &s.download_dir,
+            &s.filename_template,
+        )
+        .await
+        .map_err(e)?;
+
+        let channel_id = if probe.channel_id.is_empty() {
+            "UC000000000000000000000".to_string()
+        } else {
+            probe.channel_id.clone()
+        };
+
+        // subscribed = false: keeps the uploader's name on the card without
+        // adding them to the subscription list or any poll cycle.
+        state
+            .db
+            .upsert_channel(&Channel {
+                id: channel_id.clone(),
+                title: if probe.channel_title.is_empty() {
+                    "Added manually".into()
+                } else {
+                    probe.channel_title.clone()
+                },
+                handle: None,
+                url: format!("https://www.youtube.com/channel/{channel_id}"),
+                thumb_path: None,
+                subscribed: false,
+                added_at: chrono::Utc::now().timestamp(),
+                last_polled_at: None,
+            })
+            .map_err(e)?;
+
+        state
+            .db
+            .insert_video_if_new(&NewVideo {
+                id: video_id.clone(),
+                channel_id,
+                title: probe.title.clone(),
+                description: None,
+                thumb_url: Some(ytdlp::thumb_url_for(&video_id)),
+                published_at: probe.published_at, // true upload date, for display
+                sort_at: Some(chrono::Utc::now().timestamp()), // top of the grid
+                feed_rank: 0,
+                added_manually: true,
+                duration_secs: probe.duration_secs,
+                view_count: None,
+                status: VideoStatus::Ready,
+            })
+            .map_err(e)?;
+
+        poll::cache_thumb(
+            &state.http,
+            &state.db,
+            &video_id,
+            &ytdlp::thumb_url_for(&video_id),
+        )
+        .await;
+    }
+
+    state
+        .queue
+        .enqueue(video_id.clone(), s.download_dir, s.filename_template)
+        .await
+        .map_err(e)?;
+    state
+        .db
+        .get_video(&video_id)
+        .map_err(e)?
+        .ok_or_else(|| "Video disappeared after being added".to_string())
+}
+
+#[tauri::command]
+pub async fn add_channel(
+    input: String,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<Channel> {
+    if let resolve::AddTarget::Short(_) = resolve::parse_add_input(&input).map_err(e)? {
+        return Err("MyTube does not handle YouTube Shorts.".into());
+    }
+    let id = resolve::resolve(&state.http, &input).await.map_err(e)?;
+    if let Some(existing) = state.db.get_channel(&id).map_err(e)? {
+        if existing.subscribed {
+            return Ok(existing);
+        }
+    }
+
+    let settings = config::load().map_err(e)?;
+    let channel = Channel {
+        id: id.clone(),
+        title: id.clone(),
+        handle: None,
+        url: format!("https://www.youtube.com/channel/{id}"),
+        thumb_path: None,
+        subscribed: true,
+        added_at: chrono::Utc::now().timestamp(),
+        last_polled_at: None,
+    };
+    state.db.upsert_channel(&channel).map_err(e)?;
+
+    // Backfill history, then poll RSS so the recent window gets real dates.
+    if let Err(err) = poll::backfill_channel(&state, &id, settings.backfill_count).await {
+        eprintln!("backfill failed for {id}: {err}");
+    }
+    poll::poll_channels(&state, &app, vec![channel]).await;
+
+    state
+        .db
+        .get_channel(&id)
+        .map_err(e)?
+        .ok_or_else(|| "Channel disappeared after being added".to_string())
+}
+
+#[tauri::command]
+pub fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    state.db.remove_channel(&channel_id).map_err(e)
+}
+
+#[tauri::command]
+pub async fn import_takeout_csv(
+    path: String,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<ImportResult> {
+    let data = std::fs::read_to_string(&path).map_err(e)?;
+    let rows = resolve::parse_takeout_csv(&data).map_err(e)?;
+    let settings = config::load().map_err(e)?;
+    let mut result = ImportResult::default();
+
+    for (id, title) in rows {
+        if state
+            .db
+            .get_channel(&id)
+            .map_err(e)?
+            .map(|c| c.subscribed)
+            .unwrap_or(false)
+        {
+            result.skipped += 1;
+            continue;
+        }
+        let channel = Channel {
+            id: id.clone(),
+            title: if title.is_empty() {
+                id.clone()
+            } else {
+                title.clone()
+            },
+            handle: None,
+            url: format!("https://www.youtube.com/channel/{id}"),
+            thumb_path: None,
+            subscribed: true,
+            added_at: chrono::Utc::now().timestamp(),
+            last_polled_at: None,
+        };
+        if let Err(err) = state.db.upsert_channel(&channel) {
+            result.failed.push(format!("{title}: {err}"));
+            continue;
+        }
+        match poll::backfill_channel(&state, &id, settings.backfill_count).await {
+            Ok(_) => result.added += 1,
+            Err(err) => result.failed.push(format!("{title}: {err}")),
+        }
+    }
+    let channels = state.db.list_subscribed_channels().map_err(e)?;
+    poll::poll_channels(&state, &app, channels).await;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn poll_all(state: State<'_, Arc<AppState>>, app: AppHandle) -> R<PollSummary> {
+    let channels = state.db.list_subscribed_channels().map_err(e)?;
+    Ok(poll::poll_channels(&state, &app, channels).await)
+}
+
+#[tauri::command]
+pub async fn poll_channel(
+    channel_id: String,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<PollSummary> {
+    let c = state
+        .db
+        .get_channel(&channel_id)
+        .map_err(e)?
+        .ok_or_else(|| format!("No such channel: {channel_id}"))?;
+    Ok(poll::poll_channels(&state, &app, vec![c]).await)
+}
+
+#[tauri::command]
+pub fn list_videos(filter: VideoFilter, state: State<'_, Arc<AppState>>) -> R<Vec<Video>> {
+    state.db.list_videos(&filter).map_err(e)
+}
+
+#[tauri::command]
+pub fn set_watched(
+    video_id: String,
+    watched: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<()> {
+    state.db.set_watched(&video_id, watched).map_err(e)
+}
+
+#[tauri::command]
+pub async fn enqueue_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    let s = config::load().map_err(e)?;
+    state
+        .queue
+        .enqueue(video_id, s.download_dir, s.filename_template)
+        .await
+        .map_err(e)
+}
+
+#[tauri::command]
+pub async fn cancel_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    state.queue.cancel(&video_id).await.map_err(e)
+}
+
+#[tauri::command]
+pub fn open_in_player(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    let v = state
+        .db
+        .get_video(&video_id)
+        .map_err(e)?
+        .ok_or_else(|| "Unknown video".to_string())?;
+    let path = v
+        .file_path
+        .ok_or_else(|| "This video has not been downloaded".to_string())?;
+    if !std::path::Path::new(&path).exists() {
+        state.db.clear_file_path(&video_id).map_err(e)?;
+        return Err(format!("File is gone: {path}. Marked as not downloaded."));
+    }
+    let s = config::load().map_err(e)?;
+    player::launch(&s.player_command, &path).map_err(e)
+}
+
+#[tauri::command]
+pub fn delete_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    let v = state
+        .db
+        .get_video(&video_id)
+        .map_err(e)?
+        .ok_or_else(|| "Unknown video".to_string())?;
+    if let Some(p) = v.file_path {
+        let _ = std::fs::remove_file(p);
+    }
+    state.db.clear_file_path(&video_id).map_err(e)
+}

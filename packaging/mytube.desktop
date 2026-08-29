@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MyTube
+GenericName=Subscription Tracker
+Comment=Track YouTube subscriptions, download videos, and record what you have watched
+Exec=sh -c "exec \\"\\$HOME/.local/bin/mytube\\""
+Icon=mytube
+Terminal=false
+Categories=AudioVideo;Video;Network;
+StartupWMClass=mytube
