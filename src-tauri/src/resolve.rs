@@ -131,6 +131,14 @@ pub fn parse_takeout_csv(data: &str) -> Result<Vec<(String, String)>> {
         let title = rec.get(title_col).unwrap_or("").trim().to_string();
         out.push((id, title));
     }
+    // Alphabetical by title so a several-hundred-row import checklist is
+    // scannable. Case-insensitive, with the id as a tiebreaker so the order is
+    // stable for channels sharing a name (or missing one).
+    out.sort_by(|a, b| {
+        a.1.to_lowercase()
+            .cmp(&b.1.to_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
     Ok(out)
 }
 
@@ -257,8 +265,35 @@ mod tests {
                    UCXuqSBlHAE6Xw-yeJA0Tunw,http://www.youtube.com/channel/UCXuqSBlHAE6Xw-yeJA0Tunw,\"Linus Tech Tips, LLC\"\n";
         let rows = parse_takeout_csv(csv).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], (REAL.to_string(), "Veritasium".to_string()));
-        assert_eq!(rows[1].1, "Linus Tech Tips, LLC", "quoted commas must survive");
+        // Rows come back alphabetically, not in file order.
+        assert_eq!(rows[0].1, "Linus Tech Tips, LLC", "quoted commas must survive");
+        assert_eq!(rows[1], (REAL.to_string(), "Veritasium".to_string()));
+    }
+
+    #[test]
+    fn takeout_rows_come_back_alphabetically() {
+        let csv = "Channel Id,Channel Url,Channel Title\n\
+                   UCXuqSBlHAE6Xw-yeJA0Tunw,u,zebra channel\n\
+                   UCHnyfMqiRRG1u-2MsSQLbXA,u,Veritasium\n\
+                   UCBJycsmduvYEL83R_U4JriQ,u,apple channel\n\
+                   UC4QobU6STFB0P71PMvOGN5A,u,Beta\n";
+        let titles: Vec<String> =
+            parse_takeout_csv(csv).unwrap().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            titles,
+            vec!["apple channel", "Beta", "Veritasium", "zebra channel"],
+            "sorting must ignore case, not push lowercase names to the end"
+        );
+    }
+
+    #[test]
+    fn alphabetical_order_is_stable_for_duplicate_titles() {
+        let csv = "Channel Id,Channel Url,Channel Title\n\
+                   UCXuqSBlHAE6Xw-yeJA0Tunw,u,Same\n\
+                   UCHnyfMqiRRG1u-2MsSQLbXA,u,Same\n";
+        let ids: Vec<String> =
+            parse_takeout_csv(csv).unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["UCHnyfMqiRRG1u-2MsSQLbXA", "UCXuqSBlHAE6Xw-yeJA0Tunw"]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::models::*;
 
 pub struct Db { conn: Mutex<Connection> }
 
-const SCHEMA: &str = r#"
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS channels (
   id             TEXT PRIMARY KEY,
   title          TEXT NOT NULL,
@@ -44,6 +44,49 @@ CREATE INDEX IF NOT EXISTS idx_videos_feed    ON videos(status, sort_at DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at DESC);
 "#;
 
+/// Current schema version. Bump and add a step below when the schema changes.
+const SCHEMA_VERSION: i64 = 2;
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        if r.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Stepwise migration keyed off `user_version`.
+///
+/// A fresh database runs every step in order, so it converges on exactly the
+/// same schema an upgraded one has. `CREATE TABLE IF NOT EXISTS` alone is NOT a
+/// migration: on an existing database it silently does nothing, so any new
+/// column has to arrive through its own ALTER step.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+    if version < 1 {
+        conn.execute_batch(SCHEMA_V1)?;
+    }
+
+    if version < 2 {
+        if !column_exists(conn, "videos", "hidden")? {
+            conn.execute(
+                "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_videos_hidden ON videos(hidden, sort_at DESC);",
+        )?;
+    }
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
 fn now() -> i64 { chrono::Utc::now().timestamp() }
 
 /// Escapes LIKE wildcards so a literal `%` or `_` in a search box is literal.
@@ -64,8 +107,7 @@ impl Db {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", 1)?;
+        migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -174,6 +216,20 @@ impl Db {
         Ok(())
     }
 
+    /// Fills a date only where one is missing. An exact RSS timestamp must never
+    /// be clobbered by the day-granular approximate date from a flat listing.
+    pub fn set_published_at_if_missing(&self, id: &str, ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE videos SET published_at=?2,
+                    sort_at = CASE WHEN added_manually=1 THEN sort_at
+                                   ELSE COALESCE(sort_at, ?2) END
+             WHERE id=?1 AND published_at IS NULL",
+            params![id, ts],
+        )?;
+        Ok(())
+    }
+
     pub fn set_thumb_path(&self, id: &str, path: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET thumb_path=?2 WHERE id=?1", params![id, path])?;
@@ -215,6 +271,7 @@ impl Db {
             args.push(Box::new(ch.clone()));
             sql.push_str(&format!(" AND v.channel_id=?{}", args.len()));
         }
+        if !f.show_hidden { sql.push_str(" AND v.hidden=0"); }
         if f.hide_watched { sql.push_str(" AND v.watched=0"); }
         if f.downloaded_only { sql.push_str(" AND v.download_state='done'"); }
         if let Some(term) = f.search.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -264,6 +321,44 @@ impl Db {
         Ok(())
     }
 
+    /// Tombstones a video so polling never surfaces it again. The row stays put,
+    /// which is precisely what stops `INSERT OR IGNORE` from re-adding it.
+    pub fn set_hidden(&self, id: &str, hidden: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE videos SET hidden=?2 WHERE id=?1", params![id, hidden as i64])?;
+        Ok(())
+    }
+
+    /// Removes a row outright. Only safe for manually added videos: nothing polls
+    /// them, so nothing can bring them back.
+    pub fn delete_video(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM videos WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Drops an unsubscribed channel once it has no videos left, so ad-hoc
+    /// uploaders do not accumulate as empty rows.
+    pub fn prune_orphan_channel(&self, channel_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM channels
+             WHERE id=?1 AND subscribed=0
+               AND NOT EXISTS (SELECT 1 FROM videos WHERE channel_id=?1)",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Video ids on a channel that still have no publish date, for the v2 date backfill.
+    pub fn video_ids_missing_date(&self, channel_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT id FROM videos WHERE channel_id=?1 AND published_at IS NULL")?;
+        let rows = st.query_map(params![channel_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// A yt-dlp child never survives an app restart, so anything left mid-flight
     /// is reset to `none` and becomes clickable again.
     pub fn reset_stale_downloads(&self) -> Result<()> {
@@ -277,7 +372,7 @@ impl Db {
 const SELECT_VIDEO: &str = "
 SELECT v.id, v.channel_id, c.title, v.title, v.description, v.thumb_url, v.thumb_path,
        v.published_at, v.sort_at, v.feed_rank, v.added_manually,
-       v.duration_secs, v.view_count, v.status,
+       v.duration_secs, v.view_count, v.status, v.hidden,
        v.watched, v.watched_at, v.download_state, v.download_error, v.file_path,
        v.first_seen_at
 FROM videos v JOIN channels c ON c.id = v.channel_id";
@@ -290,16 +385,16 @@ fn map_video(r: &Row) -> rusqlite::Result<Video> {
         added_manually: r.get::<_, i64>(10)? != 0,
         duration_secs: r.get(11)?, view_count: r.get(12)?,
         status: VideoStatus::parse(&r.get::<_, String>(13)?),
-        watched: r.get::<_, i64>(14)? != 0, watched_at: r.get(15)?,
-        download_state: DownloadState::parse(&r.get::<_, String>(16)?),
-        download_error: r.get(17)?, file_path: r.get(18)?, first_seen_at: r.get(19)?,
+        hidden: r.get::<_, i64>(14)? != 0,
+        watched: r.get::<_, i64>(15)? != 0, watched_at: r.get(16)?,
+        download_state: DownloadState::parse(&r.get::<_, String>(17)?),
+        download_error: r.get(18)?, file_path: r.get(19)?, first_seen_at: r.get(20)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::*;
 
     fn db() -> Db { Db::open_in_memory().unwrap() }
 
@@ -432,6 +527,118 @@ mod tests {
         let got = &d.list_channels().unwrap()[0];
         assert_eq!(got.title, "New");
         assert_eq!(got.added_at, 42, "added_at must not be overwritten");
+    }
+
+    /// The failure mode that only shows up on a database that already has data:
+    /// `CREATE TABLE IF NOT EXISTS` does nothing to an existing table, so a new
+    /// column must arrive via its own ALTER step.
+    #[test]
+    fn migrating_a_v1_database_preserves_rows_and_adds_hidden() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Build a genuine v1 database: original schema, stamped version 1.
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO videos (id,channel_id,title,published_at,sort_at,status,first_seen_at)
+             VALUES ('a','UC1','kept',100,100,'ready',1)",
+            [],
+        ).unwrap();
+        assert!(!column_exists(&conn, "videos", "hidden").unwrap());
+
+        let db = Db::init(conn).unwrap();
+
+        let v = db.get_video("a").unwrap().expect("row survived the migration");
+        assert_eq!(v.title, "kept");
+        assert_eq!(v.published_at, Some(100));
+        assert!(!v.hidden, "existing rows default to visible");
+        assert_eq!(db.list_channels().unwrap()[0].added_at, 7);
+        assert_eq!(db.list_videos(&VideoFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_a_fresh_db_matches_an_upgraded_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        let db = Db::init(conn).unwrap();
+        {
+            let c = db.conn.lock().unwrap();
+            assert!(column_exists(&c, "videos", "hidden").unwrap());
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            // Running it again must not error or duplicate anything.
+            migrate(&c).unwrap();
+        }
+        assert_eq!(db.list_videos(&VideoFilter::default()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn hidden_videos_leave_the_feed_and_come_back_with_show_hidden() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(2))).unwrap();
+        d.insert_video_if_new(&vid("b", "UC1", Some(1))).unwrap();
+        d.set_hidden("a", true).unwrap();
+
+        let ids: Vec<String> = d.list_videos(&VideoFilter::default()).unwrap()
+            .into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec!["b"]);
+
+        let showing = VideoFilter { show_hidden: true, ..Default::default() };
+        assert_eq!(d.list_videos(&showing).unwrap().len(), 2);
+
+        d.set_hidden("a", false).unwrap();
+        assert_eq!(d.list_videos(&VideoFilter::default()).unwrap().len(), 2);
+    }
+
+    /// The whole point of hiding rather than deleting: polling must not undo it.
+    #[test]
+    fn a_hidden_video_is_not_resurrected_by_a_later_poll() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(1))).unwrap();
+        d.set_hidden("a", true).unwrap();
+        // A later poll sees the same id again and tries to insert it.
+        assert!(!d.insert_video_if_new(&vid("a", "UC1", Some(1))).unwrap());
+        assert!(d.get_video("a").unwrap().unwrap().hidden, "still hidden after re-poll");
+        assert!(d.list_videos(&VideoFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_video_removes_it_and_prunes_an_orphan_adhoc_channel() {
+        let d = db();
+        let mut adhoc = chan("UC2", "Ad-hoc uploader");
+        adhoc.subscribed = false;
+        d.upsert_channel(&adhoc).unwrap();
+        let mut v = vid("m", "UC2", Some(1));
+        v.added_manually = true;
+        d.insert_video_if_new(&v).unwrap();
+
+        d.delete_video("m").unwrap();
+        assert!(d.get_video("m").unwrap().is_none());
+        d.prune_orphan_channel("UC2").unwrap();
+        assert!(d.get_channel("UC2").unwrap().is_none(), "empty ad-hoc channel pruned");
+    }
+
+    #[test]
+    fn pruning_never_removes_a_real_subscription() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "Subscribed")).unwrap();
+        d.prune_orphan_channel("UC1").unwrap();
+        assert!(d.get_channel("UC1").unwrap().is_some(), "subscribed channels are never pruned");
+    }
+
+    #[test]
+    fn videos_missing_a_date_are_listed_for_the_backfill() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("dated", "UC1", Some(5))).unwrap();
+        let mut undated = vid("undated", "UC1", None);
+        undated.sort_at = None;
+        d.insert_video_if_new(&undated).unwrap();
+        assert_eq!(d.video_ids_missing_date("UC1").unwrap(), vec!["undated".to_string()]);
     }
 
     #[test]

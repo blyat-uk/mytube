@@ -47,6 +47,11 @@ pub fn run() {
             // Startup poll, then a repeating background timer.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Repairs rows written before approximate dates were fetched.
+                let fixed = poll::backfill_missing_dates(&state).await;
+                if fixed > 0 {
+                    eprintln!("mytube: filled in {fixed} missing upload dates");
+                }
                 if settings.poll_on_startup {
                     let channels = state.db.list_subscribed_channels().unwrap_or_default();
                     if !channels.is_empty() {
@@ -75,6 +80,9 @@ pub fn run() {
             commands::classify_add_input,
             commands::remove_channel,
             commands::import_takeout_csv,
+            commands::preview_takeout_csv,
+            commands::set_video_hidden,
+            commands::delete_video,
             commands::poll_all,
             commands::poll_channel,
             commands::list_videos,

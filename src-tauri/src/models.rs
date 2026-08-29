@@ -89,6 +89,7 @@ pub struct Video {
     pub duration_secs: Option<i64>,
     pub view_count: Option<i64>,
     pub status: VideoStatus,
+    pub hidden: bool,
     pub watched: bool,
     pub watched_at: Option<i64>,
     pub download_state: DownloadState,
@@ -129,6 +130,7 @@ pub struct VideoFilter {
     pub channel_id: Option<String>,
     pub hide_watched: bool,
     pub downloaded_only: bool,
+    pub show_hidden: bool,
     pub search: Option<String>,
     pub sort: SortOrder,
     pub limit: i64,
@@ -141,6 +143,7 @@ impl Default for VideoFilter {
             channel_id: None,
             hide_watched: false,
             downloaded_only: false,
+            show_hidden: false,
             search: None,
             sort: SortOrder::Newest,
             limit: 100,
@@ -176,6 +179,10 @@ pub struct FlatEntry {
     pub duration_secs: Option<i64>,
     pub live_status: Option<String>,
     pub view_count: Option<i64>,
+    /// Approximate upload date, from `youtubetab:approximate_date`. Day-granular,
+    /// which is enough to interleave backfilled videos into the feed by date.
+    /// RSS later overwrites the recent window with exact timestamps.
+    pub published_at: Option<i64>,
 }
 
 /// What the Add box was handed.
@@ -224,6 +231,23 @@ pub struct PollSummary {
     pub new_videos: usize,
     pub shorts_rejected: usize,
     pub errors: Vec<String>,
+}
+
+/// One row of a Takeout CSV, for the pre-import checklist.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeoutRow {
+    pub channel_id: String,
+    pub title: String,
+    pub already_subscribed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgress {
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

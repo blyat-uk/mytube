@@ -49,3 +49,45 @@ describe("cardAction", () => {
     expect(cardAction({ download_state: "done", file_path: "/x.mkv", added_manually: true } as any))
       .toBe("play"));
 });
+
+import { clampCardSize, nextCardSize, insertToken, TEMPLATE_PRESETS, TOKEN_CHIPS } from "./format";
+
+describe("card size zoom", () => {
+  it("clamps to the supported range", () => {
+    expect(clampCardSize(10)).toBe(160);
+    expect(clampCardSize(9999)).toBe(460);
+    expect(clampCardSize(300)).toBe(300);
+    expect(clampCardSize(Number.NaN)).toBe(260);
+  });
+  it("steps up when scrolling up and down when scrolling down", () => {
+    expect(nextCardSize(260, -1)).toBeGreaterThan(260);
+    expect(nextCardSize(260, 1)).toBeLessThan(260);
+  });
+  it("cannot step outside the range", () => {
+    expect(nextCardSize(160, 1)).toBe(160);
+    expect(nextCardSize(460, -1)).toBe(460);
+  });
+});
+
+describe("filename template helpers", () => {
+  it("inserts a token at the caret", () => {
+    expect(insertToken("a/b.%(ext)s", 2, "%(id)s")).toEqual({
+      value: "a/%(id)sb.%(ext)s",
+      caret: 2 + "%(id)s".length,
+    });
+  });
+  it("appends when the caret is at the end", () => {
+    expect(insertToken("abc", 3, "X").value).toBe("abcX");
+  });
+  it("treats a null caret as the end of the string", () => {
+    expect(insertToken("abc", null, "X").value).toBe("abcX");
+  });
+  it("offers presets that all produce an extension", () => {
+    expect(TEMPLATE_PRESETS.length).toBeGreaterThanOrEqual(4);
+    for (const p of TEMPLATE_PRESETS) expect(p.value).toContain("%(ext)s");
+  });
+  it("offers token chips that are all yt-dlp fields", () => {
+    expect(TOKEN_CHIPS.length).toBeGreaterThanOrEqual(6);
+    for (const t of TOKEN_CHIPS) expect(t).toMatch(/^%\(.+\)[sd]$/);
+  });
+});

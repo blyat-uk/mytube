@@ -55,3 +55,88 @@ export function formatDate(ts: number | null): string {
     year: "numeric", month: "short", day: "numeric",
   });
 }
+
+/* ------------------------------------------------------------------ *
+ * Card zoom
+ * ------------------------------------------------------------------ */
+
+export const CARD_MIN = 160;
+export const CARD_MAX = 460;
+export const CARD_DEFAULT = 260;
+const CARD_STEP = 20;
+
+export function clampCardSize(px: number): number {
+  if (!Number.isFinite(px)) return CARD_DEFAULT;
+  return Math.min(CARD_MAX, Math.max(CARD_MIN, Math.round(px)));
+}
+
+/** `deltaY` follows wheel convention: negative scrolls up, which zooms in. */
+export function nextCardSize(current: number, deltaY: number): number {
+  const dir = deltaY < 0 ? 1 : -1;
+  return clampCardSize(current + dir * CARD_STEP);
+}
+
+/* ------------------------------------------------------------------ *
+ * Filename template helpers
+ * ------------------------------------------------------------------ */
+
+export interface TemplatePreset {
+  label: string;
+  value: string;
+  hint: string;
+}
+
+/** Whole templates, applied by replacing the field. */
+export const TEMPLATE_PRESETS: TemplatePreset[] = [
+  {
+    label: "Channel folder",
+    value: "%(uploader)s/%(title)s [%(id)s].%(ext)s",
+    hint: "Veritasium/Some video [abc123].mkv",
+  },
+  {
+    label: "Channel folder, dated",
+    value: "%(uploader)s/%(upload_date)s - %(title)s [%(id)s].%(ext)s",
+    hint: "Veritasium/20260818 - Some video [abc123].mkv",
+  },
+  {
+    label: "Flat",
+    value: "%(title)s [%(id)s].%(ext)s",
+    hint: "Some video [abc123].mkv",
+  },
+  {
+    label: "Channel / year",
+    value: "%(uploader)s/%(upload_date>%Y)s/%(title)s [%(id)s].%(ext)s",
+    hint: "Veritasium/2026/Some video [abc123].mkv",
+  },
+  {
+    label: "Dated, flat",
+    value: "%(upload_date)s - %(uploader)s - %(title)s.%(ext)s",
+    hint: "20260818 - Veritasium - Some video.mkv",
+  },
+];
+
+/** Individual fields, inserted at the caret. */
+export const TOKEN_CHIPS = [
+  "%(title)s",
+  "%(id)s",
+  "%(uploader)s",
+  "%(channel)s",
+  "%(upload_date)s",
+  "%(duration)s",
+  "%(resolution)s",
+  "%(view_count)s",
+  "%(playlist_index)d",
+  "%(ext)s",
+];
+
+export function insertToken(
+  value: string,
+  caret: number | null,
+  token: string,
+): { value: string; caret: number } {
+  const at = caret === null || caret > value.length ? value.length : caret;
+  return {
+    value: value.slice(0, at) + token + value.slice(at),
+    caret: at + token.length,
+  };
+}

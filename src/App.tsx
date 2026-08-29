@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CARD_DEFAULT, clampCardSize } from "./format";
 import TopNav, { type Tab } from "./components/TopNav";
 import SubscriptionsView from "./components/SubscriptionsView";
 import DownloadsView from "./components/DownloadsView";
@@ -27,6 +28,8 @@ function Shell() {
   const [search, setSearch] = useState("");
   const [hideWatched, setHideWatched] = useState(false);
   const [downloadedOnly, setDownloadedOnly] = useState(false);
+  const [showHidden, setShowHidden] = useState(false);
+  const [cardSize, setCardSize] = useState(CARD_DEFAULT);
   const [sort, setSort] = useState<SortOrder>("newest");
   const [polling, setPolling] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
@@ -88,6 +91,25 @@ function Shell() {
     if (channelId && !channels.some((c) => c.id === channelId)) setChannelId(null);
   }, [channels, channelId]);
 
+  // Card size lives in settings.json so the zoom level survives a restart.
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => setCardSize(clampCardSize(s.card_size ?? CARD_DEFAULT)))
+      .catch(() => {});
+  }, []);
+
+  const sizeTimer = useRef<number | undefined>(undefined);
+  const saveCardSize = useCallback((px: number) => {
+    setCardSize(px);
+    window.clearTimeout(sizeTimer.current);
+    // Zooming fires many wheel events; only the resting value is worth writing.
+    sizeTimer.current = window.setTimeout(() => {
+      api.getSettings()
+        .then((s) => api.saveSettings({ ...s, card_size: px }))
+        .catch(() => {});
+    }, 400);
+  }, []);
+
   return (
     <div className="app">
       <TopNav
@@ -102,6 +124,8 @@ function Shell() {
         onHideWatched={setHideWatched}
         downloadedOnly={downloadedOnly}
         onDownloadedOnly={setDownloadedOnly}
+        showHidden={showHidden}
+        onShowHidden={setShowHidden}
         sort={sort}
         onSort={setSort}
         polling={polling}
@@ -116,6 +140,9 @@ function Shell() {
             search={search}
             hideWatched={hideWatched}
             downloadedOnly={downloadedOnly}
+            showHidden={showHidden}
+            cardSize={cardSize}
+            onCardSize={saveCardSize}
             sort={sort}
             reloadToken={reloadToken}
             channelCount={channels.length}

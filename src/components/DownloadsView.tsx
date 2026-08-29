@@ -26,11 +26,11 @@ export default function DownloadsView({ reloadToken }: Props) {
       // guarantees completed downloads show even when they are old.
       const [recent, done] = await Promise.all([
         api.listVideos({
-          channelId: null, hideWatched: false, downloadedOnly: false,
+          channelId: null, hideWatched: false, downloadedOnly: false, showHidden: true,
           search: null, sort: "newest", limit: SWEEP, offset: 0,
         }),
         api.listVideos({
-          channelId: null, hideWatched: false, downloadedOnly: true,
+          channelId: null, hideWatched: false, downloadedOnly: true, showHidden: true,
           search: null, sort: "newest", limit: SWEEP, offset: 0,
         }),
       ]);

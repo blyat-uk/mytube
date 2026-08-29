@@ -46,6 +46,19 @@ pub async fn cache_thumb(http: &reqwest::Client, db: &Db, video_id: &str, url: &
     }
 }
 
+const THUMB_CONCURRENCY: usize = 8;
+
+/// Thumbnails were the real cost of an import: fetching ~30 per channel one at a
+/// time meant a 300-channel Takeout CSV spent most of its time waiting on HTTP.
+pub async fn cache_thumbs(state: &AppState, items: impl Iterator<Item = (String, String)>) {
+    let jobs: Vec<(String, String)> = items.collect();
+    stream::iter(jobs)
+        .for_each_concurrent(THUMB_CONCURRENCY, |(id, url)| async move {
+            cache_thumb(&state.http, &state.db, &id, &url).await;
+        })
+        .await;
+}
+
 /// Fills duration/status for a channel's unresolved videos with ONE yt-dlp call.
 async fn resolve_metadata(db: &Db, channel_id: &str, backfill: u32) -> Result<()> {
     let cutoff = chrono::Utc::now().timestamp() - RETRY_WINDOW_SECS;
@@ -61,8 +74,32 @@ async fn resolve_metadata(db: &Db, channel_id: &str, backfill: u32) -> Result<()
         }
         let status = ytdlp::status_from(e.live_status.as_deref(), e.duration_secs);
         db.update_video_meta(&e.id, e.duration_secs, e.view_count, status)?;
+        if let Some(ts) = e.published_at {
+            db.set_published_at_if_missing(&e.id, ts)?;
+        }
     }
     Ok(())
+}
+
+/// One-off repair for databases written before approximate dates were fetched:
+/// those rows have a NULL `published_at` and sort last forever. One flat listing
+/// per subscribed channel fixes them.
+pub async fn backfill_missing_dates(state: &AppState) -> usize {
+    let Ok(channels) = state.db.list_subscribed_channels() else { return 0 };
+    let backfill = config::load().map(|s| s.backfill_count).unwrap_or(30);
+    let mut fixed = 0;
+    for c in channels {
+        let missing = state.db.video_ids_missing_date(&c.id).unwrap_or_default();
+        if missing.is_empty() { continue; }
+        let Ok(entries) = ytdlp::flat_playlist(&c.id, backfill.max(missing.len() as u32)).await
+        else { continue };
+        for e in entries {
+            if let Some(ts) = e.published_at {
+                if state.db.set_published_at_if_missing(&e.id, ts).is_ok() { fixed += 1; }
+            }
+        }
+    }
+    fixed
 }
 
 pub async fn poll_one(
@@ -114,13 +151,16 @@ pub async fn poll_one(
 
     resolve_metadata(&state.db, &channel.id, backfill).await?;
 
-    for e in &feed.entries {
-        let url = e
-            .thumb_url
-            .clone()
-            .unwrap_or_else(|| ytdlp::thumb_url_for(&e.video_id));
-        cache_thumb(&state.http, &state.db, &e.video_id, &url).await;
-    }
+    cache_thumbs(
+        state,
+        feed.entries.iter().map(|e| {
+            (
+                e.video_id.clone(),
+                e.thumb_url.clone().unwrap_or_else(|| ytdlp::thumb_url_for(&e.video_id)),
+            )
+        }),
+    )
+    .await;
     state.db.set_channel_polled(&channel.id)?;
     Ok((new_count, feed.shorts_rejected))
 }
@@ -180,8 +220,11 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
             title: e.title.clone(),
             description: None,
             thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
-            published_at: None, // flat-playlist provides no date
-            sort_at: None,      // sorts last, ordered by feed_rank
+            // Approximate dates come from `youtubetab:approximate_date`, so
+            // backfilled videos interleave into the feed by upload date instead
+            // of piling up at the bottom.
+            published_at: e.published_at,
+            sort_at: e.published_at,
             feed_rank: rank as i64,
             added_manually: false,
             duration_secs: e.duration_secs,
@@ -192,8 +235,10 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
             added += 1;
         }
     }
-    for e in &entries {
-        cache_thumb(&state.http, &state.db, &e.id, &ytdlp::thumb_url_for(&e.id)).await;
-    }
+    cache_thumbs(
+        state,
+        entries.iter().map(|e| (e.id.clone(), ytdlp::thumb_url_for(&e.id))),
+    )
+    .await;
     Ok(added)
 }

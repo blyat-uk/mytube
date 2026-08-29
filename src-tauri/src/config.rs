@@ -28,6 +28,10 @@ fn d_poll_on_startup() -> bool {
 fn d_backfill_count() -> u32 {
     30
 }
+/// Minimum grid card width in px, driven by Ctrl+scroll on the grid.
+fn d_card_size() -> u32 {
+    260
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -45,6 +49,8 @@ pub struct Settings {
     pub poll_on_startup: bool,
     #[serde(default = "d_backfill_count")]
     pub backfill_count: u32,
+    #[serde(default = "d_card_size")]
+    pub card_size: u32,
     /// Preserves keys written by future versions or by hand.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -63,6 +69,7 @@ impl Settings {
         v.max_concurrent_downloads = v.max_concurrent_downloads.clamp(1, 16);
         v.poll_interval_minutes = v.poll_interval_minutes.clamp(1, 1440);
         v.backfill_count = v.backfill_count.clamp(1, 500);
+        v.card_size = v.card_size.clamp(160, 460);
         Ok(v)
     }
 
@@ -125,6 +132,7 @@ mod tests {
         assert_eq!(s.max_concurrent_downloads, 5);
         assert_eq!(s.poll_interval_minutes, 30);
         assert_eq!(s.backfill_count, 30);
+        assert_eq!(s.card_size, 260);
         assert_eq!(s.player_command, "smplayer");
         assert!(s.poll_on_startup);
         assert_eq!(s.filename_template, "%(uploader)s/%(title)s [%(id)s].%(ext)s");
@@ -142,6 +150,13 @@ mod tests {
         let s = Settings::from_json_str(r#"{"future_option":true}"#).unwrap();
         let out = s.to_json_string().unwrap();
         assert!(out.contains("future_option"), "unknown key was dropped: {out}");
+    }
+
+    #[test]
+    fn card_size_is_clamped_to_the_zoom_range() {
+        assert_eq!(Settings::from_json_str(r#"{"card_size":10}"#).unwrap().card_size, 160);
+        assert_eq!(Settings::from_json_str(r#"{"card_size":9999}"#).unwrap().card_size, 460);
+        assert_eq!(Settings::from_json_str(r#"{"card_size":300}"#).unwrap().card_size, 300);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import TakeoutDialog from "./TakeoutDialog";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
-import type { AddKind, Channel } from "../types";
+import type { AddKind, Channel, TakeoutRow } from "../types";
 
 interface Props {
   open: boolean;
@@ -32,6 +33,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
   const [problem, setProblem] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [takeout, setTakeout] = useState<{ path: string; rows: TakeoutRow[] } | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const classifyId = useRef(0);
@@ -105,7 +107,8 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
     }
   }
 
-  async function importCsv() {
+  /** Step one: parse the CSV and show the checklist. Nothing is imported yet. */
+  async function pickCsv() {
     setImporting(true);
     try {
       const path = await open({
@@ -115,7 +118,25 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
         filters: [{ name: "CSV", extensions: ["csv"] }],
       });
       if (!path) return;
-      const result = await api.importTakeoutCsv(path);
+      const rows = await api.previewTakeoutCsv(path as string);
+      if (rows.length === 0) {
+        toast.error("That CSV has no channels in it.");
+        return;
+      }
+      setTakeout({ path: path as string, rows });
+    } catch (err) {
+      toast.error(errText(err));
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  /** Step two: import exactly what was ticked. */
+  async function runImport(channelIds: string[]) {
+    if (!takeout) return;
+    setImporting(true);
+    try {
+      const result = await api.importTakeoutCsv(takeout.path, channelIds);
       const failed = result.failed.length;
       toast.success(
         `Imported ${result.added} channel${result.added === 1 ? "" : "s"}` +
@@ -123,6 +144,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
         (failed ? `, ${failed} failed` : "") + ".",
       );
       if (failed) toast.error(`Could not import: ${result.failed.slice(0, 5).join(", ")}`);
+      setTakeout(null);
       onChanged();
     } catch (err) {
       toast.error(errText(err));
@@ -203,7 +225,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
           <button
             type="button"
             className="btn"
-            onClick={() => void importCsv()}
+            onClick={() => void pickCsv()}
             disabled={importing}
           >
             {importing ? "Importing…" : "Import Takeout CSV"}
@@ -249,6 +271,15 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
           </ul>
         )}
       </div>
+
+      {takeout && (
+        <TakeoutDialog
+          rows={takeout.rows}
+          importing={importing}
+          onImport={(ids) => void runImport(ids)}
+          onCancel={() => setTakeout(null)}
+        />
+      )}
     </div>
   );
 }

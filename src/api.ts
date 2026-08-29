@@ -1,6 +1,6 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import type {
-  AddKind, Channel, Video, VideoFilter, Settings, PollSummary, ImportResult,
+  AddKind, Channel, Video, VideoFilter, Settings, PollSummary, ImportResult, TakeoutRow,
 } from "./types";
 
 export const api = {
@@ -11,7 +11,12 @@ export const api = {
   addVideo: (input: string) => invoke<Video>("add_video", { input }),
   classifyAddInput: (input: string) => invoke<AddKind>("classify_add_input", { input }),
   removeChannel: (channelId: string) => invoke<void>("remove_channel", { channelId }),
-  importTakeoutCsv: (path: string) => invoke<ImportResult>("import_takeout_csv", { path }),
+  previewTakeoutCsv: (path: string) => invoke<TakeoutRow[]>("preview_takeout_csv", { path }),
+  importTakeoutCsv: (path: string, channelIds: string[]) =>
+    invoke<ImportResult>("import_takeout_csv", { path, channelIds }),
+  setVideoHidden: (videoId: string, hidden: boolean) =>
+    invoke<void>("set_video_hidden", { videoId, hidden }),
+  deleteVideo: (videoId: string) => invoke<void>("delete_video", { videoId }),
   pollAll: () => invoke<PollSummary>("poll_all"),
   pollChannel: (channelId: string) => invoke<PollSummary>("poll_channel", { channelId }),
   listVideos: (filter: VideoFilter) => invoke<Video[]>("list_videos", { filter }),

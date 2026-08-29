@@ -1,9 +1,14 @@
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use futures::stream::StreamExt;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::models::*;
 use crate::poll::{self, AppState};
 use crate::{config, player, resolve, ytdlp};
+
+/// Backfills run a few at a time: enough to hide latency, few enough
+/// to stay clear of YouTube rate limiting.
+const IMPORT_CONCURRENCY: usize = 3;
 
 type R<T> = Result<T, String>;
 fn e<E: std::fmt::Display>(err: E) -> String {
@@ -181,35 +186,56 @@ pub fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>) -> R<
     state.db.remove_channel(&channel_id).map_err(e)
 }
 
+/// Parses the CSV without importing anything, so the UI can offer a checklist.
+#[tauri::command]
+pub fn preview_takeout_csv(path: String, state: State<'_, Arc<AppState>>) -> R<Vec<TakeoutRow>> {
+    let data = std::fs::read_to_string(&path).map_err(e)?;
+    let rows = resolve::parse_takeout_csv(&data).map_err(e)?;
+    let subscribed: std::collections::HashSet<String> = state
+        .db
+        .list_subscribed_channels()
+        .map_err(e)?
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    Ok(rows
+        .into_iter()
+        .map(|(channel_id, title)| TakeoutRow {
+            already_subscribed: subscribed.contains(&channel_id),
+            title: if title.is_empty() { channel_id.clone() } else { title },
+            channel_id,
+        })
+        .collect())
+}
+
+/// Imports only the channels the user ticked. Backfills run a few at a time and
+/// report progress, rather than blocking on one long opaque spinner.
 #[tauri::command]
 pub async fn import_takeout_csv(
     path: String,
+    channel_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> R<ImportResult> {
     let data = std::fs::read_to_string(&path).map_err(e)?;
-    let rows = resolve::parse_takeout_csv(&data).map_err(e)?;
+    let all = resolve::parse_takeout_csv(&data).map_err(e)?;
+    let wanted: std::collections::HashSet<String> = channel_ids.into_iter().collect();
+    let rows: Vec<(String, String)> =
+        all.into_iter().filter(|(id, _)| wanted.contains(id)).collect();
+
     let settings = config::load().map_err(e)?;
+    let total = rows.len();
     let mut result = ImportResult::default();
+    let mut to_backfill: Vec<(String, String)> = Vec::new();
 
     for (id, title) in rows {
-        if state
-            .db
-            .get_channel(&id)
-            .map_err(e)?
-            .map(|c| c.subscribed)
-            .unwrap_or(false)
-        {
+        if state.db.get_channel(&id).map_err(e)?.map(|c| c.subscribed).unwrap_or(false) {
             result.skipped += 1;
             continue;
         }
         let channel = Channel {
             id: id.clone(),
-            title: if title.is_empty() {
-                id.clone()
-            } else {
-                title.clone()
-            },
+            title: if title.is_empty() { id.clone() } else { title.clone() },
             handle: None,
             url: format!("https://www.youtube.com/channel/{id}"),
             thumb_path: None,
@@ -221,14 +247,67 @@ pub async fn import_takeout_csv(
             result.failed.push(format!("{title}: {err}"));
             continue;
         }
-        match poll::backfill_channel(&state, &id, settings.backfill_count).await {
-            Ok(_) => result.added += 1,
-            Err(err) => result.failed.push(format!("{title}: {err}")),
-        }
+        to_backfill.push((id, channel.title));
     }
+
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let failures: tokio::sync::Mutex<Vec<String>> = tokio::sync::Mutex::new(Vec::new());
+    let inner = state.inner().clone();
+
+    futures::stream::iter(to_backfill.iter())
+        .for_each_concurrent(IMPORT_CONCURRENCY, |(id, title)| {
+            let inner = inner.clone();
+            let done = &done;
+            let failures = &failures;
+            let app = app.clone();
+            async move {
+                if let Err(err) =
+                    poll::backfill_channel(&inner, id, settings.backfill_count).await
+                {
+                    failures.lock().await.push(format!("{title}: {err}"));
+                }
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "import://progress",
+                    ImportProgress { done: n, total, current: title.clone() },
+                );
+            }
+        })
+        .await;
+
+    let failed = failures.into_inner();
+    result.added = to_backfill.len() - failed.len();
+    result.failed.extend(failed);
+
     let channels = state.db.list_subscribed_channels().map_err(e)?;
     poll::poll_channels(&state, &app, channels).await;
     Ok(result)
+}
+
+/// Hides a video so polling never surfaces it again.
+#[tauri::command]
+pub fn set_video_hidden(
+    video_id: String,
+    hidden: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<()> {
+    state.db.set_hidden(&video_id, hidden).map_err(e)
+}
+
+/// Removes a manually added video outright. Refuses subscription videos, which
+/// would simply reappear on the next poll — those must be hidden instead.
+#[tauri::command]
+pub fn delete_video(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    let v = state
+        .db
+        .get_video(&video_id)
+        .map_err(e)?
+        .ok_or_else(|| "Unknown video".to_string())?;
+    if !v.added_manually {
+        return Err("Only manually added videos can be deleted. Hide this one instead.".into());
+    }
+    state.db.delete_video(&video_id).map_err(e)?;
+    state.db.prune_orphan_channel(&v.channel_id).map_err(e)
 }
 
 #[tauri::command]

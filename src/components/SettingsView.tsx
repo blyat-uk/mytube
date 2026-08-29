@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { TEMPLATE_PRESETS, TOKEN_CHIPS, insertToken } from "../format";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
@@ -57,6 +58,8 @@ export default function SettingsView() {
     }
   }, [toast]);
 
+  const templateRef = useRef<HTMLInputElement | null>(null);
+
   const set = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
     const base = current.current;
     if (!base) return;
@@ -78,6 +81,26 @@ export default function SettingsView() {
   const blurCommit = useCallback(() => {
     if (current.current) void commit(current.current);
   }, [commit]);
+
+  /** Replaces the whole template with a preset and saves immediately. */
+  const applyTemplate = useCallback((value: string) => {
+    setAndSave("filename_template", value);
+  }, [setAndSave]);
+
+  /** Inserts a field at the caret, keeping the caret after what was inserted. */
+  const applyToken = useCallback((token: string) => {
+    const base = current.current;
+    const el = templateRef.current;
+    if (!base) return;
+    const caret = el && document.activeElement === el ? el.selectionStart : null;
+    const { value, caret: next } = insertToken(base.filename_template, caret, token);
+    setAndSave("filename_template", value);
+    requestAnimationFrame(() => {
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next, next);
+    });
+  }, [setAndSave]);
 
   const setDraft = useCallback((field: NumField, raw: string) => {
     const next = { ...draftRef.current, [field]: raw };
@@ -168,12 +191,47 @@ export default function SettingsView() {
 
       <Field label="Filename template" hint="yt-dlp output template, relative to the download folder.">
         <input
+          ref={templateRef}
           className="text-input mono"
           value={s.filename_template}
           onChange={(e) => set("filename_template", e.currentTarget.value)}
           onBlur={blurCommit}
           spellCheck={false}
         />
+
+        <div className="preset-block">
+          <span className="preset-label">Presets</span>
+          <div className="chip-row">
+            {TEMPLATE_PRESETS.map((preset) => (
+              <button
+                key={preset.value}
+                type="button"
+                className={`preset-chip${s.filename_template === preset.value ? " is-on" : ""}`}
+                title={preset.hint}
+                onClick={() => applyTemplate(preset.value)}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="preset-block">
+          <span className="preset-label">Insert a field</span>
+          <div className="chip-row">
+            {TOKEN_CHIPS.map((token) => (
+              <button
+                key={token}
+                type="button"
+                className="token-chip mono"
+                title={`Insert ${token} at the cursor`}
+                onClick={() => applyToken(token)}
+              >
+                {token}
+              </button>
+            ))}
+          </div>
+        </div>
       </Field>
 
       <Field

@@ -23,6 +23,8 @@ interface Props {
   onDownloadedOnly: (b: boolean) => void;
   sort: SortOrder;
   onSort: (s: SortOrder) => void;
+  showHidden: boolean;
+  onShowHidden: (v: boolean) => void;
   polling: boolean;
   onRefresh: () => void;
   onAdd: () => void;
@@ -129,8 +131,21 @@ export default function TopNav(p: Props) {
           >
             Downloaded only
           </button>
+          <button
+            type="button"
+            className={`chip${p.showHidden ? " is-on" : ""}`}
+            aria-pressed={p.showHidden}
+            title="Show videos you have hidden, so you can un-hide them"
+            onClick={() => p.onShowHidden(!p.showHidden)}
+          >
+            Show hidden
+          </button>
 
           <div className="filterbar-spacer" />
+
+          <span className="zoom-hint" title="Hold Ctrl and scroll over the grid to resize cards">
+            Ctrl + scroll to resize
+          </span>
 
           <label className="sort-picker">
             <span className="sort-picker-label">Sort</span>

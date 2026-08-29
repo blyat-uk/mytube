@@ -15,7 +15,7 @@ export interface Video {
   description: string | null; thumb_url: string | null; thumb_path: string | null;
   published_at: number | null; sort_at: number | null; feed_rank: number;
   added_manually: boolean; duration_secs: number | null;
-  view_count: number | null; status: VideoStatus;
+  view_count: number | null; status: VideoStatus; hidden: boolean;
   watched: boolean; watched_at: number | null;
   download_state: DownloadState; download_error: string | null;
   file_path: string | null; first_seen_at: number;
@@ -23,13 +23,19 @@ export interface Video {
 
 export interface VideoFilter {
   channelId: string | null; hideWatched: boolean; downloadedOnly: boolean;
+  showHidden: boolean;
   search: string | null; sort: SortOrder; limit: number; offset: number;
 }
+
+export interface TakeoutRow {
+  channelId: string; title: string; alreadySubscribed: boolean;
+}
+export interface ImportProgress { done: number; total: number; current: string; }
 
 export interface Settings {
   download_dir: string; filename_template: string; player_command: string;
   max_concurrent_downloads: number; poll_interval_minutes: number;
-  poll_on_startup: boolean; backfill_count: number;
+  poll_on_startup: boolean; backfill_count: number; card_size: number;
 }
 
 export interface PollSummary {

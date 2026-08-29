@@ -144,6 +144,11 @@ pub fn flat_playlist_args(channel_id: &str, limit: u32) -> Vec<String> {
     vec![
         s("--flat-playlist"),
         s("-j"),
+        // Without this, a flat listing carries no upload date at all, and
+        // backfilled videos cannot be interleaved into the feed by date.
+        // Day-granular is plenty for ordering; RSS later supplies exact times
+        // for the recent window.
+        s("--extractor-args"), s("youtubetab:approximate_date"),
         s("--playlist-end"), limit.to_string(),
         s("--no-warnings"),
         s("--color"), s("no_color"),
@@ -169,7 +174,22 @@ pub fn parse_flat_entry(json_line: &str) -> Option<FlatEntry> {
         duration_secs: v.get("duration").and_then(|x| x.as_f64()).map(|d| d as i64),
         live_status: v.get("live_status").and_then(|x| x.as_str()).map(str::to_string),
         view_count: v.get("view_count").and_then(|x| x.as_i64()),
+        published_at: v
+            .get("timestamp")
+            .and_then(|x| x.as_i64())
+            .or_else(|| v.get("upload_date").and_then(|x| x.as_str()).and_then(parse_upload_date)),
     })
+}
+
+/// `upload_date` is `YYYYMMDD`; used only when `timestamp` is absent.
+fn parse_upload_date(d: &str) -> Option<i64> {
+    if d.len() != 8 { return None; }
+    let y: i32 = d[0..4].parse().ok()?;
+    let m: u32 = d[4..6].parse().ok()?;
+    let day: u32 = d[6..8].parse().ok()?;
+    chrono::NaiveDate::from_ymd_opt(y, m, day)?
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp())
 }
 
 pub fn status_from(live_status: Option<&str>, duration: Option<i64>) -> VideoStatus {
@@ -368,6 +388,31 @@ mod tests {
         assert_eq!(parse_flat_entry(r#"{"id":"x","title":"T","duration":60.7}"#).unwrap().duration_secs, Some(60));
         assert!(parse_flat_entry("not json").is_none());
         assert!(parse_flat_entry(r#"{"title":"no id"}"#).is_none());
+    }
+
+    #[test]
+    fn flat_listing_requests_approximate_dates() {
+        let a = flat_playlist_args("UC1", 30);
+        let i = a.iter().position(|x| x == "--extractor-args")
+            .expect("flat listings must ask for approximate dates");
+        assert_eq!(a[i + 1], "youtubetab:approximate_date");
+    }
+
+    #[test]
+    fn flat_entries_carry_an_upload_date() {
+        let e = parse_flat_entry(
+            r#"{"id":"x","title":"T","duration":60,"timestamp":1787011200,"upload_date":"20260818"}"#
+        ).unwrap();
+        assert_eq!(e.published_at, Some(1787011200), "timestamp wins when present");
+
+        let only_date = parse_flat_entry(r#"{"id":"x","title":"T","upload_date":"20260818"}"#).unwrap();
+        assert_eq!(only_date.published_at, Some(1787011200), "falls back to upload_date");
+
+        let neither = parse_flat_entry(r#"{"id":"x","title":"T"}"#).unwrap();
+        assert_eq!(neither.published_at, None);
+
+        let junk = parse_flat_entry(r#"{"id":"x","title":"T","upload_date":"nonsense"}"#).unwrap();
+        assert_eq!(junk.published_at, None, "malformed dates must not panic");
     }
 
     #[test]

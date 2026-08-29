@@ -9,6 +9,7 @@ interface Props {
   progress?: DownloadProgress;
   onAction: (action: CardAction, video: Video) => void;
   onToggleWatched: (video: Video) => void;
+  onContextMenu: (video: Video, e: React.MouseEvent) => void;
 }
 
 const RING_R = 26;
@@ -21,7 +22,7 @@ const ACTION_GLYPH: Record<CardAction, string> = {
   retry: "↻",
 };
 
-export default function VideoCard({ video, progress, onAction, onToggleWatched }: Props) {
+export default function VideoCard({ video, progress, onAction, onToggleWatched, onContextMenu }: Props) {
   // Prefer the locally cached thumbnail, fall back to the remote URL, then to a
   // plain placeholder — a broken image icon in a grid looks like a bug.
   const sources = useMemo(() => {
@@ -45,9 +46,11 @@ export default function VideoCard({ video, progress, onAction, onToggleWatched }
 
   return (
     <article
-      className={`card${video.watched ? " is-watched" : ""}${busy ? " is-busy" : ""}`}
+      className={`card${video.watched ? " is-watched" : ""}${busy ? " is-busy" : ""}${video.hidden ? " is-hidden-video" : ""}`}
       onClick={run}
+      onContextMenu={(e) => onContextMenu(video, e)}
       data-state={state}
+      data-video-id={video.id}
     >
       <div className="card-thumb">
         {src ? (
