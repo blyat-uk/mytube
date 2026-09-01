@@ -241,8 +241,8 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
               <li key={c.id} className="channel-row">
                 <span className="channel-name" title={c.handle ?? c.url}>{c.title}</span>
                 {confirmRemove === c.id ? (
-                  <span className="confirm">
-                    <span className="confirm-text">Remove and delete its videos?</span>
+                  <span className="inline-confirm">
+                    <span className="inline-confirm-text">Remove and delete its videos?</span>
                     <button
                       type="button"
                       className="btn btn-danger"

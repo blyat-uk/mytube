@@ -16,6 +16,9 @@
   --muted: #aaaaaa;
   --faint: #757575;
 
+  /* The mark's red, reused by the one thing that says "you are here". */
+  --brand: #ff2d55;
+
   --accent: #3ea6ff;
   --accent-soft: rgba(62, 166, 255, 0.14);
   --accent-ink: #04263f;
@@ -23,6 +26,13 @@
   --danger-soft: rgba(255, 90, 95, 0.14);
   --ok: #56d364;
   --ok-soft: rgba(86, 211, 100, 0.14);
+  /* Downloaded cards: a green face and frame, plus text tuned to stay legible
+     on it — grey meta text on a green card loses too much contrast. */
+  --ok-face: #2f4331;
+  --ok-line: rgba(86, 211, 100, 0.42);
+  --ok-line-strong: rgba(86, 211, 100, 0.72);
+  --ok-text: #c6dbc8;
+  --ok-text-dim: #9ab29c;
 
   --radius: 12px;
   --radius-sm: 8px;
@@ -114,22 +124,33 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-bottom: 1px solid var(--line);
 }
 
+/* One row, at every width. The controls shed their labels as the window
+   narrows (see "narrow windows" at the foot of this file) rather than wrapping
+   to a second row -- two rows put a cluster in each corner and left the eye
+   nowhere to start, which is the layout this replaced. */
 .topnav-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 24px;
+  gap: 8px;
+  padding: 8px 16px;
 }
 
 .topnav-spacer { flex: 1 1 auto; }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding-right: 6px;
-  user-select: none;
+/* Splits the row in two: what is in the list to its left, how the list is
+   drawn to its right. */
+.topnav-rule {
+  width: 1px;
+  height: 20px;
+  flex: none;
+  margin: 0 2px;
+  background: var(--line);
 }
+
+.topnav-row .icon { width: 15px; height: 15px; }
+/* The refresh button is the one circle in a row of pills; it matches their
+   height rather than the 34px it wears nowhere else. */
+.topnav-row .icon-btn { width: 32px; height: 32px; font-size: 15px; }
 
 .brand-mark {
   width: 22px;
@@ -148,36 +169,101 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-bottom: 4px solid transparent;
 }
 
-.brand-name {
-  font-weight: 700;
-  font-size: 16px;
-  letter-spacing: -0.02em;
-}
-
 .tabs {
   display: flex;
-  gap: 2px;
-  padding: 3px;
-  background: var(--surface-2);
-  border: 1px solid var(--line-soft);
-  border-radius: 999px;
+  align-items: center;
+  gap: 4px;
+  margin-left: 4px;
 }
 
 .tab {
   appearance: none;
   border: 0;
+  border-bottom: 2px solid transparent;
   background: transparent;
   color: var(--muted);
   font: inherit;
   font-weight: 500;
-  padding: 6px 15px;
-  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 2px;
+  margin: 0 7px;
   cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
+  transition: color 120ms ease, border-color 120ms ease;
   white-space: nowrap;
 }
-.tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
-.tab.is-active { background: var(--text); color: #0f0f0f; }
+.tab:hover { color: var(--text); }
+.tab.is-active { color: var(--text); border-bottom-color: var(--brand); }
+/* The glyph only appears once the window is too narrow for the word. */
+.tab-glyph { display: none; align-items: center; }
+.tab .icon { width: 17px; height: 17px; }
+
+/* --- the open series' breadcrumb ----------------------------------------- */
+
+/* It stands in for the tab strip rather than adding a bar of its own: a series
+   is where you are, not a notice about where you are. */
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-left: 4px;
+}
+.crumb-parent {
+  appearance: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 500;
+  padding: 5px 2px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.crumb-parent:hover { color: var(--text); border-bottom-color: var(--line); }
+.crumb-sep { color: var(--faint); }
+.crumb-here {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 5px 2px;
+  border-bottom: 2px solid var(--brand);
+  color: var(--text);
+  font-weight: 600;
+}
+.crumb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 30ch;
+}
+.crumb-x {
+  appearance: none;
+  border: 0;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--card);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.crumb-x:hover { background: var(--danger-soft); color: #ffc9ca; }
+.crumb-x .icon { width: 11px; height: 11px; }
+.crumb-meta {
+  color: var(--faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
 
 /* --- controls ------------------------------------------------------------ */
 
@@ -204,6 +290,15 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   font-weight: 600;
 }
 .btn-primary:hover:not(:disabled) { background: #62b7ff; border-color: #62b7ff; }
+
+.btn-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-size: 13px;
+  padding: 5px 13px;
+}
 
 .btn-danger { color: #ffc9ca; border-color: rgba(255, 90, 95, 0.4); background: var(--danger-soft); }
 .btn-danger:hover:not(:disabled) { background: rgba(255, 90, 95, 0.24); border-color: var(--danger); }
@@ -274,25 +369,28 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   position: relative;
   display: flex;
   align-items: center;
-  flex: 0 1 300px;
-  min-width: 150px;
+  flex: 0 1 240px;
+  min-width: 110px;
 }
 .search-glyph {
   position: absolute;
   left: 10px;
-  font-size: 15px;
+  font-size: 14px;
   color: var(--faint);
   pointer-events: none;
 }
+/* 13px and 5px of padding, like the segment and the two pickers: everything on
+   the row has to come out the same height or the row reads as ragged. */
 .search-input {
   appearance: none;
   width: 100%;
   font: inherit;
+  font-size: 13px;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 7px 12px 7px 30px;
+  padding: 5px 12px 5px 28px;
   transition: border-color 120ms ease, background 120ms ease;
 }
 .search-input::placeholder { color: var(--faint); }
@@ -303,27 +401,50 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 .search-input::-webkit-search-cancel-button { filter: invert(0.7); cursor: pointer; }
 
-.channel-picker,
-.sort-picker {
+/* Both pickers wear their value instead of a label beside it: "Newest first"
+   and a channel name say what they are, and the row has no width to spare. */
+.channel-select,
+.sort-select {
+  flex: none;
+  font-size: 13px;
+  padding: 5px 26px 5px 10px;
+}
+.channel-select { max-width: 170px; }
+
+/* --- the filter segment -------------------------------------------------- */
+
+/* Three toggles drawn as one object. Four loose pills read as clutter; joined,
+   they read as a single "what is in this list" control. */
+.seg {
+  display: inline-flex;
+  flex: none;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.seg-btn {
+  appearance: none;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  color: var(--muted);
+  gap: 6px;
+  padding: 5px 11px;
+  cursor: pointer;
   white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease;
 }
-.channel-picker-label,
-.sort-picker-label { font-size: 13px; }
-.channel-picker .select { max-width: 190px; }
-
-/* --- filter bar ---------------------------------------------------------- */
-
-.filterbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 24px 10px;
-}
-.filterbar-spacer { flex: 1 1 auto; }
+.seg-btn:last-child { border-right: 0; }
+.seg-btn:hover:not(:disabled) { background: var(--card); color: var(--text); }
+.seg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.seg-btn.is-on { background: var(--accent-soft); color: #9ed3ff; }
+.seg-glyph { display: none; align-items: center; }
 
 .chip {
   appearance: none;
@@ -336,9 +457,15 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-radius: 999px;
   padding: 5px 13px;
   cursor: pointer;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
-.chip:hover { background: var(--card); color: var(--text); }
+.chip-glyph { display: none; align-items: center; }
+.chip:hover:not(:disabled) { background: var(--card); color: var(--text); }
+.chip:disabled { opacity: 0.4; cursor: not-allowed; }
 .chip.is-on {
   background: var(--accent-soft);
   border-color: rgba(62, 166, 255, 0.5);
@@ -349,11 +476,21 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 
 .video-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(var(--card-min, 260px), 1fr));
+  /* Fixed tracks, not `minmax(…, 1fr)`: the zoom decides how big a card is, so
+     resizing the window may change the number of columns and nothing else. A
+     stretched card would silently overrule the size you picked. `auto-fit`
+     collapses the tracks no card landed in, so `justify-content` centres the
+     cards that exist rather than the row they could have filled, and the
+     `min(…, 100%)` keeps a card wider than the pane from overflowing it. */
+  grid-template-columns: repeat(auto-fit, min(var(--card-w, 260px), 100%));
+  justify-content: center;
   gap: 26px 18px;
 }
 
 .card {
+  /* Hover-action buttons scale with the grid zoom: they must stay tappable on a
+     160px card and must not swallow a 640px one. */
+  --act: clamp(38px, calc(var(--card-w, 260px) * 0.21), 58px);
   display: flex;
   flex-direction: column;
   background: var(--card);
@@ -361,23 +498,168 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-radius: var(--radius);
   overflow: hidden;
   cursor: pointer;
-  transition: transform 140ms ease, border-color 140ms ease,
-              box-shadow 140ms ease, opacity 140ms ease;
+  transition: border-color 140ms ease, opacity 140ms ease;
 }
 .card:hover {
-  transform: translateY(-2px);
   border-color: #3b3b3b;
-  box-shadow: var(--shadow);
 }
 .card.is-watched { opacity: 0.55; }
 .card.is-watched:hover { opacity: 0.85; }
 .card[data-state="failed"] { border-color: rgba(255, 90, 95, 0.35); }
+
+/* A downloaded video is one you can watch right now, so the whole card says so
+   rather than a badge in a corner: green wash rising out of the thumbnail,
+   green face, green frame. */
+.card.is-downloaded {
+  background: var(--ok-face);
+  border-color: var(--ok-line);
+}
+.card.is-downloaded:hover {
+  border-color: var(--ok-line-strong);
+}
+.card.is-downloaded .card-thumb::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  left: 0; right: 0; bottom: 0;
+  height: 42%;
+  background: linear-gradient(180deg, rgba(86, 211, 100, 0), rgba(86, 211, 100, 0.26));
+  pointer-events: none;
+}
+.card.is-downloaded .card-body {
+  background: linear-gradient(180deg, rgba(86, 211, 100, 0.1), rgba(86, 211, 100, 0) 70%);
+}
+.card.is-downloaded .card-channel { color: var(--ok-text); }
+.card.is-downloaded .card-meta,
+.card.is-downloaded .dot { color: var(--ok-text-dim); }
+
+/* A series reads as a stack: two sheet edges peek out above the card, the way a
+   pile of them does. They sit strictly *above* the card's own box rather than
+   behind it, so no z-index juggling is needed to keep them out of its face —
+   and the row gap is deep enough to hold them. */
+.series-card { position: relative; }
+.series-card::before,
+.series-card::after {
+  content: "";
+  position: absolute;
+  bottom: 100%;
+  margin-bottom: -1px;
+  border: 1px solid var(--line-soft);
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  pointer-events: none;
+}
+/* The near sheet, painted over the far one. */
+.series-card::before {
+  z-index: 1;
+  left: 8px; right: 8px;
+  height: 9px;
+  background: var(--card);
+}
+/* The far sheet: narrower, taller, dimmer — the stack recedes. */
+.series-card::after {
+  left: 17px; right: 17px;
+  height: 15px;
+  background: var(--surface-2);
+}
+.series-card:hover::before { background: var(--card-hover); }
+
+/* The part count, standing in the same place a YouTube playlist puts it. Wide
+   enough that "unwatched" still fits on one line at the smallest card size the
+   zoom allows (160px), which is what sets the 42%. */
+.series-count {
+  position: absolute;
+  z-index: 1;
+  top: 0; right: 0; bottom: 0;
+  width: 42%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 0 4px;
+  background: rgba(0, 0, 0, 0.76);
+  color: #fff;
+}
+/* Everything in the panel scales with the grid zoom, like the hover buttons. */
+.series-count-n {
+  font-size: clamp(15px, calc(var(--card-w, 260px) * 0.075), 30px);
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.series-count-label {
+  font-size: clamp(10px, calc(var(--card-w, 260px) * 0.043), 15px);
+  color: #cfcfcf;
+  letter-spacing: 0.02em;
+}
+.series-count .icon {
+  width: clamp(12px, calc(var(--card-w, 260px) * 0.05), 20px);
+  height: auto;
+  margin-bottom: 1px;
+  opacity: 0.75;
+}
+
+/* How much of the series is behind you. The track is what is left and the fill
+   is what you have watched, in the same two colours as the tally below — so the
+   bar reads at a glance and needs no legend of its own. */
+.series-progress {
+  width: 74%;
+  height: 3px;
+  margin-top: 3px;
+  border-radius: 2px;
+  background: rgba(62, 166, 255, 0.55);
+  overflow: hidden;
+}
+.series-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.series-tally {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.35;
+  font-size: clamp(9px, calc(var(--card-w, 260px) * 0.038), 13px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.series-tally-seen { color: #d8d8d8; }
+.series-tally-left { color: #8f8f8f; }
+/* Blue only while there is actually something left to watch. */
+.series-tally-left.is-due { color: var(--accent); }
+/* The whole series' runtime, a step quieter again than the tally above it:
+   useful when you are picking what to start, never the first thing the card
+   says. */
+.series-runtime {
+  margin-top: 2px;
+  color: #8f8f8f;
+  letter-spacing: 0.01em;
+}
+/* Below roughly 200px of card the panel's stack is taller than the thumb it is
+   clipped to, and the runtime is the line that can go: it is the panel's least
+   important fact, and the card's tooltip and aria-label still carry it. The
+   thumb is already the positioning context for everything in here, so making it
+   the query container changes no layout. */
+@container (max-width: 200px) {
+  .series-runtime { display: none; }
+}
+
+/* A finished series dims like a watched video, and the sheet edges behind it go
+   with it — opacity on the card carries its pseudo-elements too. */
+.series-card.is-watched .series-count { background: rgba(0, 0, 0, 0.72); }
 
 .card-thumb {
   position: relative;
   aspect-ratio: 16 / 9;
   background: #000;
   overflow: hidden;
+  /* So the series panel's contents can drop a line on small cards: card size is
+     a zoom setting, not a viewport width, which no media query can see. */
+  container-type: inline-size;
 }
 
 .card-img {
@@ -413,88 +695,88 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   background: rgba(62, 166, 255, 0.92);
   color: #04263f;
 }
-.pill-downloaded {
-  left: 7px; bottom: 7px;
-  background: rgba(86, 211, 100, 0.92);
-  color: #062d0d;
-}
-
-.watch-toggle {
-  position: absolute;
-  z-index: 3;
-  top: 7px; right: 7px;
-  width: 28px; height: 28px;
-  display: grid;
-  place-items: center;
-  font-size: 14px;
-  line-height: 1;
-  color: #fff;
-  background: rgba(0, 0, 0, 0.68);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 50%;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 120ms ease, background 120ms ease, transform 120ms ease;
-}
-.card:hover .watch-toggle,
-.watch-toggle:focus-visible { opacity: 1; }
-.watch-toggle:hover { background: rgba(0, 0, 0, 0.9); transform: scale(1.08); }
-.watch-toggle.is-on {
-  opacity: 1;
-  background: var(--ok);
-  border-color: var(--ok);
-  color: #062d0d;
-}
-
-.card-action {
+.card-overlay {
   position: absolute;
   z-index: 2;
   inset: 0;
   display: grid;
   place-items: center;
-  appearance: none;
-  border: 0;
-  padding: 0;
-  font: inherit;
-  color: #fff;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.55));
-  cursor: pointer;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.58));
   opacity: 0;
   transition: opacity 140ms ease;
 }
-.card:hover .card-action,
-.card-action:focus-visible,
-.card-action.is-busy { opacity: 1; }
-.card-action.is-busy { background: rgba(0, 0, 0, 0.5); }
+.card:hover .card-overlay,
+.card:focus-within .card-overlay,
+.card-overlay.is-busy { opacity: 1; }
+.card-overlay.is-busy { background: rgba(0, 0, 0, 0.5); }
 
-.action-bubble {
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--act) * 0.2);
+  transform: translateY(4px);
+  transition: transform 140ms ease;
+}
+.card:hover .card-actions,
+.card:focus-within .card-actions { transform: translateY(0); }
+
+/* One size for both buttons; the hierarchy is weight, not scale. The primary
+   action is a solid disc, the link to YouTube a quiet translucent one. */
+.card-btn {
+  position: relative;
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: var(--act);
+  height: var(--act);
+  flex: none;
+  padding: 0;
+  font: inherit;
+  color: #fff;
+  background: rgba(16, 16, 16, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 50%;
+  backdrop-filter: blur(4px);
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+.card-btn:hover {
+  transform: scale(1.08);
+  background: rgba(28, 28, 28, 0.9);
+  border-color: rgba(255, 255, 255, 0.45);
+}
+.card-btn:focus-visible { border-radius: 50%; outline-offset: 3px; }
+.card-btn.is-primary {
+  background: rgba(255, 255, 255, 0.94);
+  border-color: transparent;
+  color: #101010;
+}
+.card-btn.is-primary:hover { background: #fff; }
+
+.icon {
+  width: calc(var(--act, 48px) * 0.42);
+  height: calc(var(--act, 48px) * 0.42);
+  display: block;
+}
+
+.queued-badge {
+  appearance: none;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 15px;
+  padding: 7px 14px;
+  font: inherit;
+  color: #fff;
   border-radius: 999px;
   background: rgba(20, 20, 20, 0.86);
   border: 1px solid rgba(255, 255, 255, 0.16);
   backdrop-filter: blur(4px);
   font-weight: 600;
   font-size: 13px;
-  transform: translateY(4px);
-  transition: transform 140ms ease;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
 }
-.card:hover .action-bubble { transform: translateY(0); }
-.action-glyph { font-size: 14px; line-height: 1; }
-
-.queued-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 14px;
-  border-radius: 999px;
-  background: rgba(20, 20, 20, 0.86);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  font-weight: 600;
-  font-size: 13px;
-}
+.queued-badge:hover { background: rgba(34, 34, 34, 0.92); border-color: rgba(255, 255, 255, 0.34); }
 .queued-dot {
   width: 7px; height: 7px;
   border-radius: 50%;
@@ -506,16 +788,19 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   50% { opacity: 1; transform: scale(1.15); }
 }
 
-.ring-wrap {
-  position: relative;
-  width: 64px; height: 64px;
-  display: grid;
-  place-items: center;
+/* The ring doubles as the cancel button, so it lives in the action row — but it
+   carries a percentage, so it never shrinks below legible. */
+.card-btn.is-ring {
+  width: max(52px, var(--act));
+  height: max(52px, var(--act));
+  background: rgba(0, 0, 0, 0.6);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #fff;
 }
+.card-btn.is-ring:hover { background: rgba(0, 0, 0, 0.72); }
 .ring {
   position: absolute;
   inset: 0;
-  width: 64px; height: 64px;
   transform: rotate(-90deg);
 }
 .ring-track {
@@ -531,7 +816,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   transition: stroke-dashoffset 220ms linear;
 }
 .ring-pct {
-  font-size: 13px;
+  font-size: clamp(11px, calc(var(--act) * 0.23), 14px);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
@@ -540,13 +825,12 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   inset: 0;
   display: grid;
   place-items: center;
-  font-size: 20px;
   border-radius: 50%;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(0, 0, 0, 0.66);
   opacity: 0;
   transition: opacity 120ms ease;
 }
-.card:hover .ring-hover { opacity: 1; }
+.card-btn.is-ring:hover .ring-hover { opacity: 1; }
 
 .card-progressbar {
   position: absolute;
@@ -572,13 +856,13 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   white-space: nowrap;
 }
 
-.card-body { padding: 11px 13px 14px; }
+.card-body { padding: 10px 12px 11px; }
 
 .card-title {
   font-size: 14px;
   font-weight: 600;
   line-height: 1.35;
-  margin-bottom: 5px;
+  margin-bottom: 4px;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   line-clamp: 2;
@@ -588,22 +872,26 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   min-height: calc(2 * 1.35em);
 }
 
-.card-channel {
+/* Channel, date and download stats on one line. No wrapping — wrapping would
+   put back the third line that merging them removed. */
+.card-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  flex-wrap: nowrap;
   font-size: 12.5px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+/* Only the channel gives way when the line is too narrow; the date and the
+   stats are short and fixed, so they stay whole. */
+.card-meta > * { flex: none; }
+.card-meta .card-channel {
+  flex: 0 1 auto;
+  min-width: 0;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.card-meta {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  flex-wrap: wrap;
-  font-size: 12.5px;
-  color: var(--faint);
-  margin-top: 2px;
 }
 .dot { color: var(--faint); }
 .card-speed { color: var(--accent); font-variant-numeric: tabular-nums; }
@@ -753,18 +1041,15 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   font-variant-numeric: tabular-nums;
 }
 
-.row-path,
 .row-error {
   display: block;
   max-width: 320px;
   font-size: 12px;
-  color: var(--faint);
-  font-family: var(--mono);
+  color: #ffb9ba;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.row-error { color: #ffb9ba; font-family: var(--font); }
 
 /* --- settings ------------------------------------------------------------ */
 
@@ -911,8 +1196,12 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   white-space: nowrap;
 }
 
-.confirm { display: flex; align-items: center; gap: 7px; }
-.confirm-text { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+/* The inline "Remove and delete its videos?" row inside a channel list entry.
+   Named apart from .modal.confirm on purpose: a bare .confirm here used to
+   match the confirm modal too, laying its title, body and buttons out as three
+   centred columns. */
+.inline-confirm { display: flex; align-items: center; gap: 7px; }
+.inline-confirm-text { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
 
 /* --- toasts -------------------------------------------------------------- */
 
@@ -971,16 +1260,39 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 
 /* --- narrow windows ------------------------------------------------------ */
 
-@media (max-width: 900px) {
-  .topnav-row { flex-wrap: wrap; padding: 10px 16px; }
-  .topnav-spacer { display: none; }
-  .search { flex: 1 1 100%; order: 10; }
-  .channel-picker { order: 11; }
-  .filterbar { padding: 0 16px 10px; flex-wrap: wrap; }
+/* The top row never wraps. It gives up words instead, in the order they can
+   most afford to go: the filters keep their glyphs, the sort picker keeps its
+   words to the end -- "Newest first" is the one control nobody could guess
+   from an icon. */
+
+@media (max-width: 1180px) {
+  .seg-label { display: none; }
+  .seg-glyph { display: inline-flex; }
+  .seg-btn { padding: 5px 10px; }
+}
+
+@media (max-width: 980px) {
+  .chip-label, .btn-add-label { display: none; }
+  .chip-glyph { display: inline-flex; }
+  .chip { padding: 5px 10px; }
+  /* A native select cannot wear an icon, so it truncates instead and hands the
+     full channel name to its tooltip. */
+  .channel-select { max-width: 96px; }
+  .crumb-name { max-width: 22ch; }
   .content { padding: 16px 16px 56px; }
   .dl-row { grid-template-columns: 96px minmax(0, 1fr); }
   .dl-actions { grid-column: 1 / -1; justify-content: flex-start; }
-  .row-path, .row-error { max-width: none; }
+  .row-error { max-width: none; }
+}
+
+@media (max-width: 860px) {
+  .tab-label { display: none; }
+  .tab-glyph { display: inline-flex; }
+  .tab { margin: 0 4px; }
+  .channel-select { max-width: 74px; }
+  .crumb-meta { display: none; }
+  .crumb-name { max-width: 16ch; }
+  .topnav-row { padding: 8px 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1139,10 +1451,3 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 .token-chip { font-size: 11.5px; color: var(--muted); }
 
-.zoom-hint {
-  color: var(--faint);
-  font-size: 11.5px;
-  white-space: nowrap;
-  user-select: none;
-}
-@media (max-width: 900px) { .zoom-hint { display: none; } }

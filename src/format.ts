@@ -9,6 +9,45 @@ export function formatDuration(secs: number | null): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/**
+ * A series' total runtime: worded, and never down to the second.
+ *
+ * Deliberately not `formatDuration`'s clock form. A sum of seven parts is not a
+ * timestamp -- its seconds are noise, and `4:10:00` beside a thumbnail reads as
+ * "this is four hours long to watch through", which is exactly the thing it is
+ * not. The words also match the register of the panel it sits in ("7 parts",
+ * "3 watched").
+ */
+export function formatTotalRuntime(secs: number): string {
+  if (!secs || secs <= 0) return "";
+  if (secs < 60) return `${Math.floor(secs)}s`;
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (!h) return `${m}m`;
+  // A clean two hours says "2h": a trailing "0m" is noise, not precision.
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+/**
+ * A series' runtime, and how much of it is guesswork.
+ *
+ * A part whose duration has not resolved yet contributes nothing, which would
+ * silently understate the total -- so the count of those comes back with it and
+ * the caller marks the number "4h 10m+" rather than letting it read as exact.
+ * Shared by the series card and the nav's breadcrumb so the two never disagree.
+ */
+export function seriesRuntime(
+  videos: { duration_secs: number | null }[],
+): { runtime: string; unknown: number } {
+  let total = 0;
+  let unknown = 0;
+  for (const v of videos) {
+    if (v.duration_secs) total += v.duration_secs;
+    else unknown += 1;
+  }
+  return { runtime: formatTotalRuntime(total), unknown };
+}
+
 export function formatRelative(ts: number | null, now = Date.now() / 1000): string {
   if (!ts) return "—";
   const d = Math.max(0, now - ts);
@@ -28,12 +67,21 @@ export function formatViews(n: number | null): string {
   return String(n);
 }
 
-export type CardAction = "download" | "play" | "cancel" | "retry";
+/**
+ * Whether there is a file on disk to play or to delete. `done` alone is not
+ * enough: the row keeps its state after the file is removed, and `file_path`
+ * is what actually clears.
+ */
+export function hasDownloadedFile(v: Pick<Video, "download_state" | "file_path">): boolean {
+  return v.download_state === "done" && !!v.file_path;
+}
+
+export type CardAction = "download" | "play" | "cancel" | "retry" | "open";
 
 /** Clicking a card does different things depending on its state. */
 export function cardAction(v: Video): CardAction {
   if (v.download_state === "downloading" || v.download_state === "queued") return "cancel";
-  if (v.download_state === "done" && v.file_path) return "play";
+  if (hasDownloadedFile(v)) return "play";
   if (v.download_state === "failed") return "retry";
   return "download";
 }
@@ -45,7 +93,16 @@ export function cardActionLabel(a: CardAction): string {
     case "play": return "Play";
     case "cancel": return "Cancel";
     case "retry": return "Retry";
+    case "open": return "Open on YouTube";
   }
+}
+
+/**
+ * Where this video lives on YouTube. Shorts play from `/watch` too, so one
+ * shape covers everything we store.
+ */
+export function videoUrl(v: { id: string }): string {
+  return `https://www.youtube.com/watch?v=${encodeURIComponent(v.id)}`;
 }
 
 /** Absolute upload date, shown in the card tooltip alongside the relative one. */
@@ -61,7 +118,7 @@ export function formatDate(ts: number | null): string {
  * ------------------------------------------------------------------ */
 
 export const CARD_MIN = 160;
-export const CARD_MAX = 460;
+export const CARD_MAX = 640;
 export const CARD_DEFAULT = 260;
 const CARD_STEP = 20;
 

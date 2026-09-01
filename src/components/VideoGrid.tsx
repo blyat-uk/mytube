@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import VideoCard from "./VideoCard";
+import SeriesCard from "./SeriesCard";
 import { nextCardSize, type CardAction } from "../format";
-import type { DownloadProgress, Video } from "../types";
+import type { DownloadProgress, Video, VideoGroup } from "../types";
 
 interface Props {
-  videos: Video[];
+  /** One entry per card. Ungrouped views wrap each video in a group of one, so
+   *  the grid has a single shape to lay out either way. */
+  groups: VideoGroup[];
   progress: Record<string, DownloadProgress>;
   loading: boolean;
   hasMore: boolean;
@@ -12,8 +15,9 @@ interface Props {
   onCardSize: (px: number) => void;
   onLoadMore: () => void;
   onAction: (action: CardAction, video: Video) => void;
-  onToggleWatched: (video: Video) => void;
   onContextMenu: (video: Video, x: number, y: number) => void;
+  /** Opens a series, anchored on its leader and named by its shared stem. */
+  onOpenSeries: (leader: Video, stem: string | null) => void;
   empty?: ReactNode;
 }
 
@@ -23,8 +27,8 @@ const MAX_ANIMATED = 60;
 const NEAR_VIEWPORT = 400;
 
 export default function VideoGrid({
-  videos, progress, loading, hasMore, cardSize, onCardSize,
-  onLoadMore, onAction, onToggleWatched, onContextMenu, empty,
+  groups, progress, loading, hasMore, cardSize, onCardSize,
+  onLoadMore, onAction, onContextMenu, onOpenSeries, empty,
 }: Props) {
   const sentinel = useRef<HTMLDivElement | null>(null);
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -81,7 +85,8 @@ export default function VideoGrid({
     const el = gridRef.current;
     if (!el) return;
 
-    const ids = videos.map((v) => v.id);
+    // Keyed on the leader, which is what the card carries in `data-video-id`.
+    const ids = groups.map((g) => g.videos[0].id);
     const before = prevRects.current;
     const beforeIds = new Set(prevIds.current);
     const added = ids.filter((id) => !beforeIds.has(id));
@@ -135,7 +140,7 @@ export default function VideoGrid({
     }
     prevRects.current = next;
     prevIds.current = ids;
-  }, [videos]);
+  }, [groups]);
 
   const onCtx = useCallback(
     (video: Video, e: React.MouseEvent) => {
@@ -145,7 +150,9 @@ export default function VideoGrid({
     [onContextMenu],
   );
 
-  if (!loading && videos.length === 0) {
+  const total = groups.reduce((n, g) => n + g.videos.length, 0);
+
+  if (!loading && groups.length === 0) {
     return <div className="grid-empty">{empty ?? <p>Nothing here yet.</p>}</div>;
   }
 
@@ -154,18 +161,25 @@ export default function VideoGrid({
       <div
         ref={gridRef}
         className="video-grid"
-        style={{ ["--card-min" as string]: `${cardSize}px` }}
+        // The zoom used to be advertised by a line of text in the filter bar.
+        // It is a thing you learn once, so it lives where you would reach for
+        // it instead of taking up room in the chrome for good.
+        title="Hold Ctrl and scroll to resize the cards"
+        style={{ ["--card-w" as string]: `${cardSize}px` }}
       >
-        {videos.map((v) => (
-          <VideoCard
-            key={v.id}
-            video={v}
-            progress={progress[v.id]}
-            onAction={onAction}
-            onToggleWatched={onToggleWatched}
-            onContextMenu={onCtx}
-          />
-        ))}
+        {groups.map((g) =>
+          g.videos.length > 1 ? (
+            <SeriesCard key={g.videos[0].id} group={g} onOpen={onOpenSeries} />
+          ) : (
+            <VideoCard
+              key={g.videos[0].id}
+              video={g.videos[0]}
+              progress={progress[g.videos[0].id]}
+              onAction={onAction}
+              onContextMenu={onCtx}
+            />
+          ),
+        )}
       </div>
       <div ref={sentinel} className="grid-sentinel" aria-hidden="true" />
       {loading && (
@@ -174,9 +188,11 @@ export default function VideoGrid({
           Loading…
         </div>
       )}
-      {!loading && !hasMore && videos.length > 0 && (
+      {/* Counts videos rather than cards, so the answer to "how much is here"
+          does not change when a series is collapsed behind one of them. */}
+      {!loading && !hasMore && groups.length > 0 && (
         <div className="grid-end">
-          {videos.length} video{videos.length === 1 ? "" : "s"}
+          {total} video{total === 1 ? "" : "s"}
         </div>
       )}
     </>

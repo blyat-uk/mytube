@@ -1,6 +1,8 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
-  AddKind, Channel, Video, VideoFilter, Settings, PollSummary, ImportResult, TakeoutRow,
+  AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, PollSummary, ImportResult,
+  TakeoutRow,
 } from "./types";
 
 export const api = {
@@ -20,12 +22,18 @@ export const api = {
   pollAll: () => invoke<PollSummary>("poll_all"),
   pollChannel: (channelId: string) => invoke<PollSummary>("poll_channel", { channelId }),
   listVideos: (filter: VideoFilter) => invoke<Video[]>("list_videos", { filter }),
+  /** The same feed with each channel's series collapsed. `limit`/`offset` count
+   *  groups here, not videos. */
+  listVideoGroups: (filter: VideoFilter) =>
+    invoke<VideoGroup[]>("list_video_groups", { filter }),
   setWatched: (videoId: string, watched: boolean) =>
     invoke<void>("set_watched", { videoId, watched }),
   enqueueDownload: (videoId: string) => invoke<void>("enqueue_download", { videoId }),
   cancelDownload: (videoId: string) => invoke<void>("cancel_download", { videoId }),
   openInPlayer: (videoId: string) => invoke<void>("open_in_player", { videoId }),
   deleteDownload: (videoId: string) => invoke<void>("delete_download", { videoId }),
+  /** Hands a URL to the desktop's default browser. */
+  openExternal: (url: string) => openUrl(url),
 };
 
 /** Local cached thumb if we have one, else the remote URL, else a blank. */

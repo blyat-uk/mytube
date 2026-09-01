@@ -5,10 +5,17 @@ import ConfirmDialog from "./ConfirmDialog";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { useDownloadEvents } from "../events";
-import type { CardAction } from "../format";
-import type { DownloadProgress, SortOrder, Video } from "../types";
+import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction } from "../format";
+import type { DownloadProgress, SortOrder, Video, VideoGroup } from "../types";
 
 const PAGE = 100;
+
+/** What an open series holds, for the breadcrumb that names it. */
+export interface SeriesTally {
+  parts: number;
+  runtime: string;
+  unknown: number;
+}
 
 interface Props {
   channelId: string | null;
@@ -17,6 +24,14 @@ interface Props {
   downloadedOnly: boolean;
   sort: SortOrder;
   showHidden: boolean;
+  /** Collapse each channel's multi-part uploads behind one card. */
+  grouped: boolean;
+  /** When set, the grid shows this video's series instead of the feed. */
+  siblingOf: Video | null;
+  /** The stem comes from a series card; a lone card has only its title. */
+  onFindSiblings: (video: Video, stem?: string | null) => void;
+  /** Hands the nav's breadcrumb what the open series turned out to hold. */
+  onSeriesTally: (t: SeriesTally) => void;
   cardSize: number;
   onCardSize: (px: number) => void;
   /** Bumped by the shell after a poll or an add, to force a refetch. */
@@ -27,7 +42,9 @@ interface Props {
 
 export default function SubscriptionsView(p: Props) {
   const toast = useToast();
-  const [videos, setVideos] = useState<Video[]>([]);
+  // One entry per card. Ungrouped, every group holds a single video — carrying
+  // one shape through the view keeps the two modes off every code path below.
+  const [groups, setGroups] = useState<VideoGroup[]>([]);
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(false);
@@ -35,26 +52,41 @@ export default function SubscriptionsView(p: Props) {
   // Guards against a slow first request overwriting a newer filter's results.
   const request = useRef(0);
 
-  const { channelId, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken } = p;
+  const {
+    channelId, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken, siblingOf,
+    onSeriesTally,
+  } = p;
+  // A series view is a flat list of parts on purpose, so grouping stands down
+  // while one is open rather than collapsing the very series being shown.
+  const grouped = p.grouped && siblingOf === null;
   const [menu, setMenu] = useState<{ video: Video; x: number; y: number } | null>(null);
-  const [confirm, setConfirm] = useState<Video | null>(null);
+  /**
+   * Two dialogs share this slot: "remove" asks how to hide or delete a video,
+   * "file" asks only whether to delete a watched video's download.
+   */
+  const [confirm, setConfirm] = useState<{ kind: "remove" | "file"; video: Video } | null>(null);
 
   const fetchPage = useCallback(async (from: number) => {
     const id = ++request.current;
     setLoading(true);
+    // PAGE counts cards either way, which for the grouped feed means groups.
+    const filter = {
+      channelId,
+      hideWatched,
+      downloadedOnly,
+      showHidden,
+      search: search.trim() ? search.trim() : null,
+      siblingOf: siblingOf?.id ?? null,
+      sort,
+      limit: PAGE,
+      offset: from,
+    };
     try {
-      const page = await api.listVideos({
-        channelId,
-        hideWatched,
-        downloadedOnly,
-        showHidden,
-        search: search.trim() ? search.trim() : null,
-        sort,
-        limit: PAGE,
-        offset: from,
-      });
+      const page = grouped
+        ? await api.listVideoGroups(filter)
+        : (await api.listVideos(filter)).map((v) => ({ videos: [v], stem: null }));
       if (id !== request.current) return;
-      setVideos((prev) => (from === 0 ? page : [...prev, ...page]));
+      setGroups((prev) => (from === 0 ? page : [...prev, ...page]));
       offset.current = from + page.length;
       setHasMore(page.length === PAGE);
     } catch (err) {
@@ -64,22 +96,41 @@ export default function SubscriptionsView(p: Props) {
     } finally {
       if (id === request.current) setLoading(false);
     }
-  }, [channelId, search, hideWatched, downloadedOnly, showHidden, sort, toast]);
+  }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, toast]);
 
   useEffect(() => {
     offset.current = 0;
     void fetchPage(0);
   }, [fetchPage, reloadToken]);
 
-  const patch = useCallback((videoId: string, fields: Partial<Video>) => {
-    setVideos((prev) => prev.map((v) => (v.id === videoId ? { ...v, ...fields } : v)));
+  // The breadcrumb names the open series and says what it holds -- which this
+  // view knows and the nav does not -- so every settled page hands the count
+  // and the runtime up. Taken from the loaded list rather than from the page
+  // that just arrived, so a second page adds to the tally instead of replacing
+  // it.
+  useEffect(() => {
+    if (!siblingOf) return;
+    // Mid-first-load the grid holds nothing yet, and "no other parts found" is
+    // an answer, not a placeholder -- so nothing is said until one page is in.
+    if (loading && groups.length === 0) return;
+    const videos = groups.flatMap((g) => g.videos);
+    onSeriesTally({ parts: videos.length, ...seriesRuntime(videos) });
+  }, [siblingOf, groups, loading, onSeriesTally]);
+
+  /** Rewrites every video in place, wherever in the grouping it sits. */
+  const mapVideos = useCallback((fn: (v: Video) => Video) => {
+    setGroups((prev) => prev.map((g) => ({ ...g, videos: g.videos.map(fn) })));
   }, []);
+
+  const patch = useCallback((videoId: string, fields: Partial<Video>) => {
+    mapVideos((v) => (v.id === videoId ? { ...v, ...fields } : v));
+  }, [mapVideos]);
 
   // Live updates land straight on the cards; no refetch, no scroll jump.
   useDownloadEvents({
     onProgress: (pr) => setProgress((prev) => ({ ...prev, [pr.videoId]: pr })),
     onState: (s) => {
-      setVideos((prev) => prev.map((v) => (
+      mapVideos((v) => (
         v.id === s.videoId
           ? {
               ...v,
@@ -88,7 +139,7 @@ export default function SubscriptionsView(p: Props) {
               download_error: s.error,
             }
           : v
-      )));
+      ));
       if (s.state !== "downloading") {
         setProgress((prev) => {
           if (!(s.videoId in prev)) return prev;
@@ -115,12 +166,35 @@ export default function SubscriptionsView(p: Props) {
         case "play":
           await api.openInPlayer(video.id);
           break;
+        case "open":
+          await api.openExternal(videoUrl(video));
+          break;
       }
     } catch (err) {
       patch(video.id, before);
       toast.error(errText(err));
     }
   }, [patch, toast]);
+
+  /** Mirrors what the backend writes when it clears a download. */
+  const deleteFile = useCallback(async (video: Video) => {
+    try {
+      await api.deleteDownload(video.id);
+      patch(video.id, { download_state: "none", download_error: null, file_path: null });
+    } catch (err) {
+      toast.error(errText(err));
+    }
+  }, [patch, toast]);
+
+  /** Removes a video from view without waiting for a refetch, taking its card
+   *  with it once nothing is left in the group. */
+  const drop = useCallback((id: string) => {
+    setGroups((prev) => prev
+      .map((g) => (g.videos.some((v) => v.id === id)
+        ? { ...g, videos: g.videos.filter((v) => v.id !== id) }
+        : g))
+      .filter((g) => g.videos.length > 0));
+  }, []);
 
   const onToggleWatched = useCallback(async (video: Video) => {
     const next = !video.watched;
@@ -131,19 +205,15 @@ export default function SubscriptionsView(p: Props) {
     try {
       await api.setWatched(video.id, next);
       // With "hide watched" on, a freshly watched card no longer belongs here.
-      if (next && hideWatched) {
-        setVideos((prev) => prev.filter((v) => v.id !== video.id));
-      }
+      if (next && hideWatched) drop(video.id);
+      // Watching something is usually the end of its life on disk — but that is
+      // the user's call, and it is a separate step from marking it watched.
+      if (next && hasDownloadedFile(video)) setConfirm({ kind: "file", video });
     } catch (err) {
       patch(video.id, { watched: video.watched, watched_at: video.watched_at });
       toast.error(errText(err));
     }
-  }, [patch, hideWatched, toast]);
-
-  /** Removes the card from view without waiting for a refetch. */
-  const drop = useCallback((id: string) => {
-    setVideos((prev) => prev.filter((v) => v.id !== id));
-  }, []);
+  }, [patch, drop, hideWatched, toast]);
 
   const hideVideo = useCallback(async (video: Video) => {
     try {
@@ -190,8 +260,7 @@ export default function SubscriptionsView(p: Props) {
   }, [deleteVideo, hideVideo, toast]);
 
   const requestRemove = useCallback((video: Video) => {
-    const hasFile = video.download_state === "done" && !!video.file_path;
-    if (hasFile) setConfirm(video);
+    if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video });
     else void removeVideo(video, false);
   }, [removeVideo]);
 
@@ -202,11 +271,25 @@ export default function SubscriptionsView(p: Props) {
         onSelect: () => void onToggleWatched(video),
       },
     ];
-    if (video.download_state === "done" && video.file_path) {
+    if (hasDownloadedFile(video)) {
       items.push({ label: "Play", onSelect: () => void onAction("play", video) });
     } else if (video.download_state === "none" || video.download_state === "failed") {
       items.push({ label: "Download", onSelect: () => void onAction("download", video) });
     }
+    // Offered for any downloaded file, watched or not: the prompt at
+    // marking-time is easy to dismiss, and a video you decide *not* to watch
+    // leaves a file behind just the same.
+    if (hasDownloadedFile(video)) {
+      items.push({
+        label: "Delete downloaded file",
+        danger: true,
+        onSelect: () => setConfirm({ kind: "file", video }),
+      });
+    }
+    items.push({
+      label: "Find siblings",
+      onSelect: () => p.onFindSiblings(video),
+    });
     if (video.hidden) {
       items.push({ label: "Un-hide", onSelect: () => void unhideVideo(video) });
     } else {
@@ -217,7 +300,7 @@ export default function SubscriptionsView(p: Props) {
       });
     }
     return items;
-  }, [onToggleWatched, onAction, unhideVideo, requestRemove]);
+  }, [onToggleWatched, onAction, unhideVideo, requestRemove, p.onFindSiblings]);
 
   const openMenu = useCallback((video: Video, x: number, y: number) => {
     setMenu({ video, x, y });
@@ -228,7 +311,7 @@ export default function SubscriptionsView(p: Props) {
   return (
     <>
     <VideoGrid
-      videos={videos}
+      groups={groups}
       progress={progress}
       loading={loading}
       hasMore={hasMore}
@@ -236,8 +319,8 @@ export default function SubscriptionsView(p: Props) {
       onCardSize={p.onCardSize}
       onLoadMore={() => fetchPage(offset.current)}
       onAction={onAction}
-      onToggleWatched={onToggleWatched}
       onContextMenu={openMenu}
+      onOpenSeries={p.onFindSiblings}
       empty={
         p.channelCount === 0 && !filtered ? (
           <div className="empty">
@@ -272,29 +355,48 @@ export default function SubscriptionsView(p: Props) {
       />
     )}
 
-    {confirm && (
+    {confirm?.kind === "file" && (
       <ConfirmDialog
-        title={confirm.added_manually ? "Delete this video?" : "Hide this video?"}
+        title="Delete the downloaded file?"
         body={
-          confirm.added_manually
+          confirm.video.watched
+            ? `“${confirm.video.title}” is marked as watched. Its file is still on disk.`
+            : `“${confirm.video.title}” has not been watched. Deleting only removes the` +
+              ` file — the video stays in your feed.`
+        }
+        choices={[{ label: "Delete file", value: "delete", danger: true }]}
+        onCancel={() => setConfirm(null)}
+        onChoose={() => {
+          const target = confirm.video;
+          setConfirm(null);
+          void deleteFile(target);
+        }}
+      />
+    )}
+
+    {confirm?.kind === "remove" && (
+      <ConfirmDialog
+        title={confirm.video.added_manually ? "Delete this video?" : "Hide this video?"}
+        body={
+          confirm.video.added_manually
             ? "It will be removed from MyTube. The downloaded file is kept unless you choose otherwise."
             : "It will stay out of your feed even after future refreshes. The downloaded file is kept unless you choose otherwise."
         }
         choices={[
           {
-            label: confirm.added_manually ? "Delete, keep file" : "Hide, keep file",
+            label: confirm.video.added_manually ? "Delete, keep file" : "Hide, keep file",
             value: "keep",
             primary: true,
           },
           {
-            label: confirm.added_manually ? "Delete and remove file" : "Hide and remove file",
+            label: confirm.video.added_manually ? "Delete and remove file" : "Hide and remove file",
             value: "delete",
             danger: true,
           },
         ]}
         onCancel={() => setConfirm(null)}
         onChoose={(choice) => {
-          const target = confirm;
+          const target = confirm.video;
           setConfirm(null);
           void removeVideo(target, choice === "delete");
         }}
