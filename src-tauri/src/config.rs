@@ -1,3 +1,4 @@
+use crate::models::SortOrder;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,81 @@ fn d_window_width() -> u32 {
 fn d_window_height() -> u32 {
     840
 }
+fn d_sort() -> SortOrder {
+    SortOrder::Newest
+}
+
+/// The Subscriptions feed's filters, remembered between runs.
+///
+/// The active tab is deliberately absent: a launch always lands on
+/// Subscriptions.
+///
+/// Deliberately no `#[serde(flatten)] extra` here, unlike `Settings`: a key
+/// this struct doesn't know about would round-trip through `get_settings`
+/// but never appear in the frontend's hand-built `ViewState` literal, so the
+/// "did anything change" comparison in `App.tsx` would disagree with itself
+/// on every single launch -- the exact redundant write that guard exists to
+/// prevent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewState {
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub hide_watched: bool,
+    #[serde(default)]
+    pub downloaded_only: bool,
+    #[serde(default)]
+    pub show_hidden: bool,
+    #[serde(default)]
+    pub grouped: bool,
+    #[serde(default = "d_sort")]
+    pub sort: SortOrder,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            channel_id: None,
+            search: String::new(),
+            hide_watched: false,
+            downloaded_only: false,
+            show_hidden: false,
+            grouped: false,
+            sort: SortOrder::Newest,
+        }
+    }
+}
+
+impl ViewState {
+    /// Repairs values the UI can never produce but a hand-edited file can, so
+    /// the pickers that read this block always land on an option they offer.
+    /// `pub(crate)`, not private: `commands::save_view_state` calls this too,
+    /// so the 200-character search cap (and the rest) bounds what gets
+    /// *stored*, not just what `Settings::from_json_str` later *reads*.
+    pub(crate) fn sanitize(&mut self) {
+        // `Downloaded` belongs to the Downloads tab's own ordering, and
+        // `Parts` only exists in the picker while Group siblings is on.
+        if self.sort == SortOrder::Downloaded || (self.sort == SortOrder::Parts && !self.grouped) {
+            self.sort = SortOrder::Newest;
+        }
+        let trimmed = self.search.trim();
+        self.search = if trimmed.chars().count() > 200 {
+            trimmed.chars().take(200).collect()
+        } else {
+            trimmed.to_string()
+        };
+        if self.channel_id.as_deref() == Some("") {
+            self.channel_id = None;
+        }
+    }
+}
+
+fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ViewState, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -71,6 +147,11 @@ pub struct Settings {
     pub window_y: Option<i32>,
     #[serde(default)]
     pub window_maximized: bool,
+    /// The feed's filters. Deserialised leniently: settings.json is
+    /// hand-editable by design, and a typo in this block should cost the
+    /// filters, not the download directory.
+    #[serde(default, deserialize_with = "lenient_view")]
+    pub view: ViewState,
     /// Preserves keys written by future versions or by hand.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -94,11 +175,20 @@ impl Settings {
         // corrupt value would otherwise restore a window too small to use.
         v.window_width = v.window_width.clamp(720, 16_384);
         v.window_height = v.window_height.clamp(480, 16_384);
+        v.view.sanitize();
         Ok(v)
     }
 
     pub fn to_json_string(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// The Settings view sends the whole object back, from a snapshot taken
+    /// when it mounted -- and the feed's filters move while it is open. The
+    /// file's copy of `view` therefore wins over any incoming one; only
+    /// `save_view_state` writes that block.
+    pub fn keep_view_of(&mut self, disk: &Settings) {
+        self.view = disk.view.clone();
     }
 }
 
@@ -232,5 +322,98 @@ mod tests {
                 .max_concurrent_downloads,
             16
         );
+    }
+
+    #[test]
+    fn view_defaults_when_absent_from_an_existing_settings_file() {
+        let s = Settings::from_json_str(r#"{"player_command":"mpv"}"#).unwrap();
+        assert_eq!(s.view, ViewState::default());
+    }
+
+    #[test]
+    fn a_populated_view_round_trips_through_to_json_string_and_from_json_str() {
+        let mut s = Settings::default();
+        s.view = ViewState {
+            channel_id: Some("UC123".into()),
+            search: "cats".into(),
+            hide_watched: true,
+            downloaded_only: true,
+            show_hidden: true,
+            grouped: true,
+            sort: SortOrder::Length,
+        };
+        let json = s.to_json_string().unwrap();
+        let back = Settings::from_json_str(&json).unwrap();
+        assert_eq!(back.view, s.view);
+    }
+
+    #[test]
+    fn a_broken_view_block_falls_back_to_default_and_keeps_other_keys() {
+        let s =
+            Settings::from_json_str(r#"{"player_command":"mpv","view":{"sort":"sideways"}}"#)
+                .unwrap();
+        assert_eq!(s.view, ViewState::default());
+        assert_eq!(s.player_command, "mpv");
+    }
+
+    #[test]
+    fn a_view_of_the_wrong_type_falls_back_to_default_and_keeps_other_keys() {
+        let s = Settings::from_json_str(r#"{"player_command":"mpv","view":42}"#).unwrap();
+        assert_eq!(s.view, ViewState::default());
+        assert_eq!(s.player_command, "mpv");
+    }
+
+    #[test]
+    fn sort_parts_with_grouped_false_sanitises_to_newest() {
+        let s = Settings::from_json_str(r#"{"view":{"sort":"parts","grouped":false}}"#).unwrap();
+        assert_eq!(s.view.sort, SortOrder::Newest);
+    }
+
+    #[test]
+    fn sort_parts_with_grouped_true_is_kept() {
+        let s = Settings::from_json_str(r#"{"view":{"sort":"parts","grouped":true}}"#).unwrap();
+        assert_eq!(s.view.sort, SortOrder::Parts);
+    }
+
+    #[test]
+    fn sort_downloaded_sanitises_to_newest_regardless_of_grouped() {
+        let ungrouped =
+            Settings::from_json_str(r#"{"view":{"sort":"downloaded","grouped":false}}"#).unwrap();
+        assert_eq!(ungrouped.view.sort, SortOrder::Newest);
+        let grouped =
+            Settings::from_json_str(r#"{"view":{"sort":"downloaded","grouped":true}}"#).unwrap();
+        assert_eq!(grouped.view.sort, SortOrder::Newest);
+    }
+
+    #[test]
+    fn search_is_trimmed_and_capped_at_200_characters() {
+        let s = Settings::from_json_str(r#"{"view":{"search":"  cats  "}}"#).unwrap();
+        assert_eq!(s.view.search, "cats");
+
+        let long = "a".repeat(500);
+        let s2 =
+            Settings::from_json_str(&format!(r#"{{"view":{{"search":"{long}"}}}}"#)).unwrap();
+        assert_eq!(s2.view.search.len(), 200);
+    }
+
+    #[test]
+    fn search_cap_counts_characters_not_bytes() {
+        // "é" is two bytes in UTF-8. A byte-oriented cap (`String::truncate(200)`)
+        // would keep only 100 of these; the intended behaviour keeps 200.
+        let long = "é".repeat(500);
+        let s = Settings::from_json_str(&format!(r#"{{"view":{{"search":"{long}"}}}}"#)).unwrap();
+        assert_eq!(s.view.search.chars().count(), 200);
+    }
+
+    #[test]
+    fn keep_view_of_takes_the_files_block_and_discards_the_incoming_one() {
+        let mut incoming = Settings::default();
+        incoming.view.search = "incoming".into();
+
+        let mut disk = Settings::default();
+        disk.view.search = "disk".into();
+
+        incoming.keep_view_of(&disk);
+        assert_eq!(incoming.view.search, "disk");
     }
 }

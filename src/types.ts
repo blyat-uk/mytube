@@ -61,6 +61,16 @@ export interface TakeoutRow {
 }
 export interface ImportProgress { done: number; total: number; current: string; }
 
+/**
+ * The Subscriptions feed's filters, persisted between runs. The active tab is
+ * deliberately absent: a launch always lands on Subscriptions.
+ */
+export interface ViewState {
+  channel_id: string | null; search: string;
+  hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
+  grouped: boolean; sort: SortOrder;
+}
+
 export interface Settings {
   download_dir: string; filename_template: string; player_command: string;
   max_concurrent_downloads: number; poll_interval_minutes: number;
@@ -69,6 +79,7 @@ export interface Settings {
   window_width: number; window_height: number;
   window_x: number | null; window_y: number | null;
   window_maximized: boolean;
+  view: ViewState;
 }
 
 export interface PollSummary {

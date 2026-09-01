@@ -22,15 +22,39 @@ pub fn get_settings() -> R<config::Settings> {
 
 #[tauri::command]
 pub async fn save_settings(
-    settings: config::Settings,
+    mut settings: config::Settings,
     state: State<'_, Arc<AppState>>,
 ) -> R<()> {
+    // The Settings view sends a snapshot taken at mount, so if a filter
+    // changed while it was open, saving it verbatim would revert `view` to
+    // that stale copy. A failed re-read (e.g. no file yet) just means there
+    // is nothing on disk to defer to, so fall through and write as sent.
+    if let Ok(disk) = config::load() {
+        settings.keep_view_of(&disk);
+    }
     config::save(&settings).map_err(e)?;
     state
         .queue
         .set_concurrency(settings.max_concurrent_downloads)
         .await;
     Ok(())
+}
+
+/// Writes only the feed's filters, re-reading the file first so a settings
+/// edit or the window geometry is never overwritten by a filter change --
+/// the same re-read-then-touch-one-block pattern `window::persist` uses to
+/// save geometry without disturbing the rest of the file.
+#[tauri::command]
+pub fn save_view_state(mut view: config::ViewState) -> R<()> {
+    // `Settings::from_json_str` only sanitises on the way back in, so without
+    // this an unbounded search string (no `maxLength` on the search box)
+    // would be written to settings.json in full every 400ms of typing.
+    // Sanitising here also means the stored block is always byte-for-byte
+    // what the next launch's `sanitize` call would produce anyway.
+    view.sanitize();
+    let mut s = config::load().map_err(e)?;
+    s.view = view;
+    config::save(&s).map_err(e)
 }
 
 #[tauri::command]

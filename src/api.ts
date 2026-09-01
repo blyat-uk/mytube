@@ -1,13 +1,15 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
-  AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, PollSummary, ImportResult,
-  TakeoutRow,
+  AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
+  ImportResult, TakeoutRow,
 } from "./types";
 
 export const api = {
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
+  /** Writes only the feed's filters; `save_settings` ignores this block. */
+  saveViewState: (view: ViewState) => invoke<void>("save_view_state", { view }),
   listChannels: () => invoke<Channel[]>("list_channels"),
   addChannel: (input: string) => invoke<Channel>("add_channel", { input }),
   addVideo: (input: string) => invoke<Video>("add_video", { input }),
