@@ -7,7 +7,7 @@ MyTube installs entirely into your home directory. Nothing here needs `sudo`.
 1. **Build the release binary** from the repository root:
 
    ```sh
-   bun run tauri build
+   bun run tauri build --no-bundle
    ```
 
    This produces `src-tauri/target/release/mytube`.
@@ -63,7 +63,7 @@ Exec=sh -c "exec \\"\\$HOME/.local/bin/mytube\\""
 
 `$HOME` is expanded by the shell at launch time, so there is no hardcoded
 username, no `sudo`, and no dependence on the session's `PATH`. (`%h` is a
-*systemd* unit specifier, not a Desktop Entry field code — the Desktop Entry
+_systemd_ unit specifier, not a Desktop Entry field code — the Desktop Entry
 spec only defines `%f %F %u %U %i %c %k`, and GLib/GIO refuses to load an entry
 whose `Exec` contains an unrecognised field code, which makes the launcher
 vanish from the menu entirely. Hence the `sh -c` form.)
@@ -72,11 +72,11 @@ vanish from the menu entirely. Hence the `sh -c` form.)
 
 These are not bundled; install them with your distribution's package manager.
 
-| Requirement | Why |
-| --- | --- |
-| `yt-dlp` | Fetches video metadata and performs all downloads. Keep it current — YouTube changes break old versions. |
-| `ffmpeg` | Required by `yt-dlp` to merge the separate video and audio streams into the `.mkv` output and to embed thumbnails. |
-| Firefox | Downloads run with `--cookies-from-browser firefox`, so a Firefox profile with your YouTube cookies must exist on the machine. |
+| Requirement    | Why                                                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `yt-dlp`       | Fetches video metadata and performs all downloads. Keep it current — YouTube changes break old versions.                                         |
+| `ffmpeg`       | Required by `yt-dlp` to merge the separate video and audio streams into the `.mkv` output and to embed thumbnails.                               |
+| Firefox        | Downloads run with `--cookies-from-browser firefox`, so a Firefox profile with your YouTube cookies must exist on the machine.                   |
 | A video player | Used to play downloaded files. The default is `smplayer`; change it in Settings (`player_command`) if you prefer `mpv`, `vlc`, or anything else. |
 
 ## Configuration
