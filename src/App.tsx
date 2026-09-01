@@ -8,7 +8,7 @@ import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
 import { usePollEvents } from "./events";
-import type { Channel, SortOrder, Video } from "./types";
+import type { Channel, SortOrder, Video, ViewState } from "./types";
 import "./App.css";
 
 export default function App() {
@@ -17,6 +17,23 @@ export default function App() {
       <Shell />
     </ToastProvider>
   );
+}
+
+// The one place a `ViewState` object literal is built, so hydration's seed
+// and the writer's comparison always produce identically-ordered JSON
+// regardless of the field order `config.rs`'s `ViewState` happens to
+// serialise in -- `JSON.stringify` order follows a JS object's own key
+// insertion order, and that order now comes from this literal, not from
+// whatever order the IPC payload's keys arrived in.
+function buildViewState(
+  channelId: string | null, search: string, hideWatched: boolean,
+  downloadedOnly: boolean, showHidden: boolean, grouped: boolean, sort: SortOrder,
+): ViewState {
+  return {
+    channel_id: channelId, search,
+    hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
+    grouped, sort,
+  };
 }
 
 function Shell() {
@@ -83,9 +100,20 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   }, [siblingOf, closeSeries]);
 
+  // Set once the channel list has actually been fetched -- not once it is
+  // non-empty, since a user with no subscriptions at all must still have a
+  // stale channel filter pruned below. A ref, not state: it only needs to be
+  // readable by the time `channels` itself changes, which already re-renders.
+  // On a failed fetch it is left false, so a restored channel filter stays
+  // unpruned for the rest of the session rather than being cleared on a
+  // transient error; the next successful load heals it.
+  const channelsFetched = useRef(false);
+
   const loadChannels = useCallback(async () => {
     try {
-      setChannels(await api.listChannels());
+      const list = await api.listChannels();
+      channelsFetched.current = true;
+      setChannels(list);
     } catch (err) {
       toast.error(errText(err));
     }
@@ -132,15 +160,51 @@ function Shell() {
   }, [polling, loadChannels, reload, toast]);
 
   // A channel filter pointing at a channel that no longer exists shows nothing.
+  // Gated on the list having actually been fetched: hydration can restore
+  // `channelId` from settings.json before `listChannels` resolves, and until
+  // then `channels` is its unfetched `[]` default -- indistinguishable from
+  // "you have no channels" -- so pruning against it would silently discard a
+  // channel filter that the list, once it arrives, would have kept.
   useEffect(() => {
+    if (!channelsFetched.current) return;
     if (channelId && !channels.some((c) => c.id === channelId)) setChannelId(null);
   }, [channels, channelId]);
 
-  // Card size lives in settings.json so the zoom level survives a restart.
+  // Card size and the feed's filters both live in settings.json, so both are
+  // read up front and rendering waits for them -- see the early return below.
+  const [hydrated, setHydrated] = useState(false);
+  // The view last known to be on disk, so hydration flipping this effect's own
+  // dependency does not read as a change and write the defaults back over it.
+  const persistedView = useRef("");
+
   useEffect(() => {
     api.getSettings()
-      .then((s) => setCardSize(clampCardSize(s.card_size ?? CARD_DEFAULT)))
-      .catch(() => {});
+      .then((s) => {
+        setCardSize(clampCardSize(s.card_size ?? CARD_DEFAULT));
+        const v = s.view;
+        setChannelId(v.channel_id);
+        setSearch(v.search);
+        setHideWatched(v.hide_watched);
+        setDownloadedOnly(v.downloaded_only);
+        setShowHidden(v.show_hidden);
+        setGrouped(v.grouped);
+        setSort(v.sort);
+        persistedView.current = JSON.stringify(
+          buildViewState(v.channel_id, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped, v.sort),
+        );
+      })
+      .catch(() => {
+        // get_settings failed -- or threw on a malformed `s.view` dereferenced
+        // just above -- so none of the setters above ran and every filter is
+        // still at its useState default. Seed the guard from that same
+        // default state, not from "", so the writer effect below sees
+        // nothing has changed and does not write the defaults over a view it
+        // never actually managed to read.
+        persistedView.current = JSON.stringify(
+          buildViewState(channelId, search, hideWatched, downloadedOnly, showHidden, grouped, sort),
+        );
+      })
+      .finally(() => setHydrated(true));
   }, []);
 
   const sizeTimer = useRef<number | undefined>(undefined);
@@ -154,6 +218,27 @@ function Shell() {
         .catch(() => {});
     }, 400);
   }, []);
+
+  // Debounced like saveCardSize, but there is no explicit call site for a
+  // filter change -- every setter above is reachable straight from TopNav --
+  // so this watches the seven values instead of wrapping each setter.
+  useEffect(() => {
+    if (!hydrated) return;
+    const view = buildViewState(channelId, search, hideWatched, downloadedOnly, showHidden, grouped, sort);
+    const serialised = JSON.stringify(view);
+    if (serialised === persistedView.current) return;
+    const t = window.setTimeout(() => {
+      api.saveViewState(view)
+        .then(() => { persistedView.current = serialised; })
+        .catch(() => {});
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [hydrated, channelId, search, hideWatched, downloadedOnly, showHidden, grouped, sort]);
+
+  // SubscriptionsView and TopNav both seed themselves from props at mount, so
+  // rendering before the saved view lands would spend a query on the
+  // unfiltered feed and leave the search box briefly out of sync with it.
+  if (!hydrated) return <div className="app" />;
 
   return (
     <div className="app">

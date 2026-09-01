@@ -105,6 +105,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::save_settings,
+            commands::save_view_state,
             commands::list_channels,
             commands::add_channel,
             commands::add_video,
