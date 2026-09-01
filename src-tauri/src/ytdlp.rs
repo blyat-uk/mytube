@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::models::{FlatEntry, ProbeInfo, VideoStatus};
 
@@ -203,11 +204,43 @@ pub fn status_from(live_status: Option<&str>, duration: Option<i64>) -> VideoSta
     }
 }
 
+/// How long a channel listing may take before it is written off.
+///
+/// Generous: a 200-entry listing normally lands in a few seconds, and the only
+/// job of this number is to be finite.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Runs a child and captures its output, with a ceiling on how long it may
+/// take.
+///
+/// `.output()` on its own waits forever. That is survivable for a download,
+/// which you can see sitting there and cancel, but `flat_playlist` runs inside
+/// the poll loop: one wedged child stops *every* future poll for the life of
+/// the process, because the loop polls sequentially and holds `poll_lock`
+/// while it does -- so a manual refresh then answers "A refresh is already
+/// running" and only a restart clears it. Nothing is on screen to say so
+/// either, when the window is closed to the tray.
+///
+/// `kill_on_drop` is what makes the ceiling real: dropping the future on
+/// timeout otherwise leaves the child running with nothing left to reap it.
+async fn run_with_timeout(
+    program: &str,
+    args: Vec<String>,
+    limit: Duration,
+) -> Result<std::process::Output> {
+    let run = tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(limit, run).await {
+        Ok(finished) => finished.map_err(|e| anyhow!("could not run {program}: {e}")),
+        Err(_) => Err(anyhow!("{program} timed out after {}s", limit.as_secs())),
+    }
+}
+
 pub async fn flat_playlist(channel_id: &str, limit: u32) -> Result<Vec<FlatEntry>> {
-    let out = tokio::process::Command::new("yt-dlp")
-        .args(flat_playlist_args(channel_id, limit))
-        .output().await
-        .map_err(|e| anyhow!("could not run yt-dlp: {e}"))?;
+    let out = run_with_timeout("yt-dlp", flat_playlist_args(channel_id, limit), LISTING_TIMEOUT)
+        .await?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!("yt-dlp listing failed for {channel_id}: {}",
@@ -431,5 +464,53 @@ mod tests {
     #[test]
     fn thumbnail_url_is_deterministic() {
         assert_eq!(thumb_url_for("abc"), "https://i.ytimg.com/vi/abc/hqdefault.jpg");
+    }
+
+    /// A unique `sleep` duration, so `pgrep` can find this test's own child and
+    /// nobody else's.
+    fn probe_seconds() -> String {
+        format!("300.{}", std::process::id())
+    }
+
+    fn child_alive(pattern: &str) -> bool {
+        let out = std::process::Command::new("pgrep")
+            .arg("-f").arg(pattern)
+            .output()
+            .expect("pgrep is available");
+        !out.stdout.is_empty()
+    }
+
+    #[tokio::test]
+    async fn a_child_that_finishes_in_time_returns_its_output() {
+        let out = run_with_timeout("echo", vec![s("hello")], Duration::from_secs(10))
+            .await
+            .expect("echo should not time out");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn a_child_that_overruns_its_budget_is_an_error_rather_than_a_hang() {
+        let err = run_with_timeout("sleep", vec![probe_seconds()], Duration::from_millis(100))
+            .await
+            .expect_err("a 300s sleep must not survive a 100ms budget");
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_child_is_killed_rather_than_left_running() {
+        // The timeout is only real if the process actually goes away: dropping
+        // the future otherwise leaves yt-dlp running, and the app would collect
+        // one stuck child per poll interval forever.
+        let secs = probe_seconds();
+        let pattern = format!("sleep {secs}");
+        let _ = run_with_timeout("sleep", vec![secs.clone()], Duration::from_millis(100)).await;
+
+        for _ in 0..40 {
+            if !child_alive(&pattern) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("`{pattern}` outlived the timeout that was supposed to kill it");
     }
 }

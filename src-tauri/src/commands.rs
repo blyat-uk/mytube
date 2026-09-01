@@ -335,6 +335,16 @@ pub fn list_videos(filter: VideoFilter, state: State<'_, Arc<AppState>>) -> R<Ve
     state.db.list_videos(&filter).map_err(e)
 }
 
+/// The same feed, with each channel's multi-part uploads behind one card.
+/// `filter.limit` and `filter.offset` count groups here, not videos.
+#[tauri::command]
+pub fn list_video_groups(
+    filter: VideoFilter,
+    state: State<'_, Arc<AppState>>,
+) -> R<Vec<VideoGroup>> {
+    state.db.list_video_groups(&filter).map_err(e)
+}
+
 #[tauri::command]
 pub fn set_watched(
     video_id: String,

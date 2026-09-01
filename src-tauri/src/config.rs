@@ -32,6 +32,14 @@ fn d_backfill_count() -> u32 {
 fn d_card_size() -> u32 {
     260
 }
+/// Window geometry in logical px. The defaults match `app.windows[0]` in
+/// tauri.conf.json, so a first run and a deleted settings.json look alike.
+fn d_window_width() -> u32 {
+    1280
+}
+fn d_window_height() -> u32 {
+    840
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -51,6 +59,18 @@ pub struct Settings {
     pub backfill_count: u32,
     #[serde(default = "d_card_size")]
     pub card_size: u32,
+    #[serde(default = "d_window_width")]
+    pub window_width: u32,
+    #[serde(default = "d_window_height")]
+    pub window_height: u32,
+    /// Absent until a position is known. Wayland never reports one, so it stays
+    /// null there however long the app is used.
+    #[serde(default)]
+    pub window_x: Option<i32>,
+    #[serde(default)]
+    pub window_y: Option<i32>,
+    #[serde(default)]
+    pub window_maximized: bool,
     /// Preserves keys written by future versions or by hand.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -69,7 +89,11 @@ impl Settings {
         v.max_concurrent_downloads = v.max_concurrent_downloads.clamp(1, 16);
         v.poll_interval_minutes = v.poll_interval_minutes.clamp(1, 1440);
         v.backfill_count = v.backfill_count.clamp(1, 500);
-        v.card_size = v.card_size.clamp(160, 460);
+        v.card_size = v.card_size.clamp(160, 640);
+        // Floors match minWidth/minHeight in tauri.conf.json; a hand-edited or
+        // corrupt value would otherwise restore a window too small to use.
+        v.window_width = v.window_width.clamp(720, 16_384);
+        v.window_height = v.window_height.clamp(480, 16_384);
         Ok(v)
     }
 
@@ -155,8 +179,43 @@ mod tests {
     #[test]
     fn card_size_is_clamped_to_the_zoom_range() {
         assert_eq!(Settings::from_json_str(r#"{"card_size":10}"#).unwrap().card_size, 160);
-        assert_eq!(Settings::from_json_str(r#"{"card_size":9999}"#).unwrap().card_size, 460);
+        assert_eq!(Settings::from_json_str(r#"{"card_size":9999}"#).unwrap().card_size, 640);
         assert_eq!(Settings::from_json_str(r#"{"card_size":300}"#).unwrap().card_size, 300);
+    }
+
+    #[test]
+    fn window_geometry_defaults_match_the_tauri_config() {
+        let s = Settings::default();
+        assert_eq!(s.window_width, 1280);
+        assert_eq!(s.window_height, 840);
+        assert_eq!(s.window_x, None);
+        assert_eq!(s.window_y, None);
+        assert!(!s.window_maximized);
+    }
+
+    #[test]
+    fn window_size_is_clamped_to_something_usable() {
+        let tiny = Settings::from_json_str(r#"{"window_width":1,"window_height":1}"#).unwrap();
+        assert_eq!((tiny.window_width, tiny.window_height), (720, 480));
+        let huge =
+            Settings::from_json_str(r#"{"window_width":999999,"window_height":999999}"#).unwrap();
+        assert_eq!((huge.window_width, huge.window_height), (16_384, 16_384));
+    }
+
+    #[test]
+    fn a_negative_window_position_survives_a_round_trip() {
+        // A second monitor left of the primary one gives genuine negatives.
+        let s = Settings::from_json_str(r#"{"window_x":-1920,"window_y":-40}"#).unwrap();
+        assert_eq!((s.window_x, s.window_y), (Some(-1920), Some(-40)));
+        let back = Settings::from_json_str(&s.to_json_string().unwrap()).unwrap();
+        assert_eq!((back.window_x, back.window_y), (Some(-1920), Some(-40)));
+    }
+
+    #[test]
+    fn window_keys_are_optional_in_an_existing_settings_file() {
+        let s = Settings::from_json_str(r#"{"player_command":"mpv"}"#).unwrap();
+        assert_eq!(s.window_width, 1280);
+        assert_eq!(s.window_x, None);
     }
 
     #[test]

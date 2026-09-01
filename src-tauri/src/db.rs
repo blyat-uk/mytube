@@ -1,10 +1,11 @@
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 use crate::models::*;
+use crate::siblings;
 
 pub struct Db { conn: Mutex<Connection> }
 
@@ -45,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -83,7 +84,43 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    if version < 3 {
+        if !column_exists(conn, "videos", "downloaded_at")? {
+            conn.execute("ALTER TABLE videos ADD COLUMN downloaded_at INTEGER", [])?;
+            backfill_downloaded_at(conn)?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_videos_downloaded ON videos(downloaded_at DESC);",
+        )?;
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Seeds `downloaded_at` for files that were already on disk when the column
+/// arrived, from each file's mtime. Without it every download predating the
+/// migration falls back to release order -- precisely the ordering the column
+/// exists to replace. Runs once, inside the ALTER step, so an ordinary open
+/// never stats the library. A file that has since been moved or deleted keeps
+/// NULL and sorts last, which is the same place an unknown date always lands.
+fn backfill_downloaded_at(conn: &Connection) -> Result<()> {
+    // Collected up front so the statement's borrow of `conn` ends before the
+    // UPDATEs below need it.
+    let rows: Vec<(String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT id, file_path FROM videos
+             WHERE download_state='done' AND file_path IS NOT NULL")?;
+        let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        it.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, path) in rows {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let Ok(age) = mtime.duration_since(std::time::UNIX_EPOCH) else { continue };
+        conn.execute("UPDATE videos SET downloaded_at=?2 WHERE id=?1",
+                     params![id, age.as_secs() as i64])?;
+    }
     Ok(())
 }
 
@@ -93,6 +130,133 @@ fn now() -> i64 { chrono::Utc::now().timestamp() }
 fn like_pattern(term: &str) -> String {
     let escaped = term.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
     format!("%{escaped}%")
+}
+
+/// Ids of every ready video on the anchor's channel whose title reads as
+/// another part of the same upload -- the anchor itself included, since a
+/// series view that omits the video you opened it from is disorienting.
+///
+/// Matching runs here rather than in SQL because it is fuzzy (see
+/// [`crate::siblings`]); a single channel's titles are few enough that loading
+/// them to compare in Rust costs nothing.
+fn sibling_ids(conn: &rusqlite::Connection, anchor_id: &str) -> Result<Vec<String>> {
+    let anchor: Option<(String, String)> = conn
+        .query_row(
+            "SELECT channel_id, title FROM videos WHERE id=?1",
+            params![anchor_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((channel_id, title)) = anchor else { return Ok(Vec::new()) };
+
+    let stem = siblings::normalize(&title);
+    let mut st = conn.prepare(
+        "SELECT id, title FROM videos WHERE channel_id=?1 AND status='ready'")?;
+    let rows = st.query_map(params![channel_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+
+    let mut ids = Vec::new();
+    for row in rows {
+        let (id, other) = row?;
+        if siblings::is_sibling(&stem, &siblings::normalize(&other)) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// The feed query, ordered but unpaged: `list_videos` bolts `LIMIT`/`OFFSET`
+/// onto it, `list_video_groups` walks all of it. `select` decides how much of
+/// each row comes back -- the grouping walk needs ids alone, and reading
+/// twenty-two columns of a whole library only to drop them would be waste.
+///
+/// `Ok(None)` means the filter selects nothing at all, which is not the same as
+/// a query that returns no rows: an anchor with no siblings has no `IN ()` that
+/// SQLite would accept.
+fn feed_query(
+    conn: &Connection,
+    f: &VideoFilter,
+    select: &str,
+) -> Result<Option<(String, Vec<Box<dyn rusqlite::ToSql>>)>> {
+    let mut sql = format!("{select} WHERE v.status='ready'");
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(anchor) = &f.sibling_of {
+        // Showing a series means showing all of it, so none of the ordinary
+        // filters apply here -- a part you have watched, hidden or not yet
+        // downloaded is still a part.
+        let ids = sibling_ids(conn, anchor)?;
+        if ids.is_empty() { return Ok(None); }
+        let holes = ids
+            .into_iter()
+            .map(|id| { args.push(Box::new(id)); format!("?{}", args.len()) })
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND v.id IN ({holes})"));
+    } else {
+        if let Some(ch) = &f.channel_id {
+            args.push(Box::new(ch.clone()));
+            sql.push_str(&format!(" AND v.channel_id=?{}", args.len()));
+        }
+        if !f.show_hidden { sql.push_str(" AND v.hidden=0"); }
+        if f.hide_watched { sql.push_str(" AND v.watched=0"); }
+        if f.downloaded_only { sql.push_str(" AND v.download_state='done'"); }
+        if let Some(term) = f.search.as_ref().filter(|s| !s.trim().is_empty()) {
+            args.push(Box::new(like_pattern(term.trim())));
+            let i = args.len();
+            sql.push_str(&format!(
+                " AND (v.title LIKE ?{i} ESCAPE '\\' OR c.title LIKE ?{i} ESCAPE '\\')"));
+        }
+    }
+    sql.push_str(order_by(f.sort));
+    Ok(Some((sql, args)))
+}
+
+/// The one place the feed's orderings are written down. `list_video_groups`
+/// reuses it to order a series' parts, so a group can never be sorted by a rule
+/// the feed around it does not follow.
+fn order_by(sort: SortOrder) -> &'static str {
+    match sort {
+        SortOrder::Newest  => " ORDER BY v.sort_at DESC NULLS LAST, v.feed_rank ASC, v.id ASC",
+        SortOrder::Oldest  => " ORDER BY v.sort_at ASC NULLS LAST, v.feed_rank DESC, v.id ASC",
+        SortOrder::Channel => " ORDER BY c.title COLLATE NOCASE ASC, v.sort_at DESC NULLS LAST, v.feed_rank ASC, v.id ASC",
+        SortOrder::Downloaded => " ORDER BY v.downloaded_at DESC NULLS LAST, v.sort_at DESC NULLS LAST, v.id ASC",
+        SortOrder::Length  => " ORDER BY v.duration_secs DESC NULLS LAST, v.sort_at DESC NULLS LAST, v.id ASC",
+        // Group size is not a column: `list_video_groups` ranks the finished
+        // groups itself. What SQL still owns here is the order the walk sees
+        // rows in -- which decides each group's leader, its parts' order, and
+        // how ties between equal-length series break.
+        SortOrder::Parts => order_by(SortOrder::Newest),
+    }
+}
+
+/// How many ids one hydration query may bind. Well under SQLite's parameter
+/// ceiling, and only ever exceeded by a single series longer than the batch.
+const HYDRATE_BATCH: usize = 200;
+
+/// Fetches `ids` in the feed's order, recording each row and the position it
+/// came back in. Positions are only ever compared within one batch, which is
+/// why [`Db::list_video_groups`] never lets a group straddle two.
+fn hydrate(
+    conn: &Connection,
+    ids: &[&String],
+    sort: SortOrder,
+    rows: &mut HashMap<String, Video>,
+    rank: &mut HashMap<String, usize>,
+) -> Result<()> {
+    if ids.is_empty() { return Ok(()); }
+    let holes = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!("{SELECT_VIDEO} WHERE v.id IN ({holes}){}", order_by(sort));
+    let mut st = conn.prepare(&sql)?;
+    let fetched = st.query_map(rusqlite::params_from_iter(ids.iter()), map_video)?;
+    let base = rank.len();
+    for (i, row) in fetched.enumerate() {
+        let v = row?;
+        rank.insert(v.id.clone(), base + i);
+        rows.insert(v.id.clone(), v);
+    }
+    Ok(())
 }
 
 impl Db {
@@ -230,6 +394,27 @@ impl Db {
         Ok(())
     }
 
+    /// RSS is the authority on a title: a YouTuber who renames a fresh upload
+    /// is renaming it for everyone, so the feed's string wins over the one
+    /// stored when the row was first seen. Only the ~15 entries a feed carries
+    /// pass through here, which is the whole scope of the feature -- an old
+    /// video is never revisited.
+    ///
+    /// Both guards live in the SQL rather than at the call site, so a poll can
+    /// call this for every entry unconditionally: an empty title from a mangled
+    /// feed must not cost a card its name, and an unchanged title -- almost
+    /// every entry of almost every poll -- must not rewrite the row.
+    ///
+    /// No `added_manually` exemption, unlike [`Db::set_published_at`]: a title
+    /// carries no user intent to preserve.
+    pub fn set_title(&self, id: &str, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE videos SET title=?2 WHERE id=?1 AND ?2<>'' AND title<>?2",
+            params![id, title])?;
+        Ok(())
+    }
+
     pub fn set_thumb_path(&self, id: &str, path: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET thumb_path=?2 WHERE id=?1", params![id, path])?;
@@ -264,27 +449,9 @@ impl Db {
 
     pub fn list_videos(&self, f: &VideoFilter) -> Result<Vec<Video>> {
         let conn = self.conn.lock().unwrap();
-        let mut sql = format!("{SELECT_VIDEO} WHERE v.status='ready'");
-        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if let Some(ch) = &f.channel_id {
-            args.push(Box::new(ch.clone()));
-            sql.push_str(&format!(" AND v.channel_id=?{}", args.len()));
-        }
-        if !f.show_hidden { sql.push_str(" AND v.hidden=0"); }
-        if f.hide_watched { sql.push_str(" AND v.watched=0"); }
-        if f.downloaded_only { sql.push_str(" AND v.download_state='done'"); }
-        if let Some(term) = f.search.as_ref().filter(|s| !s.trim().is_empty()) {
-            args.push(Box::new(like_pattern(term.trim())));
-            let i = args.len();
-            sql.push_str(&format!(
-                " AND (v.title LIKE ?{i} ESCAPE '\\' OR c.title LIKE ?{i} ESCAPE '\\')"));
-        }
-        sql.push_str(match f.sort {
-            SortOrder::Newest  => " ORDER BY v.sort_at DESC NULLS LAST, v.feed_rank ASC, v.id ASC",
-            SortOrder::Oldest  => " ORDER BY v.sort_at ASC NULLS LAST, v.feed_rank DESC, v.id ASC",
-            SortOrder::Channel => " ORDER BY c.title COLLATE NOCASE ASC, v.sort_at DESC NULLS LAST, v.feed_rank ASC, v.id ASC",
-        });
+        let Some((mut sql, mut args)) = feed_query(&conn, f, SELECT_VIDEO)? else {
+            return Ok(Vec::new());
+        };
         args.push(Box::new(f.limit));
         sql.push_str(&format!(" LIMIT ?{}", args.len()));
         args.push(Box::new(f.offset));
@@ -295,6 +462,145 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The feed as cards, with each channel's multi-part uploads collapsed into
+    /// one group. `limit` and `offset` count **groups**, not videos.
+    ///
+    /// Grouping cannot be done a page at a time: the parts of one series
+    /// routinely sit pages apart in date order, so the walk has to see the whole
+    /// filtered set before it can hand back the first card. Each group is formed
+    /// by matching its leader against every ready video on that leader's channel
+    /// -- the same match [`sibling_ids`] makes -- so a group's contents are by
+    /// construction exactly what "Find siblings" on that leader returns.
+    ///
+    /// The filters therefore choose which groups appear, not what is inside
+    /// them: a card says "7 parts" because there are seven, and the series stays
+    /// on screen until every one of them has been filtered out. `sibling_of` is
+    /// meaningless here and is ignored -- the series view is a flat list on
+    /// purpose.
+    pub fn list_video_groups(&self, f: &VideoFilter) -> Result<Vec<VideoGroup>> {
+        let conn = self.conn.lock().unwrap();
+        let seed_filter = VideoFilter { sibling_of: None, ..f.clone() };
+        let Some((sql, args)) = feed_query(&conn, &seed_filter, SELECT_VIDEO_IDS)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut st = conn.prepare(&sql)?;
+        let seeds: Vec<(String, String)> = st
+            .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Every ready title on each channel in play, normalised once. Matching
+        // against the unfiltered set is the whole point: the filterbar must not
+        // be able to shorten a series, only to hide one.
+        let mut st_titles = conn.prepare(
+            "SELECT id, title, duration_secs FROM videos
+             WHERE channel_id=?1 AND status='ready'")?;
+        let mut index: HashMap<String, Vec<(String, siblings::Normalized)>> = HashMap::new();
+        // Runtimes come out of the query above rather than a second one, since
+        // `SortOrder::Length` has to total a group up while all it holds is ids.
+        // A row with no duration yet contributes nothing to its series.
+        let mut runtimes: HashMap<String, i64> = HashMap::new();
+        for (_, channel) in &seeds {
+            if index.contains_key(channel) { continue; }
+            let rows = st_titles.query_map(params![channel], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?))
+            })?;
+            let mut titles = Vec::new();
+            for row in rows {
+                let (id, title, secs) = row?;
+                runtimes.insert(id.clone(), secs.unwrap_or(0));
+                titles.push((id, siblings::normalize(&title)));
+            }
+            index.insert(channel.clone(), titles);
+        }
+
+        // Top-down: the first part to survive the filters leads its group, and
+        // every part it claims is struck off so it cannot open a group of its
+        // own further down the feed.
+        let mut consumed: HashSet<String> = HashSet::new();
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (id, channel) in &seeds {
+            if consumed.contains(id) { continue; }
+            let mut members = vec![id.clone()];
+            if let Some((_, stem)) = index[channel].iter().find(|(other, _)| other == id) {
+                for (other, other_stem) in &index[channel] {
+                    if other != id && siblings::is_sibling(stem, other_stem) {
+                        members.push(other.clone());
+                    }
+                }
+            }
+            for m in &members { consumed.insert(m.clone()); }
+            groups.push(members);
+        }
+
+        // Two of the sort orders rank a card by something only the finished
+        // group knows -- how many parts it holds, or how long they run in
+        // total. Both have to be applied before the page is cut, or
+        // `limit`/`offset` would page through the underlying order and then
+        // reshuffle each page on its own. `sort_by_key` is stable, so a tie
+        // keeps the order the feed's own sort gave it.
+        //
+        // `Length` is ranked here even though SQL already ordered the seeds by
+        // duration: that ordering settled each group's leader and its parts'
+        // order, but a series is worth the sum of its parts, which no single
+        // row's `duration_secs` can express.
+        match f.sort {
+            SortOrder::Parts => {
+                groups.sort_by_key(|members| std::cmp::Reverse(members.len()));
+            }
+            SortOrder::Length => {
+                groups.sort_by_key(|members| {
+                    let total: i64 = members.iter()
+                        .map(|id| runtimes.get(id).copied().unwrap_or(0))
+                        .sum();
+                    std::cmp::Reverse(total)
+                });
+            }
+            _ => {}
+        }
+
+        let page: Vec<Vec<String>> = groups
+            .into_iter()
+            .skip(f.offset.max(0) as usize)
+            .take(f.limit.max(0) as usize)
+            .collect();
+
+        // Rows for the page, fetched in batches of whole groups: keeping a group
+        // inside one ordered query is what makes its parts' order meaningful.
+        let mut rows: HashMap<String, Video> = HashMap::new();
+        let mut rank: HashMap<String, usize> = HashMap::new();
+        let mut batch: Vec<&String> = Vec::new();
+        for members in &page {
+            if !batch.is_empty() && batch.len() + members.len() > HYDRATE_BATCH {
+                hydrate(&conn, &batch, f.sort, &mut rows, &mut rank)?;
+                batch.clear();
+            }
+            batch.extend(members.iter());
+        }
+        hydrate(&conn, &batch, f.sort, &mut rows, &mut rank)?;
+
+        let mut out = Vec::with_capacity(page.len());
+        for members in &page {
+            let mut rest: Vec<&String> = members.iter().skip(1).collect();
+            rest.sort_by_key(|id| rank.get(*id).copied().unwrap_or(usize::MAX));
+            let mut videos: Vec<Video> = Vec::with_capacity(members.len());
+            for id in std::iter::once(&members[0]).chain(rest) {
+                if let Some(v) = rows.get(id) { videos.push(v.clone()); }
+            }
+            if videos.is_empty() { continue; }
+            let stem = if videos.len() > 1 {
+                let titles: Vec<&str> = videos.iter().map(|v| v.title.as_str()).collect();
+                siblings::display_stem(&titles)
+            } else {
+                None
+            };
+            out.push(VideoGroup { videos, stem });
+        }
+        Ok(out)
+    }
+
     pub fn set_watched(&self, id: &str, watched: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET watched=?2, watched_at=?3 WHERE id=?1",
@@ -302,21 +608,35 @@ impl Db {
         Ok(())
     }
 
+    /// Also maintains `downloaded_at`, the Downloads tab's ordering key:
+    ///
+    /// - `Queued` stamps the queue time,
+    /// - `Downloading` deliberately leaves it alone, so a running download keeps
+    ///   its place in queue order instead of jumping ahead of what is still
+    ///   waiting behind it,
+    /// - `Done` and `Failed` overwrite it with the moment the attempt ended,
+    /// - `None` -- a cancel -- clears it, since a row with nothing downloaded
+    ///   has no place in that ordering at all.
     pub fn set_download_state(&self, id: &str, state: DownloadState,
                               file_path: Option<&str>, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE videos SET download_state=?2,
                                file_path=COALESCE(?3, file_path),
-                               download_error=?4
+                               download_error=?4,
+                               downloaded_at=CASE ?2
+                                   WHEN 'none'        THEN NULL
+                                   WHEN 'downloading' THEN downloaded_at
+                                   ELSE ?5 END
              WHERE id=?1",
-            params![id, state.as_str(), file_path, error])?;
+            params![id, state.as_str(), file_path, error, now()])?;
         Ok(())
     }
 
     pub fn clear_file_path(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE videos SET file_path=NULL, download_state='none', download_error=NULL WHERE id=?1",
+        conn.execute("UPDATE videos SET file_path=NULL, download_state='none', download_error=NULL,
+                                        downloaded_at=NULL WHERE id=?1",
                      params![id])?;
         Ok(())
     }
@@ -350,12 +670,22 @@ impl Db {
         Ok(())
     }
 
-    /// Video ids on a channel that still have no publish date, for the v2 date backfill.
-    pub fn video_ids_missing_date(&self, channel_id: &str) -> Result<Vec<String>> {
+    /// Video ids whose stored date is not a real upload date: either absent, or
+    /// an `youtubetab:approximate_date` bucket, which lands on midnight UTC
+    /// exactly (see `upload_date::is_bucketed`).
+    ///
+    /// Manually added rows keep whatever date they were given, so they are left
+    /// out -- the same exemption `set_published_at` already makes for `sort_at`.
+    pub fn video_ids_needing_real_date(&self, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
-            "SELECT id FROM videos WHERE channel_id=?1 AND published_at IS NULL")?;
-        let rows = st.query_map(params![channel_id], |r| r.get::<_, String>(0))?;
+            "SELECT id FROM videos
+             WHERE added_manually = 0
+               AND (published_at IS NULL OR published_at % 86400 = 0)
+             ORDER BY feed_rank ASC
+             LIMIT ?1",
+        )?;
+        let rows = st.query_map(params![limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -363,7 +693,7 @@ impl Db {
     /// is reset to `none` and becomes clickable again.
     pub fn reset_stale_downloads(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE videos SET download_state='none'
+        conn.execute("UPDATE videos SET download_state='none', downloaded_at=NULL
                       WHERE download_state IN ('downloading','queued')", [])?;
         Ok(())
     }
@@ -374,8 +704,13 @@ SELECT v.id, v.channel_id, c.title, v.title, v.description, v.thumb_url, v.thumb
        v.published_at, v.sort_at, v.feed_rank, v.added_manually,
        v.duration_secs, v.view_count, v.status, v.hidden,
        v.watched, v.watched_at, v.download_state, v.download_error, v.file_path,
-       v.first_seen_at
+       v.downloaded_at, v.first_seen_at
 FROM videos v JOIN channels c ON c.id = v.channel_id";
+
+/// The same shape as `SELECT_VIDEO` -- the join stays, since `By channel`
+/// orders on it -- but only the two columns the grouping walk reads.
+const SELECT_VIDEO_IDS: &str =
+    "SELECT v.id, v.channel_id FROM videos v JOIN channels c ON c.id = v.channel_id";
 
 fn map_video(r: &Row) -> rusqlite::Result<Video> {
     Ok(Video {
@@ -388,7 +723,8 @@ fn map_video(r: &Row) -> rusqlite::Result<Video> {
         hidden: r.get::<_, i64>(14)? != 0,
         watched: r.get::<_, i64>(15)? != 0, watched_at: r.get(16)?,
         download_state: DownloadState::parse(&r.get::<_, String>(17)?),
-        download_error: r.get(18)?, file_path: r.get(19)?, first_seen_at: r.get(20)?,
+        download_error: r.get(18)?, file_path: r.get(19)?,
+        downloaded_at: r.get(20)?, first_seen_at: r.get(21)?,
     })
 }
 
@@ -425,6 +761,436 @@ mod tests {
         assert!(d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap());
         assert!(!d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap());
         assert_eq!(d.list_videos(&VideoFilter::default()).unwrap().len(), 1);
+    }
+
+    /// Builds a channel of titled videos and returns the filter that asks for
+    /// the siblings of one of them.
+    fn titled(d: &Db, ch: &str, rows: &[(&str, &str)]) {
+        d.upsert_channel(&chan(ch, ch)).unwrap();
+        for (i, (id, title)) in rows.iter().enumerate() {
+            let mut v = vid(id, ch, Some(100 + i as i64));
+            v.title = (*title).into();
+            d.insert_video_if_new(&v).unwrap();
+        }
+    }
+
+    /// Like [`titled`], but each row carries a runtime too -- `None` for a
+    /// video whose duration was never resolved.
+    fn timed(d: &Db, ch: &str, rows: &[(&str, &str, Option<i64>)]) {
+        d.upsert_channel(&chan(ch, ch)).unwrap();
+        for (i, (id, title, secs)) in rows.iter().enumerate() {
+            let mut v = vid(id, ch, Some(100 + i as i64));
+            v.title = (*title).into();
+            v.duration_secs = *secs;
+            d.insert_video_if_new(&v).unwrap();
+        }
+    }
+
+    fn siblings_of(d: &Db, id: &str) -> Vec<String> {
+        let f = VideoFilter { sibling_of: Some(id.into()), ..Default::default() };
+        d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect()
+    }
+
+    #[test]
+    fn siblings_are_the_matching_titles_from_the_same_channel() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p7", "The Blackwood Tapes - Part 7"),
+            ("other", "A Completely Different Story"),
+        ]);
+        let mut got = siblings_of(&d, "p7");
+        got.sort();
+        assert_eq!(got, vec!["p1", "p2", "p7"], "the anchor is part of its own series");
+    }
+
+    #[test]
+    fn siblings_never_cross_a_channel_boundary() {
+        let d = db();
+        titled(&d, "UC1", &[("mine", "The Blackwood Tapes Part 1")]);
+        titled(&d, "UC2", &[("theirs", "The Blackwood Tapes Part 2")]);
+        assert_eq!(siblings_of(&d, "mine"), vec!["mine"]);
+    }
+
+    #[test]
+    fn siblings_ignore_every_other_filter() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+            // Ignoring the filters must not mean ignoring the series.
+            ("outsider", "An Unrelated Upload"),
+        ]);
+        d.set_watched("p1", true).unwrap();
+        d.set_hidden("p2", true).unwrap();
+
+        let f = VideoFilter {
+            sibling_of: Some("p3".into()),
+            // Every one of these would drop a part if it were honoured.
+            hide_watched: true,
+            downloaded_only: true,
+            show_hidden: false,
+            search: Some("nothing matches this".into()),
+            channel_id: Some("UC-other".into()),
+            ..Default::default()
+        };
+        let mut got: Vec<String> = d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
+        got.sort();
+        assert_eq!(got, vec!["p1", "p2", "p3"]);
+    }
+
+    #[test]
+    fn siblings_still_follow_the_sort_order() {
+        let d = db();
+        titled(&d, "UC1", &[
+            // Oldest of all, and no sibling: it leads the channel in this sort
+            // order, so it appears here only if the filter is not applied.
+            ("outsider", "An Unrelated Upload"),
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+        ]);
+        let oldest = VideoFilter {
+            sibling_of: Some("p3".into()), sort: SortOrder::Oldest, ..Default::default()
+        };
+        let ids: Vec<String> =
+            d.list_videos(&oldest).unwrap().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec!["p1", "p2", "p3"]);
+    }
+
+    #[test]
+    fn an_unknown_anchor_yields_nothing() {
+        let d = db();
+        titled(&d, "UC1", &[("p1", "The Blackwood Tapes")]);
+        assert!(siblings_of(&d, "does-not-exist").is_empty());
+    }
+
+    /// The grouped feed as `(leader, part count)` pairs, in the order the grid
+    /// would lay them out.
+    fn grouped(d: &Db, f: &VideoFilter) -> Vec<(String, usize)> {
+        d.list_video_groups(f)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.videos[0].id.clone(), g.videos.len()))
+            .collect()
+    }
+
+    #[test]
+    fn a_series_becomes_one_card_and_a_lone_video_stays_one() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("other", "A Completely Different Story"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+        ]);
+        // Newest first, so the newest part leads its series -- and the unrelated
+        // upload keeps the place its own date earned it.
+        assert_eq!(
+            grouped(&d, &VideoFilter::default()),
+            vec![("p3".to_string(), 3), ("other".to_string(), 1)],
+        );
+    }
+
+    #[test]
+    fn a_group_carries_the_name_its_parts_share() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "The Blackwood Tapes - Part 2"),
+        ]);
+        let groups = d.list_video_groups(&VideoFilter::default()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].stem.as_deref(), Some("The Blackwood Tapes"));
+    }
+
+    #[test]
+    fn a_lone_video_has_no_series_name() {
+        let d = db();
+        titled(&d, "UC1", &[("only", "A Completely Different Story")]);
+        let groups = d.list_video_groups(&VideoFilter::default()).unwrap();
+        assert_eq!(groups[0].stem, None);
+    }
+
+    #[test]
+    fn filters_choose_which_groups_appear_not_what_is_in_them() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+            ("done", "An Entirely Watched Thing"),
+        ]);
+        for id in ["p1", "p2", "done"] {
+            d.set_watched(id, true).unwrap();
+        }
+        let f = VideoFilter { hide_watched: true, ..Default::default() };
+        // One part of the series survives the filter, and the card it leads
+        // still holds all three -- while the lone watched video is gone.
+        assert_eq!(grouped(&d, &f), vec![("p3".to_string(), 3)]);
+    }
+
+    #[test]
+    fn a_series_vanishes_only_once_every_part_is_filtered_out() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+        ]);
+        d.set_watched("p1", true).unwrap();
+        d.set_watched("p2", true).unwrap();
+        let f = VideoFilter { hide_watched: true, ..Default::default() };
+        assert!(d.list_video_groups(&f).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_leader_is_the_part_that_survived_the_filters() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+        ]);
+        d.set_watched("p3", true).unwrap();
+        let f = VideoFilter { hide_watched: true, ..Default::default() };
+        let groups = d.list_video_groups(&f).unwrap();
+        // Newest first would put p3 at the head of the series, but the card
+        // wears the newest part you have *not* watched -- and opens on it, so
+        // the card and the series view it leads to agree about the anchor.
+        assert_eq!(groups[0].videos[0].id, "p2");
+        assert_eq!(groups[0].videos.len(), 3);
+    }
+
+    #[test]
+    fn a_group_holds_exactly_what_the_series_view_would_show() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+            ("other", "A Completely Different Story"),
+        ]);
+        let groups = d.list_video_groups(&VideoFilter::default()).unwrap();
+        let mut in_card: Vec<String> = groups[0].videos.iter().map(|v| v.id.clone()).collect();
+        let mut in_view = siblings_of(&d, &groups[0].videos[0].id);
+        in_card.sort();
+        in_view.sort();
+        assert_eq!(in_card, in_view);
+    }
+
+    #[test]
+    fn a_group_lists_its_parts_in_the_feeds_order() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+        ]);
+        let ids = |f: &VideoFilter| -> Vec<String> {
+            d.list_video_groups(f).unwrap()[0].videos.iter().map(|v| v.id.clone()).collect()
+        };
+        assert_eq!(ids(&VideoFilter::default()), vec!["p3", "p2", "p1"]);
+        let oldest = VideoFilter { sort: SortOrder::Oldest, ..Default::default() };
+        assert_eq!(ids(&oldest), vec!["p1", "p2", "p3"]);
+    }
+
+    /// A channel holding a three-part series, a two-part one that is newer, and
+    /// a lone upload newer than both -- so date order and part-count order
+    /// disagree about every card.
+    fn mixed_series(d: &Db) {
+        titled(d, "UC1", &[
+            ("b1", "The Blackwood Tapes"),
+            ("b2", "(2) The Blackwood Tapes"),
+            ("b3", "(3) The Blackwood Tapes"),
+            ("m1", "Midnight Diner"),
+            ("m2", "Midnight Diner - Part 2"),
+            ("lone", "A Completely Different Story"),
+        ]);
+    }
+
+    #[test]
+    fn parts_order_puts_the_longest_series_first() {
+        let d = db();
+        mixed_series(&d);
+        // Newest first is the opposite order: the lone upload is the newest
+        // thing on the channel and the longest series the oldest.
+        assert_eq!(
+            grouped(&d, &VideoFilter::default()),
+            vec![("lone".to_string(), 1), ("m2".to_string(), 2), ("b3".to_string(), 3)],
+        );
+        let f = VideoFilter { sort: SortOrder::Parts, ..Default::default() };
+        assert_eq!(
+            grouped(&d, &f),
+            vec![("b3".to_string(), 3), ("m2".to_string(), 2), ("lone".to_string(), 1)],
+        );
+    }
+
+    #[test]
+    fn series_of_equal_length_keep_their_date_order() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("a1", "Alpha Chronicle"),
+            ("a2", "Alpha Chronicle - Part 2"),
+            ("z1", "Zephyr Diaries"),
+            ("z2", "Zephyr Diaries - Part 2"),
+        ]);
+        let f = VideoFilter { sort: SortOrder::Parts, ..Default::default() };
+        // The sort is stable, so a tie is broken by what the underlying feed
+        // order already decided -- newest-led series first.
+        assert_eq!(grouped(&d, &f), vec![("z2".to_string(), 2), ("a2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn parts_order_reorders_the_cards_not_what_is_inside_them() {
+        let d = db();
+        mixed_series(&d);
+        let f = VideoFilter { sort: SortOrder::Parts, ..Default::default() };
+        let groups = d.list_video_groups(&f).unwrap();
+        let ids: Vec<String> = groups[0].videos.iter().map(|v| v.id.clone()).collect();
+        // Only the cards are ranked by length; a series' own parts still run in
+        // the feed's order, which for this sort is newest first.
+        assert_eq!(ids, vec!["b3", "b2", "b1"]);
+    }
+
+    #[test]
+    fn parts_order_still_pages_by_group() {
+        let d = db();
+        mixed_series(&d);
+        let f = VideoFilter { sort: SortOrder::Parts, limit: 1, offset: 1, ..Default::default() };
+        // Ranking happens before the page is cut, so page two is the second
+        // longest series and not whatever date order would have put there.
+        assert_eq!(grouped(&d, &f), vec![("m2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn the_flat_feed_can_run_longest_first() {
+        let d = db();
+        timed(&d, "UC1", &[
+            ("short", "A Short Thing", Some(300)),
+            ("long", "A Long Thing", Some(3000)),
+            ("middling", "A Middling Thing", Some(1200)),
+            ("unknown", "An Unresolved Thing", None),
+        ]);
+        let f = VideoFilter { sort: SortOrder::Length, ..Default::default() };
+        let ids: Vec<String> = d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
+        // A row whose duration never resolved cannot claim a place it has not
+        // earned, so it sorts last rather than first.
+        assert_eq!(ids, vec!["long", "middling", "short", "unknown"]);
+    }
+
+    #[test]
+    fn a_series_is_ranked_by_its_parts_added_up() {
+        let d = db();
+        timed(&d, "UC1", &[
+            ("b1", "The Blackwood Tapes", Some(1200)),
+            ("b2", "(2) The Blackwood Tapes", Some(1200)),
+            ("b3", "(3) The Blackwood Tapes", Some(1200)),
+            ("solo", "One Very Long Film", Some(2700)),
+        ]);
+        let f = VideoFilter { sort: SortOrder::Length, ..Default::default() };
+        // No single part comes near the lone film, but the series is an hour of
+        // watching to its forty-five minutes -- and that is what the card ranks
+        // on, since the card stands for the whole series.
+        assert_eq!(grouped(&d, &f), vec![("b3".to_string(), 3), ("solo".to_string(), 1)]);
+    }
+
+    #[test]
+    fn an_unresolved_part_adds_nothing_to_its_series_total() {
+        let d = db();
+        timed(&d, "UC1", &[
+            ("a1", "Alpha Chronicle", Some(600)),
+            ("a2", "Alpha Chronicle - Part 2", None),
+            ("z1", "Zephyr Diaries", Some(400)),
+            ("z2", "Zephyr Diaries - Part 2", Some(400)),
+        ]);
+        let f = VideoFilter { sort: SortOrder::Length, ..Default::default() };
+        // 800 beats 600: the unknown part counts as nothing, not as something
+        // large enough to carry its series to the top.
+        assert_eq!(grouped(&d, &f), vec![("z2".to_string(), 2), ("a1".to_string(), 2)]);
+    }
+
+    #[test]
+    fn length_order_reaches_inside_a_group_too() {
+        let d = db();
+        timed(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes", Some(600)),
+            ("p2", "(2) The Blackwood Tapes", Some(1800)),
+            ("p3", "(3) The Blackwood Tapes", Some(1200)),
+        ]);
+        let f = VideoFilter { sort: SortOrder::Length, ..Default::default() };
+        let groups = d.list_video_groups(&f).unwrap();
+        let ids: Vec<String> = groups[0].videos.iter().map(|v| v.id.clone()).collect();
+        // The longest part leads the card and the rest follow it down, the same
+        // rule the feed around the card is following.
+        assert_eq!(ids, vec!["p2", "p3", "p1"]);
+    }
+
+    #[test]
+    fn a_group_never_crosses_a_channel_boundary() {
+        let d = db();
+        titled(&d, "UC1", &[("mine", "The Blackwood Tapes Part 1")]);
+        titled(&d, "UC2", &[("theirs", "The Blackwood Tapes Part 2")]);
+        let got = grouped(&d, &VideoFilter::default());
+        assert_eq!(got.len(), 2, "two channels, two lone cards: {got:?}");
+        assert!(got.iter().all(|(_, parts)| *parts == 1));
+    }
+
+    #[test]
+    fn paging_counts_groups_rather_than_videos() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+            ("solo", "A Completely Different Story"),
+        ]);
+        // Three of these four videos are one card, so a page of one group holds
+        // three videos and the page after it holds the lone one.
+        let first = VideoFilter { limit: 1, ..Default::default() };
+        assert_eq!(grouped(&d, &first), vec![("solo".to_string(), 1)]);
+        let second = VideoFilter { limit: 1, offset: 1, ..Default::default() };
+        assert_eq!(grouped(&d, &second), vec![("p3".to_string(), 3)]);
+    }
+
+    /// Prints the grouped feed the real library would produce, so the cards can
+    /// be judged against real titles rather than invented ones. Read-only in
+    /// intent, but `Db::open` runs migrations, so it insists on a **copy**:
+    ///
+    ///     cp ~/.config/mytube/mytube.db /tmp/lib.db
+    ///     MYTUBE_DB=/tmp/lib.db cargo test group_the_real_library -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads a copy of the real library"]
+    fn group_the_real_library() {
+        let path = std::env::var("MYTUBE_DB")
+            .expect("set MYTUBE_DB to a *copy* of the library; this opens it read-write");
+        let d = Db::open(std::path::Path::new(&path)).expect("library opens");
+
+        let f = VideoFilter { limit: 100_000, ..Default::default() };
+        let started = std::time::Instant::now();
+        let groups = d.list_video_groups(&f).unwrap();
+        let elapsed = started.elapsed();
+
+        let series: Vec<&VideoGroup> = groups.iter().filter(|g| g.videos.len() > 1).collect();
+        for g in &series {
+            println!(
+                "\n[{}] {} parts  \u{2014}  {}",
+                g.videos[0].channel_title,
+                g.videos.len(),
+                g.stem.as_deref().unwrap_or("<no shared name>"),
+            );
+            for v in &g.videos {
+                println!("    {}", v.title);
+            }
+        }
+        let videos: usize = groups.iter().map(|g| g.videos.len()).sum();
+        println!(
+            "\n=== {} cards for {videos} videos: {} series, {} lone \u{2014} built in {elapsed:?} ===",
+            groups.len(),
+            series.len(),
+            groups.len() - series.len(),
+        );
     }
 
     #[test]
@@ -630,15 +1396,47 @@ mod tests {
         assert!(d.get_channel("UC1").unwrap().is_some(), "subscribed channels are never pruned");
     }
 
+    /// 2026-07-30 00:00:00 UTC -- in a real library 364 unrelated videos all
+    /// carried this one `approximate_date` bucket.
+    const BUCKET: i64 = 1_785_369_600;
+
     #[test]
-    fn videos_missing_a_date_are_listed_for_the_backfill() {
+    fn rows_without_a_real_upload_date_are_listed_for_repair() {
         let d = db();
         d.upsert_channel(&chan("UC1", "One")).unwrap();
-        d.insert_video_if_new(&vid("dated", "UC1", Some(5))).unwrap();
+
+        // A real date from RSS: carries a time of day, so it is left alone.
+        d.insert_video_if_new(&vid("real", "UC1", Some(BUCKET + 43_200))).unwrap();
+        // An approximate bucket: midnight exactly.
+        d.insert_video_if_new(&vid("bucketed", "UC1", Some(BUCKET))).unwrap();
+        // No date at all.
         let mut undated = vid("undated", "UC1", None);
         undated.sort_at = None;
         d.insert_video_if_new(&undated).unwrap();
-        assert_eq!(d.video_ids_missing_date("UC1").unwrap(), vec!["undated".to_string()]);
+
+        let mut got = d.video_ids_needing_real_date(100).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["bucketed".to_string(), "undated".to_string()]);
+    }
+
+    #[test]
+    fn a_manually_added_video_keeps_the_date_it_was_given() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        let mut manual = vid("manual", "UC1", Some(BUCKET));
+        manual.added_manually = true;
+        d.insert_video_if_new(&manual).unwrap();
+        assert!(d.video_ids_needing_real_date(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_repair_batch_is_bounded() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        for n in 0..5 {
+            d.insert_video_if_new(&vid(&format!("v{n}"), "UC1", Some(BUCKET))).unwrap();
+        }
+        assert_eq!(d.video_ids_needing_real_date(3).unwrap().len(), 3);
     }
 
     #[test]
@@ -688,6 +1486,48 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_rss_title_replaces_the_stored_one() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
+        d.set_title("a", "The Retitled Cut").unwrap();
+        assert_eq!(d.get_video("a").unwrap().unwrap().title, "The Retitled Cut");
+    }
+
+    #[test]
+    fn an_empty_title_never_blanks_a_row() {
+        // A mangled feed entry must not cost a card its name.
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
+        d.set_title("a", "").unwrap();
+        assert_eq!(d.get_video("a").unwrap().unwrap().title, "t-a");
+    }
+
+    #[test]
+    fn retitling_only_touches_the_named_video() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
+        d.insert_video_if_new(&vid("b", "UC1", Some(200))).unwrap();
+        d.set_title("a", "Only Mine").unwrap();
+        assert_eq!(d.get_video("b").unwrap().unwrap().title, "t-b");
+    }
+
+    #[test]
+    fn a_manually_added_video_is_retitled_too() {
+        // Unlike `sort_at`, a title carries no user intent -- it is YouTube's
+        // string either way, so `added_manually` earns no exemption here.
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        let mut manual = vid("m", "UC1", Some(10));
+        manual.added_manually = true;
+        d.insert_video_if_new(&manual).unwrap();
+        d.set_title("m", "Renamed By Its Uploader").unwrap();
+        assert_eq!(d.get_video("m").unwrap().unwrap().title, "Renamed By Its Uploader");
+    }
+
+    #[test]
     fn only_subscribed_channels_are_listed_for_polling() {
         let d = db();
         d.upsert_channel(&chan("UC1", "Subscribed")).unwrap();
@@ -722,5 +1562,140 @@ mod tests {
         assert_eq!(ids, vec!["p".to_string()]);
         // Cutoff in the future excludes everything.
         assert!(d.unresolved_video_ids("UC1", i64::MAX).unwrap().is_empty());
+    }
+
+    /// Backdates a fetch stamp. `now()` has one-second resolution, which is far
+    /// too coarse to order two calls made in the same test.
+    fn stamp(d: &Db, id: &str, at: i64) {
+        d.conn.lock().unwrap()
+            .execute("UPDATE videos SET downloaded_at=?2 WHERE id=?1", params![id, at])
+            .unwrap();
+    }
+
+    /// The whole point of the Downloads tab's ordering: a video uploaded years
+    /// ago but fetched this morning belongs above one uploaded last week and
+    /// fetched a month back.
+    #[test]
+    fn downloads_order_by_when_they_were_fetched_not_when_released() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("old_upload", "UC1", Some(1_000))).unwrap();
+        d.insert_video_if_new(&vid("new_upload", "UC1", Some(9_000))).unwrap();
+        d.set_download_state("old_upload", DownloadState::Done, Some("/tmp/a.mkv"), None).unwrap();
+        d.set_download_state("new_upload", DownloadState::Done, Some("/tmp/b.mkv"), None).unwrap();
+        stamp(&d, "old_upload", 500);
+        stamp(&d, "new_upload", 400);
+
+        let by_release = VideoFilter {
+            downloaded_only: true, sort: SortOrder::Newest, ..Default::default()
+        };
+        let ids: Vec<String> =
+            d.list_videos(&by_release).unwrap().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["new_upload", "old_upload"], "release order is left alone");
+
+        let by_fetch = VideoFilter { sort: SortOrder::Downloaded, ..by_release };
+        let ids: Vec<String> =
+            d.list_videos(&by_fetch).unwrap().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["old_upload", "new_upload"], "the most recent fetch comes first");
+    }
+
+    #[test]
+    fn a_download_with_no_recorded_fetch_time_sorts_last() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("dated", "UC1", Some(1_000))).unwrap();
+        d.insert_video_if_new(&vid("undated", "UC1", Some(9_000))).unwrap();
+        d.set_download_state("dated", DownloadState::Done, Some("/tmp/a.mkv"), None).unwrap();
+        d.set_download_state("undated", DownloadState::Done, Some("/tmp/b.mkv"), None).unwrap();
+        d.conn.lock().unwrap()
+            .execute("UPDATE videos SET downloaded_at=NULL WHERE id='undated'", []).unwrap();
+
+        let f = VideoFilter {
+            downloaded_only: true, sort: SortOrder::Downloaded, ..Default::default()
+        };
+        let ids: Vec<String> = d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, ["dated", "undated"],
+                   "the newer upload still sorts last while it has no fetch time");
+    }
+
+    #[test]
+    fn a_running_download_keeps_its_queue_position() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
+
+        d.set_download_state("a", DownloadState::Queued, None, None).unwrap();
+        stamp(&d, "a", 42);
+        d.set_download_state("a", DownloadState::Downloading, None, None).unwrap();
+        assert_eq!(d.get_video("a").unwrap().unwrap().downloaded_at, Some(42),
+                   "starting a download must not push it past what is still waiting");
+
+        d.set_download_state("a", DownloadState::Done, Some("/tmp/a.mkv"), None).unwrap();
+        assert!(d.get_video("a").unwrap().unwrap().downloaded_at.unwrap() > 42,
+                "finishing records when the file actually landed");
+    }
+
+    #[test]
+    fn dropping_a_download_clears_its_fetch_time() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        for id in ["cancelled", "deleted", "stale"] {
+            d.insert_video_if_new(&vid(id, "UC1", Some(100))).unwrap();
+            d.set_download_state(id, DownloadState::Queued, None, None).unwrap();
+            assert!(d.get_video(id).unwrap().unwrap().downloaded_at.is_some());
+        }
+        d.set_download_state("deleted", DownloadState::Done, Some("/tmp/d.mkv"), None).unwrap();
+
+        d.set_download_state("cancelled", DownloadState::None, None, None).unwrap();
+        d.clear_file_path("deleted").unwrap();
+        d.reset_stale_downloads().unwrap();
+
+        for id in ["cancelled", "deleted", "stale"] {
+            assert_eq!(d.get_video(id).unwrap().unwrap().downloaded_at, None,
+                       "{id} has no file, so it has no place in the fetch ordering");
+        }
+    }
+
+    /// The v3 migration dates pre-existing downloads from their files. Without
+    /// it an upgraded library opens with every completed download back in
+    /// release order -- the ordering the column exists to replace.
+    #[test]
+    fn the_migration_dates_existing_downloads_from_their_files() {
+        let dir = std::env::temp_dir().join("mytube-migration-backfill-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("kept.mkv");
+        std::fs::write(&file, b"x").unwrap();
+
+        // A database frozen at v2, before `downloaded_at` existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute("ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id,title,url,added_at) VALUES ('UC1','One','u',0)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO videos (id,channel_id,title,status,first_seen_at,download_state,file_path)
+             VALUES ('kept','UC1','k','ready',0,'done',?1),
+                    ('gone','UC1','g','ready',0,'done','/nonexistent/x.mkv')",
+            params![file.to_str().unwrap()]).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let kept: Option<i64> = conn
+            .query_row("SELECT downloaded_at FROM videos WHERE id='kept'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, Some(mtime), "an existing file is dated from its mtime");
+
+        let gone: Option<i64> = conn
+            .query_row("SELECT downloaded_at FROM videos WHERE id='gone'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gone, None, "a file that has since moved away stays undated");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

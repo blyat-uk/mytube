@@ -95,6 +95,11 @@ pub struct Video {
     pub download_state: DownloadState,
     pub download_error: Option<String>,
     pub file_path: Option<String>,
+    /// When this row last moved through the download pipeline: the moment it
+    /// was queued, then overwritten with the moment the file finished. NULL
+    /// once nothing is downloaded. Ordering key for the Downloads tab, which
+    /// is browsed by when you fetched a video rather than by when it aired.
+    pub downloaded_at: Option<i64>,
     pub first_seen_at: i64,
 }
 
@@ -122,6 +127,22 @@ pub enum SortOrder {
     Newest,
     Oldest,
     Channel,
+    /// Most recently downloaded first. Only the Downloads tab asks for this;
+    /// it is deliberately absent from the Subscriptions sort picker, where
+    /// most rows have no `downloaded_at` at all.
+    Downloaded,
+    /// Longest first. Ungrouped that is simply the video's own runtime, which
+    /// SQL can order on; grouped, a card is ranked by its parts added up, since
+    /// the card stands for the whole series. A `NULL` duration counts as
+    /// nothing, so an unresolved row cannot outrank a real one.
+    Length,
+    /// Longest series first: the grouped feed's cards ranked by how many parts
+    /// they hold. There is no column to sort on -- a group's size is only known
+    /// once the walk in [`crate::db::Db::list_video_groups`] has built it -- so
+    /// in SQL this is simply `Newest`, and the ranking is applied to the
+    /// finished groups. Ungrouped it therefore *is* `Newest`, which is why the
+    /// picker only offers it while Group siblings is on.
+    Parts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +153,10 @@ pub struct VideoFilter {
     pub downloaded_only: bool,
     pub show_hidden: bool,
     pub search: Option<String>,
+    /// Id of the video whose siblings to show. When set it replaces every other
+    /// filter above: the point of the view is the whole series, so a watched,
+    /// hidden or undownloaded part still belongs in it.
+    pub sibling_of: Option<String>,
     pub sort: SortOrder,
     pub limit: i64,
     pub offset: i64,
@@ -145,11 +170,30 @@ impl Default for VideoFilter {
             downloaded_only: false,
             show_hidden: false,
             search: None,
+            sibling_of: None,
             sort: SortOrder::Newest,
             limit: 100,
             offset: 0,
         }
     }
+}
+
+/// One card in the grouped feed: either a lone video, or a whole multi-part
+/// upload collapsed behind a single entry.
+///
+/// Both field names are single words, so the camelCase/snake_case split the
+/// rest of this IPC boundary lives with cannot bite here -- and the nested
+/// `Video` keeps its own snake_case names either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VideoGroup {
+    /// The parts, leader first. The leader is the row that earned the group its
+    /// place in the feed -- the first part to survive the filters, in the
+    /// requested sort order -- and is the anchor the series view opens on.
+    pub videos: Vec<Video>,
+    /// A name for the series: what the parts' titles share once their part
+    /// markers are stripped. `None` for a lone video, and for a series whose
+    /// titles share nothing showable.
+    pub stem: Option<String>,
 }
 
 /// One `<entry>` from a channel RSS feed, after Shorts have been rejected.

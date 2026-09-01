@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use crate::db::Db;
 use crate::models::*;
 use crate::queue::Queue;
-use crate::{config, rss, ytdlp};
+use crate::{config, rss, tray, upload_date, ytdlp};
 
 const FEED_CONCURRENCY: usize = 8;
 const RETRY_WINDOW_SECS: i64 = 30 * 24 * 3600;
@@ -81,25 +81,29 @@ async fn resolve_metadata(db: &Db, channel_id: &str, backfill: u32) -> Result<()
     Ok(())
 }
 
-/// One-off repair for databases written before approximate dates were fetched:
-/// those rows have a NULL `published_at` and sort last forever. One flat listing
-/// per subscribed channel fixes them.
-pub async fn backfill_missing_dates(state: &AppState) -> usize {
-    let Ok(channels) = state.db.list_subscribed_channels() else { return 0 };
-    let backfill = config::load().map(|s| s.backfill_count).unwrap_or(30);
-    let mut fixed = 0;
-    for c in channels {
-        let missing = state.db.video_ids_missing_date(&c.id).unwrap_or_default();
-        if missing.is_empty() { continue; }
-        let Ok(entries) = ytdlp::flat_playlist(&c.id, backfill.max(missing.len() as u32)).await
-        else { continue };
-        for e in entries {
-            if let Some(ts) = e.published_at {
-                if state.db.set_published_at_if_missing(&e.id, ts).is_ok() { fixed += 1; }
-            }
-        }
+/// How many dates one startup repairs. A flat listing costs nothing per video,
+/// but a watch page is a request each, so a large library is spread over a few
+/// launches rather than fired at YouTube all at once.
+const DATE_REPAIR_LIMIT: usize = 1000;
+
+/// Replaces stored dates that are not real upload dates with the true instant
+/// from each video's watch page.
+///
+/// Two kinds of row qualify: those with no date at all, and those carrying an
+/// `youtubetab:approximate_date` bucket. A bucket is not an upload date -- it
+/// is "roughly this long ago" measured from the poll, so unrelated videos pile
+/// onto one value and `sort_at` orders the feed by a fiction.
+pub async fn repair_dates(state: &AppState) -> usize {
+    let Ok(ids) = state.db.video_ids_needing_real_date(DATE_REPAIR_LIMIT) else {
+        return 0;
+    };
+    if ids.is_empty() {
+        return 0;
     }
-    fixed
+    let real = upload_date::fetch_many(&state.http, ids).await;
+    real.into_iter()
+        .filter(|(id, ts)| state.db.set_published_at(id, *ts).is_ok())
+        .count()
 }
 
 pub async fn poll_one(
@@ -125,6 +129,10 @@ pub async fn poll_one(
             if e.published_at > 0 {
                 let _ = state.db.set_published_at(&e.video_id, e.published_at);
             }
+            // A retitled upload. Called for every entry the feed carries --
+            // `set_title` itself ignores an empty or unchanged title -- which
+            // scopes the refresh to the ~15 recent videos RSS knows about.
+            let _ = state.db.set_title(&e.video_id, &e.title);
             continue;
         }
         let inserted = state.db.insert_video_if_new(&NewVideo {
@@ -165,16 +173,50 @@ pub async fn poll_one(
     Ok((new_count, feed.shorts_rejected))
 }
 
+/// One line per poll, for the journal.
+///
+/// mytube is launched from a `.desktop` file, so the session wraps it in a
+/// transient systemd user service and stderr lands in
+/// `journalctl --user -u 'app-mytube@*'`. Without this the outcome of a poll
+/// existed only as the `poll://finished` toast, which a window closed to the
+/// tray can never show -- so a loop that had quietly stopped finding anything
+/// was indistinguishable from a night with nothing to find, and the only way
+/// to tell them apart afterwards was to reconstruct it from `first_seen_at`.
+fn summary_line(s: &PollSummary) -> String {
+    let mut line = format!("polled {} {}", s.channels_polled, plural(s.channels_polled, "channel"));
+    match s.new_videos {
+        0 => line.push_str(", nothing new"),
+        n => line.push_str(&format!(", {n} new")),
+    }
+    if s.shorts_rejected > 0 {
+        let word = plural(s.shorts_rejected, "short");
+        line.push_str(&format!(", {} {word} rejected", s.shorts_rejected));
+    }
+    if !s.errors.is_empty() {
+        let word = plural(s.errors.len(), "error");
+        line.push_str(&format!(", {} {word}: {}", s.errors.len(), s.errors.join("; ")));
+    }
+    line
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 { word.to_string() } else { format!("{word}s") }
+}
+
 pub async fn poll_channels(
     state: &AppState,
     app: &AppHandle,
     channels: Vec<Channel>,
 ) -> PollSummary {
     let Ok(_guard) = state.poll_lock.try_lock() else {
-        return PollSummary {
+        // Logged like any other outcome: "every tick prints a line" is what
+        // makes a gap in the journal mean something.
+        let refused = PollSummary {
             errors: vec!["A refresh is already running".into()],
             ..Default::default()
         };
+        eprintln!("mytube: {}", summary_line(&refused));
+        return refused;
     };
     let _ = app.emit("poll://started", ());
     let backfill = config::load().map(|s| s.backfill_count).unwrap_or(30);
@@ -204,13 +246,27 @@ pub async fn poll_channels(
             Err(e) => summary.errors.push(format!("{title}: {e}")),
         }
     }
+    eprintln!("mytube: {}", summary_line(&summary));
     let _ = app.emit("poll://finished", summary.clone());
+    // Polls only. A backfill or a manually added video is something you asked
+    // for with the window in front of you, so it is read the moment it lands.
+    tray::note_new_videos(app, summary.new_videos);
     summary
 }
 
 /// One flat-playlist call seeds a newly added channel's back catalogue.
 pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) -> Result<usize> {
     let entries = ytdlp::flat_playlist(channel_id, count).await?;
+
+    // The listing carries only `approximate_date` buckets, so ask each watch
+    // page for the real instant before these rows are written. Ids that fail
+    // keep the bucket and get picked up by `repair_dates` on a later start.
+    //
+    // Collected up front: an iterator borrowing `entries` across the await
+    // makes the resulting future fail Tauri's higher-ranked lifetime bounds.
+    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let real = upload_date::fetch_many(&state.http, ids).await;
+
     let mut added = 0;
     for (rank, e) in entries.iter().enumerate() {
         let status = ytdlp::status_from(e.live_status.as_deref(), e.duration_secs);
@@ -220,11 +276,11 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
             title: e.title.clone(),
             description: None,
             thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
-            // Approximate dates come from `youtubetab:approximate_date`, so
-            // backfilled videos interleave into the feed by upload date instead
-            // of piling up at the bottom.
-            published_at: e.published_at,
-            sort_at: e.published_at,
+            // The real date when the watch page gave one; otherwise the
+            // approximate bucket, which at least interleaves the video into the
+            // feed instead of piling it up at the bottom.
+            published_at: real.get(&e.id).copied().or(e.published_at),
+            sort_at: real.get(&e.id).copied().or(e.published_at),
             feed_rank: rank as i64,
             added_manually: false,
             duration_secs: e.duration_secs,
@@ -241,4 +297,69 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
     )
     .await;
     Ok(added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(channels: usize, new: usize, shorts: usize) -> PollSummary {
+        PollSummary {
+            channels_polled: channels,
+            new_videos: new,
+            shorts_rejected: shorts,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_quiet_poll_still_reports_that_it_ran() {
+        // The whole point of the line: proving the loop is alive on a night
+        // where nothing was published.
+        assert_eq!(summary_line(&summary(27, 0, 0)), "polled 27 channels, nothing new");
+    }
+
+    #[test]
+    fn a_haul_is_counted() {
+        assert_eq!(summary_line(&summary(27, 2, 0)), "polled 27 channels, 2 new");
+    }
+
+    #[test]
+    fn rejected_shorts_are_only_mentioned_when_there_were_some() {
+        assert_eq!(
+            summary_line(&summary(27, 2, 3)),
+            "polled 27 channels, 2 new, 3 shorts rejected"
+        );
+    }
+
+    #[test]
+    fn one_channel_is_not_pluralised() {
+        assert_eq!(summary_line(&summary(1, 1, 1)), "polled 1 channel, 1 new, 1 short rejected");
+    }
+
+    #[test]
+    fn a_refused_poll_still_renders_a_line() {
+        // `poll_channels` bails out before polling anything when the lock is
+        // held, and that line is the one worth seeing in the journal.
+        let refused = PollSummary {
+            errors: vec!["A refresh is already running".into()],
+            ..summary(0, 0, 0)
+        };
+        assert_eq!(
+            summary_line(&refused),
+            "polled 0 channels, nothing new, 1 error: A refresh is already running"
+        );
+    }
+
+    #[test]
+    fn errors_are_spelled_out_because_a_hidden_window_never_shows_the_toast() {
+        let s = PollSummary {
+            errors: vec!["Alpha: boom".into(), "Beta: bang".into()],
+            ..summary(27, 0, 0)
+        };
+        assert_eq!(
+            summary_line(&s),
+            "polled 27 channels, nothing new, 2 errors: Alpha: boom; Beta: bang"
+        );
+    }
 }
