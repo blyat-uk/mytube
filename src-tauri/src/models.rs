@@ -101,6 +101,10 @@ pub struct Video {
     /// is browsed by when you fetched a video rather than by when it aired.
     pub downloaded_at: Option<i64>,
     pub first_seen_at: i64,
+    /// Key shared with every video marked its sibling by hand. `None` -- all
+    /// but a handful of rows -- leaves the title matcher to work alone. The
+    /// frontend reads it to know whether "Unlink from siblings" applies.
+    pub sibling_group: Option<String>,
 }
 
 /// A row to insert. Separate from `Video` because inserts have no joined

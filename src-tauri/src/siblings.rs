@@ -7,6 +7,8 @@
 //! leaves the same stem behind, so that stem -- the *core* -- is what siblings
 //! are matched on.
 
+use std::collections::HashMap;
+
 /// A title reduced to the stem it shares with its siblings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Normalized {
@@ -245,6 +247,143 @@ pub fn display_stem(titles: &[&str]) -> Option<String> {
         })
         .trim();
     if stem.is_empty() { None } else { Some(stem.to_string()) }
+}
+
+/// One video as the grouping rule sees it.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub id: String,
+    pub title: String,
+    /// Key shared with every video marked its sibling by hand. `None` -- the
+    /// ordinary case -- leaves the title matcher to work alone.
+    pub group: Option<String>,
+}
+
+/// One channel's videos, bucketed into the indivisible units the grouping rule
+/// works in.
+///
+/// Titles are all the matcher above has, and they run out exactly where a
+/// YouTuber renames a follow-up to chase the algorithm: `The Blackwood Tapes
+/// Pt 3` and `EVERYTHING CHANGED` are the same show and share nothing. Marking
+/// them siblings by hand records what the titles cannot.
+///
+/// An *atom* is a set of videos that belong on one card whatever the titles
+/// say: a manual group, or -- for all but a handful of rows -- a single video
+/// on its own. Two rules follow from a manual link being a promise:
+///
+/// - **An atom is never split**, and an atom pulled into a group arrives whole.
+///   Half a promise is worse than none.
+/// - **Only the leader's atom seeds.** Every title in it is matched against
+///   every other atom, so marking a renamed part teaches the matcher that name;
+///   but an atom that joins does *not* then widen the net further. Without that
+///   ceiling one loose fuzzy match would weld two unrelated series into a card
+///   there is no good way to take apart.
+///
+/// With no keys anywhere every atom is a single video and the result is exactly
+/// what the matcher did before manual marking existed.
+pub struct Atoms {
+    ids: Vec<String>,
+    stems: Vec<Normalized>,
+    /// Which atom each entry landed in.
+    atom_of: Vec<usize>,
+    /// Entry indices per atom, in the order the entries came in.
+    atoms: Vec<Vec<usize>>,
+    by_id: HashMap<String, usize>,
+}
+
+impl Atoms {
+    pub fn new(entries: Vec<Entry>) -> Self {
+        let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if let Some(k) = &e.group {
+                buckets.entry(k.clone()).or_default().push(i);
+            }
+        }
+
+        let n = entries.len();
+        let mut atom_of = vec![usize::MAX; n];
+        let mut atoms: Vec<Vec<usize>> = Vec::new();
+        for members in buckets.into_values() {
+            // A key left holding one live member -- the rest deleted since --
+            // is not a group, and honouring it would pin a lone card in place.
+            if members.len() < 2 {
+                continue;
+            }
+            for &i in &members {
+                atom_of[i] = atoms.len();
+            }
+            atoms.push(members);
+        }
+
+        let (mut ids, mut stems) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let mut by_id = HashMap::with_capacity(n);
+        for (i, e) in entries.into_iter().enumerate() {
+            if atom_of[i] == usize::MAX {
+                atom_of[i] = atoms.len();
+                atoms.push(vec![i]);
+            }
+            stems.push(normalize(&e.title));
+            by_id.insert(e.id.clone(), i);
+            ids.push(e.id);
+        }
+        Self { ids, stems, atom_of, atoms, by_id }
+    }
+
+    /// Ids of every video belonging on the card `anchor` leads. The anchor
+    /// comes first -- callers treat it as the leader -- and the rest follow in
+    /// entry order, so the answer never depends on how the atoms happened to be
+    /// bucketed.
+    ///
+    /// Empty when the anchor is not among the entries at all, which is not the
+    /// same as a video with no siblings: that one comes back alone.
+    pub fn group_led_by(&self, anchor: &str) -> Vec<&str> {
+        let Some(&ai) = self.by_id.get(anchor) else { return Vec::new() };
+        let home = self.atom_of[ai];
+
+        let mut joined = vec![false; self.atoms.len()];
+        joined[home] = true;
+        // Which atoms' titles seed the search: the leader's, plus every
+        // hand-marked atom drawn in after it. Marking a renamed part records
+        // *both* its names, and both keep working from then on -- so pulling in
+        // that pair has to bring what its other title reaches, or the series it
+        // was marked to join would still arrive in pieces.
+        //
+        // A singleton that joins adds nothing. That is the ceiling: only names
+        // a person vouched for can widen a group, so one loose fuzzy match
+        // cannot cascade through a channel.
+        let mut seeds = vec![home];
+        let mut next = 0;
+        while next < seeds.len() {
+            let seed = seeds[next];
+            next += 1;
+            for a in 0..self.atoms.len() {
+                if joined[a] || !self.atoms_match(seed, a) {
+                    continue;
+                }
+                joined[a] = true;
+                if self.atoms[a].len() > 1 {
+                    seeds.push(a);
+                }
+            }
+        }
+
+        let mut out = vec![self.ids[ai].as_str()];
+        for i in 0..self.ids.len() {
+            if i != ai && joined[self.atom_of[i]] {
+                out.push(self.ids[i].as_str());
+            }
+        }
+        out
+    }
+
+    /// Whether any title in one atom reads as a part of the same upload as any
+    /// title in the other. Both sides are compared whole because a manual
+    /// group's titles are precisely the extra seeds the user supplied.
+    fn atoms_match(&self, a: usize, b: usize) -> bool {
+        self.atoms[a]
+            .iter()
+            .any(|&i| self.atoms[b].iter().any(|&j| is_sibling(&self.stems[i], &self.stems[j])))
+    }
 }
 
 #[cfg(test)]
@@ -557,5 +696,127 @@ mod tests {
     #[test]
     fn the_core_is_the_stem_without_the_marker() {
         assert_eq!(normalize("(2) The Blackwood Tapes!").core, "the blackwood tapes");
+    }
+
+    /* ---------------- atoms: what a manual mark changes ---------------- */
+
+    /// `(id, title, manual group key)`.
+    type Row<'a> = (&'a str, &'a str, Option<&'a str>);
+
+    fn led_by(rows: &[Row], anchor: &str) -> Vec<String> {
+        let entries = rows
+            .iter()
+            .map(|(id, title, group)| Entry {
+                id: (*id).into(),
+                title: (*title).into(),
+                group: group.map(str::to_string),
+            })
+            .collect();
+        let mut got: Vec<String> =
+            Atoms::new(entries).group_led_by(anchor).into_iter().map(String::from).collect();
+        // The anchor leads; the rest are a set as far as the callers care.
+        if !got.is_empty() {
+            got[1..].sort();
+        }
+        got
+    }
+
+    #[test]
+    fn without_any_marks_a_group_is_what_the_titles_share() {
+        let rows: &[Row] = &[
+            ("a", "The Blackwood Tapes", None),
+            ("b", "The Blackwood Tapes Part 2", None),
+            ("c", "Something Else Entirely", None),
+        ];
+        assert_eq!(led_by(rows, "a"), ["a", "b"]);
+        assert_eq!(led_by(rows, "c"), ["c"]);
+    }
+
+    #[test]
+    fn a_hand_marked_pair_groups_though_the_titles_share_nothing() {
+        // The case the whole feature exists for: a follow-up renamed to chase
+        // the algorithm, which no amount of pattern tuning could ever join.
+        let rows: &[Row] = &[
+            ("p3", "The Blackwood Tapes Pt 3", Some("g1")),
+            ("ec", "EVERYTHING CHANGED", Some("g1")),
+        ];
+        assert_eq!(led_by(rows, "p3"), ["p3", "ec"]);
+        assert_eq!(led_by(rows, "ec"), ["ec", "p3"]);
+    }
+
+    #[test]
+    fn every_marked_title_seeds_the_automatic_matcher() {
+        // `w2` matches neither the anchor nor the anchor's own title -- only the
+        // other title in its atom -- and still joins. That is the point of
+        // marking: the name you recorded keeps working on its own afterwards.
+        let rows: &[Row] = &[
+            ("p3", "The Blackwood Tapes Pt 3", Some("g1")),
+            ("w1", "Whispers In The Dark", Some("g1")),
+            ("w2", "Whispers In The Dark Part 2", None),
+        ];
+        assert_eq!(led_by(rows, "p3"), ["p3", "w1", "w2"]);
+    }
+
+    #[test]
+    fn an_auto_joined_title_does_not_seed_further_matches() {
+        // `b` joins through the marked title `a`. `c` matches `b` but not `a`,
+        // and stays out: only what was marked by hand widens the net, so one
+        // loose match cannot cascade through a channel.
+        let rows: &[Row] = &[
+            ("a", "Nightfall Ashen Court Chronicle Reborn Again", Some("g1")),
+            ("z", "An Unrelated Title", Some("g1")),
+            ("b", "Nightfall Ashen Court Part 2", None),
+            ("c", "Nightfall Ashen Court Of Dawn And Dusk Part 4", None),
+        ];
+        assert!(is_sibling(
+            &normalize("Nightfall Ashen Court Part 2"),
+            &normalize("Nightfall Ashen Court Of Dawn And Dusk Part 4"),
+        ));
+        assert_eq!(led_by(rows, "a"), ["a", "b", "z"]);
+    }
+
+    #[test]
+    fn a_marked_atom_drawn_in_keeps_seeding() {
+        // The realistic shape: parts 1 and 2 match each other, part 2 was
+        // marked with the renamed part 3, and part 4 arrived under the new name.
+        // Whichever end leads, one card has to hold all four -- a mark that
+        // still left the series in pieces would not have done its job.
+        let rows: &[Row] = &[
+            ("p1", "The Blackwood Tapes", None),
+            ("p2", "The Blackwood Tapes Part 2", Some("g1")),
+            ("ec", "EVERYTHING CHANGED", Some("g1")),
+            ("ec2", "EVERYTHING CHANGED Part 2", None),
+        ];
+        assert_eq!(led_by(rows, "ec2"), ["ec2", "ec", "p1", "p2"]);
+        assert_eq!(led_by(rows, "p1"), ["p1", "ec", "ec2", "p2"]);
+    }
+
+    #[test]
+    fn a_matched_atom_joins_whole() {
+        // `b` matches the anchor and `x` does not, but they were marked
+        // together -- so `x` comes too. A manual link promises those two share
+        // a card, and half a promise is worse than none.
+        let rows: &[Row] = &[
+            ("a", "The Blackwood Tapes", None),
+            ("b", "The Blackwood Tapes Part 2", Some("g1")),
+            ("x", "Nothing Like The Others", Some("g1")),
+        ];
+        assert_eq!(led_by(rows, "a"), ["a", "b", "x"]);
+    }
+
+    #[test]
+    fn a_key_left_with_one_member_is_not_a_group() {
+        // Its siblings deleted since. The row must fall back to plain title
+        // matching rather than sitting pinned to a group of one.
+        let rows: &[Row] = &[
+            ("a", "The Blackwood Tapes", Some("g1")),
+            ("b", "The Blackwood Tapes Part 2", None),
+        ];
+        assert_eq!(led_by(rows, "a"), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_anchor_that_is_not_here_has_no_group() {
+        assert!(led_by(&[("a", "The Blackwood Tapes", None)], "nope").is_empty());
     }
 }

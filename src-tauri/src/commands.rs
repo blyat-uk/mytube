@@ -369,6 +369,22 @@ pub fn list_video_groups(
     state.db.list_video_groups(&filter).map_err(e)
 }
 
+/// Marks videos siblings by hand, for a series whose titles no matcher could
+/// ever join -- a renamed follow-up, most often. Returns the finished group's
+/// size, which can exceed what was sent: marking across two hand-built groups
+/// merges both. Refused across channels.
+#[tauri::command]
+pub fn mark_siblings(video_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> R<usize> {
+    state.db.mark_siblings(&video_ids).map_err(e)
+}
+
+/// Takes one video back out of its hand-built group, dissolving the group when
+/// that leaves it with a single member.
+#[tauri::command]
+pub fn unlink_siblings(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    state.db.unlink_siblings(&video_id).map_err(e)
+}
+
 #[tauri::command]
 pub fn set_watched(
     video_id: String,

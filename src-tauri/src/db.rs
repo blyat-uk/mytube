@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -94,6 +94,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    if version < 4 {
+        if !column_exists(conn, "videos", "sibling_group")? {
+            conn.execute("ALTER TABLE videos ADD COLUMN sibling_group TEXT", [])?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_videos_sibling_group ON videos(sibling_group);",
+        )?;
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -132,38 +141,54 @@ fn like_pattern(term: &str) -> String {
     format!("%{escaped}%")
 }
 
-/// Ids of every ready video on the anchor's channel whose title reads as
-/// another part of the same upload -- the anchor itself included, since a
-/// series view that omits the video you opened it from is disorienting.
+/// Every ready video on a channel as the grouping rule sees it, plus each row's
+/// runtime.
 ///
-/// Matching runs here rather than in SQL because it is fuzzy (see
-/// [`crate::siblings`]); a single channel's titles are few enough that loading
-/// them to compare in Rust costs nothing.
-fn sibling_ids(conn: &rusqlite::Connection, anchor_id: &str) -> Result<Vec<String>> {
-    let anchor: Option<(String, String)> = conn
-        .query_row(
-            "SELECT channel_id, title FROM videos WHERE id=?1",
-            params![anchor_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((channel_id, title)) = anchor else { return Ok(Vec::new()) };
-
-    let stem = siblings::normalize(&title);
+/// Matching runs in Rust rather than in SQL because it is fuzzy, and because a
+/// hand-marked group is a set of seed titles rather than a single stem (see
+/// [`crate::siblings::Atoms`]); one channel's titles are few enough that
+/// loading them to compare costs nothing. The runtimes ride along on the same
+/// query because [`SortOrder::Length`] has to total a group up while all it
+/// holds is ids, and the rows are already in hand.
+fn channel_atoms(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<(siblings::Atoms, HashMap<String, i64>)> {
     let mut st = conn.prepare(
-        "SELECT id, title FROM videos WHERE channel_id=?1 AND status='ready'")?;
+        "SELECT id, title, duration_secs, sibling_group FROM videos
+         WHERE channel_id=?1 AND status='ready'",
+    )?;
     let rows = st.query_map(params![channel_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
     })?;
 
-    let mut ids = Vec::new();
+    let mut entries = Vec::new();
+    let mut runtimes = HashMap::new();
     for row in rows {
-        let (id, other) = row?;
-        if siblings::is_sibling(&stem, &siblings::normalize(&other)) {
-            ids.push(id);
-        }
+        let (id, title, secs, group) = row?;
+        // A row whose duration has not resolved yet contributes nothing to its
+        // series rather than dropping the series out of the ordering.
+        runtimes.insert(id.clone(), secs.unwrap_or(0));
+        entries.push(siblings::Entry { id, title, group });
     }
-    Ok(ids)
+    Ok((siblings::Atoms::new(entries), runtimes))
+}
+
+/// Ids of every ready video on the anchor's channel that belongs on the same
+/// card -- the anchor itself included, since a series view that omits the video
+/// you opened it from is disorienting.
+fn sibling_ids(conn: &rusqlite::Connection, anchor_id: &str) -> Result<Vec<String>> {
+    let channel_id: Option<String> = conn
+        .query_row("SELECT channel_id FROM videos WHERE id=?1", params![anchor_id], |r| r.get(0))
+        .optional()?;
+    let Some(channel_id) = channel_id else { return Ok(Vec::new()) };
+    let (atoms, _) = channel_atoms(conn, &channel_id)?;
+    Ok(atoms.group_led_by(anchor_id).into_iter().map(String::from).collect())
 }
 
 /// The feed query, ordered but unpaged: `list_videos` bolts `LIMIT`/`OFFSET`
@@ -491,29 +516,16 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // Every ready title on each channel in play, normalised once. Matching
+        // Every ready video on each channel in play, bucketed once. Matching
         // against the unfiltered set is the whole point: the filterbar must not
         // be able to shorten a series, only to hide one.
-        let mut st_titles = conn.prepare(
-            "SELECT id, title, duration_secs FROM videos
-             WHERE channel_id=?1 AND status='ready'")?;
-        let mut index: HashMap<String, Vec<(String, siblings::Normalized)>> = HashMap::new();
-        // Runtimes come out of the query above rather than a second one, since
-        // `SortOrder::Length` has to total a group up while all it holds is ids.
-        // A row with no duration yet contributes nothing to its series.
+        let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
         let mut runtimes: HashMap<String, i64> = HashMap::new();
         for (_, channel) in &seeds {
             if index.contains_key(channel) { continue; }
-            let rows = st_titles.query_map(params![channel], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?))
-            })?;
-            let mut titles = Vec::new();
-            for row in rows {
-                let (id, title, secs) = row?;
-                runtimes.insert(id.clone(), secs.unwrap_or(0));
-                titles.push((id, siblings::normalize(&title)));
-            }
-            index.insert(channel.clone(), titles);
+            let (atoms, secs) = channel_atoms(&conn, channel)?;
+            runtimes.extend(secs);
+            index.insert(channel.clone(), atoms);
         }
 
         // Top-down: the first part to survive the filters leads its group, and
@@ -523,14 +535,11 @@ impl Db {
         let mut groups: Vec<Vec<String>> = Vec::new();
         for (id, channel) in &seeds {
             if consumed.contains(id) { continue; }
-            let mut members = vec![id.clone()];
-            if let Some((_, stem)) = index[channel].iter().find(|(other, _)| other == id) {
-                for (other, other_stem) in &index[channel] {
-                    if other != id && siblings::is_sibling(stem, other_stem) {
-                        members.push(other.clone());
-                    }
-                }
-            }
+            let mut members: Vec<String> =
+                index[channel].group_led_by(id).into_iter().map(String::from).collect();
+            // A seed the atoms do not know is a row that stopped being `ready`
+            // between the two queries; it still deserves its own card.
+            if members.is_empty() { members.push(id.clone()); }
             for m in &members { consumed.insert(m.clone()); }
             groups.push(members);
         }
@@ -599,6 +608,102 @@ impl Db {
             out.push(VideoGroup { videos, stem });
         }
         Ok(out)
+    }
+
+    /// Marks `ids` siblings by hand, and returns how many videos the finished
+    /// group holds.
+    ///
+    /// The answer can exceed what was asked for, because the key is stamped on
+    /// every row already sharing *any* key among the ids as well: dropping a
+    /// card from one hand-built group onto another merges both wholesale rather
+    /// than stranding half of one. The caller reports the number back, so what
+    /// the user is told is what actually happened.
+    ///
+    /// Refused across channels. Nothing in the schema enforces that, but the
+    /// grouping walk is per-channel and a card carries one channel's name, so a
+    /// link spanning two would have nowhere to show.
+    pub fn mark_siblings(&self, ids: &[String]) -> Result<usize> {
+        let mut seen = HashSet::new();
+        let ids: Vec<&String> = ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+        if ids.len() < 2 {
+            bail!("Pick at least two videos to mark as siblings.");
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut channels: HashSet<String> = HashSet::new();
+        let mut keys: Vec<String> = Vec::new();
+        for id in &ids {
+            let row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT channel_id, sibling_group FROM videos WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((channel, key)) = row else {
+                bail!("That video is no longer in the library.");
+            };
+            channels.insert(channel);
+            if let Some(k) = key { keys.push(k); }
+        }
+        if channels.len() > 1 {
+            bail!("Siblings must come from the same channel.");
+        }
+
+        // Reusing a key a merge already has keeps one of the two groups' own
+        // identity; a fresh one is only minted when neither side had a group.
+        // A minted key cannot collide: it would take the same anchor keying two
+        // different groups in one millisecond, and the anchor being in both is
+        // exactly what would already have merged them.
+        let key = keys.first().cloned().unwrap_or_else(|| {
+            format!("{}-{}", chrono::Utc::now().timestamp_millis(), ids[0])
+        });
+
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(key.clone())];
+        let named = ids
+            .iter()
+            .map(|id| { args.push(Box::new((*id).clone())); format!("?{}", args.len()) })
+            .collect::<Vec<_>>()
+            .join(",");
+        let merged = keys
+            .iter()
+            .map(|k| { args.push(Box::new(k.clone())); format!("?{}", args.len()) })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE videos SET sibling_group=?1
+             WHERE id IN ({named}){}",
+            if merged.is_empty() { String::new() } else { format!(" OR sibling_group IN ({merged})") },
+        );
+        conn.execute(&sql, rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())))?;
+
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM videos WHERE sibling_group=?1", params![key], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Takes one video back out of its hand-built group.
+    ///
+    /// A key left holding a single member is cleared outright, since a group of
+    /// one is not a group -- which is also what makes unlinking either half of
+    /// a mistaken pair dissolve the whole thing. [`siblings::Atoms`] ignores
+    /// singleton keys at read time regardless, so a video deleted out of a pair
+    /// can never strand the other; this keeps the table itself honest.
+    pub fn unlink_siblings(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let key: Option<Option<String>> = conn
+            .query_row("SELECT sibling_group FROM videos WHERE id=?1", params![id], |r| r.get(0))
+            .optional()?;
+        let Some(Some(key)) = key else { return Ok(()) };
+
+        conn.execute("UPDATE videos SET sibling_group=NULL WHERE id=?1", params![id])?;
+        let left: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM videos WHERE sibling_group=?1", params![key], |r| r.get(0))?;
+        if left < 2 {
+            conn.execute("UPDATE videos SET sibling_group=NULL WHERE sibling_group=?1",
+                         params![key])?;
+        }
+        Ok(())
     }
 
     pub fn set_watched(&self, id: &str, watched: bool) -> Result<()> {
@@ -704,7 +809,7 @@ SELECT v.id, v.channel_id, c.title, v.title, v.description, v.thumb_url, v.thumb
        v.published_at, v.sort_at, v.feed_rank, v.added_manually,
        v.duration_secs, v.view_count, v.status, v.hidden,
        v.watched, v.watched_at, v.download_state, v.download_error, v.file_path,
-       v.downloaded_at, v.first_seen_at
+       v.downloaded_at, v.first_seen_at, v.sibling_group
 FROM videos v JOIN channels c ON c.id = v.channel_id";
 
 /// The same shape as `SELECT_VIDEO` -- the join stays, since `By channel`
@@ -725,6 +830,7 @@ fn map_video(r: &Row) -> rusqlite::Result<Video> {
         download_state: DownloadState::parse(&r.get::<_, String>(17)?),
         download_error: r.get(18)?, file_path: r.get(19)?,
         downloaded_at: r.get(20)?, first_seen_at: r.get(21)?,
+        sibling_group: r.get(22)?,
     })
 }
 
@@ -1321,6 +1427,7 @@ mod tests {
         assert_eq!(v.title, "kept");
         assert_eq!(v.published_at, Some(100));
         assert!(!v.hidden, "existing rows default to visible");
+        assert_eq!(v.sibling_group, None, "existing rows carry no hand-built group");
         assert_eq!(db.list_channels().unwrap()[0].added_at, 7);
         assert_eq!(db.list_videos(&VideoFilter::default()).unwrap().len(), 1);
     }
@@ -1332,6 +1439,7 @@ mod tests {
         {
             let c = db.conn.lock().unwrap();
             assert!(column_exists(&c, "videos", "hidden").unwrap());
+            assert!(column_exists(&c, "videos", "sibling_group").unwrap());
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
             assert_eq!(v, SCHEMA_VERSION);
             // Running it again must not error or duplicate anything.
@@ -1698,4 +1806,175 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /* ---------------- marking siblings by hand ---------------- */
+
+    fn mark(d: &Db, ids: &[&str]) -> Result<usize> {
+        d.mark_siblings(&ids.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+    }
+
+    fn key_of(d: &Db, id: &str) -> Option<String> {
+        d.get_video(id).unwrap().unwrap().sibling_group
+    }
+
+    #[test]
+    fn marking_joins_videos_no_matcher_could_have() {
+        // The case the feature exists for: a follow-up renamed to chase the
+        // algorithm shares nothing with the part before it.
+        let d = db();
+        titled(&d, "UC1", &[("p3", "The Blackwood Tapes Pt 3"), ("ec", "EVERYTHING CHANGED")]);
+        assert_eq!(siblings_of(&d, "p3"), vec!["p3"], "unmarked, they are strangers");
+
+        assert_eq!(mark(&d, &["p3", "ec"]).unwrap(), 2);
+        let mut got = siblings_of(&d, "p3");
+        got.sort();
+        assert_eq!(got, vec!["ec", "p3"]);
+        assert_eq!(key_of(&d, "p3"), key_of(&d, "ec"));
+    }
+
+    #[test]
+    fn a_marked_title_then_seeds_the_matcher_on_its_own() {
+        // The whole point of recording the new name: the *next* upload under it
+        // needs no marking at all.
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p3", "The Blackwood Tapes Pt 3"),
+            ("ec", "EVERYTHING CHANGED"),
+            ("ec2", "EVERYTHING CHANGED Part 2"),
+        ]);
+        mark(&d, &["p3", "ec"]).unwrap();
+
+        let mut got = siblings_of(&d, "p3");
+        got.sort();
+        assert_eq!(got, vec!["ec", "ec2", "p3"]);
+    }
+
+    #[test]
+    fn marking_merges_two_hand_built_groups() {
+        // Neither group may be stranded: a link into a group is a link into all
+        // of it.
+        let d = db();
+        titled(&d, "UC1", &[
+            ("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie"), ("e", "Echo"),
+        ]);
+        mark(&d, &["a", "b"]).unwrap();
+        mark(&d, &["c", "e"]).unwrap();
+        assert_ne!(key_of(&d, "a"), key_of(&d, "c"));
+
+        assert_eq!(mark(&d, &["b", "c"]).unwrap(), 4, "all four end up together");
+        let mut got = siblings_of(&d, "a");
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c", "e"]);
+    }
+
+    #[test]
+    fn marking_is_refused_across_channels() {
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha")]);
+        titled(&d, "UC2", &[("b", "Bravo")]);
+        let err = mark(&d, &["a", "b"]).unwrap_err().to_string();
+        assert!(err.contains("same channel"), "{err}");
+        assert_eq!(key_of(&d, "a"), None);
+    }
+
+    #[test]
+    fn marking_needs_two_distinct_videos_that_exist() {
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha")]);
+        assert!(mark(&d, &["a"]).is_err());
+        assert!(mark(&d, &["a", "a"]).is_err(), "the same card twice is one video");
+        assert!(mark(&d, &["a", "gone"]).is_err());
+        assert_eq!(key_of(&d, "a"), None, "a refused mark writes nothing");
+    }
+
+    #[test]
+    fn unlinking_dissolves_a_pair_from_either_side() {
+        // A group of one is not a group, so undoing a mis-drop takes one action
+        // rather than two.
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha"), ("b", "Bravo")]);
+        mark(&d, &["a", "b"]).unwrap();
+
+        d.unlink_siblings("b").unwrap();
+        assert_eq!(key_of(&d, "a"), None, "the survivor is not left pinned to a group of one");
+        assert_eq!(key_of(&d, "b"), None);
+        assert_eq!(siblings_of(&d, "a"), vec!["a"]);
+    }
+
+    #[test]
+    fn unlinking_leaves_a_larger_group_standing() {
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie")]);
+        mark(&d, &["a", "b", "c"]).unwrap();
+
+        d.unlink_siblings("c").unwrap();
+        assert_eq!(key_of(&d, "c"), None);
+        let mut got = siblings_of(&d, "a");
+        got.sort();
+        assert_eq!(got, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn unlinking_an_unmarked_video_is_a_no_op() {
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha")]);
+        d.unlink_siblings("a").unwrap();
+        d.unlink_siblings("gone").unwrap();
+    }
+
+    #[test]
+    fn a_hand_marked_pair_is_one_card_in_the_grouped_feed() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p3", "The Blackwood Tapes Pt 3"),
+            ("ec", "EVERYTHING CHANGED"),
+            ("other", "Nothing To Do With It"),
+        ]);
+        assert_eq!(grouped(&d, &VideoFilter::default()).len(), 3, "three cards before marking");
+
+        mark(&d, &["p3", "ec"]).unwrap();
+        let cards = grouped(&d, &VideoFilter::default());
+        assert_eq!(cards.len(), 2);
+        // "other" is newest, so it leads; the pair follows behind its own leader.
+        assert!(cards.contains(&("other".to_string(), 1)));
+        assert!(cards.iter().any(|(_, n)| *n == 2), "{cards:?}");
+    }
+
+    #[test]
+    fn a_marked_group_survives_a_filter_that_hides_part_of_it() {
+        // The filters choose which cards appear, never what is inside one --
+        // the same promise the title matcher already makes.
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha"), ("b", "Bravo")]);
+        mark(&d, &["a", "b"]).unwrap();
+        d.set_watched("b", true).unwrap();
+
+        let f = VideoFilter { hide_watched: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("a".to_string(), 2)], "the watched part stays inside");
+    }
+
+    #[test]
+    fn find_siblings_still_returns_exactly_what_the_card_holds() {
+        // The invariant CLAUDE.md records, now that a manual mark can widen a
+        // group: opening a card must show precisely the card's own parts.
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "The Blackwood Tapes Part 2"),
+            ("ec", "EVERYTHING CHANGED"),
+            ("ec2", "EVERYTHING CHANGED Part 2"),
+        ]);
+        mark(&d, &["p2", "ec"]).unwrap();
+
+        let cards = d.list_video_groups(&VideoFilter::default()).unwrap();
+        for card in &cards {
+            let mut inside: Vec<String> = card.videos.iter().map(|v| v.id.clone()).collect();
+            let mut opened = siblings_of(&d, &card.videos[0].id);
+            inside.sort();
+            opened.sort();
+            assert_eq!(inside, opened, "leader {}", card.videos[0].id);
+        }
+        assert_eq!(cards.len(), 1, "all four hang together off the marked pair");
+    }
+
 }

@@ -119,6 +119,8 @@ pub fn run() {
             commands::poll_channel,
             commands::list_videos,
             commands::list_video_groups,
+            commands::mark_siblings,
+            commands::unlink_siblings,
             commands::set_watched,
             commands::enqueue_download,
             commands::cancel_download,
