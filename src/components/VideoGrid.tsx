@@ -165,10 +165,6 @@ export default function VideoGrid({
       <div
         ref={gridRef}
         className="video-grid"
-        // The zoom used to be advertised by a line of text in the filter bar.
-        // It is a thing you learn once, so it lives where you would reach for
-        // it instead of taking up room in the chrome for good.
-        title="Hold Ctrl and scroll to resize the cards"
         style={{ ["--card-w" as string]: `${cardSize}px` }}
       >
         {groups.map((g) =>
