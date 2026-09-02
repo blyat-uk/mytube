@@ -1433,6 +1433,40 @@ mod tests {
     }
 
     #[test]
+    fn migrating_a_v3_database_adds_sibling_group_and_keeps_its_rows() {
+        // The path a real library actually takes: v3 is what shipped before
+        // marking siblings by hand existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN downloaded_at INTEGER;",
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO videos (id,channel_id,title,published_at,sort_at,status,first_seen_at,
+                                 downloaded_at)
+             VALUES ('a','UC1','kept',100,100,'ready',1,55)",
+            [],
+        ).unwrap();
+        assert!(!column_exists(&conn, "videos", "sibling_group").unwrap());
+
+        let db = Db::init(conn).unwrap();
+
+        let v = db.get_video("a").unwrap().expect("row survived the migration");
+        assert_eq!(v.title, "kept");
+        assert_eq!(v.downloaded_at, Some(55), "the v3 column is untouched");
+        assert_eq!(v.sibling_group, None, "nothing is marked until someone marks it");
+        // And the feature works on the upgraded database.
+        titled(&db, "UC2", &[("x", "Alpha"), ("y", "Bravo")]);
+        assert_eq!(mark(&db, &["x", "y"]).unwrap(), 2);
+    }
+
+    #[test]
     fn migration_is_idempotent_and_a_fresh_db_matches_an_upgraded_one() {
         let conn = Connection::open_in_memory().unwrap();
         let db = Db::init(conn).unwrap();

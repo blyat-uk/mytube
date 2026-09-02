@@ -22,7 +22,7 @@ function video(over: Partial<Video>): Video {
     sort_at: 1_700_000_000, feed_rank: 0, added_manually: false, duration_secs: 754,
     view_count: 1500, status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "done", download_error: null, file_path: "/videos/some.mkv",
-    downloaded_at: null, first_seen_at: 0,
+    downloaded_at: null, first_seen_at: 0, sibling_group: null,
     ...over,
   };
 }

@@ -28,6 +28,11 @@ export const api = {
    *  groups here, not videos. */
   listVideoGroups: (filter: VideoFilter) =>
     invoke<VideoGroup[]>("list_video_groups", { filter }),
+  /** Marks videos siblings by hand, for a series the titles could never join.
+   *  Resolves with the finished group's size, which can exceed what was sent:
+   *  marking across two hand-built groups merges both. */
+  markSiblings: (videoIds: string[]) => invoke<number>("mark_siblings", { videoIds }),
+  unlinkSiblings: (videoId: string) => invoke<void>("unlink_siblings", { videoId }),
   setWatched: (videoId: string, watched: boolean) =>
     invoke<void>("set_watched", { videoId, watched }),
   enqueueDownload: (videoId: string) => invoke<void>("enqueue_download", { videoId }),

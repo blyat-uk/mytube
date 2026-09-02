@@ -30,6 +30,9 @@ export interface Video {
    *  downloaded. Ordering key for the Downloads tab. */
   downloaded_at: number | null;
   first_seen_at: number;
+  /** Key shared with every video marked its sibling by hand. Null — all but a
+   *  handful of rows — leaves the title matcher to work alone. */
+  sibling_group: string | null;
 }
 
 /**

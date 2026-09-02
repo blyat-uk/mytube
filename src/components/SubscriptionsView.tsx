@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import VideoGrid from "./VideoGrid";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
 import ConfirmDialog from "./ConfirmDialog";
@@ -6,6 +6,7 @@ import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { useDownloadEvents } from "../events";
 import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction } from "../format";
+import { useSiblingMarking } from "../marking";
 import type { DownloadProgress, SortOrder, Video, VideoGroup } from "../types";
 
 const PAGE = 100;
@@ -235,6 +236,46 @@ export default function SubscriptionsView(p: Props) {
     }
   }, [patch, toast]);
 
+  /** Records what the titles could not say: these are parts of one series. */
+  const markSiblings = useCallback(async (ids: string[]) => {
+    try {
+      // The answer can exceed what was sent -- marking across two hand-built
+      // groups merges both -- so the toast reports what actually happened.
+      const n = await api.markSiblings(ids);
+      toast.success(`Marked ${n} videos as siblings.`);
+      offset.current = 0;
+      void fetchPage(0);
+    } catch (err) {
+      toast.error(errText(err));
+    }
+  }, [fetchPage, toast]);
+
+  const unlinkSiblings = useCallback(async (video: Video) => {
+    try {
+      await api.unlinkSiblings(video.id);
+      toast.success(`Unlinked “${video.title}”.`);
+      offset.current = 0;
+      void fetchPage(0);
+    } catch (err) {
+      toast.error(errText(err));
+    }
+  }, [fetchPage, toast]);
+
+  const marking = useSiblingMarking(
+    groups,
+    useMemo(
+      () => ({
+        mark: (ids: string[]) => void markSiblings(ids),
+        refuse: (message: string) => toast.error(message),
+      }),
+      [markSiblings, toast],
+    ),
+  );
+
+  // A new filter, sort or refresh is a new grid, and nothing stays picked
+  // across one.
+  useEffect(() => { marking.clear(); }, [fetchPage, reloadToken, marking.clear]);
+
   const deleteVideo = useCallback(async (video: Video) => {
     try {
       await api.deleteVideo(video.id);
@@ -265,7 +306,21 @@ export default function SubscriptionsView(p: Props) {
   }, [removeVideo]);
 
   const menuItems = useCallback((video: Video): MenuItem[] => {
+    const picked = marking.selected.size;
+    const markItem: MenuItem[] =
+      picked >= 2 && marking.selected.has(video.id)
+        ? [{ label: `Mark ${picked} videos as siblings`, onSelect: marking.markSelected }]
+        : [];
+
+    // A series card stands for every one of its parts, so the items below --
+    // which all act on a single video -- would silently act on one part out of
+    // seven. Marking is the exception, because it is the card being marked.
+    // With nothing to mark the caller opens no menu at all.
+    const card = groups.find((g) => g.videos[0].id === video.id);
+    if ((card?.videos.length ?? 1) > 1) return markItem;
+
     const items: MenuItem[] = [
+      ...markItem,
       {
         label: video.watched ? "Mark as unwatched" : "Mark as watched",
         onSelect: () => void onToggleWatched(video),
@@ -290,6 +345,12 @@ export default function SubscriptionsView(p: Props) {
       label: "Find siblings",
       onSelect: () => p.onFindSiblings(video),
     });
+    if (video.sibling_group) {
+      items.push({
+        label: "Unlink from siblings",
+        onSelect: () => void unlinkSiblings(video),
+      });
+    }
     if (video.hidden) {
       items.push({ label: "Un-hide", onSelect: () => void unhideVideo(video) });
     } else {
@@ -300,11 +361,15 @@ export default function SubscriptionsView(p: Props) {
       });
     }
     return items;
-  }, [onToggleWatched, onAction, unhideVideo, requestRemove, p.onFindSiblings]);
+  }, [onToggleWatched, onAction, unhideVideo, requestRemove, unlinkSiblings, groups,
+      marking.selected, marking.markSelected, p.onFindSiblings]);
 
   const openMenu = useCallback((video: Video, x: number, y: number) => {
+    // An empty menu is worse than none: a series card with nothing selected
+    // has nothing to offer that would not act on one part out of seven.
+    if (menuItems(video).length === 0) return;
     setMenu({ video, x, y });
-  }, []);
+  }, [menuItems]);
 
   const filtered = channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly;
 
@@ -321,6 +386,7 @@ export default function SubscriptionsView(p: Props) {
       onAction={onAction}
       onContextMenu={openMenu}
       onOpenSeries={p.onFindSiblings}
+      marking={marking}
       empty={
         p.channelCount === 0 && !filtered ? (
           <div className="empty">

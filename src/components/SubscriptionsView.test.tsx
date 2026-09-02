@@ -14,6 +14,8 @@ vi.stubGlobal("IntersectionObserver", NoopObserver);
 
 const setWatched = vi.fn(() => Promise.resolve());
 const deleteDownload = vi.fn(() => Promise.resolve());
+const markSiblings = vi.fn(() => Promise.resolve(2));
+const unlinkSiblings = vi.fn(() => Promise.resolve());
 const listVideos = vi.fn(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn(() => Promise.resolve(groups));
 
@@ -23,6 +25,8 @@ vi.mock("../api", () => ({
     listVideoGroups: (...a: unknown[]) => listVideoGroups(...(a as [])),
     setWatched: (...a: unknown[]) => setWatched(...(a as [])),
     deleteDownload: (...a: unknown[]) => deleteDownload(...(a as [])),
+    markSiblings: (...a: unknown[]) => markSiblings(...(a as [])),
+    unlinkSiblings: (...a: unknown[]) => unlinkSiblings(...(a as [])),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
@@ -38,7 +42,7 @@ function video(over: Partial<Video> = {}): Video {
     sort_at: null, feed_rank: 0, added_manually: false, duration_secs: 754,
     view_count: 1500, status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "done", download_error: null, file_path: "/videos/some.mkv",
-    downloaded_at: null, first_seen_at: 0,
+    downloaded_at: null, first_seen_at: 0, sibling_group: null,
     ...over,
   };
 }
@@ -271,5 +275,160 @@ describe("what an open series reports to the breadcrumb", () => {
     const { onSeriesTally } = renderView();
     await waitFor(() => expect(listVideos).toHaveBeenCalled());
     expect(onSeriesTally).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------------- marking siblings by hand ---------------- */
+
+/** Two cards on one channel, plus one on another. */
+function threeCards() {
+  videos = [
+    video({ id: "a", title: "The Blackwood Tapes Pt 3", download_state: "none",
+            file_path: null }),
+    video({ id: "b", title: "EVERYTHING CHANGED", download_state: "none", file_path: null }),
+    video({ id: "far", channel_id: "UC2", channel_title: "Elsewhere", title: "Other",
+            download_state: "none", file_path: null }),
+  ];
+}
+
+const cards = () => Array.from(document.querySelectorAll<HTMLElement>(".card"));
+
+/** The grid after its first fetch has landed. */
+async function cardsReady(n: number) {
+  await waitFor(() => expect(cards().length).toBe(n));
+  return cards();
+}
+
+/** A DataTransfer stand-in: jsdom's drag events carry none of their own. */
+function dt() {
+  return { effectAllowed: "", dropEffect: "", setData: vi.fn(), getData: () => "" };
+}
+
+describe("marking siblings by hand", () => {
+  beforeEach(threeCards);
+
+  it("ctrl+click picks a card out without running its action", async () => {
+    renderView();
+    const [a] = await cardsReady(3);
+    fireEvent.click(a, { ctrlKey: true });
+
+    expect(a.className).toContain("is-selected");
+    // The card's primary action is a download; selecting must not start one.
+    expect(markSiblings).not.toHaveBeenCalled();
+  });
+
+  it("offers the marking item only once two are picked", async () => {
+    renderView();
+    const [a, b] = await cardsReady(3);
+
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.contextMenu(a);
+    expect(menuLabels(screen.getByRole("menu"))).not.toContain("Mark 1 videos as siblings");
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(b, { ctrlKey: true });
+    fireEvent.contextMenu(a);
+    fireEvent.click(within(screen.getByRole("menu"), "Mark 2 videos as siblings"));
+
+    await waitFor(() => expect(markSiblings).toHaveBeenCalledWith(["a", "b"]));
+  });
+
+  it("clears the selection on Escape", async () => {
+    renderView();
+    const [a] = await cardsReady(3);
+    fireEvent.click(a, { ctrlKey: true });
+    expect(a.className).toContain("is-selected");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(cards()[0].className).not.toContain("is-selected"));
+  });
+
+  it("a plain click drops the selection and lets the card act as usual", async () => {
+    renderView();
+    const [a, b] = await cardsReady(3);
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(b);
+
+    await waitFor(() => expect(cards()[0].className).not.toContain("is-selected"));
+    expect(markSiblings).not.toHaveBeenCalled();
+  });
+
+  it("dropping one card on another marks the two", async () => {
+    renderView();
+    const [a, b] = await cardsReady(3);
+    const data = dt();
+    fireEvent.dragStart(a, { dataTransfer: data });
+    fireEvent.dragOver(b, { dataTransfer: data });
+    expect(cards()[1].className).toContain("is-drop-target");
+
+    fireEvent.drop(b, { dataTransfer: data });
+    await waitFor(() => expect(markSiblings).toHaveBeenCalledWith(["a", "b"]));
+  });
+
+  it("refuses a drop from another channel, and never lights the card up", async () => {
+    renderView();
+    const [a, , far] = await cardsReady(3);
+    const data = dt();
+    fireEvent.dragStart(a, { dataTransfer: data });
+    fireEvent.dragOver(far, { dataTransfer: data });
+    expect(cards()[2].className).not.toContain("is-drop-target");
+
+    fireEvent.drop(far, { dataTransfer: data });
+    expect(await screen.findByText("Siblings must come from the same channel.")).toBeTruthy();
+    expect(markSiblings).not.toHaveBeenCalled();
+  });
+
+  it("dragging a picked card brings the whole selection", async () => {
+    renderView();
+    const [a, b, far] = await cardsReady(3);
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(far, { ctrlKey: true });
+
+    const data = dt();
+    fireEvent.dragStart(a, { dataTransfer: data });
+    fireEvent.drop(b, { dataTransfer: data });
+    // Two channels in one link: refused rather than half-applied.
+    expect(await screen.findByText("Siblings must come from the same channel.")).toBeTruthy();
+    expect(markSiblings).not.toHaveBeenCalled();
+  });
+
+  it("offers Unlink only for a video carrying a mark", async () => {
+    videos = [video({ id: "a", sibling_group: null })];
+    renderView();
+    expect(menuLabels(await openMenu())).not.toContain("Unlink from siblings");
+    fireEvent.keyDown(window, { key: "Escape" });
+    cleanup();
+
+    videos = [video({ id: "a", sibling_group: "g1" })];
+    renderView();
+    fireEvent.click(within(await openMenu(), "Unlink from siblings"));
+    await waitFor(() => expect(unlinkSiblings).toHaveBeenCalledWith("a"));
+  });
+
+  it("wears a Linked pill so a hand-built group is visible", async () => {
+    videos = [video({ id: "a", sibling_group: "g1" })];
+    renderView();
+    expect(await screen.findByText("Linked")).toBeTruthy();
+  });
+});
+
+describe("a series card's right-click menu", () => {
+  it("offers nothing but marking, and no menu at all with nothing picked", async () => {
+    groups = [
+      { videos: [video({ id: "p2" }), video({ id: "p1" })], stem: "The Blackwood Tapes" },
+      { videos: [video({ id: "solo" })], stem: null },
+    ];
+    renderView({ grouped: true });
+    const [series, solo] = await cardsReady(2);
+
+    // A full menu here would act on the leader alone -- one part out of two.
+    fireEvent.contextMenu(series);
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.click(series, { ctrlKey: true });
+    fireEvent.click(solo, { ctrlKey: true });
+    fireEvent.contextMenu(series);
+    expect(menuLabels(screen.getByRole("menu"))).toEqual(["Mark 2 videos as siblings"]);
   });
 });

@@ -13,7 +13,7 @@ function video(over: Partial<Video> = {}): Video {
     added_manually: false, duration_secs: 754, view_count: 1500,
     status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "none", download_error: null,
-    file_path: null, downloaded_at: null, first_seen_at: 0,
+    file_path: null, downloaded_at: null, first_seen_at: 0, sibling_group: null,
     ...over,
   };
 }
@@ -33,7 +33,7 @@ function group(over: Partial<VideoGroup> = {}): VideoGroup {
 
 function renderCard(over: Partial<VideoGroup> = {}) {
   const onOpen = vi.fn();
-  render(<SeriesCard group={group(over)} onOpen={onOpen} />);
+  render(<SeriesCard group={group(over)} onOpen={onOpen} onContextMenu={vi.fn()} />);
   return { onOpen };
 }
 
@@ -86,33 +86,33 @@ describe("SeriesCard watch progress", () => {
   }
 
   it("tallies the parts watched and the parts still to go", () => {
-    render(<SeriesCard group={withWatched(2)} onOpen={vi.fn()} />);
+    render(<SeriesCard group={withWatched(2)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     expect(screen.getByText("2 watched")).toBeTruthy();
     expect(screen.getByText("1 unwatched")).toBeTruthy();
   });
 
   it("fills the bar by the share of the series behind you", () => {
-    render(<SeriesCard group={withWatched(1)} onOpen={vi.fn()} />);
+    render(<SeriesCard group={withWatched(1)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     const fill = document.querySelector(".series-progress-fill") as HTMLElement;
     expect(fill.style.width).toBe(`${(1 / 3) * 100}%`);
   });
 
   it("dims the whole card once every part has been watched", () => {
-    render(<SeriesCard group={withWatched(3)} onOpen={vi.fn()} />);
+    render(<SeriesCard group={withWatched(3)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     expect(document.querySelector(".series-card")!.className).toContain("is-watched");
   });
 
   it("stays undimmed while any one part is unwatched", () => {
-    render(<SeriesCard group={withWatched(2)} onOpen={vi.fn()} />);
+    render(<SeriesCard group={withWatched(2)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     expect(document.querySelector(".series-card")!.className).not.toContain("is-watched");
   });
 
   // A zero is not something to chase, so it drops out of the accent colour.
   it("only accents the count still to watch while there is one", () => {
-    render(<SeriesCard group={withWatched(2)} onOpen={vi.fn()} />);
+    render(<SeriesCard group={withWatched(2)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     expect(screen.getByText("1 unwatched").className).toContain("is-due");
     cleanup();
-    render(<SeriesCard group={withWatched(3)} onOpen={vi.fn()} />);
+    render(<SeriesCard group={withWatched(3)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     expect(screen.getByText("0 unwatched").className).not.toContain("is-due");
   });
 });

@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { thumbSrc } from "../api";
 import { formatDate, formatRelative, seriesRuntime } from "../format";
 import { IconSeries } from "./Icons";
+import type { CardMark } from "../marking";
 import type { Video, VideoGroup } from "../types";
 
 interface Props {
@@ -9,6 +10,12 @@ interface Props {
   /** Opens the series: the sibling view, anchored on the leader and carrying
    *  the shared stem, which is the name the breadcrumb then wears. */
   onOpen: (leader: Video, stem: string | null) => void;
+  /** Right-click. The view answers with a menu holding nothing but the marking
+   *  item, and with no menu at all when there is nothing to mark — a full one
+   *  would act on the leader alone, which is what this card exists not to do. */
+  onContextMenu: (leader: Video, e: React.MouseEvent) => void;
+  /** Selection and drag, when the view offers sibling marking. */
+  mark?: CardMark;
 }
 
 /**
@@ -19,7 +26,7 @@ interface Props {
  * opens the series, and the parts are acted on inside it — a button here would
  * silently act on one part out of seven.
  */
-export default function SeriesCard({ group, onOpen }: Props) {
+export default function SeriesCard({ group, onOpen, onContextMenu, mark }: Props) {
   const leader = group.videos[0];
   const parts = group.videos.length;
   const watched = group.videos.filter((v) => v.watched).length;
@@ -54,7 +61,7 @@ export default function SeriesCard({ group, onOpen }: Props) {
 
   return (
     <article
-      className={`card series-card${done ? " is-watched" : ""}`}
+      className={`card series-card${done ? " is-watched" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}`}
       role="button"
       tabIndex={0}
       aria-label={
@@ -62,12 +69,17 @@ export default function SeriesCard({ group, onOpen }: Props) {
         (runtime ? `${runtime} total, ` : "") +
         `${watched} watched, ${unwatched} unwatched`
       }
-      onClick={open}
+      onClick={(e) => {
+        if (mark?.onClick(e)) return;
+        open();
+      }}
+      onContextMenu={(e) => onContextMenu(leader, e)}
       onKeyDown={(e) => {
         if (e.key !== "Enter" && e.key !== " ") return;
         e.preventDefault();
         open();
       }}
+      {...mark?.drag}
       data-video-id={leader.id}
     >
       <div className="card-thumb">

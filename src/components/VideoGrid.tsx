@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, type ReactNode } from 
 import VideoCard from "./VideoCard";
 import SeriesCard from "./SeriesCard";
 import { nextCardSize, type CardAction } from "../format";
+import type { Marking } from "../marking";
 import type { DownloadProgress, Video, VideoGroup } from "../types";
 
 interface Props {
@@ -18,6 +19,9 @@ interface Props {
   onContextMenu: (video: Video, x: number, y: number) => void;
   /** Opens a series, anchored on its leader and named by its shared stem. */
   onOpenSeries: (leader: Video, stem: string | null) => void;
+  /** Selecting and dragging cards to mark them siblings by hand. Optional: a
+   *  grid without it behaves exactly as it did before marking existed. */
+  marking?: Marking;
   empty?: ReactNode;
 }
 
@@ -28,7 +32,7 @@ const NEAR_VIEWPORT = 400;
 
 export default function VideoGrid({
   groups, progress, loading, hasMore, cardSize, onCardSize,
-  onLoadMore, onAction, onContextMenu, onOpenSeries, empty,
+  onLoadMore, onAction, onContextMenu, onOpenSeries, marking, empty,
 }: Props) {
   const sentinel = useRef<HTMLDivElement | null>(null);
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -169,7 +173,13 @@ export default function VideoGrid({
       >
         {groups.map((g) =>
           g.videos.length > 1 ? (
-            <SeriesCard key={g.videos[0].id} group={g} onOpen={onOpenSeries} />
+            <SeriesCard
+              key={g.videos[0].id}
+              group={g}
+              onOpen={onOpenSeries}
+              onContextMenu={onCtx}
+              mark={marking?.forGroup(g)}
+            />
           ) : (
             <VideoCard
               key={g.videos[0].id}
@@ -177,6 +187,7 @@ export default function VideoGrid({
               progress={progress[g.videos[0].id]}
               onAction={onAction}
               onContextMenu={onCtx}
+              mark={marking?.forGroup(g)}
             />
           ),
         )}

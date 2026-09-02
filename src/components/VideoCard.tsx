@@ -6,6 +6,7 @@ import {
 } from "../format";
 import type { CardAction } from "../format";
 import { IconCancel, IconDownload, IconExternal, IconPlay, IconRetry } from "./Icons";
+import type { CardMark } from "../marking";
 import type { DownloadProgress, Video } from "../types";
 
 interface Props {
@@ -13,6 +14,8 @@ interface Props {
   progress?: DownloadProgress;
   onAction: (action: CardAction, video: Video) => void;
   onContextMenu: (video: Video, e: React.MouseEvent) => void;
+  /** Selection and drag, when the view offers sibling marking. */
+  mark?: CardMark;
 }
 
 const RING_R = 26;
@@ -26,7 +29,7 @@ const ACTION_ICON: Record<CardAction, ReactNode> = {
   open: <IconExternal />,
 };
 
-export default function VideoCard({ video, progress, onAction, onContextMenu }: Props) {
+export default function VideoCard({ video, progress, onAction, onContextMenu, mark }: Props) {
   // Prefer the locally cached thumbnail, fall back to the remote URL, then to a
   // plain placeholder — a broken image icon in a grid looks like a bug.
   const sources = useMemo(() => {
@@ -55,9 +58,15 @@ export default function VideoCard({ video, progress, onAction, onContextMenu }: 
 
   return (
     <article
-      className={`card${video.watched ? " is-watched" : ""}${busy ? " is-busy" : ""}${downloaded ? " is-downloaded" : ""}${video.hidden ? " is-hidden-video" : ""}`}
-      onClick={run}
+      className={`card${video.watched ? " is-watched" : ""}${busy ? " is-busy" : ""}${downloaded ? " is-downloaded" : ""}${video.hidden ? " is-hidden-video" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}`}
+      // A ctrl+click is a selection, not a download, so marking gets first
+      // refusal on the click and the primary action only runs if it declines.
+      onClick={(e) => {
+        if (mark?.onClick(e)) return;
+        run();
+      }}
       onContextMenu={(e) => onContextMenu(video, e)}
+      {...mark?.drag}
       data-state={state}
       data-video-id={video.id}
     >
@@ -79,6 +88,14 @@ export default function VideoCard({ video, progress, onAction, onContextMenu }: 
         {video.added_manually && (
           <span className="pill pill-added" title="Added manually, not from a subscription">
             Added
+          </span>
+        )}
+
+        {/* Without this a hand-built group is invisible, and "Unlink from
+            siblings" is a menu item nobody would think to look for. */}
+        {video.sibling_group && (
+          <span className="pill pill-linked" title="Marked as part of a series by hand">
+            Linked
           </span>
         )}
 
