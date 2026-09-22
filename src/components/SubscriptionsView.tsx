@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject,
+} from "react";
 import VideoGrid from "./VideoGrid";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
 import ConfirmDialog from "./ConfirmDialog";
@@ -10,6 +12,40 @@ import { useSiblingMarking } from "../marking";
 import type { DownloadProgress, SortOrder, Video, VideoGroup } from "../types";
 
 const PAGE = 100;
+
+/** How many lists' places to keep: the feed, an open series, and whatever the
+ *  filter row was set to before this one. Every debounced search query makes a
+ *  list of its own, so the oldest are dropped rather than kept for the session. */
+const PLACES_KEPT = 16;
+
+/**
+ * Where a list was when it was last on screen. The paged-in count belongs with
+ * the offset: put one back without the other and the offset lands past the end
+ * of a grid that has shrunk to a single page, which is the bottom of page one
+ * rather than where you were.
+ */
+interface Place {
+  scroll: number;
+  cards: number;
+}
+
+/** Files where a list was left, keeping only the most recently seen ones. */
+function remember(places: Map<string, Place>, key: string, place: Place) {
+  // Deleted first so it is re-inserted last, which makes the oldest key the
+  // first one the eviction walk below reaches.
+  places.delete(key);
+  places.set(key, place);
+  for (const oldest of places.keys()) {
+    if (places.size <= PLACES_KEPT) break;
+    places.delete(oldest);
+  }
+}
+
+/** Whole pages enough to hold `cards`, so a restored grid still ends on a page
+ *  boundary and `hasMore` keeps meaning "the last page came back full". */
+function pagesFor(cards: number): number {
+  return Math.max(PAGE, Math.ceil(cards / PAGE) * PAGE);
+}
 
 /** What an open series holds, for the breadcrumb that names it. */
 export interface SeriesTally {
@@ -35,6 +71,10 @@ interface Props {
   onSeriesTally: (t: SeriesTally) => void;
   cardSize: number;
   onCardSize: (px: number) => void;
+  /** The shell's scroll container. The view needs it to put the feed back where
+   *  it was: a series, or a poll's refetch, replaces the whole grid, and the
+   *  browser clamps the offset to whatever short list arrives in its place. */
+  scrollRef: RefObject<HTMLElement | null>;
   /** Bumped by the shell after a poll or an add, to force a refetch. */
   reloadToken: number;
   channelCount: number;
@@ -55,11 +95,31 @@ export default function SubscriptionsView(p: Props) {
 
   const {
     channelId, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken, siblingOf,
-    onSeriesTally,
+    onSeriesTally, scrollRef,
   } = p;
   // A series view is a flat list of parts on purpose, so grouping stands down
   // while one is open rather than collapsing the very series being shown.
   const grouped = p.grouped && siblingOf === null;
+
+  // What makes this list this list. A series, a filter, a sort and a search
+  // each make a different one; `grouped` is the derived value above, so opening
+  // a series out of the grouped feed counts as one change of list, not two.
+  const listKey = JSON.stringify([
+    channelId, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped,
+    siblingOf?.id ?? null,
+  ]);
+  // Where each list this view has shown was left. Coming back to one -- leaving
+  // a series, clearing a search -- comes back to your place in it; a list never
+  // shown starts at the top. A refetch of the list already up (a poll, or a
+  // sibling mark) is the same list, so it keeps its place too.
+  const places = useRef(new Map<string, Place>());
+  /** The list the grid holds, "" until its first page has landed. */
+  const shown = useRef("");
+  /** Where the next landed page zero puts the grid. */
+  const restore = useRef(0);
+  /** Bumped by each landed page zero, so the restore below runs in the commit
+   *  that put those rows on screen and not in some later one. */
+  const [pageEpoch, setPageEpoch] = useState(0);
   const [menu, setMenu] = useState<{ video: Video; x: number; y: number } | null>(null);
   /**
    * Two dialogs share this slot: "remove" asks how to hide or delete a video,
@@ -70,7 +130,29 @@ export default function SubscriptionsView(p: Props) {
   const fetchPage = useCallback(async (from: number) => {
     const id = ++request.current;
     setLoading(true);
-    // PAGE counts cards either way, which for the grouped feed means groups.
+    let limit = PAGE;
+    if (from === 0) {
+      // Filed now rather than when the rows land, because the grid on screen is
+      // still the outgoing list's: by the time a shorter one has replaced it,
+      // the browser has already clamped the offset to the bottom of what is
+      // left and there is nothing left to read.
+      if (shown.current) {
+        remember(places.current, shown.current, {
+          scroll: scrollRef.current?.scrollTop ?? 0,
+          cards: offset.current,
+        });
+      }
+      const back = places.current.get(listKey);
+      restore.current = back?.scroll ?? 0;
+      // Every page the list had, in one request. Asking for one page and letting
+      // the sentinel fetch the rest would put the offset past the end of the
+      // grid, which is the only place a scroll can be restored to.
+      if (back) limit = pagesFor(back.cards);
+      // Page zero is what resets the paging, so a load-more firing while this
+      // request is in flight cannot page on from the outgoing list's offset.
+      offset.current = 0;
+    }
+    // The limit counts cards either way, which for the grouped feed means groups.
     const filter = {
       channelId,
       hideWatched,
@@ -79,7 +161,7 @@ export default function SubscriptionsView(p: Props) {
       search: search.trim() ? search.trim() : null,
       siblingOf: siblingOf?.id ?? null,
       sort,
-      limit: PAGE,
+      limit,
       offset: from,
     };
     try {
@@ -89,7 +171,11 @@ export default function SubscriptionsView(p: Props) {
       if (id !== request.current) return;
       setGroups((prev) => (from === 0 ? page : [...prev, ...page]));
       offset.current = from + page.length;
-      setHasMore(page.length === PAGE);
+      setHasMore(page.length === limit);
+      if (from === 0) {
+        shown.current = listKey;
+        setPageEpoch((n) => n + 1);
+      }
     } catch (err) {
       if (id !== request.current) return;
       setHasMore(false);
@@ -97,12 +183,18 @@ export default function SubscriptionsView(p: Props) {
     } finally {
       if (id === request.current) setLoading(false);
     }
-  }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, toast]);
+  }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped,
+      listKey, scrollRef, toast]);
 
-  useEffect(() => {
-    offset.current = 0;
-    void fetchPage(0);
-  }, [fetchPage, reloadToken]);
+  useEffect(() => { void fetchPage(0); }, [fetchPage, reloadToken]);
+
+  // Put the grid back where its list was left, in the same commit the rows
+  // arrive in: a frame painted at the top on the way there is the jump this
+  // exists to prevent.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = restore.current;
+  }, [pageEpoch, scrollRef]);
 
   // The breadcrumb names the open series and says what it holds -- which this
   // view knows and the nav does not -- so every settled page hands the count
@@ -199,17 +291,19 @@ export default function SubscriptionsView(p: Props) {
 
   const onToggleWatched = useCallback(async (video: Video) => {
     const next = !video.watched;
-    patch(video.id, {
-      watched: next,
-      watched_at: next ? Math.floor(Date.now() / 1000) : null,
-    });
+    const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
+    patch(video.id, watched);
     try {
       await api.setWatched(video.id, next);
       // With "hide watched" on, a freshly watched card no longer belongs here.
       if (next && hideWatched) drop(video.id);
       // Watching something is usually the end of its life on disk — but that is
       // the user's call, and it is a separate step from marking it watched.
-      if (next && hasDownloadedFile(video)) setConfirm({ kind: "file", video });
+      // The dialog gets the video as it now is: its copy reads `watched`, and
+      // the argument is the row from before the click.
+      if (next && hasDownloadedFile(video)) {
+        setConfirm({ kind: "file", video: { ...video, ...watched } });
+      }
     } catch (err) {
       patch(video.id, { watched: video.watched, watched_at: video.watched_at });
       toast.error(errText(err));
@@ -243,7 +337,6 @@ export default function SubscriptionsView(p: Props) {
       // groups merges both -- so the toast reports what actually happened.
       const n = await api.markSiblings(ids);
       toast.success(`Marked ${n} videos as siblings.`);
-      offset.current = 0;
       void fetchPage(0);
     } catch (err) {
       toast.error(errText(err));
@@ -254,7 +347,6 @@ export default function SubscriptionsView(p: Props) {
     try {
       await api.unlinkSiblings(video.id);
       toast.success(`Unlinked “${video.title}”.`);
-      offset.current = 0;
       void fetchPage(0);
     } catch (err) {
       toast.error(errText(err));

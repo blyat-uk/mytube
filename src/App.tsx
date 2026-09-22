@@ -207,6 +207,10 @@ function Shell() {
       .finally(() => setHydrated(true));
   }, []);
 
+  // The feed's scroll container, handed to SubscriptionsView so leaving a series
+  // -- or riding out a poll's refetch -- can put the grid back where it was.
+  const contentRef = useRef<HTMLElement | null>(null);
+
   const sizeTimer = useRef<number | undefined>(undefined);
   const saveCardSize = useCallback((px: number) => {
     setCardSize(px);
@@ -267,7 +271,7 @@ function Shell() {
         onAdd={() => setAddOpen(true)}
       />
 
-      <main className="content">
+      <main className="content" ref={contentRef}>
         {tab === "subscriptions" && (
           <SubscriptionsView
             channelId={channelId}
@@ -278,6 +282,7 @@ function Shell() {
             grouped={grouped}
             cardSize={cardSize}
             onCardSize={saveCardSize}
+            scrollRef={contentRef}
             sort={sort}
             siblingOf={siblingOf}
             onFindSiblings={openSeries}
@@ -287,7 +292,9 @@ function Shell() {
             onAdd={() => setAddOpen(true)}
           />
         )}
-        {tab === "downloads" && <DownloadsView reloadToken={reloadToken} />}
+        {tab === "downloads" && (
+          <DownloadsView reloadToken={reloadToken} cardSize={cardSize} scrollRef={contentRef} />
+        )}
         {tab === "settings" && <SettingsView />}
       </main>
 

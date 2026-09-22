@@ -82,12 +82,18 @@ export default function VideoGrid({
    * Insertions only. Re-sorting, filtering or searching replaces the whole
    * list, and animating every card then is noise, not information.            */
 
-  const prevRects = useRef<Map<string, DOMRect>>(new Map());
+  // Positions from the last render, measured relative to the grid itself rather
+  // than to the viewport: the grid scrolls with its cards, so a scroll offset
+  // that moved between two commits -- the user's own scrolling, or the feed
+  // being put back where it was after a series or a poll -- cancels out instead
+  // of reading as every card having jumped that far.
+  const prevRects = useRef<Map<string, { top: number; left: number }>>(new Map());
   const prevIds = useRef<string[]>([]);
 
   useLayoutEffect(() => {
     const el = gridRef.current;
     if (!el) return;
+    const base = el.getBoundingClientRect();
 
     // Keyed on the leader, which is what the card carries in `data-video-id`.
     const ids = groups.map((g) => g.videos[0].id);
@@ -114,8 +120,8 @@ export default function VideoGrid({
 
         const then = before.get(id);
         if (then) {
-          const dx = then.left - now.left;
-          const dy = then.top - now.top;
+          const dx = then.left - (now.left - base.left);
+          const dy = then.top - (now.top - base.top);
           if (dx || dy) {
             child.animate(
               [
@@ -137,10 +143,12 @@ export default function VideoGrid({
       }
     }
 
-    const next = new Map<string, DOMRect>();
+    const next = new Map<string, { top: number; left: number }>();
     for (const child of Array.from(el.children) as HTMLElement[]) {
       const id = child.dataset.videoId;
-      if (id) next.set(id, child.getBoundingClientRect());
+      if (!id) continue;
+      const r = child.getBoundingClientRect();
+      next.set(id, { top: r.top - base.top, left: r.left - base.left });
     }
     prevRects.current = next;
     prevIds.current = ids;

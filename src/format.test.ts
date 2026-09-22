@@ -62,12 +62,46 @@ describe("seriesRuntime", () => {
 
 describe("formatRelative", () => {
   const now = 1_700_000_000;
-  it("uses coarse buckets", () => {
+  /** Local time, because the calendar the labels count in is the viewer's. */
+  const at = (y: number, m: number, d: number) => new Date(y, m - 1, d, 12).getTime() / 1000;
+
+  it("uses coarse buckets under a day", () => {
     expect(formatRelative(now - 30, now)).toBe("just now");
+    expect(formatRelative(now - 60 * 45, now)).toBe("45m ago");
     expect(formatRelative(now - 3600 * 5, now)).toBe("5h ago");
+  });
+  it("counts days for the whole first month", () => {
     expect(formatRelative(now - 86400 * 3, now)).toBe("3d ago");
-    expect(formatRelative(now - 86400 * 14, now)).toBe("2w ago");
-    expect(formatRelative(now - 86400 * 400, now)).toBe("1y ago");
+    expect(formatRelative(now - 86400 * 14, now)).toBe("14d ago");
+    expect(formatRelative(now - 86400 * 31, now)).toBe("31d ago");
+  });
+  it("switches to months and days past 31 days", () => {
+    expect(formatRelative(at(2026, 1, 8), at(2026, 4, 16))).toBe("3m 8d ago");
+    expect(formatRelative(at(2026, 5, 1), at(2026, 6, 3))).toBe("1m 2d ago");
+  });
+  it("keeps the day part on a month's anniversary", () => {
+    // "2m ago" would read as two minutes -- `m` is already minutes above.
+    expect(formatRelative(at(2026, 1, 15), at(2026, 3, 15))).toBe("2m 0d ago");
+  });
+  it("counts months by the calendar, not by 30-day blocks", () => {
+    // 31 Jan plus a month is 28 Feb, so 20 Mar is "1m 20d" -- a `setMonth`
+    // rollover to 3 Mar would quietly shorten it to "1m 17d".
+    expect(formatRelative(at(2026, 1, 31), at(2026, 3, 20))).toBe("1m 20d ago");
+    // Shortest span past the threshold: 32 days over a 28-day February.
+    expect(formatRelative(at(2026, 1, 31), at(2026, 3, 4))).toBe("1m 4d ago");
+  });
+  it("does not lose a day to a clock change", () => {
+    // 28 Feb to 30 Mar 2026 is thirty days but only 29d23h of them, because the
+    // clocks went forward on the 29th; dividing elapsed time by 24h says "29d".
+    // Only bites in a DST-observing zone, which is where the app runs.
+    expect(formatRelative(at(2026, 1, 31), at(2026, 3, 30))).toBe("1m 30d ago");
+  });
+  it("switches to years and months at twelve months", () => {
+    expect(formatRelative(at(2026, 3, 10), at(2027, 5, 20))).toBe("1y 2m ago");
+    expect(formatRelative(at(2016, 4, 2), at(2026, 8, 30))).toBe("10y 4m ago");
+  });
+  it("drops a whole year's empty month part", () => {
+    expect(formatRelative(at(2024, 6, 1), at(2026, 6, 1))).toBe("2y ago");
   });
   it("renders unknown dates as an em dash", () => expect(formatRelative(null, now)).toBe("—"));
 });
@@ -99,7 +133,9 @@ describe("cardAction", () => {
       .toBe("play"));
 });
 
-import { clampCardSize, nextCardSize, insertToken, TEMPLATE_PRESETS, TOKEN_CHIPS } from "./format";
+import {
+  clampCardSize, nextCardSize, insertToken, popoutPlacement, TEMPLATE_PRESETS, TOKEN_CHIPS,
+} from "./format";
 
 describe("hasDownloadedFile", () => {
   it("is true only when the download finished and the file is still recorded", () => {
@@ -137,6 +173,31 @@ describe("card size zoom", () => {
     expect(nextCardSize(160, 1)).toBe(160);
     expect(nextCardSize(640, -1)).toBe(640);
   });
+});
+
+describe("popoutPlacement", () => {
+  /** A 128px Downloads thumbnail, its top-left corner at (x, y). */
+  const slot = (x: number, y: number) => ({ left: x, top: y, right: x + 128, bottom: y + 72 });
+  const area = { left: 0, top: 0, right: 1200, bottom: 800 };
+
+  it("grows to the card size with its top-left corner where the slot's is", () =>
+    expect(popoutPlacement(slot(50, 100), area, 640)).toEqual({ width: 640, offsetY: 0 }));
+
+  it("slides up just far enough to clear the bottom of the scroll area", () =>
+    // 360px tall from y=600 would end at 960; 8px short of 800 is 792.
+    expect(popoutPlacement(slot(50, 600), area, 640)).toEqual({ width: 640, offsetY: -168 }));
+
+  it("comes down into view when its row is half scrolled off the top", () =>
+    expect(popoutPlacement(slot(50, -20), area, 640).offsetY).toBe(28));
+
+  it("keeps its top on screen when the area is shorter than the picture", () =>
+    expect(popoutPlacement(slot(50, 100), { ...area, bottom: 300 }, 640).offsetY).toBe(-92));
+
+  it("grows only as wide as there is room for on the right", () =>
+    expect(popoutPlacement(slot(50, 100), { ...area, right: 500 }, 640).width).toBe(442));
+
+  it("never shrinks below the slot it came out of", () =>
+    expect(popoutPlacement(slot(50, 100), { ...area, right: 150 }, 640).width).toBe(128));
 });
 
 describe("filename template helpers", () => {

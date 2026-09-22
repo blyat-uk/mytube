@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject,
+} from "react";
+import ConfirmDialog from "./ConfirmDialog";
+import { IconCancel, IconDelete, IconPlay, IconRetry, IconWatched } from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText, thumbSrc } from "../api";
 import { useDownloadEvents } from "../events";
-import { formatDuration, formatRelative } from "../format";
+import { formatDuration, formatRelative, hasDownloadedFile, popoutPlacement } from "../format";
 import type { DownloadProgress, DownloadState, Video } from "../types";
 
 /** Downloads are rare relative to the library, so one wide sweep is enough. */
@@ -36,13 +40,19 @@ function stampFor(state: DownloadState, current: number | null): number | null {
 
 interface Props {
   reloadToken: number;
+  /** The Subscriptions zoom, which is the size a thumbnail pops out to. */
+  cardSize: number;
+  /** The shell's scroll container, which a popped-out thumbnail must stay inside. */
+  scrollRef: RefObject<HTMLElement | null>;
 }
 
-export default function DownloadsView({ reloadToken }: Props) {
+export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Props) {
   const toast = useToast();
   const [items, setItems] = useState<Video[]>([]);
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
   const [loading, setLoading] = useState(true);
+  /** A video just marked watched, whose file may now be done with. */
+  const [confirmFile, setConfirmFile] = useState<Video | null>(null);
   const reloadTimer = useRef<number | null>(null);
 
   const load = useCallback(async () => {
@@ -135,6 +145,27 @@ export default function DownloadsView({ reloadToken }: Props) {
     failed: items.filter((v) => v.download_state === "failed").sort(byDownloadRecency),
   }), [items]);
 
+  /**
+   * Settles where a thumbnail will land before `:hover` starts growing it. The
+   * result goes straight onto the slot as custom properties rather than into
+   * state, so pointing at a thumbnail costs no render. The client box, not the
+   * bounding one, is the edge that matters: the scrollbar would clip it too.
+   */
+  const placePopout = useCallback((slot: HTMLElement) => {
+    const area = scrollRef.current;
+    if (!area) return;
+    const box = area.getBoundingClientRect();
+    const left = box.left + area.clientLeft;
+    const top = box.top + area.clientTop;
+    const { width, offsetY } = popoutPlacement(
+      slot.getBoundingClientRect(),
+      { left, top, right: left + area.clientWidth, bottom: top + area.clientHeight },
+      cardSize,
+    );
+    slot.style.setProperty("--pop-w", `${width}px`);
+    slot.style.setProperty("--pop-y", `${offsetY}px`);
+  }, [scrollRef, cardSize]);
+
   const guard = useCallback(async (fn: () => Promise<void>) => {
     try { await fn(); } catch (err) { toast.error(errText(err)); }
   }, [toast]);
@@ -152,6 +183,22 @@ export default function DownloadsView({ reloadToken }: Props) {
     setItems((prev) => prev.filter((x) => x.id !== v.id));
     toast.success(`Deleted the file for “${v.title}”.`);
   });
+  /** The Subscriptions menu's rule: watching a video asks about its file, and
+   *  un-watching one asks nothing. */
+  const toggleWatched = async (v: Video) => {
+    const next = !v.watched;
+    const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
+    const put = (fields: Pick<Video, "watched" | "watched_at">) =>
+      setItems((prev) => prev.map((x) => (x.id === v.id ? { ...x, ...fields } : x)));
+    put(watched);
+    try {
+      await api.setWatched(v.id, next);
+      if (next && hasDownloadedFile(v)) setConfirmFile({ ...v, ...watched });
+    } catch (err) {
+      put({ watched: v.watched, watched_at: v.watched_at });
+      toast.error(errText(err));
+    }
+  };
 
   if (loading && items.length === 0) {
     return (
@@ -173,10 +220,10 @@ export default function DownloadsView({ reloadToken }: Props) {
   }
 
   return (
-    <div className="page">
+    <div className="page" style={{ ["--card-w" as string]: `${cardSize}px` }}>
       <Section title="Active" count={active.length}>
         {active.map((v) => (
-          <Row key={v.id} video={v}>
+          <Row key={v.id} video={v} onPopout={placePopout}>
             <div className="row-progress">
               <div className="bar">
                 <div
@@ -192,31 +239,73 @@ export default function DownloadsView({ reloadToken }: Props) {
                     }${progress[v.id]?.eta ? ` · ETA ${progress[v.id]!.eta}` : ""}`}
               </span>
             </div>
-            <button type="button" className="btn" onClick={() => cancel(v)}>Cancel</button>
+            <RowAction label="Cancel download" onClick={() => cancel(v)}><IconCancel /></RowAction>
           </Row>
         ))}
       </Section>
 
       <Section title="Completed" count={completed.length}>
         {completed.map((v) => (
-          <Row key={v.id} video={v}>
-            <button type="button" className="btn btn-primary" onClick={() => play(v)}>Play</button>
-            <button type="button" className="btn btn-danger" onClick={() => remove(v)}>Delete file</button>
+          <Row key={v.id} video={v} onPopout={placePopout}>
+            <RowAction label="Play" tone="is-primary" onClick={() => play(v)}><IconPlay /></RowAction>
+            <RowAction
+              label={v.watched ? "Mark as unwatched" : "Mark as watched"}
+              tone={v.watched ? "is-on" : undefined}
+              onClick={() => void toggleWatched(v)}
+            >
+              <IconWatched done={v.watched} />
+            </RowAction>
+            <RowAction label="Delete file" tone="is-danger" onClick={() => remove(v)}><IconDelete /></RowAction>
           </Row>
         ))}
       </Section>
 
       <Section title="Failed" count={failed.length}>
         {failed.map((v) => (
-          <Row key={v.id} video={v}>
+          <Row key={v.id} video={v} onPopout={placePopout}>
             <span className="row-error" title={v.download_error ?? ""}>
               {v.download_error ?? "Download failed"}
             </span>
-            <button type="button" className="btn" onClick={() => retry(v)}>Retry</button>
+            <RowAction label="Retry download" onClick={() => retry(v)}><IconRetry /></RowAction>
           </Row>
         ))}
       </Section>
+
+      {confirmFile && (
+        <ConfirmDialog
+          title="Delete the downloaded file?"
+          body={`“${confirmFile.title}” is marked as watched. Its file is still on disk.`}
+          choices={[{ label: "Delete file", value: "delete", danger: true }]}
+          onCancel={() => setConfirmFile(null)}
+          onChoose={() => {
+            const target = confirmFile;
+            setConfirmFile(null);
+            void remove(target);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/** A row's actions are glyphs, so the tooltip and the screen-reader name carry
+ *  the words the buttons used to. */
+function RowAction({ label, tone, onClick, children }: {
+  label: string;
+  tone?: "is-primary" | "is-on" | "is-danger";
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      className={`icon-btn${tone ? ` ${tone}` : ""}`}
+      title={label}
+      onClick={onClick}
+    >
+      {children}
+      <span className="sr-only">{label}</span>
+    </button>
   );
 }
 
@@ -234,16 +323,27 @@ function Section({ title, count, children }: {
   );
 }
 
-function Row({ video, children }: { video: Video; children: ReactNode }) {
+function Row({ video, onPopout, children }: {
+  video: Video;
+  onPopout: (slot: HTMLElement) => void;
+  children: ReactNode;
+}) {
   const src = thumbSrc(video);
   const duration = formatDuration(video.duration_secs);
   return (
     <div className="dl-row">
-      <div className="dl-thumb">
-        {src
-          ? <img src={src} alt="" loading="lazy" decoding="async" />
-          : <div className="card-img-blank" aria-hidden="true" />}
-        {duration && <span className="pill pill-duration">{duration}</span>}
+      {/* The slot holds the row's layout still while the picture inside it lifts
+          out. A striped placeholder has nothing worth enlarging. */}
+      <div
+        className={`dl-thumb${src ? " can-pop" : ""}`}
+        onMouseEnter={src ? (e) => onPopout(e.currentTarget) : undefined}
+      >
+        <div className="dl-pop">
+          {src
+            ? <img src={src} alt="" loading="lazy" decoding="async" />
+            : <div className="card-img-blank" aria-hidden="true" />}
+          {duration && <span className="pill pill-duration">{duration}</span>}
+        </div>
       </div>
       <div className="dl-meta">
         <div className="dl-title" title={video.title}>{video.title}</div>

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
-import type { Channel, Settings, ViewState, VideoFilter } from "./types";
+import type { Channel, Settings, Video, ViewState, VideoFilter } from "./types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
 
@@ -208,5 +208,47 @@ describe("saving the view back", () => {
 
     resolveSettings(settings);
     expect(await screen.findByLabelText("Search videos")).toHaveProperty("value", "python");
+  });
+});
+
+/** One ready card, so the feed has something to open a series from. */
+function feedVideo(): Video {
+  return {
+    id: "vid1", channel_id: "UC1", channel_title: "Veritasium", title: "Some video",
+    description: null, thumb_url: null, thumb_path: null, published_at: 1_700_000_000,
+    sort_at: null, feed_rank: 0, added_manually: false, duration_secs: 754,
+    view_count: 1500, status: "ready", hidden: false, watched: false, watched_at: null,
+    download_state: "none", download_error: null, file_path: null,
+    downloaded_at: null, first_seen_at: 0, sibling_group: null,
+  };
+}
+
+/**
+ * The scroll container is the shell's, and the view that puts an offset back
+ * into it is a child holding a ref to it -- so this covers the one thing the
+ * view's own tests cannot: that the ref reaches `.content` itself.
+ */
+describe("keeping the feed's place across a series visit", () => {
+  it("puts the shell's scroll container back where it was", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+
+    const card = await screen.findByRole("article");
+    const content = document.querySelector(".content") as HTMLElement;
+    content.scrollTop = 900;
+
+    fireEvent.contextMenu(card);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find siblings" }));
+    await waitFor(() => {
+      const calls = listVideos.mock.calls;
+      expect(calls[calls.length - 1][0]).toMatchObject({ siblingOf: "vid1" });
+    });
+    // What the browser does once the grid collapses to the parts of one series.
+    // jsdom lays nothing out, so the clamp is applied by hand.
+    content.scrollTop = 0;
+
+    // Escape leaves the series, the same as the breadcrumb's own button.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(content.scrollTop).toBe(900));
   });
 });

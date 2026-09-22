@@ -1,27 +1,38 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
-import type { Video, VideoGroup } from "../types";
+import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
+import type { Video, VideoFilter, VideoGroup } from "../types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
 
 // jsdom ships no IntersectionObserver, and the grid's infinite scroll wants one.
-class NoopObserver {
+// This one keeps its callbacks, so `pageIn()` below can reach the sentinel the
+// way scrolling to the bottom of the grid does.
+type Fired = (entries: { isIntersecting: boolean }[]) => void;
+const sentinels: Fired[] = [];
+class StubObserver {
+  constructor(fired: Fired) { sentinels.push(fired); }
   observe() {}
   unobserve() {}
   disconnect() {}
 }
-vi.stubGlobal("IntersectionObserver", NoopObserver);
+vi.stubGlobal("IntersectionObserver", StubObserver);
+
+/** Scroll the sentinel into view, which is what fetches the next page. */
+function pageIn() {
+  act(() => { for (const fired of sentinels) fired([{ isIntersecting: true }]); });
+}
 
 const setWatched = vi.fn(() => Promise.resolve());
 const deleteDownload = vi.fn(() => Promise.resolve());
 const markSiblings = vi.fn(() => Promise.resolve(2));
 const unlinkSiblings = vi.fn(() => Promise.resolve());
-const listVideos = vi.fn(() => Promise.resolve(videos));
+// Typed with the filter so a test can page through a library with it.
+const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn(() => Promise.resolve(groups));
 
 vi.mock("../api", () => ({
   api: {
-    listVideos: (...a: unknown[]) => listVideos(...(a as [])),
+    listVideos: (...a: unknown[]) => listVideos(...(a as [VideoFilter])),
     listVideoGroups: (...a: unknown[]) => listVideoGroups(...(a as [])),
     setWatched: (...a: unknown[]) => setWatched(...(a as [])),
     deleteDownload: (...a: unknown[]) => deleteDownload(...(a as [])),
@@ -55,19 +66,29 @@ type ViewProps = Partial<React.ComponentProps<typeof SubscriptionsView>>;
 function renderView(over: ViewProps = {}) {
   const onFindSiblings = vi.fn();
   const onSeriesTally = vi.fn();
-  render(
+  // Stands in for the shell's `.content`: a real element, so a test can move
+  // its offset and read back where the view put it.
+  const scroller = document.createElement("div");
+  document.body.appendChild(scroller);
+  const scrollRef = { current: scroller };
+  const view = (props: ViewProps) => (
     <ToastProvider>
       <SubscriptionsView
         channelId={null} search="" hideWatched={false} downloadedOnly={false}
         sort="newest" showHidden={false} grouped={false} siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
-        channelCount={1} onAdd={vi.fn()}
-        {...over}
+        channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
+        {...props}
       />
-    </ToastProvider>,
+    </ToastProvider>
   );
-  return { onFindSiblings, onSeriesTally };
+  const { rerender } = render(view(over));
+  return {
+    onFindSiblings, onSeriesTally, scroller,
+    /** Re-renders with the props changed, the rest of them as they were. */
+    rerender: (next: ViewProps) => rerender(view({ ...over, ...next })),
+  };
 }
 
 /** Right-click the only card and read back the menu. */
@@ -80,6 +101,7 @@ async function openMenu() {
 beforeEach(() => {
   videos = [video()];
   groups = [];
+  sentinels.length = 0;
   vi.clearAllMocks();
   listVideos.mockImplementation(() => Promise.resolve(videos));
   listVideoGroups.mockImplementation(() => Promise.resolve(groups));
@@ -93,6 +115,8 @@ describe("marking a downloaded video as watched", () => {
 
     await waitFor(() => expect(setWatched).toHaveBeenCalledWith("vid1", true));
     expect(await screen.findByText("Delete the downloaded file?")).toBeTruthy();
+    // It was watched a moment ago, and the copy has to know that.
+    expect(screen.getByText(/is marked as watched/)).toBeTruthy();
     // Asking is not doing: nothing is removed until the choice is made.
     expect(deleteDownload).not.toHaveBeenCalled();
   });
@@ -430,5 +454,74 @@ describe("a series card's right-click menu", () => {
     fireEvent.click(solo, { ctrlKey: true });
     fireEvent.contextMenu(series);
     expect(menuLabels(screen.getByRole("menu"))).toEqual(["Mark 2 videos as siblings"]);
+  });
+});
+
+/* ---------------- keeping your place in the feed ---------------- */
+
+/** A library big enough to page, so "the pages it had" means more than one. */
+function shelf(n: number): Video[] {
+  return Array.from({ length: n }, (_, i) =>
+    video({ id: `v${i}`, title: `Video ${i}`, download_state: "none", file_path: null }));
+}
+
+/** The filter the most recent fetch went out with. */
+function lastFilter(): VideoFilter {
+  const calls = listVideos.mock.calls;
+  return calls[calls.length - 1][0];
+}
+
+describe("keeping your place in the feed", () => {
+  beforeEach(() => {
+    const all = shelf(250);
+    listVideos.mockImplementation((f) =>
+      Promise.resolve(all.slice(f.offset, f.offset + f.limit)));
+  });
+
+  /** Two pages in, scrolled down. Returns the view and its scroll container. */
+  async function twoPagesIn(at: number) {
+    const view = renderView();
+    await cardsReady(100);
+    pageIn();
+    await cardsReady(200);
+    view.scroller.scrollTop = at;
+    return view;
+  }
+
+  it("comes back to where you were when a series is left", async () => {
+    const { scroller, rerender } = await twoPagesIn(4200);
+
+    rerender({ siblingOf: video({ id: "v7" }) });
+    await waitFor(() => expect(lastFilter().siblingOf).toBe("v7"));
+    // What the browser does once the grid collapses to a handful of parts.
+    // jsdom lays nothing out, so the clamp is applied by hand.
+    scroller.scrollTop = 0;
+
+    rerender({ siblingOf: null });
+    // Both pages back in one request: an offset past the end of a single page
+    // would land at the bottom of it instead of where you were.
+    await waitFor(() => expect(lastFilter().limit).toBe(200));
+    await waitFor(() => expect(scroller.scrollTop).toBe(4200));
+  });
+
+  it("stays put when a poll refetches the same feed", async () => {
+    const { scroller, rerender } = await twoPagesIn(3100);
+
+    rerender({ reloadToken: 1 });
+    scroller.scrollTop = 0;
+
+    await waitFor(() => expect(lastFilter().limit).toBe(200));
+    await waitFor(() => expect(scroller.scrollTop).toBe(3100));
+  });
+
+  it("starts a list it has not shown before at the top", async () => {
+    const { scroller, rerender } = await twoPagesIn(3100);
+
+    rerender({ channelId: "UC1" });
+    await waitFor(() => expect(lastFilter().channelId).toBe("UC1"));
+
+    // A different feed, so the pages the old one had mean nothing here.
+    expect(lastFilter().limit).toBe(100);
+    await waitFor(() => expect(scroller.scrollTop).toBe(0));
   });
 });

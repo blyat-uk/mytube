@@ -1,14 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, within } from "@testing-library/react";
 import type { Video } from "../types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
 
 const listVideos = vi.fn(() => Promise.resolve(videos));
+const setWatched = vi.fn((_id: string, _watched: boolean) => Promise.resolve());
+const deleteDownload = vi.fn((_id: string) => Promise.resolve());
 
 vi.mock("../api", () => ({
-  api: { listVideos: (...a: unknown[]) => listVideos(...(a as [])) },
-  thumbSrc: () => "",
+  api: {
+    listVideos: (...a: unknown[]) => listVideos(...(a as [])),
+    setWatched: (id: string, watched: boolean) => setWatched(id, watched),
+    deleteDownload: (id: string) => deleteDownload(id),
+  },
+  thumbSrc: (v: { thumb_path: string | null }) => v.thumb_path ?? "",
   errText: (e: unknown) => String(e),
 }));
 
@@ -40,13 +46,19 @@ function titlesUnder(heading: string): string[] {
 beforeEach(() => {
   vi.clearAllMocks();
   listVideos.mockImplementation(() => Promise.resolve(videos));
+  setWatched.mockImplementation(() => Promise.resolve());
+  deleteDownload.mockImplementation(() => Promise.resolve());
 });
 afterEach(cleanup);
 
-function renderView() {
+/** Stands in for the shell's `.content`, the area a popped-out thumbnail must stay inside. */
+let scrollArea: HTMLElement;
+
+function renderView(cardSize = 260) {
+  scrollArea = document.createElement("main");
   render(
     <ToastProvider>
-      <DownloadsView reloadToken={0} />
+      <DownloadsView reloadToken={0} cardSize={cardSize} scrollRef={{ current: scrollArea }} />
     </ToastProvider>,
   );
 }
@@ -96,5 +108,118 @@ describe("Downloads ordering", () => {
     for (const [filter] of listVideos.mock.calls as unknown as [{ sort: string }][]) {
       expect(filter.sort).toBe("downloaded");
     }
+  });
+});
+
+describe("Downloads row actions", () => {
+  it("offers each row's actions as named icon buttons", async () => {
+    videos = [
+      video({ id: "a", title: "Running", download_state: "downloading" }),
+      video({ id: "b", title: "Finished", download_state: "done" }),
+      video({ id: "c", title: "Broken", download_state: "failed", file_path: null }),
+    ];
+    renderView();
+
+    await screen.findByText("Finished");
+    for (const name of ["Cancel download", "Play", "Mark as watched", "Delete file", "Retry download"]) {
+      const button = screen.getByRole("button", { name });
+      expect(button.classList.contains("icon-btn")).toBe(true);
+      // No visible words: the glyph stands in, and the tooltip names it.
+      expect(button.getAttribute("title")).toBeTruthy();
+    }
+  });
+
+  it("marks a finished download watched, then asks whether to delete its file", async () => {
+    videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Delete the downloaded file?" });
+    expect(within(dialog).getByText(/is marked as watched/)).toBeTruthy();
+    expect(setWatched).toHaveBeenCalledWith("a", true);
+    expect(deleteDownload).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete file" }));
+
+    await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("a"));
+    await waitFor(() => expect(screen.queryByText("Finished")).toBeNull());
+  });
+
+  it("keeps the file, and the row, when the prompt is dismissed", async () => {
+    videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(deleteDownload).not.toHaveBeenCalled();
+    expect(screen.getByText("Finished")).toBeTruthy();
+    // The button now undoes what it just did.
+    expect(screen.getByRole("button", { name: "Mark as unwatched" })).toBeTruthy();
+  });
+
+  it("unmarks a watched download without asking anything", async () => {
+    videos = [video({ id: "a", title: "Seen", download_state: "done", watched: true, watched_at: 5 })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Mark as unwatched" }));
+
+    await waitFor(() => expect(setWatched).toHaveBeenCalledWith("a", false));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(await screen.findByRole("button", { name: "Mark as watched" })).toBeTruthy();
+  });
+
+  it("puts the watched state back, and asks nothing, when the backend refuses", async () => {
+    setWatched.mockImplementation(() => Promise.reject("database is locked"));
+    videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Mark as watched" })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+describe("Downloads thumbnail pop-out", () => {
+  const rect = (left: number, top: number, width: number, height: number) =>
+    ({ left, top, width, height, right: left + width, bottom: top + height, x: left, y: top }) as DOMRect;
+
+  it("hands the Subscriptions card size to the page", async () => {
+    videos = [video({ id: "a", title: "Finished", thumb_path: "/t/a.jpg" })];
+    renderView(640);
+
+    await screen.findByText("Finished");
+    expect(document.querySelector<HTMLElement>(".page")!.style.getPropertyValue("--card-w")).toBe("640px");
+  });
+
+  it("works out where the picture lands when the pointer reaches the thumbnail", async () => {
+    videos = [video({ id: "a", title: "Near the bottom", thumb_path: "/t/a.jpg" })];
+    renderView(640);
+
+    await screen.findByText("Near the bottom");
+    scrollArea.getBoundingClientRect = () => rect(0, 60, 1200, 800);
+    Object.defineProperty(scrollArea, "clientWidth", { value: 1185 });
+    Object.defineProperty(scrollArea, "clientHeight", { value: 800 });
+    const thumb = document.querySelector<HTMLElement>(".dl-thumb")!;
+    thumb.getBoundingClientRect = () => rect(50, 700, 128, 72);
+
+    fireEvent.mouseEnter(thumb);
+
+    expect(thumb.style.getPropertyValue("--pop-w")).toBe("640px");
+    // The area ends at 860; 8px short of that, less 360px of picture, is 492.
+    expect(thumb.style.getPropertyValue("--pop-y")).toBe("-208px");
+  });
+
+  it("leaves a row with no picture where it is", async () => {
+    videos = [video({ id: "a", title: "Blank" })];
+    renderView(640);
+
+    await screen.findByText("Blank");
+    expect(document.querySelector(".dl-thumb")!.classList.contains("can-pop")).toBe(false);
   });
 });

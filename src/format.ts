@@ -48,15 +48,84 @@ export function seriesRuntime(
   return { runtime: formatTotalRuntime(total), unknown };
 }
 
+const DAY_MS = 86_400_000;
+
+function daysInMonth(y: number, m: number): number {
+  return new Date(y, m + 1, 0).getDate();
+}
+
+/**
+ * `date` shifted by whole calendar months, clamped to the target month's length.
+ * 31 Jan plus one month is 28 Feb, not the 3 Mar that `setMonth` alone rolls
+ * over to -- a rollover would make the anchor below overshoot `to` and cost the
+ * span a whole month.
+ */
+function addMonths(date: Date, n: number): Date {
+  const day = date.getDate();
+  const d = new Date(date.getTime());
+  d.setDate(1);
+  d.setMonth(d.getMonth() + n);
+  d.setDate(Math.min(day, daysInMonth(d.getFullYear(), d.getMonth())));
+  return d;
+}
+
+const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+
+/**
+ * Whole days between two instants, counted over the calendar rather than in
+ * 24-hour blocks. A span crossing a spring-forward is an hour short of the days
+ * it plainly covers -- 28 Feb to 30 Mar 2026 is 30 days but 29h23 of them -- and
+ * dividing by 86 400 000 would round that down to 29. The date difference is
+ * rounded (that stray hour is all it can be off by) and the final day only
+ * counts once the time of day has come round again.
+ */
+function daysBetween(from: Date, to: Date): number {
+  const whole = Math.round((startOfDay(to) - startOfDay(from)) / DAY_MS);
+  const sameDayIncomplete =
+    to.getTime() - startOfDay(to) < from.getTime() - startOfDay(from);
+  return Math.max(0, sameDayIncomplete ? whole - 1 : whole);
+}
+
+/**
+ * Whole calendar months between two instants, plus the leftover days.
+ *
+ * Calendar, not 30.44-day arithmetic: a video uploaded on the 8th is "3m 0d"
+ * three months later on the 8th whatever those months were worth, which is the
+ * only reading that survives being checked against a calendar.
+ */
+function calendarSpan(from: Date, to: Date): { months: number; days: number } {
+  let months =
+    (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth());
+  if (addMonths(from, months) > to) months -= 1;
+  if (months < 0) months = 0;
+  return { months, days: daysBetween(addMonths(from, months), to) };
+}
+
+/**
+ * Age of an upload, as the card and the downloads list show it.
+ *
+ * Days run the whole first month -- "23d ago" places an upload where "3w ago"
+ * only gestures at it -- and past 31 days the label carries two units so it
+ * still narrows down to the day: "3m 8d ago", then "1y 2m ago" once a year is
+ * up, rather than a bare year that says nothing for the eleven months after it.
+ *
+ * The months form keeps its day part even at zero ("3m 0d ago"). `m` is already
+ * minutes in the tier above, so a bare "3m ago" would read as three minutes;
+ * the second unit is what disambiguates it. Years have no such clash, so a
+ * clean anniversary is just "1y ago".
+ */
 export function formatRelative(ts: number | null, now = Date.now() / 1000): string {
   if (!ts) return "—";
   const d = Math.max(0, now - ts);
   if (d < 60) return "just now";
   if (d < 3600) return `${Math.floor(d / 60)}m ago`;
   if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
-  if (d < 86400 * 7) return `${Math.floor(d / 86400)}d ago`;
-  if (d < 86400 * 365) return `${Math.floor(d / (86400 * 7))}w ago`;
-  return `${Math.floor(d / (86400 * 365))}y ago`;
+  if (d < 86400 * 32) return `${Math.floor(d / 86400)}d ago`;
+  const { months, days } = calendarSpan(new Date(ts * 1000), new Date(now * 1000));
+  if (months < 12) return `${months}m ${days}d ago`;
+  const years = Math.floor(months / 12);
+  const rest = months % 12;
+  return rest ? `${years}y ${rest}m ago` : `${years}y ago`;
 }
 
 export function formatViews(n: number | null): string {
@@ -131,6 +200,40 @@ export function clampCardSize(px: number): number {
 export function nextCardSize(current: number, deltaY: number): number {
   const dir = deltaY < 0 ? 1 : -1;
   return clampCardSize(current + dir * CARD_STEP);
+}
+
+/** What a popped-out thumbnail keeps between itself and the scroll area's edge. */
+const POPOUT_MARGIN = 8;
+
+export interface Edges {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+/**
+ * Where a Downloads thumbnail lands when it pops out of its row: `width` wide,
+ * pinned to the slot's left edge, `offsetY` below the slot's top.
+ *
+ * It aims for the Subscriptions card size with its top-left corner exactly on
+ * the slot's, and gives ground only to stay inside `area`, the scroll container
+ * that would otherwise clip it: narrower where the right edge runs out, slid up
+ * near the bottom, and down when its row is half scrolled off the top. The top
+ * wins when the area is too short for the whole picture, because that is where
+ * the eye already is. It never ends up smaller than the slot it came out of.
+ */
+export function popoutPlacement(
+  slot: Edges, area: Edges, cardSize: number,
+): { width: number; offsetY: number } {
+  const slotWidth = slot.right - slot.left;
+  const width = Math.max(slotWidth, Math.min(cardSize, area.right - POPOUT_MARGIN - slot.left));
+  const height = (width * 9) / 16;
+  const top = Math.max(
+    area.top + POPOUT_MARGIN,
+    Math.min(slot.top, area.bottom - POPOUT_MARGIN - height),
+  );
+  return { width, offsetY: top - slot.top };
 }
 
 /* ------------------------------------------------------------------ *

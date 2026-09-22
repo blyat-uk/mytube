@@ -8,6 +8,7 @@
  */
 import { ArrowClockwise } from "@phosphor-icons/react/dist/icons/ArrowClockwise";
 import { ArrowSquareOut } from "@phosphor-icons/react/dist/icons/ArrowSquareOut";
+import { CheckCircle } from "@phosphor-icons/react/dist/icons/CheckCircle";
 import { Circle } from "@phosphor-icons/react/dist/icons/Circle";
 import { DownloadSimple } from "@phosphor-icons/react/dist/icons/DownloadSimple";
 import { EyeSlash } from "@phosphor-icons/react/dist/icons/EyeSlash";
@@ -29,6 +30,12 @@ export const IconRetry = () => <ArrowClockwise className="icon" weight="bold" />
 export const IconExternal = () => <ArrowSquareOut className="icon" weight="bold" />;
 export const IconSeries = () => <Stack className="icon" weight="fill" />;
 export const IconDelete = () => <Trash className="icon" weight="bold" />;
+/** Ticked off: an outline while it is still to watch, filled once it is done —
+ *  the counterpart of IconUnwatched's dot. */
+export const IconWatched = ({ done = false }: { done?: boolean }) => (
+  <CheckCircle className="icon" weight={done ? "fill" : "bold"} />
+);
+
 /** Work in flight: IconRetry's arrow again, named for waiting rather than for
  *  retrying — `.icon-btn.is-spinning` is what turns it. */
 export const IconBusy = () => <ArrowClockwise className="icon" weight="bold" />;
