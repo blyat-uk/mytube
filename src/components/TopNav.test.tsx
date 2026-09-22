@@ -8,12 +8,12 @@ const CHANNELS: Channel[] = [
   {
     id: "UC1", title: "Chills Narrated", handle: null,
     url: "https://youtube.com/channel/UC1", thumb_path: null,
-    subscribed: true, added_at: 0, last_polled_at: null,
+    subscribed: true, member: false, added_at: 0, last_polled_at: null,
   },
   {
     id: "UC2", title: "Nexpo", handle: null,
     url: "https://youtube.com/channel/UC2", thumb_path: null,
-    subscribed: true, added_at: 0, last_polled_at: null,
+    subscribed: true, member: true, added_at: 0, last_polled_at: null,
   },
 ];
 

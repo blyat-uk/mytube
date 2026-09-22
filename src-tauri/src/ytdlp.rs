@@ -179,6 +179,7 @@ pub fn parse_flat_entry(json_line: &str) -> Option<FlatEntry> {
         duration_secs: v.get("duration").and_then(|x| x.as_f64()).map(|d| d as i64),
         live_status: v.get("live_status").and_then(|x| x.as_str()).map(str::to_string),
         view_count: v.get("view_count").and_then(|x| x.as_i64()),
+        availability: v.get("availability").and_then(|x| x.as_str()).map(str::to_string),
         published_at: v
             .get("timestamp")
             .and_then(|x| x.as_i64())
@@ -450,6 +451,19 @@ mod tests {
 
         let junk = parse_flat_entry(r#"{"id":"x","title":"T","upload_date":"nonsense"}"#).unwrap();
         assert_eq!(junk.published_at, None, "malformed dates must not panic");
+    }
+
+    /// The field that tells a members-only upload from a public one. It is the
+    /// only way to know: the listing serves both to anyone, membership or not.
+    #[test]
+    fn flat_entries_carry_their_availability() {
+        let members = parse_flat_entry(
+            r#"{"id":"x","title":"T","duration":7982,"availability":"subscriber_only"}"#
+        ).unwrap();
+        assert_eq!(members.availability.as_deref(), Some("subscriber_only"));
+
+        let public = parse_flat_entry(r#"{"id":"y","title":"T","duration":60}"#).unwrap();
+        assert_eq!(public.availability, None, "a public entry says nothing at all");
     }
 
     #[test]

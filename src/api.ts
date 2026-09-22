@@ -23,6 +23,10 @@ export const api = {
   deleteVideo: (videoId: string) => invoke<void>("delete_video", { videoId }),
   pollAll: () => invoke<PollSummary>("poll_all"),
   pollChannel: (channelId: string) => invoke<PollSummary>("poll_channel", { channelId }),
+  /** Records a channel membership. Joining reads one deep listing there and
+   *  then and resolves with the number of members-only videos it found. */
+  setChannelMember: (channelId: string, member: boolean) =>
+    invoke<number>("set_channel_member", { channelId, member }),
   listVideos: (filter: VideoFilter) => invoke<Video[]>("list_videos", { filter }),
   /** The same feed with each channel's series collapsed. `limit`/`offset` count
    *  groups here, not videos. */

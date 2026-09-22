@@ -126,7 +126,7 @@ describe("restoring a channel filter while the channel list is still loading", (
       {
         id: "UC1", title: "Chills Narrated", handle: null,
         url: "https://youtube.com/channel/UC1", thumb_path: null,
-        subscribed: true, added_at: 0, last_polled_at: null,
+        subscribed: true, member: false, added_at: 0, last_polled_at: null,
       },
     ]);
     await new Promise((resolve) => setTimeout(resolve, 100));

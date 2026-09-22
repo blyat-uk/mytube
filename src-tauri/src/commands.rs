@@ -119,6 +119,7 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
                 url: format!("https://www.youtube.com/channel/{channel_id}"),
                 thumb_path: None,
                 subscribed: false,
+                member: false,
                 added_at: chrono::Utc::now().timestamp(),
                 last_polled_at: None,
             })
@@ -187,6 +188,7 @@ pub async fn add_channel(
         url: format!("https://www.youtube.com/channel/{id}"),
         thumb_path: None,
         subscribed: true,
+        member: false,
         added_at: chrono::Utc::now().timestamp(),
         last_polled_at: None,
     };
@@ -264,6 +266,7 @@ pub async fn import_takeout_csv(
             url: format!("https://www.youtube.com/channel/{id}"),
             thumb_path: None,
             subscribed: true,
+            member: false,
             added_at: chrono::Utc::now().timestamp(),
             last_polled_at: None,
         };
@@ -352,6 +355,32 @@ pub async fn poll_channel(
         .map_err(e)?
         .ok_or_else(|| format!("No such channel: {channel_id}"))?;
     Ok(poll::poll_channels(&state, &app, vec![c]).await)
+}
+
+/// Records whether you have joined this channel's membership, and returns how
+/// many members-only uploads that turned up.
+///
+/// Joining reads one listing at backfill depth there and then. The poll's own
+/// window is [`poll::TITLE_REFRESH_LIMIT`] entries and a membership backlog
+/// routinely reaches past it, so anything older would otherwise never be seen
+/// at all -- it has already slid out of the window by the time you join.
+/// Leaving a membership removes nothing: those videos are yours to keep, the
+/// same way an unsubscribed channel's are.
+#[tauri::command]
+pub async fn set_channel_member(
+    channel_id: String,
+    member: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<usize> {
+    if state.db.get_channel(&channel_id).map_err(e)?.is_none() {
+        return Err(format!("No such channel: {channel_id}"));
+    }
+    state.db.set_channel_member(&channel_id, member).map_err(e)?;
+    if !member {
+        return Ok(0);
+    }
+    let depth = config::load().map(|s| s.backfill_count).unwrap_or(30);
+    poll::ingest_members_only(&state, &channel_id, depth).await.map_err(e)
 }
 
 #[tauri::command]

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import TakeoutDialog from "./TakeoutDialog";
+import { IconBusy, IconClose, IconDelete, IconExternal, IconMember } from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import type { AddKind, Channel, TakeoutRow } from "../types";
@@ -35,6 +36,9 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
   const [importing, setImporting] = useState(false);
   const [takeout, setTakeout] = useState<{ path: string; rows: TakeoutRow[] } | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  // By channel, not one at a time: joining reads a whole listing, and a slow
+  // one must not lock the rest of the list.
+  const [joining, setJoining] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const classifyId = useRef(0);
 
@@ -153,6 +157,43 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
     }
   }
 
+  /**
+   * Joins or leaves a channel's membership.
+   *
+   * Joining reads one listing at backfill depth there and then, and the count
+   * that comes back is how many members-only uploads it found — RSS never
+   * carried them, so they have been invisible for as long as the subscription
+   * has existed. Leaving collects nothing further and removes nothing already
+   * collected.
+   */
+  async function setMember(c: Channel) {
+    if (joining.includes(c.id)) return;
+    setJoining((ids) => [...ids, c.id]);
+    try {
+      const found = await api.setChannelMember(c.id, !c.member);
+      onChanged();
+      if (c.member) {
+        toast.info(`Left ${c.title}. Videos already collected stay.`);
+      } else if (found === 0) {
+        toast.info(`No members-only videos found on ${c.title}.`);
+      } else {
+        toast.success(`${found} members-only video${found === 1 ? "" : "s"} added.`);
+      }
+    } catch (err) {
+      toast.error(errText(err));
+    } finally {
+      setJoining((ids) => ids.filter((id) => id !== c.id));
+    }
+  }
+
+  async function openChannel(c: Channel) {
+    try {
+      await api.openExternal(c.url);
+    } catch (err) {
+      toast.error(errText(err));
+    }
+  }
+
   async function removeChannel(c: Channel) {
     try {
       await api.removeChannel(c.id);
@@ -243,29 +284,48 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                 {confirmRemove === c.id ? (
                   <span className="inline-confirm">
                     <span className="inline-confirm-text">Remove and delete its videos?</span>
-                    <button
-                      type="button"
-                      className="btn btn-danger"
+                    <ChannelAction
+                      label={`Remove ${c.title} and delete its videos`}
+                      tone="is-danger"
                       onClick={() => void removeChannel(c)}
                     >
-                      Remove
-                    </button>
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => setConfirmRemove(null)}
-                    >
-                      Keep
-                    </button>
+                      <IconDelete />
+                    </ChannelAction>
+                    <ChannelAction label={`Keep ${c.title}`} onClick={() => setConfirmRemove(null)}>
+                      <IconClose />
+                    </ChannelAction>
                   </span>
                 ) : (
-                  <button
-                    type="button"
-                    className="btn btn-quiet"
-                    onClick={() => setConfirmRemove(c.id)}
-                  >
-                    Remove
-                  </button>
+                  <span className="channel-actions">
+                    <ChannelAction
+                      label={`Open ${c.title} on YouTube`}
+                      onClick={() => void openChannel(c)}
+                    >
+                      <IconExternal />
+                    </ChannelAction>
+                    <ChannelAction
+                      // Every row carries one of these, so the name has to say
+                      // which channel it acts on.
+                      label={`Members — ${c.title}`}
+                      tone={c.member ? "is-on" : undefined}
+                      pressed={c.member}
+                      busy={joining.includes(c.id)}
+                      title={
+                        c.member
+                          ? `You are a member of ${c.title}. Its members-only uploads are collected with the rest.`
+                          : `Joined ${c.title}? Collect its members-only uploads too — the RSS feed never carries them.`
+                      }
+                      onClick={() => void setMember(c)}
+                    >
+                      <IconMember joined={c.member} />
+                    </ChannelAction>
+                    <ChannelAction
+                      label={`Remove ${c.title}`}
+                      onClick={() => setConfirmRemove(c.id)}
+                    >
+                      <IconDelete />
+                    </ChannelAction>
+                  </span>
                 )}
               </li>
             ))}
@@ -286,5 +346,41 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
       />
     )}
     </>
+  );
+}
+
+/**
+ * One glyph in a channel row. The rows are narrow and every channel carries the
+ * same three actions, so the words live in the tooltip and the screen-reader
+ * name instead of on the button — and the name has to name the channel, since
+ * a list of them reads as one column of identical buttons otherwise.
+ *
+ * DownloadsView has a `RowAction` of its own; this one additionally carries the
+ * pressed and busy states the membership toggle needs.
+ */
+function ChannelAction({ label, title, tone, pressed, busy, onClick, children }: {
+  label: string;
+  /** The long explanation, when the tooltip has more to say than the name. */
+  title?: string;
+  tone?: "is-on" | "is-danger";
+  pressed?: boolean;
+  busy?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      className={`icon-btn${tone ? ` ${tone}` : ""}${busy ? " is-spinning" : ""}`}
+      title={title ?? label}
+      aria-pressed={pressed}
+      aria-busy={busy}
+      disabled={busy}
+      onClick={onClick}
+    >
+      {/* `.is-spinning` turns this span, so the glyph has to sit inside one. */}
+      <span aria-hidden="true">{busy ? <IconBusy /> : children}</span>
+      <span className="sr-only">{label}</span>
+    </button>
   );
 }

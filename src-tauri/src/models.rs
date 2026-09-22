@@ -8,6 +8,10 @@ pub struct Channel {
     pub url: String,
     pub thumb_path: Option<String>,
     pub subscribed: bool,
+    /// Whether you have joined this channel's membership. Only
+    /// `Db::set_channel_member` moves it: an upsert carries no such intent,
+    /// and a membership, unlike a subscription, can end.
+    pub member: bool,
     pub added_at: i64,
     pub last_polled_at: Option<i64>,
 }
@@ -231,6 +235,11 @@ pub struct FlatEntry {
     /// which is enough to interleave backfilled videos into the feed by date.
     /// RSS later overwrites the recent window with exact timestamps.
     pub published_at: Option<i64>,
+    /// yt-dlp's `availability`, which is `subscriber_only` for a members-only
+    /// upload and absent for an ordinary one. The listing serves both to
+    /// everyone, member or not, so this says what the video is — never what
+    /// you may watch.
+    pub availability: Option<String>,
 }
 
 /// What the Add box was handed.

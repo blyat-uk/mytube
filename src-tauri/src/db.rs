@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -101,6 +101,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_videos_sibling_group ON videos(sibling_group);",
         )?;
+    }
+
+    if version < 5 {
+        if !column_exists(conn, "channels", "member")? {
+            conn.execute(
+                "ALTER TABLE channels ADD COLUMN member INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -314,7 +323,13 @@ impl Db {
                thumb_path=COALESCE(excluded.thumb_path, channels.thumb_path),
                -- subscribing is a one-way upgrade: adding an ad-hoc video from a
                -- channel you already follow must not silently unsubscribe you.
-               subscribed=MAX(channels.subscribed, excluded.subscribed)",
+               subscribed=MAX(channels.subscribed, excluded.subscribed)
+               -- `member` is deliberately absent: a new row takes the column
+               -- default and an existing one keeps what it had. Every poll
+               -- upserts its channel to catch a rename, and none of those
+               -- carries any opinion about a membership. `Channel::member` is
+               -- therefore read-only through this path -- see
+               -- `set_channel_member`.",
             params![c.id, c.title, c.handle, c.url, c.thumb_path, c.subscribed as i64,
                     if c.added_at == 0 { now() } else { c.added_at }, c.last_polled_at],
         )?;
@@ -335,12 +350,13 @@ impl Db {
     fn channels_where(&self, cond: &str) -> Result<Vec<Channel>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(&format!(
-            "SELECT id,title,handle,url,thumb_path,subscribed,added_at,last_polled_at
+            "SELECT id,title,handle,url,thumb_path,subscribed,added_at,last_polled_at,member
              FROM channels WHERE {cond} ORDER BY title COLLATE NOCASE ASC"))?;
         let rows = st.query_map([], |r| Ok(Channel {
             id: r.get(0)?, title: r.get(1)?, handle: r.get(2)?, url: r.get(3)?,
             thumb_path: r.get(4)?, subscribed: r.get::<_, i64>(5)? != 0,
             added_at: r.get(6)?, last_polled_at: r.get(7)?,
+            member: r.get::<_, i64>(8)? != 0,
         }))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -352,6 +368,14 @@ impl Db {
     pub fn remove_channel(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM channels WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Records whether you have joined this channel's membership, which is what
+    /// lets a poll ingest its members-only uploads.
+    pub fn set_channel_member(&self, id: &str, member: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE channels SET member=?2 WHERE id=?1", params![id, member as i64])?;
         Ok(())
     }
 
@@ -419,24 +443,43 @@ impl Db {
         Ok(())
     }
 
-    /// RSS is the authority on a title: a YouTuber who renames a fresh upload
-    /// is renaming it for everyone, so the feed's string wins over the one
-    /// stored when the row was first seen. Only the ~15 entries a feed carries
-    /// pass through here, which is the whole scope of the feature -- an old
-    /// video is never revisited.
+    /// The channel listing is the authority on a title -- RSS is not, however
+    /// much it looks like it should be. A feed entry carries the title the
+    /// video was *published* under and YouTube never revises it: `<updated>`
+    /// moves, `<title>` does not. Verified on `O0jqUIRhiY0`, renamed a day
+    /// after upload -- the feed, the watch page, its ld+json, oembed and
+    /// `yt-dlp` on the watch URL all still served the original string, while
+    /// `yt-dlp --flat-playlist` over the channel's /videos tab served the new
+    /// one. A rename is therefore visible only by re-reading the listing,
+    /// which `poll::refresh_from_listing` does on every poll.
     ///
-    /// Both guards live in the SQL rather than at the call site, so a poll can
-    /// call this for every entry unconditionally: an empty title from a mangled
-    /// feed must not cost a card its name, and an unchanged title -- almost
-    /// every entry of almost every poll -- must not rewrite the row.
+    /// Batched because that listing is [`TITLE_REFRESH_LIMIT`] entries deep at
+    /// its shallowest and `backfill_count` deep at its deepest: one implicit
+    /// transaction per row would be one fsync per row, for a set where almost
+    /// nothing has changed.
+    ///
+    /// All the guards live in the SQL rather than at the call site, so a poll
+    /// can pass every entry it received: an id belonging to no row must be
+    /// harmless (the listing sees uploads older than anything stored), an
+    /// empty title from a mangled entry must not cost a card its name, and an
+    /// unchanged title -- almost every entry of almost every poll -- must not
+    /// rewrite the row.
     ///
     /// No `added_manually` exemption, unlike [`Db::set_published_at`]: a title
     /// carries no user intent to preserve.
-    pub fn set_title(&self, id: &str, title: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE videos SET title=?2 WHERE id=?1 AND ?2<>'' AND title<>?2",
-            params![id, title])?;
+    ///
+    /// [`TITLE_REFRESH_LIMIT`]: crate::poll::TITLE_REFRESH_LIMIT
+    pub fn set_titles(&self, titles: &[(String, String)]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut st = tx.prepare(
+                "UPDATE videos SET title=?2 WHERE id=?1 AND ?2<>'' AND title<>?2")?;
+            for (id, title) in titles {
+                st.execute(params![id, title])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -843,7 +886,8 @@ mod tests {
     fn chan(id: &str, title: &str) -> Channel {
         Channel { id: id.into(), title: title.into(), handle: None,
                   url: format!("https://www.youtube.com/channel/{id}"),
-                  thumb_path: None, subscribed: true, added_at: 0, last_polled_at: None }
+                  thumb_path: None, subscribed: true, member: false, added_at: 0,
+                  last_polled_at: None }
     }
 
     fn vid(id: &str, ch: &str, published: Option<i64>) -> NewVideo {
@@ -1401,6 +1445,55 @@ mod tests {
         assert_eq!(got.added_at, 42, "added_at must not be overwritten");
     }
 
+    /// Membership is what tells the poll whose members-only uploads it may
+    /// ingest. Unlike `subscribed` it is not a one-way upgrade: a membership
+    /// can be cancelled, so only `set_channel_member` may move it.
+    #[test]
+    fn a_membership_is_recorded_survives_a_poll_and_can_end() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        assert!(!d.list_channels().unwrap()[0].member, "nobody has joined anything yet");
+
+        d.set_channel_member("UC1", true).unwrap();
+        // Every poll upserts the channel to pick up a rename.
+        d.upsert_channel(&chan("UC1", "One Renamed")).unwrap();
+        let got = &d.list_channels().unwrap()[0];
+        assert_eq!(got.title, "One Renamed");
+        assert!(got.member, "an ordinary upsert must not cancel a membership");
+
+        d.set_channel_member("UC1", false).unwrap();
+        assert!(!d.list_channels().unwrap()[0].member);
+    }
+
+    /// v4 is what shipped before memberships existed, so it is the upgrade a
+    /// real library actually takes.
+    #[test]
+    fn migrating_a_v4_database_adds_member_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN downloaded_at INTEGER;
+             ALTER TABLE videos ADD COLUMN sibling_group TEXT;",
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7)",
+            [],
+        ).unwrap();
+        assert!(!column_exists(&conn, "channels", "member").unwrap());
+
+        let db = Db::init(conn).unwrap();
+
+        let c = &db.list_channels().unwrap()[0];
+        assert_eq!(c.title, "One");
+        assert_eq!(c.added_at, 7, "the row survived the migration");
+        assert!(!c.member, "an existing channel has joined nothing");
+        // And the feature works on the upgraded database.
+        db.set_channel_member("UC1", true).unwrap();
+        assert!(db.list_channels().unwrap()[0].member);
+    }
+
     /// The failure mode that only shows up on a database that already has data:
     /// `CREATE TABLE IF NOT EXISTS` does nothing to an existing table, so a new
     /// column must arrive via its own ALTER step.
@@ -1474,6 +1567,7 @@ mod tests {
             let c = db.conn.lock().unwrap();
             assert!(column_exists(&c, "videos", "hidden").unwrap());
             assert!(column_exists(&c, "videos", "sibling_group").unwrap());
+            assert!(column_exists(&c, "channels", "member").unwrap());
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
             assert_eq!(v, SCHEMA_VERSION);
             // Running it again must not error or duplicate anything.
@@ -1628,21 +1722,21 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_rss_title_replaces_the_stored_one() {
+    fn a_changed_listing_title_replaces_the_stored_one() {
         let d = db();
         d.upsert_channel(&chan("UC1", "One")).unwrap();
         d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
-        d.set_title("a", "The Retitled Cut").unwrap();
+        d.set_titles(&[("a".into(), "The Retitled Cut".into())]).unwrap();
         assert_eq!(d.get_video("a").unwrap().unwrap().title, "The Retitled Cut");
     }
 
     #[test]
     fn an_empty_title_never_blanks_a_row() {
-        // A mangled feed entry must not cost a card its name.
+        // A mangled listing entry must not cost a card its name.
         let d = db();
         d.upsert_channel(&chan("UC1", "One")).unwrap();
         d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
-        d.set_title("a", "").unwrap();
+        d.set_titles(&[("a".into(), String::new())]).unwrap();
         assert_eq!(d.get_video("a").unwrap().unwrap().title, "t-a");
     }
 
@@ -1652,7 +1746,7 @@ mod tests {
         d.upsert_channel(&chan("UC1", "One")).unwrap();
         d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
         d.insert_video_if_new(&vid("b", "UC1", Some(200))).unwrap();
-        d.set_title("a", "Only Mine").unwrap();
+        d.set_titles(&[("a".into(), "Only Mine".into())]).unwrap();
         assert_eq!(d.get_video("b").unwrap().unwrap().title, "t-b");
     }
 
@@ -1665,8 +1759,35 @@ mod tests {
         let mut manual = vid("m", "UC1", Some(10));
         manual.added_manually = true;
         d.insert_video_if_new(&manual).unwrap();
-        d.set_title("m", "Renamed By Its Uploader").unwrap();
+        d.set_titles(&[("m".into(), "Renamed By Its Uploader".into())]).unwrap();
         assert_eq!(d.get_video("m").unwrap().unwrap().title, "Renamed By Its Uploader");
+    }
+
+    #[test]
+    fn a_batch_retitles_only_what_actually_changed() {
+        // The listing hands back every entry it saw: mostly unchanged titles,
+        // and ids for videos this library never stored (Shorts, or uploads
+        // older than the rows we keep).
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(100))).unwrap();
+        d.insert_video_if_new(&vid("b", "UC1", Some(200))).unwrap();
+        d.set_titles(&[
+            ("a".into(), "The Retitled Cut".into()),
+            ("b".into(), "t-b".into()),
+            ("never-seen".into(), "Belongs To No Row".into()),
+        ])
+        .unwrap();
+        assert_eq!(d.get_video("a").unwrap().unwrap().title, "The Retitled Cut");
+        assert_eq!(d.get_video("b").unwrap().unwrap().title, "t-b");
+        assert!(d.get_video("never-seen").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_empty_batch_is_not_an_error() {
+        // Every poll of a channel yt-dlp could not list ends up here.
+        let d = db();
+        d.set_titles(&[]).unwrap();
     }
 
     #[test]

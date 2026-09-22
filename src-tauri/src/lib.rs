@@ -117,6 +117,7 @@ pub fn run() {
             commands::delete_video,
             commands::poll_all,
             commands::poll_channel,
+            commands::set_channel_member,
             commands::list_videos,
             commands::list_video_groups,
             commands::mark_siblings,

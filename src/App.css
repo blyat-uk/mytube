@@ -327,6 +327,13 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 .icon-btn:hover:not(:disabled) { background: var(--card-hover); }
 .icon-btn:disabled { cursor: default; }
+/* The same three tones as .btn, for rows that act through glyphs alone. */
+.icon-btn.is-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.icon-btn.is-primary:hover:not(:disabled) { background: #62b7ff; border-color: #62b7ff; }
+.icon-btn.is-on { background: var(--accent-soft); border-color: rgba(62, 166, 255, 0.5); color: #9ed3ff; }
+.icon-btn.is-on:hover:not(:disabled) { background: rgba(62, 166, 255, 0.24); }
+.icon-btn.is-danger { color: #ffc9ca; border-color: rgba(255, 90, 95, 0.4); background: var(--danger-soft); }
+.icon-btn.is-danger:hover:not(:disabled) { background: rgba(255, 90, 95, 0.24); border-color: var(--danger); }
 .icon-btn.is-spinning > span[aria-hidden] {
   display: inline-block;
   animation: spin 900ms linear infinite;
@@ -1221,11 +1228,24 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   white-space: nowrap;
 }
 
+.channel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+/* A row of glyphs, no words: the list is a scroll box 260px tall, so a row that
+   wore three labelled buttons would show half the channels a row of circles
+   does. The star among them IS the membership status, read down the column. */
+.channel-row .icon-btn { width: 28px; height: 28px; }
+.channel-row .icon { width: 15px; height: 15px; }
+
 /* The inline "Remove and delete its videos?" row inside a channel list entry.
    Named apart from .modal.confirm on purpose: a bare .confirm here used to
    match the confirm modal too, laying its title, body and buttons out as three
    centred columns. */
-.inline-confirm { display: flex; align-items: center; gap: 7px; }
+.inline-confirm { display: flex; align-items: center; gap: 6px; }
 .inline-confirm-text { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
 
 /* --- toasts -------------------------------------------------------------- */

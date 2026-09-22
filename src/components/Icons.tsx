@@ -14,6 +14,8 @@ import { EyeSlash } from "@phosphor-icons/react/dist/icons/EyeSlash";
 import { GearSix } from "@phosphor-icons/react/dist/icons/GearSix";
 import { Play } from "@phosphor-icons/react/dist/icons/Play";
 import { SquaresFour } from "@phosphor-icons/react/dist/icons/SquaresFour";
+import { Star } from "@phosphor-icons/react/dist/icons/Star";
+import { Trash } from "@phosphor-icons/react/dist/icons/Trash";
 import { Stack } from "@phosphor-icons/react/dist/icons/Stack";
 import { X } from "@phosphor-icons/react/dist/icons/X";
 
@@ -26,6 +28,15 @@ export const IconCancel = () => <X className="icon" weight="bold" />;
 export const IconRetry = () => <ArrowClockwise className="icon" weight="bold" />;
 export const IconExternal = () => <ArrowSquareOut className="icon" weight="bold" />;
 export const IconSeries = () => <Stack className="icon" weight="fill" />;
+export const IconDelete = () => <Trash className="icon" weight="bold" />;
+/** Work in flight: IconRetry's arrow again, named for waiting rather than for
+ *  retrying — `.icon-btn.is-spinning` is what turns it. */
+export const IconBusy = () => <ArrowClockwise className="icon" weight="bold" />;
+
+/** A channel membership: an outline to offer one, filled once you have joined. */
+export const IconMember = ({ joined = false }: { joined?: boolean }) => (
+  <Star className="icon" weight={joined ? "fill" : "bold"} />
+);
 
 /* The nav wears these only once the window is too narrow for their words, so
    each one lives beside a label it has to stand in for on its own. */

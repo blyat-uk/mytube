@@ -14,6 +14,9 @@ export type AddKind = "channel" | "video" | "short";
 export interface Channel {
   id: string; title: string; handle: string | null; url: string;
   thumb_path: string | null; subscribed: boolean;
+  /** Whether you have joined this channel's membership, which is what lets a
+   *  poll ingest its members-only uploads. */
+  member: boolean;
   added_at: number; last_polled_at: number | null;
 }
 
