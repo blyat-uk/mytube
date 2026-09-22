@@ -36,3 +36,6 @@ dirs = "5"
 anyhow = "1"
 chrono = "0.4"
 regex = "1"
+# Only for `killpg`: cancelling a download has to signal yt-dlp *and* the ffmpeg
+# it shells out to, and std/tokio can only signal the direct child.
+libc = "0.2"

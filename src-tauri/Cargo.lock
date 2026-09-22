@@ -2346,6 +2346,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "ksni",
+ "libc",
  "quick-xml 0.36.2",
  "regex",
  "reqwest 0.12.28",

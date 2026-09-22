@@ -130,6 +130,10 @@ pub fn download_args(video_id: &str, out_path: &Path, print_file: &Path) -> Vec<
 pub async fn probe(url: &str, download_dir: &str, filename_template: &str) -> Result<ProbeInfo> {
     let out = tokio::process::Command::new("yt-dlp")
         .args(probe_args(url, download_dir, filename_template))
+        // Cancelling during phase 1 aborts the task, which drops this future.
+        // Without `kill_on_drop` that leaves a yt-dlp behind with nothing left
+        // to reap it -- the same trap `run_with_timeout` documents below.
+        .kill_on_drop(true)
         .output().await
         .map_err(|e| anyhow!("could not run yt-dlp: {e}"))?;
     if !out.status.success() {
