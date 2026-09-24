@@ -108,13 +108,18 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
     let s = config::load().map_err(e)?;
 
     if state.db.get_video(&video_id).map_err(e)?.is_none() {
+        // The lease lives exactly as long as the probe; the download that
+        // follows takes its own in the queue.
+        let inv = state.tools.ytdlp(&s).await.map_err(e)?;
         let probe = ytdlp::probe(
+            &inv,
             &ytdlp::watch_url(&video_id),
             &s.download_dir,
             &s.filename_template,
         )
         .await
         .map_err(e)?;
+        drop(inv);
 
         let channel_id = if probe.channel_id.is_empty() {
             "UC000000000000000000000".to_string()

@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use crate::db::Db;
 use crate::models::*;
 use crate::queue::Queue;
+use crate::tools::Tools;
 use crate::{config, rss, tray, upload_date, ytdlp};
 
 const FEED_CONCURRENCY: usize = 8;
@@ -78,6 +79,17 @@ fn listing_limit(pending: usize, backfill: u32) -> u32 {
     if pending == 0 { TITLE_REFRESH_LIMIT } else { backfill.max(TITLE_REFRESH_LIMIT) }
 }
 
+/// One channel listing, through whichever yt-dlp `tools` resolves right now.
+///
+/// The settings are re-read for each listing so a changed tool override takes
+/// effect on the next poll. The invocation's lease is held until the listing
+/// has finished, which is what keeps the updater from swapping yt-dlp under it;
+/// a yt-dlp that is not available yet is an ordinary listing failure.
+async fn listing(tools: &Tools, channel_id: &str, limit: u32) -> Result<Vec<FlatEntry>> {
+    let inv = tools.ytdlp(&config::load().unwrap_or_default()).await?;
+    ytdlp::flat_playlist(&inv, channel_id, limit).await
+}
+
 /// The channel listing, read once per poll, for the two things only it knows:
 /// the current title of every entry, and duration/status for rows still
 /// unresolved.
@@ -89,12 +101,13 @@ fn listing_limit(pending: usize, backfill: u32) -> u32 {
 /// Hands the entries back so the one call can also serve [`ingest_listing`],
 /// which needs the same listing to find what RSS never carried. Empty when the
 /// listing could not be read and the failure was swallowed.
-async fn refresh_from_listing(db: &Db, channel_id: &str, backfill: u32, mode: Ingest)
+async fn refresh_from_listing(db: &Db, tools: &Tools, channel_id: &str, backfill: u32,
+                              mode: Ingest)
     -> Result<Vec<FlatEntry>> {
     let cutoff = chrono::Utc::now().timestamp() - RETRY_WINDOW_SECS;
     let pending = db.unresolved_video_ids(channel_id, cutoff)?;
 
-    let entries = match ytdlp::flat_playlist(channel_id, listing_limit(pending.len(), backfill))
+    let entries = match listing(tools, channel_id, listing_limit(pending.len(), backfill))
         .await
     {
         Ok(entries) => entries,
@@ -250,7 +263,7 @@ async fn ingest_listing(state: &AppState, channel_id: &str, entries: &[FlatEntry
 /// leaving the older parts permanently out of sight.
 pub async fn ingest_members_only(state: &AppState, channel_id: &str, depth: u32)
     -> Result<usize> {
-    let entries = ytdlp::flat_playlist(channel_id, depth).await?;
+    let entries = listing(&state.tools, channel_id, depth).await?;
     ingest_listing(state, channel_id, &entries, true, Ingest::MembersOnly).await
 }
 
@@ -373,7 +386,9 @@ pub async fn poll_one(
         new_count += insert_from_feed(&state.db, channel, feed)?;
     }
 
-    let entries = match refresh_from_listing(&state.db, &channel.id, backfill, mode).await {
+    let entries = match refresh_from_listing(&state.db, &state.tools, &channel.id, backfill, mode)
+        .await
+    {
         Ok(entries) => entries,
         // Both sources gone. Only now is the channel an error, and it says so
         // with both reasons: a feed 404 alone is an outage to wait out, while a
@@ -509,7 +524,7 @@ pub async fn poll_channels(
 
 /// One flat-playlist call seeds a newly added channel's back catalogue.
 pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) -> Result<usize> {
-    let entries = ytdlp::flat_playlist(channel_id, count).await?;
+    let entries = listing(&state.tools, channel_id, count).await?;
 
     // The listing carries only `approximate_date` buckets, so ask each watch
     // page for the real instant before these rows are written. Ids that fail
@@ -588,7 +603,9 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         })
         .unwrap();
 
-        refresh_from_listing(&db, CHANNEL, 200, Ingest::MembersOnly).await.expect("listing read");
+        let tools = Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
+        refresh_from_listing(&db, &tools, CHANNEL, 200, Ingest::MembersOnly)
+            .await.expect("listing read");
 
         let title = db.get_video(VIDEO).unwrap().unwrap().title;
         println!("stored title is now: {title}");
@@ -626,14 +643,16 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         // MrBeast: posts to both tabs constantly, so the overlap is meaningful.
         const CHANNEL: &str = "UCX6OQ3DkcsbYNE6H8uQQuVA";
 
-        let videos = ytdlp::flat_playlist(CHANNEL, 30).await.expect("videos tab");
+        let tools = Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
+        let inv = tools.ytdlp(&config::load().unwrap_or_default()).await.expect("a yt-dlp");
+        let videos = ytdlp::flat_playlist(&inv, CHANNEL, 30).await.expect("videos tab");
 
         // The same arguments the poll uses, pointed at the other tab -- the URL
         // is the last one. Built here rather than behind a production helper
         // nothing but this test would call.
-        let mut args = ytdlp::flat_playlist_args(CHANNEL, 30);
+        let mut args = ytdlp::flat_playlist_args(&inv.runner, CHANNEL, 30);
         *args.last_mut().unwrap() = format!("https://www.youtube.com/channel/{CHANNEL}/shorts");
-        let out = tokio::process::Command::new("yt-dlp")
+        let out = crate::proc::command(&inv.runner.program)
             .args(&args).output().await.expect("yt-dlp runs");
         let shorts: Vec<FlatEntry> = String::from_utf8_lossy(&out.stdout)
             .lines()

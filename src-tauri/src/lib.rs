@@ -73,6 +73,7 @@ pub fn run() {
                 db.clone(),
                 app.handle().clone(),
                 settings.max_concurrent_downloads,
+                tools.clone(),
             ));
 
             let state = Arc::new(poll::AppState {

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::models::{FlatEntry, ProbeInfo, VideoStatus};
+use crate::proc;
+use crate::tools::Invocation;
 
 pub const PROGRESS_PREFIX: &str = "MYTUBE|";
 const PROGRESS_TEMPLATE: &str =
@@ -45,25 +47,65 @@ pub fn thumb_url_for(video_id: &str) -> String {
 
 fn s(x: &str) -> String { x.to_string() }
 
+/// What every yt-dlp run is told about this machine: where ffmpeg and deno
+/// are, so it uses exactly what MyTube resolved rather than searching `PATH`
+/// for itself (a GUI launch on macOS or Windows sees a much shorter one).
+/// Each is left out when it resolved to nothing, and yt-dlp then searches on
+/// its own.
+fn runtime_args(r: &Runner) -> Vec<String> {
+    let mut a = Vec::new();
+    if let Some(dir) = &r.ffmpeg_dir {
+        a.extend([s("--ffmpeg-location"), dir.to_string_lossy().into_owned()]);
+    }
+    if let Some(deno) = &r.deno {
+        // `RUNTIME:PATH`, where PATH may be the binary or its directory. deno
+        // is the one runtime yt-dlp enables by default, so naming it here only
+        // pins *which* deno -- it switches nothing else off.
+        a.extend([s("--js-runtimes"), format!("deno:{}", deno.to_string_lossy())]);
+    }
+    a
+}
+
+/// The cookie flag, if any. No cookie source means no flag at all: a
+/// `--cookies-from-browser firefox` on a machine with no Firefox profile fails
+/// every run outright, where no cookies only costs the videos that need them.
+fn cookie_args(c: &Cookies) -> Vec<String> {
+    match c {
+        Cookies::None => Vec::new(),
+        Cookies::Browser(spec) => vec![s("--cookies-from-browser"), spec.clone()],
+        Cookies::File(path) => vec![s("--cookies"), path.to_string_lossy().into_owned()],
+    }
+}
+
 /// Flags shared by the probe and the real download, so the probe resolves the
 /// same extension the download will actually produce.
-fn common_format_args() -> Vec<String> {
-    vec![
+pub fn common_format_args(r: &Runner) -> Vec<String> {
+    let mut a = vec![
         s("-f"), s("bv*+ba/b"),
         s("--merge-output-format"), s("mkv"),
         s("--no-playlist"),
         s("--color"), s("no_color"),
-        s("--cookies-from-browser"), s("firefox"),
+    ];
+    a.extend(cookie_args(&r.cookies));
+    a.extend(runtime_args(r));
+    a.extend([
         s("--remote-components"), s("ejs:npm"),
         s("--remote-components"), s("ejs:github"),
-        s("--no-windows-filenames"),
-    ]
+    ]);
+    // Off Windows, keep the characters Windows forbids (`:` `?` `|` ...) rather
+    // than swapping them for lookalikes: the file is named for the filesystem
+    // it is actually written to. On Windows the substitution is what makes the
+    // name legal at all.
+    #[cfg(not(windows))]
+    a.push(s("--no-windows-filenames"));
+    a
 }
 
 /// Phase 1. Resolves the output template to a concrete path and returns metadata.
 /// The `--print` order is load-bearing: `parse_probe_output` reads lines positionally.
-pub fn probe_args(url: &str, download_dir: &str, filename_template: &str) -> Vec<String> {
-    let mut a = common_format_args();
+pub fn probe_args(r: &Runner, url: &str, download_dir: &str, filename_template: &str)
+    -> Vec<String> {
+    let mut a = common_format_args(r);
     a.extend([
         s("--simulate"), s("--no-warnings"),
         s("--print"), s("%(id)s"),
@@ -134,8 +176,9 @@ pub fn unique_path(intended: &Path, is_taken: impl Fn(&Path) -> bool) -> PathBuf
 
 /// Phase 2. The output path is already decided, so it is forced as an absolute
 /// `-o`, which overrides `-P` (verified). yt-dlp never picks the final name.
-pub fn download_args(video_id: &str, out_path: &Path, print_file: &Path) -> Vec<String> {
-    let mut a = common_format_args();
+pub fn download_args(r: &Runner, video_id: &str, out_path: &Path, print_file: &Path)
+    -> Vec<String> {
+    let mut a = common_format_args(r);
     a.extend([
         s("--embed-thumbnail"),
         s("--convert-thumbnails"), s("jpg"),
@@ -150,14 +193,20 @@ pub fn download_args(video_id: &str, out_path: &Path, print_file: &Path) -> Vec<
 }
 
 /// Runs phase 1 and returns the resolved metadata plus intended path.
-pub async fn probe(url: &str, download_dir: &str, filename_template: &str) -> Result<ProbeInfo> {
-    let out = tokio::process::Command::new("yt-dlp")
-        .args(probe_args(url, download_dir, filename_template))
-        // Cancelling during phase 1 aborts the task, which drops this future.
-        // Without `kill_on_drop` that leaves a yt-dlp behind with nothing left
-        // to reap it -- the same trap `run_with_timeout` documents below.
-        .kill_on_drop(true)
-        .output().await
+///
+/// The caller holds `inv` for as long as this runs, which is what keeps the
+/// updater from swapping yt-dlp out from under it.
+pub async fn probe(inv: &Invocation, url: &str, download_dir: &str, filename_template: &str)
+    -> Result<ProbeInfo> {
+    let r = &inv.runner;
+    let mut cmd = proc::command(&r.program);
+    cmd.args(probe_args(r, url, download_dir, filename_template));
+    // Cancelling during phase 1 aborts the task, which drops this future.
+    // Without a kill on drop that leaves a yt-dlp behind with nothing left to
+    // reap it -- the same trap `run_with_timeout` documents below -- and it has
+    // to be the whole tree: `kill_on_drop` alone reaches PyInstaller's
+    // bootloader and not the real yt-dlp it runs as a child.
+    let out = proc::output(&mut cmd).await
         .map_err(|e| anyhow!("could not run yt-dlp: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -168,8 +217,15 @@ pub async fn probe(url: &str, download_dir: &str, filename_template: &str) -> Re
 }
 
 /// JSON lines, never `--print` with a `|` separator: titles contain `|`.
-pub fn flat_playlist_args(channel_id: &str, limit: u32) -> Vec<String> {
-    vec![
+///
+/// No cookies, deliberately. The listing serves members-only entries to anyone
+/// (see `poll::ingest_listing`), so cookies would buy it nothing, and reading
+/// them is not free: it decrypts a browser's cookie store for every channel of
+/// every poll, and on macOS a Chromium-family browser asks for Keychain access
+/// each time it does.
+pub fn flat_playlist_args(r: &Runner, channel_id: &str, limit: u32) -> Vec<String> {
+    let mut a = runtime_args(r);
+    a.extend([
         s("--flat-playlist"),
         s("-j"),
         // Without this, a flat listing carries no upload date at all, and
@@ -181,7 +237,8 @@ pub fn flat_playlist_args(channel_id: &str, limit: u32) -> Vec<String> {
         s("--no-warnings"),
         s("--color"), s("no_color"),
         channel_videos_url(channel_id),
-    ]
+    ]);
+    a
 }
 
 pub fn parse_progress_line(line: &str) -> Option<(f64, String, String)> {
@@ -249,25 +306,32 @@ const LISTING_TIMEOUT: Duration = Duration::from_secs(180);
 /// running" and only a restart clears it. Nothing is on screen to say so
 /// either, when the window is closed to the tray.
 ///
-/// `kill_on_drop` is what makes the ceiling real: dropping the future on
-/// timeout otherwise leaves the child running with nothing left to reap it.
+/// Killing the child on drop is what makes the ceiling real: dropping the
+/// future on timeout otherwise leaves the child running with nothing left to
+/// reap it. `proc::output` kills its whole tree, because `kill_on_drop` alone
+/// reaches only PyInstaller's bootloader and would leave the real yt-dlp it
+/// runs as a child wedged exactly as before -- one more per poll interval.
 async fn run_with_timeout(
-    program: &str,
+    program: &Path,
     args: Vec<String>,
     limit: Duration,
 ) -> Result<std::process::Output> {
-    let run = tokio::process::Command::new(program)
-        .args(args)
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(limit, run).await {
-        Ok(finished) => finished.map_err(|e| anyhow!("could not run {program}: {e}")),
-        Err(_) => Err(anyhow!("{program} timed out after {}s", limit.as_secs())),
+    let mut cmd = proc::command(program);
+    cmd.args(args);
+    let name = program.display();
+    match tokio::time::timeout(limit, proc::output(&mut cmd)).await {
+        Ok(finished) => finished.map_err(|e| anyhow!("could not run {name}: {e}")),
+        Err(_) => Err(anyhow!("{name} timed out after {}s", limit.as_secs())),
     }
 }
 
-pub async fn flat_playlist(channel_id: &str, limit: u32) -> Result<Vec<FlatEntry>> {
-    let out = run_with_timeout("yt-dlp", flat_playlist_args(channel_id, limit), LISTING_TIMEOUT)
+/// The caller holds `inv` for as long as this runs, which is what keeps the
+/// updater from swapping yt-dlp out from under it.
+pub async fn flat_playlist(inv: &Invocation, channel_id: &str, limit: u32)
+    -> Result<Vec<FlatEntry>> {
+    let r = &inv.runner;
+    let out = run_with_timeout(&r.program, flat_playlist_args(r, channel_id, limit),
+                               LISTING_TIMEOUT)
         .await?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -284,21 +348,118 @@ mod tests {
     use crate::models::VideoStatus;
     use std::path::{Path, PathBuf};
 
+    /// A machine where nothing resolved but yt-dlp itself.
+    fn bare() -> Runner {
+        Runner { program: PathBuf::from("yt-dlp"), ffmpeg_dir: None, deno: None,
+                 cookies: Cookies::None }
+    }
+
+    /// One where everything did, with Firefox cookies -- the Linux setup this
+    /// app grew up on.
+    fn full() -> Runner {
+        Runner {
+            program: PathBuf::from("/bin/dir/yt-dlp"),
+            ffmpeg_dir: Some(PathBuf::from("/tools/ffmpeg dir")),
+            deno: Some(PathBuf::from("/tools/deno")),
+            cookies: Cookies::Browser("firefox".into()),
+        }
+    }
+
     fn args() -> Vec<String> {
-        download_args("abc123", &PathBuf::from("/out/Some Title [abc123].mkv"),
+        download_args(&full(), "abc123", &PathBuf::from("/out/Some Title [abc123].mkv"),
                       &PathBuf::from("/tmp/p.txt"))
+    }
+
+    fn value_of(a: &[String], flag: &str) -> Option<String> {
+        a.iter().position(|x| x == flag).map(|i| a[i + 1].clone())
+    }
+
+    /// Every argv yt-dlp is ever given for a video, for a runner.
+    fn video_argvs(r: &Runner) -> [Vec<String>; 2] {
+        [
+            download_args(r, "abc123", &PathBuf::from("/out/x.mkv"), &PathBuf::from("/tmp/p")),
+            probe_args(r, "https://www.youtube.com/watch?v=x", "/out", "%(title)s.%(ext)s"),
+        ]
     }
 
     #[test]
     fn every_required_flag_is_present() {
-        let a = args();
-        for flag in ["-f", "bv*+ba/b", "--merge-output-format", "mkv",
-                     "--embed-thumbnail", "--convert-thumbnails", "jpg",
-                     "--cookies-from-browser", "firefox",
-                     "--no-windows-filenames", "--no-playlist",
-                     "--color", "no_color", "--newline"] {
-            assert!(a.iter().any(|x| x == flag), "missing {flag} in {a:?}");
+        for r in [bare(), full()] {
+            let a = download_args(&r, "abc123", &PathBuf::from("/out/x.mkv"),
+                                  &PathBuf::from("/tmp/p"));
+            for flag in ["-f", "bv*+ba/b", "--merge-output-format", "mkv",
+                         "--embed-thumbnail", "--convert-thumbnails", "jpg",
+                         "--no-playlist", "--color", "no_color", "--newline"] {
+                assert!(a.iter().any(|x| x == flag), "missing {flag} in {a:?}");
+            }
         }
+    }
+
+    #[test]
+    fn no_cookie_source_passes_no_cookie_flag_at_all() {
+        // `cookies_browser: "auto"` on a machine with no Firefox resolves to
+        // this, and a `--cookies-from-browser firefox` there fails every run.
+        for a in video_argvs(&bare()) {
+            assert!(!a.iter().any(|x| x.starts_with("--cookies")), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_browser_spec_is_passed_verbatim() {
+        let r = Runner { cookies: Cookies::Browser("chrome:Profile 1".into()), ..bare() };
+        for a in video_argvs(&r) {
+            assert_eq!(value_of(&a, "--cookies-from-browser").as_deref(),
+                       Some("chrome:Profile 1"));
+            assert!(!a.contains(&"--cookies".to_string()));
+        }
+    }
+
+    #[test]
+    fn a_cookies_file_is_passed_as_cookies_and_not_as_a_browser() {
+        let r = Runner { cookies: Cookies::File(PathBuf::from("/home/u/my cookies.txt")),
+                         ..bare() };
+        for a in video_argvs(&r) {
+            assert_eq!(value_of(&a, "--cookies").as_deref(), Some("/home/u/my cookies.txt"));
+            assert!(!a.contains(&"--cookies-from-browser".to_string()));
+        }
+    }
+
+    #[test]
+    fn resolved_ffmpeg_and_deno_are_handed_to_every_run() {
+        let r = full();
+        let listing = flat_playlist_args(&r, "UC1", 30);
+        for a in video_argvs(&r).iter().chain([&listing]) {
+            assert_eq!(value_of(a, "--ffmpeg-location").as_deref(), Some("/tools/ffmpeg dir"));
+            assert_eq!(value_of(a, "--js-runtimes").as_deref(), Some("deno:/tools/deno"));
+        }
+    }
+
+    #[test]
+    fn unresolved_ffmpeg_and_deno_leave_yt_dlp_to_search_for_itself() {
+        let r = bare();
+        let listing = flat_playlist_args(&r, "UC1", 30);
+        for a in video_argvs(&r).iter().chain([&listing]) {
+            assert!(!a.contains(&"--ffmpeg-location".to_string()), "{a:?}");
+            assert!(!a.contains(&"--js-runtimes".to_string()), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn windows_filenames_are_kept_minimal_only_off_windows() {
+        for a in video_argvs(&full()) {
+            assert_eq!(a.contains(&"--no-windows-filenames".to_string()), !cfg!(windows),
+                       "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_listing_never_reads_cookies() {
+        let r = Runner { cookies: Cookies::File(PathBuf::from("/c.txt")), ..full() };
+        let a = flat_playlist_args(&r, "UC1", 30);
+        assert!(!a.iter().any(|x| x.starts_with("--cookies")), "{a:?}");
+        let r = Runner { cookies: Cookies::Browser("firefox".into()), ..full() };
+        let a = flat_playlist_args(&r, "UC1", 30);
+        assert!(!a.iter().any(|x| x.starts_with("--cookies")), "{a:?}");
     }
 
     #[test]
@@ -320,7 +481,7 @@ mod tests {
 
     #[test]
     fn percent_signs_in_a_path_are_escaped_for_the_output_template() {
-        let a = download_args("x", &PathBuf::from("/out/100% real (2).mkv"),
+        let a = download_args(&bare(), "x", &PathBuf::from("/out/100% real (2).mkv"),
                               &PathBuf::from("/tmp/p.txt"));
         let i = a.iter().position(|x| x == "-o").unwrap();
         assert_eq!(a[i + 1], "/out/100%% real (2).mkv");
@@ -329,7 +490,8 @@ mod tests {
 
     #[test]
     fn the_probe_resolves_the_template_and_asks_for_every_field() {
-        let a = probe_args("https://www.youtube.com/watch?v=x", "/out", "%(title)s.%(ext)s");
+        let a = probe_args(&full(), "https://www.youtube.com/watch?v=x", "/out",
+                           "%(title)s.%(ext)s");
         assert!(a.contains(&"--simulate".to_string()));
         let at = |flag: &str| a.iter().position(|x| x == flag).map(|i| a[i + 1].clone());
         assert_eq!(at("-P").as_deref(), Some("/out"));
@@ -403,7 +565,7 @@ mod tests {
 
     #[test]
     fn flat_playlist_uses_json_lines_not_pipe_separated_print() {
-        let a = flat_playlist_args("UC1", 30);
+        let a = flat_playlist_args(&bare(), "UC1", 30);
         assert!(a.contains(&"--flat-playlist".to_string()));
         assert!(a.contains(&"-j".to_string()), "must use JSON lines");
         assert!(!a.contains(&"--print".to_string()), "--print splits on | inside titles");
@@ -453,7 +615,7 @@ mod tests {
 
     #[test]
     fn flat_listing_requests_approximate_dates() {
-        let a = flat_playlist_args("UC1", 30);
+        let a = flat_playlist_args(&bare(), "UC1", 30);
         let i = a.iter().position(|x| x == "--extractor-args")
             .expect("flat listings must ask for approximate dates");
         assert_eq!(a[i + 1], "youtubetab:approximate_date");
@@ -507,51 +669,165 @@ mod tests {
         assert_eq!(thumb_url_for("abc"), "https://i.ytimg.com/vi/abc/hqdefault.jpg");
     }
 
-    /// A unique `sleep` duration, so `pgrep` can find this test's own child and
-    /// nobody else's.
-    fn probe_seconds() -> String {
-        format!("300.{}", std::process::id())
-    }
+    /// The tests below run real processes, found through `sh`, `sleep` and
+    /// `pgrep`; the tree kill itself has a Windows test in `proc`.
+    #[cfg(unix)]
+    mod processes {
+        use super::*;
+        use std::sync::Arc;
 
-    fn child_alive(pattern: &str) -> bool {
-        let out = std::process::Command::new("pgrep")
-            .arg("-f").arg(pattern)
-            .output()
-            .expect("pgrep is available");
-        !out.stdout.is_empty()
-    }
-
-    #[tokio::test]
-    async fn a_child_that_finishes_in_time_returns_its_output() {
-        let out = run_with_timeout("echo", vec![s("hello")], Duration::from_secs(10))
-            .await
-            .expect("echo should not time out");
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
-    }
-
-    #[tokio::test]
-    async fn a_child_that_overruns_its_budget_is_an_error_rather_than_a_hang() {
-        let err = run_with_timeout("sleep", vec![probe_seconds()], Duration::from_millis(100))
-            .await
-            .expect_err("a 300s sleep must not survive a 100ms budget");
-        assert!(err.to_string().contains("timed out"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_timed_out_child_is_killed_rather_than_left_running() {
-        // The timeout is only real if the process actually goes away: dropping
-        // the future otherwise leaves yt-dlp running, and the app would collect
-        // one stuck child per poll interval forever.
-        let secs = probe_seconds();
-        let pattern = format!("sleep {secs}");
-        let _ = run_with_timeout("sleep", vec![secs.clone()], Duration::from_millis(100)).await;
-
-        for _ in 0..40 {
-            if !child_alive(&pattern) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        /// A unique `sleep` duration, so `pgrep` can find this test's own child and
+        /// nobody else's.
+        fn probe_seconds() -> String {
+            format!("300.{}", std::process::id())
         }
-        panic!("`{pattern}` outlived the timeout that was supposed to kill it");
+
+        fn child_alive(pattern: &str) -> bool {
+            let out = std::process::Command::new("pgrep")
+                .arg("-f").arg(pattern)
+                .output()
+                .expect("pgrep is available");
+            !out.stdout.is_empty()
+        }
+
+        async fn gone_soon(pattern: &str) -> bool {
+            for _ in 0..40 {
+                if !child_alive(pattern) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Leave nothing behind for the next run if the assertion is about to fail.
+            let _ = std::process::Command::new("pkill").arg("-f").arg(pattern).status();
+            false
+        }
+
+        #[tokio::test]
+        async fn a_child_that_finishes_in_time_returns_its_output() {
+            let out = run_with_timeout(Path::new("echo"), vec![s("hello")],
+                                       Duration::from_secs(10))
+                .await
+                .expect("echo should not time out");
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+        }
+
+        #[tokio::test]
+        async fn a_child_that_overruns_its_budget_is_an_error_rather_than_a_hang() {
+            let err = run_with_timeout(Path::new("sleep"), vec![probe_seconds()],
+                                       Duration::from_millis(100))
+                .await
+                .expect_err("a 300s sleep must not survive a 100ms budget");
+            assert!(err.to_string().contains("timed out"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_timed_out_child_is_killed_rather_than_left_running() {
+            // The timeout is only real if the process actually goes away: dropping
+            // the future otherwise leaves yt-dlp running, and the app would collect
+            // one stuck child per poll interval forever.
+            let secs = probe_seconds();
+            let pattern = format!("sleep {secs}");
+            let _ = run_with_timeout(Path::new("sleep"), vec![secs.clone()],
+                                     Duration::from_millis(100)).await;
+            assert!(gone_soon(&pattern).await,
+                    "`{pattern}` outlived the timeout that was supposed to kill it");
+        }
+
+        #[tokio::test]
+        async fn a_timed_out_listing_kills_the_grandchild_too() {
+            // The standalone yt-dlp is a PyInstaller bootloader that runs the real
+            // yt-dlp as its child. Killing only the process we spawned would leave
+            // that child wedged -- the very thing the timeout exists to prevent.
+            let secs = format!("305.{}", std::process::id());
+            let _ = run_with_timeout(Path::new("sh"),
+                                     vec![s("-c"), format!("sleep {secs} & sleep {secs}")],
+                                     Duration::from_millis(300)).await;
+            assert!(gone_soon(&secs).await, "a grandchild outlived the listing's timeout");
+        }
+
+        /// A stand-in yt-dlp: a script that ignores its arguments and runs `body`.
+        ///
+        /// Written by a `sh` of its own rather than `std::fs::write`. The tests
+        /// run in parallel threads, and a fork in any of them while this process
+        /// holds the file open for writing hands the child a copy of that fd --
+        /// after which exec'ing the script fails with ETXTBSY ("Text file busy")
+        /// until the child gets round to its own exec. Measured: 2 runs in 12.
+        fn fake_ytdlp(name: &str, body: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("mytube-fake-ytdlp-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("yt-dlp");
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(r#"printf '%s\n' "$1" > "$2" && chmod 755 "$2""#)
+                .arg("sh")
+                .arg(format!("#!/bin/sh\n{body}"))
+                .arg(&path)
+                .status()
+                .expect("sh is available");
+            assert!(ok.success(), "could not write {}", path.display());
+            path
+        }
+
+        async fn invocation(program: PathBuf) -> Invocation {
+            Invocation {
+                runner: Runner { program, ..bare() },
+                _lease: Arc::new(tokio::sync::RwLock::new(())).read_owned().await,
+            }
+        }
+
+        #[tokio::test]
+        async fn the_probe_runs_the_yt_dlp_it_was_handed() {
+            let program = fake_ytdlp("probe-ok",
+                "printf 'abc\\nT\\n60\\nNA\\nCh\\nUC1\\n/out/T [abc].mkv\\n'");
+            let inv = invocation(program.clone()).await;
+            let p = probe(&inv, "https://www.youtube.com/watch?v=abc", "/out", "%(title)s")
+                .await;
+            let _ = std::fs::remove_dir_all(program.parent().unwrap());
+            let p = p.expect("the fake yt-dlp prints a full probe");
+            assert_eq!(p.id, "abc");
+            assert_eq!(p.duration_secs, Some(60));
+            assert_eq!(p.intended_path, "/out/T [abc].mkv");
+        }
+
+        #[tokio::test]
+        async fn a_listing_runs_the_yt_dlp_it_was_handed() {
+            let program = fake_ytdlp("listing-ok",
+                r#"echo '{"id":"a","title":"A","duration":60}'; echo '{"id":"b","title":"B"}'"#);
+            let inv = invocation(program.clone()).await;
+            let entries = flat_playlist(&inv, "UC1", 30).await;
+            let _ = std::fs::remove_dir_all(program.parent().unwrap());
+            let ids: Vec<String> = entries.expect("the fake listing succeeds")
+                .into_iter().map(|e| e.id).collect();
+            assert_eq!(ids, vec!["a", "b"]);
+        }
+
+        #[tokio::test]
+        async fn an_aborted_probe_kills_the_whole_tree() {
+            // Cancelling a download in phase 1 aborts its task, which drops the
+            // probe mid-flight. Everything the probe started has to go with it.
+            let secs = format!("306.{}", std::process::id());
+            let program = fake_ytdlp("probe-abort", &format!("sleep {secs} & sleep {secs}"));
+            let inv = invocation(program.clone()).await;
+            let task = tokio::spawn(async move {
+                let _ = probe(&inv, "u", "/out", "t").await;
+            });
+            for _ in 0..80 {
+                if child_alive(&secs) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let started = child_alive(&secs);
+
+            task.abort();
+            let _ = task.await;
+
+            let gone = gone_soon(&secs).await;
+            let _ = std::fs::remove_dir_all(program.parent().unwrap());
+            assert!(started, "the fake probe should be running before the abort");
+            assert!(gone, "something the probe started outlived its abort");
+        }
     }
 }
+

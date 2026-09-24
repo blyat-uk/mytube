@@ -8,7 +8,8 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::db::Db;
 use crate::models::{DownloadProgress, DownloadState, DownloadStateEvent};
-use crate::ytdlp;
+use crate::tools::Tools;
+use crate::{config, proc, ytdlp};
 
 /// Keeps the last `max` characters, never splitting a UTF-8 boundary.
 pub fn tail(s: &str, max: usize) -> String {
@@ -52,22 +53,37 @@ impl PathClaims {
 
 /// One in-flight download's stop button.
 ///
-/// The cancelled flag and the process group live behind one lock because they
+/// The cancelled flag and the kill handle live behind one lock because they
 /// are read and written together. A cancel arriving between `run_one` asking
 /// "am I cancelled?" and handing over the yt-dlp it has just spawned would
 /// otherwise find no process to kill and leave no word that it happened -- and
 /// the download would run to completion with nothing left to stop it.
-#[derive(Default)]
-struct Job {
-    inner: std::sync::Mutex<JobInner>,
+///
+/// `K` is the handle that kills yt-dlp's tree: [`proc::KillTree`] for real,
+/// and a plain number in the tests, which check the handover and not the kill.
+///
+/// Signalling yt-dlp alone is not enough: it shells out to ffmpeg to merge the
+/// separate video and audio streams, and an orphaned ffmpeg carries on writing
+/// the very file the cancel is about to delete. Every download is spawned
+/// through `proc::spawn_tree` -- its own process group on unix, its own Job
+/// Object on Windows -- so that one kill reaches the lot.
+struct Job<K = proc::KillTree> {
+    inner: std::sync::Mutex<JobInner<K>>,
 }
 
-#[derive(Default)]
-struct JobInner {
+impl<K> Default for Job<K> {
+    fn default() -> Self {
+        Job {
+            inner: std::sync::Mutex::new(JobInner { cancelled: false, tree: None, spawned: false }),
+        }
+    }
+}
+
+struct JobInner<K> {
     cancelled: bool,
-    /// The group yt-dlp is running in, for as long as it is running.
-    pgid: Option<i32>,
-    /// Set when yt-dlp is spawned and never cleared. `pgid` answers "is there
+    /// The tree yt-dlp is running in, for as long as it is running.
+    tree: Option<K>,
+    /// Set when yt-dlp is spawned and never cleared. `tree` answers "is there
     /// something to kill?"; this answers "might there be a part file on disk?",
     /// which stays true after the child is reaped and is what tells `cancel` to
     /// wait for the job to clear up rather than abort it where it stands.
@@ -75,61 +91,44 @@ struct JobInner {
 }
 
 /// What `cancel` needs to know about the job it just stopped.
-struct Stop {
-    pgid: Option<i32>,
+struct Stop<K> {
+    tree: Option<K>,
     spawned: bool,
 }
 
-impl Job {
+impl<K> Job<K> {
     fn is_cancelled(&self) -> bool {
         self.inner.lock().unwrap().cancelled
     }
 
-    /// Marks the job cancelled and hands back the group to kill, once.
-    fn cancel(&self) -> Stop {
+    /// Marks the job cancelled and hands back the tree to kill, once.
+    fn cancel(&self) -> Stop<K> {
         let mut g = self.inner.lock().unwrap();
         g.cancelled = true;
         Stop {
             // Taken, not copied: a second cancel must not signal a pid the
             // kernel has since handed to somebody else.
-            pgid: g.pgid.take(),
+            tree: g.tree.take(),
             spawned: g.spawned,
         }
     }
 
-    /// Adopts the process group yt-dlp was spawned into. Returns false if a
-    /// cancel got in first, in which case the caller must kill what it has just
-    /// spawned itself -- nobody else now holds the pid.
-    fn started(&self, pgid: i32) -> bool {
+    /// Adopts the tree yt-dlp was spawned into. Returns false if a cancel got
+    /// in first, in which case the caller must kill what it has just spawned
+    /// itself -- nobody else now holds a handle to it.
+    fn started(&self, tree: K) -> bool {
         let mut g = self.inner.lock().unwrap();
         g.spawned = true;
         if g.cancelled {
             return false;
         }
-        g.pgid = Some(pgid);
+        g.tree = Some(tree);
         true
     }
 
-    /// yt-dlp has exited; there is no longer a group worth signalling.
+    /// yt-dlp has exited; there is no longer a tree worth killing.
     fn reaped(&self) {
-        self.inner.lock().unwrap().pgid = None;
-    }
-}
-
-/// SIGKILLs a whole process group.
-///
-/// Signalling yt-dlp alone is not enough: it shells out to ffmpeg to merge the
-/// separate video and audio streams, and an orphaned ffmpeg carries on writing
-/// the very file the cancel is about to delete. Every download is spawned into
-/// its own group (`process_group(0)`) so that one signal reaches the lot, and
-/// the group id is the leader's pid.
-fn kill_group(pgid: i32) {
-    if pgid > 0 {
-        // Safe: `killpg` only signals, and the group is one we created, so this
-        // can never reach mytube's own process.
-        unsafe {
-            libc::killpg(pgid, libc::SIGKILL);
-        }
+        self.inner.lock().unwrap().tree = None;
     }
 }
 
@@ -233,13 +232,15 @@ pub struct Queue {
     running: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<Job>>>>,
     claims: Arc<PathClaims>,
+    tools: Arc<Tools>,
 }
 
 impl Queue {
-    pub fn new(db: Arc<Db>, app: AppHandle, concurrency: usize) -> Self {
+    pub fn new(db: Arc<Db>, app: AppHandle, concurrency: usize, tools: Arc<Tools>) -> Self {
         Self {
             db,
             app,
+            tools,
             sem: Arc::new(Semaphore::new(concurrency.max(1))),
             permits: Arc::new(Mutex::new(concurrency.max(1))),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -265,8 +266,8 @@ impl Queue {
         // file the library is about to forget about.
         let job = self.cancels.lock().await.get(video_id).cloned();
         let stop = job.map(|j| j.cancel());
-        if let Some(pgid) = stop.as_ref().and_then(|s| s.pgid) {
-            kill_group(pgid);
+        if let Some(tree) = stop.as_ref().and_then(|s| s.tree.as_ref()) {
+            tree.kill();
         }
 
         if let Some(h) = self.running.lock().await.remove(video_id) {
@@ -329,6 +330,7 @@ impl Queue {
         let running = self.running.clone();
         let cancels = self.cancels.clone();
         let claims = self.claims.clone();
+        let tools = self.tools.clone();
         let vid = video_id.clone();
 
         let handle = tokio::spawn(async move {
@@ -341,7 +343,7 @@ impl Queue {
                 cancels.lock().await.remove(&vid);
                 return;
             }
-            let result = run_one(&db, &app, &vid, &dir, &template, &cancel, &claims).await;
+            let result = run_one(&db, &app, &tools, &vid, &dir, &template, &cancel, &claims).await;
             if let Err(e) = result {
                 let msg = tail(&e.to_string(), 2000);
                 let _ = db.set_download_state(&vid, DownloadState::Failed, None, Some(&msg));
@@ -364,9 +366,11 @@ impl Queue {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     db: &Db,
     app: &AppHandle,
+    tools: &Tools,
     video_id: &str,
     dir: &str,
     template: &str,
@@ -388,8 +392,14 @@ async fn run_one(
         },
     );
 
+    // One yt-dlp for both phases, resolved now rather than at enqueue so a job
+    // that sat in the queue gets whatever is installed when it starts. Its
+    // lease is held until the download is reaped: the updater never swaps
+    // yt-dlp while a job is using it. Not available yet is an ordinary failure.
+    let inv = tools.ytdlp(&config::load().unwrap_or_default()).await?;
+
     // Phase 1: resolve the output template to a concrete path.
-    let probe = ytdlp::probe(&ytdlp::watch_url(video_id), dir, template).await?;
+    let probe = ytdlp::probe(&inv, &ytdlp::watch_url(video_id), dir, template).await?;
     let intended = PathBuf::from(&probe.intended_path);
     if intended.as_os_str().is_empty() {
         return Err(anyhow!("yt-dlp could not resolve an output filename"));
@@ -413,29 +423,29 @@ async fn run_one(
         print_file: print_file.clone(),
     };
 
-    let mut child = tokio::process::Command::new("yt-dlp")
-        .args(ytdlp::download_args(video_id, &out_path, &print_file))
-        // Its own process group, so a cancel reaches the ffmpeg yt-dlp shells
-        // out to for the merge as well as yt-dlp itself. `kill_on_drop` covers
-        // the leader alone, and is the backstop for an aborted task.
-        .process_group(0)
-        .kill_on_drop(true)
+    let mut cmd = proc::command(&inv.runner.program);
+    cmd.args(ytdlp::download_args(&inv.runner, video_id, &out_path, &print_file))
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    // Its own tree -- a process group on unix, a Job Object on Windows -- so a
+    // cancel reaches the ffmpeg yt-dlp shells out to for the merge, and the
+    // real yt-dlp behind PyInstaller's bootloader, as well as the process we
+    // spawned. Dropping `child` before it is reaped kills the tree too, which
+    // is the backstop for an aborted task.
+    let mut child = proc::spawn_tree(&mut cmd)
         .map_err(|e| anyhow!("could not run yt-dlp: {e}"))?;
 
-    // The group id is the leader's pid. Handing it over also re-reads the
-    // cancel flag under the one lock, so a cancel landing in this instant
-    // cannot miss the process it was meant to kill -- it just leaves the
-    // killing to us.
-    let pgid = child.id().unwrap_or(0) as i32;
-    if !cancel.started(pgid) {
-        kill_group(pgid);
+    // Handing the tree over also re-reads the cancel flag under the one lock,
+    // so a cancel landing in this instant cannot miss the process it was meant
+    // to kill -- it just leaves the killing to us.
+    let tree = child.tree();
+    if !cancel.started(tree.clone()) {
+        tree.kill();
     }
 
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+    let stdout = child.child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let stderr = child.child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
     let app2 = app.clone();
     let vid2 = video_id.to_string();
@@ -526,10 +536,12 @@ mod tests {
     /// A unique `sleep` duration, so `pgrep` finds this test's own children and
     /// nobody else's. It has to stay a number `sleep` accepts, so the process
     /// id goes after the decimal point rather than into a suffix.
+    #[cfg(unix)]
     fn probe_seconds() -> String {
         format!("301.{}", std::process::id())
     }
 
+    #[cfg(unix)]
     fn alive(pattern: &str) -> bool {
         let out = std::process::Command::new("pgrep")
             .arg("-f")
@@ -539,20 +551,19 @@ mod tests {
         !out.stdout.is_empty()
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_kills_the_grandchild_too_not_just_yt_dlp() {
         // yt-dlp shells out to ffmpeg for the merge. Signalling only the child
         // leaves ffmpeg writing the very file the cancel is about to delete,
-        // which is why the download gets a process group of its own.
+        // which is why the download gets a process tree of its own. Driven
+        // through a real `Job`, the way `run_one` and `Queue::cancel` do it.
         let secs = probe_seconds();
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("sleep {secs} & sleep {secs}"))
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .expect("sh is available");
-        let pgid = child.id().expect("a freshly spawned child has a pid") as i32;
+        let mut cmd = proc::command("sh");
+        cmd.arg("-c").arg(format!("sleep {secs} & sleep {secs}"));
+        let mut child = proc::spawn_tree(&mut cmd).expect("sh is available");
+        let job: Job = Job::default();
+        assert!(job.started(child.tree()));
 
         for _ in 0..40 {
             if alive(&secs) {
@@ -562,7 +573,7 @@ mod tests {
         }
         assert!(alive(&secs), "the sleeps should be running before we cancel");
 
-        kill_group(pgid);
+        job.cancel().tree.expect("a running job hands over its tree").kill();
         let _ = child.wait().await;
 
         for _ in 0..40 {
@@ -639,9 +650,9 @@ mod tests {
 
     #[test]
     fn a_job_cancelled_before_yt_dlp_starts_has_nothing_to_kill_and_nothing_to_wait_for() {
-        let job = Job::default();
+        let job = Job::<i32>::default();
         let stop = job.cancel();
-        assert_eq!(stop.pgid, None);
+        assert_eq!(stop.tree, None);
         assert!(!stop.spawned, "nothing was spawned, so there is no part file to clear");
         assert!(job.is_cancelled());
     }
@@ -651,20 +662,20 @@ mod tests {
         // The cancel lands between "am I cancelled?" and "here is my yt-dlp".
         // `started` must refuse the handover so the caller kills what it just
         // spawned -- otherwise the download runs on with nothing to stop it.
-        let job = Job::default();
+        let job = Job::<i32>::default();
         job.cancel();
-        assert!(!job.started(4242), "a cancelled job must not adopt a process group");
+        assert!(!job.started(4242), "a cancelled job must not adopt a tree");
     }
 
     #[test]
     fn cancelling_a_running_job_yields_the_group_to_kill_exactly_once() {
-        let job = Job::default();
+        let job = Job::<i32>::default();
         assert!(job.started(4242));
         let stop = job.cancel();
-        assert_eq!(stop.pgid, Some(4242));
+        assert_eq!(stop.tree, Some(4242));
         assert!(stop.spawned);
         // A second cancel must not signal a pid that has since been reused.
-        assert_eq!(job.cancel().pgid, None);
+        assert_eq!(job.cancel().tree, None);
     }
 
     #[test]
@@ -672,11 +683,11 @@ mod tests {
         // yt-dlp has exited but `run_one` is still writing the row. There is no
         // group left to kill, yet a file is on disk -- so `cancel` must still
         // wait for the job to clear up rather than abort it where it stands.
-        let job = Job::default();
+        let job = Job::<i32>::default();
         assert!(job.started(4242));
         job.reaped();
         let stop = job.cancel();
-        assert_eq!(stop.pgid, None);
+        assert_eq!(stop.tree, None);
         assert!(stop.spawned);
     }
 
