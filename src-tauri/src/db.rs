@@ -2110,7 +2110,7 @@ mod tests {
 
     #[test]
     fn find_siblings_still_returns_exactly_what_the_card_holds() {
-        // The invariant CLAUDE.md records, now that a manual mark can widen a
+        // The grouping invariant, which matters more now that a manual mark can widen a
         // group: opening a card must show precisely the card's own parts.
         let d = db();
         titled(&d, "UC1", &[

@@ -3,7 +3,7 @@
 **Most people want a release instead.** Ready-made builds for Linux (`.deb`,
 `.rpm`, AppImage), Windows and macOS are on the
 [Releases page](https://github.com/blyat-uk/mytube/releases/latest); the
-[top-level README](../README.md#install) says which file to pick. This page is
+[top-level README](../README.md#download) says which file to pick. This page is
 for building from source and installing the result into your home directory,
 which is how a development checkout stays launchable.
 
@@ -87,7 +87,7 @@ These are not bundled, and most of them no longer need installing by hand.
 | YouTube cookies | Settings → YouTube cookies. The default, Automatic, reads Firefox's cookies when a Firefox profile exists; a `cookies.txt` file works too.                                          |
 | A video player | Used to play downloaded files. Settings → Player lists the ones installed (mpv, SMPlayer, VLC, Celluloid, Haruna, flatpak exports…), or "System default" for your desktop's choice. |
 
-See [the top-level README](../README.md#first-run) for where the managed tools
+See [the top-level README](../README.md#download) for where the managed tools
 come from and how to override them.
 
 ## Configuration

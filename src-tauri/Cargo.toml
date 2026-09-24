@@ -1,8 +1,11 @@
 [package]
 name = "mytube"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A desktop YouTube subscription feed and downloader"
+authors = ["blyat-uk"]
+license = "MIT"
+repository = "https://github.com/blyat-uk/mytube"
+homepage = "https://mytube.blyat.uk"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

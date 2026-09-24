@@ -13,8 +13,7 @@ dist-ssr
 *.local
 
 # Editor directories and files
-.vscode/*
-!.vscode/extensions.json
+.vscode/
 .idea
 .DS_Store
 *.suo
@@ -32,3 +31,7 @@ __pycache__/
 
 # agent worktrees
 .claude/worktrees/
+
+# Local-only notes and design docs, kept out of the repository
+CLAUDE.md
+docs/
