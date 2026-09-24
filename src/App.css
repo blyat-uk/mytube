@@ -1140,6 +1140,9 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 
 .field { margin-bottom: 20px; }
 .field-label { font-weight: 600; margin-bottom: 6px; }
+/* A section's caption is a real heading for screen readers, drawn exactly as
+   the caption it replaced. */
+h3.field-label { font-size: inherit; letter-spacing: normal; }
 .field-hint { display: block; font-size: 12.5px; color: var(--faint); margin-top: 6px; }
 .field .text-input { width: 100%; }
 
@@ -1300,6 +1303,14 @@ label.field-label { display: block; }
   margin: 7px 0 0;
   font-size: 12.5px;
   color: #ffb9ba;
+  overflow-wrap: anywhere;
+}
+/* The same line in the row's own quiet voice: the tool works, this is only
+   why it may not be the newest. */
+.tool-note {
+  margin: 7px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 

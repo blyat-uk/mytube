@@ -91,13 +91,17 @@ export default function ToolsSection({ channel, autoUpdate, onChannel, onAutoUpd
   async function updateNow(announce: boolean) {
     setChecking(true);
     const before = ytdlp?.version ?? null;
+    // A yt-dlp that was not already MyTube's own is not updated by this call
+    // but installed, and the shell says "yt-dlp is ready." for that — a second
+    // "updated to" toast on top would announce one event twice.
+    const wasManaged = ytdlp?.source === "managed";
     try {
       const list = await api.toolsUpdateNow();
       apply(list);
       // Only a managed yt-dlp is ever updated, so only then does "up to date"
       // mean something; a Retry speaks through its rows instead.
       const after = list.find((t) => t.kind === "ytdlp");
-      if (announce && after?.source === "managed" && after.state === "ready") {
+      if (announce && wasManaged && after?.source === "managed" && after.state === "ready") {
         if (after.version && after.version !== before) {
           toast.success(`yt-dlp updated to ${after.version}.`);
         } else {
@@ -113,7 +117,7 @@ export default function ToolsSection({ channel, autoUpdate, onChannel, onAutoUpd
 
   return (
     <section className="settings-block" aria-labelledby="tools-title">
-      <div className="field-label" id="tools-title">Tools</div>
+      <h3 className="field-label" id="tools-title">Tools</h3>
       <p className="field-hint">
         MyTube fetches whatever is missing and keeps its own yt-dlp current. A path set by
         hand in <code>settings.json</code> always wins.
@@ -162,12 +166,13 @@ export default function ToolsSection({ channel, autoUpdate, onChannel, onAutoUpd
             id="ytdlp-channel"
             className="select settings-select"
             value={channel === "stable" ? "stable" : "nightly"}
+            aria-describedby="ytdlp-channel-hint"
             onChange={(e) => onChannel(e.currentTarget.value)}
           >
             <option value="nightly">Nightly (recommended)</option>
             <option value="stable">Stable</option>
           </select>
-          <div className="field-hint">
+          <div className="field-hint" id="ytdlp-channel-hint">
             YouTube breaks things often, and the fixes reach nightly first.
           </div>
         </div>
@@ -227,7 +232,12 @@ function ToolRow({ tool, progress }: { tool: ToolStatus; progress?: ToolProgress
           </span>
         </div>
       )}
-      {tool.error && <p className="tool-error">{tool.error}</p>}
+      {/* Only a broken tool gets the alert. A working one can still carry an
+          error — a managed yt-dlp whose update check failed stays usable at the
+          version it has — and that is a note, not a reason to reach for Retry. */}
+      {tool.error && (tool.state === "error"
+        ? <p className="tool-error">{tool.error}</p>
+        : <p className="tool-note">{tool.error}</p>)}
     </li>
   );
 }

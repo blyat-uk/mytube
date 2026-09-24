@@ -437,7 +437,7 @@ export default function SettingsView() {
       />
 
       <div className="transfer-block">
-        <div className="field-label">Backup &amp; transfer</div>
+        <h3 className="field-label">Backup &amp; transfer</h3>
         <p className="field-hint">
           Everything lives in <code>~/.config/mytube</code> — channels, videos, settings and
           cached thumbnails. This packs it into one zip, enough to pick the library up on

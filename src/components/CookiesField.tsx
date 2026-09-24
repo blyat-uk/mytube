@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import Field from "./Field";
+import Field, { hintId } from "./Field";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { COOKIES_AUTO, type BrowserOption, type Settings } from "../types";
@@ -101,6 +101,7 @@ export default function CookiesField({ browser, file, onPick }: Props) {
           className="select settings-select"
           value={selected}
           disabled={picking}
+          aria-describedby={hint ? hintId("cookies-select") : undefined}
           onChange={(e) => choose(e.currentTarget.value)}
         >
           <option value={COOKIES_AUTO}>{autoLabel}</option>

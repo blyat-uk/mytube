@@ -197,6 +197,45 @@ describe("Player", () => {
     expect((screen.getByLabelText("Player command") as HTMLInputElement).value).toBe("vlc");
     expect(saveSettings).not.toHaveBeenCalled();
   });
+
+  /** Typing that happens to spell a detected command must not swap the field
+   *  for that player: the input would unmount mid-edit, never fire its blur,
+   *  and the select would show a choice settings.json does not hold. */
+  it.each([
+    ["backspaced to a detected player", "mpv"],
+    ["cleared to the system default", ""],
+  ])("keeps the text field when the command is %s, and saves it on blur", async (_, typed) => {
+    settings = { ...SETTINGS, player_command: "mpv --fullscreen" };
+    const select = await playerSelect();
+    const custom = screen.getByLabelText("Player command") as HTMLInputElement;
+    fireEvent.focus(custom);
+    fireEvent.change(custom, { target: { value: typed } });
+
+    const still = screen.getByLabelText("Player command") as HTMLInputElement;
+    expect(still).toBe(custom);
+    expect(still.value).toBe(typed);
+    expect(select.value).toBe("__custom");
+
+    fireEvent.blur(still);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(lastSaved().player_command).toBe(typed);
+  });
+
+  it("closes the text field again once a player is picked from the list", async () => {
+    const select = await playerSelect();
+    fireEvent.change(select, { target: { value: "vlc" } });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(select.value).toBe("vlc");
+    expect(screen.queryByLabelText("Player command")).toBeNull();
+  });
+
+  it("links the hint to the select for a screen reader", async () => {
+    settings = { ...SETTINGS, player_command: "vlc" };
+    const select = await playerSelect();
+    const described = select.getAttribute("aria-describedby");
+    expect(described).toBeTruthy();
+    expect(document.getElementById(described!)?.textContent).toBe("Opens each download with vlc.");
+  });
 });
 
 describe("YouTube cookies", () => {
@@ -307,6 +346,70 @@ describe("Tools", () => {
     await screen.findByText("Managed by MyTube");
     fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
     expect(await screen.findByText("busy: a download is using yt-dlp")).toBeDefined();
+  });
+
+  /** An update check that fails leaves a managed yt-dlp working at the version
+   *  it has: said quietly under the row, with no alert and no Retry. */
+  it("shows a working tool's error as a note, not an alert", async () => {
+    tools = [
+      { ...TOOLS_OK[0], error: "Update check failed: HTTP 503" },
+      TOOLS_OK[1],
+      TOOLS_OK[2],
+    ];
+    await renderSettings();
+    const note = await screen.findByText("Update check failed: HTTP 503");
+    expect(note.className).toBe("tool-note");
+    expect(note.closest(".tool-row")?.classList.contains("is-error")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("keeps the red alert for a tool that is actually broken", async () => {
+    tools = TOOLS_BROKEN;
+    await renderSettings();
+    const alert = await screen.findByText("checksum mismatch for deno");
+    expect(alert.className).toBe("tool-error");
+    expect(alert.closest(".tool-row")?.classList.contains("is-error")).toBe(true);
+  });
+
+  it("announces an update to a yt-dlp that was already managed", async () => {
+    tools = [{ ...TOOLS_OK[0], version: "2026.09.10" }, TOOLS_OK[1], TOOLS_OK[2]];
+    await renderSettings();
+    await screen.findByText("2026.09.10");
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    expect(await screen.findByText("yt-dlp updated to 2026.09.20.")).toBeDefined();
+  });
+
+  /** A system yt-dlp is replaced by a managed install, which the shell already
+   *  toasts as "yt-dlp is ready." — saying "updated to" as well is one event
+   *  told twice. */
+  it("says nothing of its own when the check installs a managed yt-dlp", async () => {
+    tools = [
+      tool({ kind: "ytdlp", source: "system", version: "2025.01.01", path: "/usr/bin/yt-dlp" }),
+      TOOLS_OK[1],
+      TOOLS_OK[2],
+    ];
+    await renderSettings();
+    await screen.findByText("2025.01.01");
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    await waitFor(() => expect(toolsUpdateNow).toHaveBeenCalledTimes(1));
+    // The row taking the answer is the sign the call has fully settled.
+    expect(await screen.findByText("Managed by MyTube")).toBeDefined();
+    expect(screen.queryByText(/yt-dlp updated to/)).toBeNull();
+    expect(screen.queryByText("yt-dlp is up to date.")).toBeNull();
+  });
+
+  it("heads the section with a real heading", async () => {
+    await renderSettings();
+    expect(screen.getByRole("heading", { name: "Tools" })).toBeDefined();
+    expect(screen.getByRole("region", { name: "Tools" })).toBeDefined();
+    expect(screen.getByRole("heading", { name: "Backup & transfer" })).toBeDefined();
+  });
+
+  it("links the update channel's hint to its select", async () => {
+    await renderSettings();
+    const channel = screen.getByLabelText("yt-dlp channel") as HTMLSelectElement;
+    const described = channel.getAttribute("aria-describedby");
+    expect(document.getElementById(described!)?.textContent).toMatch(/reach nightly first/);
   });
 
   it("saves the update channel and the auto-update switch", async () => {

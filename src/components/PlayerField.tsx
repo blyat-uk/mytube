@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import Field from "./Field";
+import Field, { hintId } from "./Field";
 import { api } from "../api";
 import type { PlayerOption } from "../types";
 
@@ -45,6 +45,16 @@ export default function PlayerField({ value, onEdit, onBlur, onPick }: Props) {
   const custom = players !== null && (customOpen || !match);
   const selected = players === null ? "" : custom ? CUSTOM : match!.id;
 
+  // Once the text field is up it stays up until another entry is picked from
+  // the list. Left to `!match` alone it would vanish the moment the typing
+  // happened to spell a detected command — `mpv --fullscreen` backspaced to
+  // `mpv`, or cleared to `""`, the System default — and an unmounted input
+  // never fires its blur, so the edit was never saved while the select showed
+  // a choice settings.json did not hold.
+  useEffect(() => {
+    if (custom && !customOpen) setCustomOpen(true);
+  }, [custom, customOpen]);
+
   function choose(id: string) {
     if (id === CUSTOM) {
       setCustomOpen(true);
@@ -73,6 +83,7 @@ export default function PlayerField({ value, onEdit, onBlur, onPick }: Props) {
         className="select settings-select"
         value={selected}
         disabled={players === null}
+        aria-describedby={hint ? hintId("player-select") : undefined}
         onChange={(e) => choose(e.currentTarget.value)}
       >
         {players === null ? (
@@ -92,7 +103,9 @@ export default function PlayerField({ value, onEdit, onBlur, onPick }: Props) {
           placeholder="mpv --fullscreen"
           value={value}
           onChange={(e) => onEdit(e.currentTarget.value)}
+          onFocus={() => setCustomOpen(true)}
           onBlur={onBlur}
+          aria-describedby={hintId("player-select")}
           spellCheck={false}
         />
       )}

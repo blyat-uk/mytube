@@ -9,7 +9,9 @@ import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
 import { usePollEvents, useToolsStatus, useTransferFinished } from "./events";
 import { toolsReadyMessage } from "./components/ToolsSection";
-import type { Channel, SortOrder, ToolKind, ToolState, Video, ViewState } from "./types";
+import type {
+  Channel, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
+} from "./types";
 import "./App.css";
 
 export default function App() {
@@ -139,22 +141,40 @@ function Shell() {
   const toolStates = useRef(new Map<ToolKind, ToolState>());
   // Provisioning starts before the webview has loaded, so the "installing"
   // event can go out before this listener exists; seeding from the command
-  // means a tool that was already installing still gets its toast. Seeded only
-  // while empty, so a late answer cannot overwrite a newer event's states.
-  useEffect(() => {
-    Promise.resolve()
-      .then(() => api.toolsStatus())
-      .then((list) => {
-        if (toolStates.current.size === 0) {
-          toolStates.current = new Map(list.map((t) => [t.kind, t.state]));
-        }
-      })
-      .catch(() => {});
-  }, []);
-  useToolsStatus((list) => {
+  // means a tool that was already installing still gets its toast.
+  //
+  // Events heard before that answer lands are held and replayed on top of it,
+  // in order. Applying them first and the seed after lost the toast outright:
+  // a "ready" event met an empty map (no transition), and a seed that had been
+  // read while the tool was still installing then arrived too late to count.
+  // Replayed, the same pair reads installing -> ready, which is what happened.
+  // An ordinary launch seeds "ready" and hears nothing, so it stays quiet.
+  const toolsSeeded = useRef(false);
+  const heldToolEvents = useRef<ToolStatus[][]>([]);
+  const applyToolStatus = useCallback((list: ToolStatus[]) => {
     const message = toolsReadyMessage(toolStates.current, list);
     toolStates.current = new Map(list.map((t) => [t.kind, t.state]));
     if (message) toast.success(message);
+  }, [toast]);
+  useEffect(() => {
+    const settle = (seed: ToolStatus[]) => {
+      if (toolsSeeded.current) return;
+      toolsSeeded.current = true;
+      toolStates.current = new Map(seed.map((t) => [t.kind, t.state]));
+      const held = heldToolEvents.current;
+      heldToolEvents.current = [];
+      for (const list of held) applyToolStatus(list);
+    };
+    Promise.resolve()
+      .then(() => api.toolsStatus())
+      .then(settle)
+      // No seed to be had: the held events still happened, so play them on an
+      // empty map rather than dropping them.
+      .catch(() => settle([]));
+  }, [applyToolStatus]);
+  useToolsStatus((list) => {
+    if (toolsSeeded.current) applyToolStatus(list);
+    else heldToolEvents.current.push(list);
   });
 
   // A poll can also start on its own (startup and the interval timer), so the

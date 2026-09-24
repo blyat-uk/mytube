@@ -1,8 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
-import type { Channel, Settings, Video, ViewState, VideoFilter } from "./types";
+import type { Channel, Settings, ToolStatus, Video, ViewState, VideoFilter } from "./types";
 
-vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
+// Every listener the shell registers, by event name, so a test can deliver an
+// event exactly when it wants to.
+const listeners = new Map<string, (e: { payload: unknown }) => void>();
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => {
+    listeners.set(name, cb);
+    return Promise.resolve(() => {});
+  },
+}));
 
 // jsdom ships no IntersectionObserver, and the grid's infinite scroll wants one.
 class NoopObserver {
@@ -20,6 +28,7 @@ const saveViewState = vi.fn(() => Promise.resolve());
 // Typed with a filter parameter so `.mock.calls[0][0]` below type-checks.
 const listVideos = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() => Promise.resolve([]));
 const listVideoGroups = vi.fn(() => Promise.resolve([]));
+const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([]));
 
 vi.mock("./api", () => ({
   api: {
@@ -28,6 +37,7 @@ vi.mock("./api", () => ({
     saveViewState: (...a: unknown[]) => saveViewState(...(a as [])),
     listVideos: (filter: VideoFilter) => listVideos(filter),
     listVideoGroups: (...a: unknown[]) => listVideoGroups(...(a as [])),
+    toolsStatus: () => toolsStatus(),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
@@ -68,6 +78,8 @@ beforeEach(() => {
   listVideos.mockImplementation(() => Promise.resolve([]));
   listVideoGroups.mockImplementation(() => Promise.resolve([]));
   saveViewState.mockImplementation(() => Promise.resolve());
+  toolsStatus.mockImplementation(() => Promise.resolve([]));
+  listeners.clear();
 });
 
 afterEach(cleanup);
@@ -252,5 +264,67 @@ describe("keeping the feed's place across a series visit", () => {
     // Escape leaves the series, the same as the breadcrumb's own button.
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(content.scrollTop).toBe(900));
+  });
+});
+
+/**
+ * `tools_status` (the seed) and `tools://status` (the events) race at launch:
+ * provisioning starts before the webview does. Whichever lands first, a tool
+ * that went from installing to ready while the shell was listening gets its
+ * toast, and a launch where everything was already ready gets none.
+ */
+describe("the tools-ready toast", () => {
+  const ytdlp = (state: ToolStatus["state"]): ToolStatus[] => [{
+    kind: "ytdlp", path: null, version: null, source: "managed", state,
+    error: null, lastCheck: null,
+  }];
+
+  /** Resolves the seed only when the test says so. */
+  function holdSeed() {
+    let resolve!: (list: ToolStatus[]) => void;
+    toolsStatus.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    return (list: ToolStatus[]) => resolve(list);
+  }
+
+  const emit = (list: ToolStatus[]) => listeners.get("tools://status")!({ payload: list });
+
+  it("still toasts when the ready event beats a seed read while installing", async () => {
+    const seed = holdSeed();
+    render(<App />);
+    await waitFor(() => expect(listeners.has("tools://status")).toBe(true));
+    await waitFor(() => expect(toolsStatus).toHaveBeenCalled());
+
+    emit(ytdlp("ready"));
+    seed(ytdlp("installing"));
+
+    expect(await screen.findByText("yt-dlp is ready.")).toBeDefined();
+  });
+
+  it("toasts when the seed lands first and the install finishes after", async () => {
+    const seed = holdSeed();
+    render(<App />);
+    await waitFor(() => expect(listeners.has("tools://status")).toBe(true));
+    await waitFor(() => expect(toolsStatus).toHaveBeenCalled());
+
+    seed(ytdlp("installing"));
+    await new Promise((r) => setTimeout(r, 0));
+    emit(ytdlp("ready"));
+
+    expect(await screen.findByText("yt-dlp is ready.")).toBeDefined();
+  });
+
+  it("stays quiet on a launch where the tools were already ready", async () => {
+    const seed = holdSeed();
+    render(<App />);
+    await waitFor(() => expect(listeners.has("tools://status")).toBe(true));
+    await waitFor(() => expect(toolsStatus).toHaveBeenCalled());
+
+    emit(ytdlp("ready"));
+    seed(ytdlp("ready"));
+    await new Promise((r) => setTimeout(r, 50));
+    emit(ytdlp("ready"));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(screen.queryByText("yt-dlp is ready.")).toBeNull();
   });
 });
