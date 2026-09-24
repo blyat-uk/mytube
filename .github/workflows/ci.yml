@@ -73,4 +73,26 @@ jobs:
         run: bun run build
 
       - name: Backend tests
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --manifest-path src-tauri/Cargo.toml 2>&1 | tee cargo-test.log
+
+      # Job logs need a signed-in viewer; annotations do not. Each failing
+      # test's name and output becomes one, so a red run can be read from the
+      # API or the run's summary page by anyone.
+      - name: Report failing tests
+        if: failure()
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" - <<'PY'
+          import re
+          text = open("cargo-test.log", encoding="utf-8", errors="replace").read().replace("\r\n", "\n")
+          blocks = re.findall(r"^---- (\S+) stdout ----\n(.*?)(?=^---- |^failures:|\Z)", text, re.S | re.M)
+          if not blocks:
+              blocks = [("cargo test", text[-4000:])]
+          for name, body in blocks[:20]:
+              body = body.strip()[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title={name.replace('::', '.')}::{body}")
+          PY
