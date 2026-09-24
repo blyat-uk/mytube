@@ -119,7 +119,10 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
 
     let mut settings = config::load().unwrap();
     settings.download_dir = downloads.to_string_lossy().into_owned();
-    settings.player_command = "mpv --fullscreen".into();
+    // Import only adopts a player that would start something on the machine
+    // it lands on, so the test uses one every machine has: this test binary.
+    let player = format!("\"{}\" --fullscreen", std::env::current_exe().unwrap().display());
+    settings.player_command = player.clone();
     settings.backfill_count = 77;
     settings.card_size = 400;
     config::save(&settings).unwrap();
@@ -200,7 +203,7 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     assert!(!dst.get_channel("UCadhoc").unwrap().unwrap().subscribed, "ad-hoc stays unsubscribed");
 
     let landed = config::load().unwrap();
-    assert_eq!(landed.player_command, "mpv --fullscreen");
+    assert_eq!(landed.player_command, player);
     assert_eq!(landed.backfill_count, 77);
     assert_eq!(landed.card_size, 400);
 
