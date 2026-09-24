@@ -246,10 +246,21 @@ impl Settings {
     /// from a future version; dropping the ones already here to take an
     /// archive's would lose settings this build cannot even name, and taking
     /// none of the archive's would lose the same on the way in.
+    ///
+    /// The player is the one portable key that can name something this machine
+    /// lacks: an archive written on Windows carries `"C:\Program Files\…\vlc.exe"`.
+    /// It is taken only when it would start something here (see
+    /// `player::command_resolves`); otherwise the local player stays.
     pub fn adopt_portable(&mut self, incoming: &Settings) {
+        self.adopt_portable_with(incoming, crate::player::command_resolves)
+    }
+
+    fn adopt_portable_with(&mut self, incoming: &Settings, resolves: impl Fn(&str) -> bool) {
         self.download_dir = incoming.download_dir.clone();
         self.filename_template = incoming.filename_template.clone();
-        self.player_command = incoming.player_command.clone();
+        if resolves(&incoming.player_command) {
+            self.player_command = incoming.player_command.clone();
+        }
         self.max_concurrent_downloads = incoming.max_concurrent_downloads;
         self.poll_interval_minutes = incoming.poll_interval_minutes;
         self.poll_on_startup = incoming.poll_on_startup;
@@ -559,7 +570,7 @@ mod tests {
     #[test]
     fn adopt_portable_takes_everything_that_describes_the_library() {
         let mut local = Settings::default();
-        local.adopt_portable(&an_incoming_file());
+        local.adopt_portable_with(&an_incoming_file(), |_| true);
         assert_eq!(local.download_dir, "/mnt/OTHER/Videos");
         assert_eq!(local.filename_template, "%(title)s.%(ext)s");
         assert_eq!(local.player_command, "mpv --fs");
@@ -568,6 +579,14 @@ mod tests {
         assert!(!local.poll_on_startup);
         assert_eq!(local.backfill_count, 120);
         assert_eq!(local.card_size, 400);
+    }
+
+    #[test]
+    fn a_player_that_does_not_exist_here_is_not_adopted() {
+        let mut local = Settings::from_json_str(r#"{"player_command":"smplayer"}"#).unwrap();
+        local.adopt_portable_with(&an_incoming_file(), |cmd| cmd != "mpv --fs");
+        assert_eq!(local.player_command, "smplayer", "the local player stays");
+        assert_eq!(local.backfill_count, 120, "the rest of the archive still lands");
     }
 
     #[test]

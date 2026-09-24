@@ -823,7 +823,10 @@ mod tests {
 
         let ch = channel("UC1", "Chan");
         let mut s = settings_with_download_dir(&dl);
-        s.player_command = "mpv --fs".into();
+        // A player that resolves on whatever machine runs the test -- the test
+        // binary itself -- since import only adopts one that does.
+        let player = format!("\"{}\" --fs", std::env::current_exe().unwrap().display());
+        s.player_command = player.clone();
         s.backfill_count = 77;
         s.window_width = 3840;
         s.view.search = "should not travel".into();
@@ -842,7 +845,7 @@ mod tests {
 
         // The portable half travels; the this-machine half is simply not there
         // to travel — `PortableSettings` has no field for it.
-        assert_eq!(m.settings.player_command, "mpv --fs");
+        assert_eq!(m.settings.player_command, player);
         assert_eq!(m.settings.backfill_count, 77);
         let raw = serde_json::to_string(&m.settings).unwrap();
         for absent in ["window_width", "window_height", "window_x", "window_y", "view"] {
@@ -902,7 +905,7 @@ mod tests {
 
         // Settings landed, and the local window geometry survived them.
         let after = config::load_from(&cfg.join("settings.json")).unwrap();
-        assert_eq!(after.player_command, "mpv --fs");
+        assert_eq!(after.player_command, player);
         assert_eq!(after.backfill_count, 77);
         assert_eq!(after.window_width, 1280, "the archive's window size was adopted");
         assert_eq!(after.view.search, "", "the archive's feed filters were adopted");
