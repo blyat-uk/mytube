@@ -25,7 +25,7 @@ it against that release's `SHA256SUMS.txt` if you like.
 | macOS | `mytube-vX.Y.Z-macos-arm64.dmg` | Drag MyTube to Applications. Not notarized: open it with right-click → Open, allow it under System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/mytube.app`. |
 | Debian / Ubuntu 22.04+ | `mytube-vX.Y.Z-linux-x86_64.deb` | `sudo apt install ./mytube-…deb` pulls in WebKitGTK. |
 | Fedora / openSUSE | `mytube-vX.Y.Z-linux-x86_64.rpm` | `sudo dnf install ./mytube-…rpm` |
-| Other Linux | `mytube-vX.Y.Z-linux-x86_64.AppImage` | `chmod +x` and run. Needs FUSE 2 (`libfuse2`), or run it with `--appimage-extract-and-run`. |
+| Other Linux | `mytube-vX.Y.Z-linux-x86_64.AppImage` | `chmod +x` and run. If the AppImage does not start, install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with `--appimage-extract-and-run`. |
 
 On Linux the tray icon needs a StatusNotifierItem host — built into KDE
 Plasma; GNOME needs the AppIndicator extension. Without one, closing the window
@@ -45,9 +45,11 @@ MyTube relies on three programs it does not ship:
 | `deno` | The JavaScript runtime `yt-dlp` needs to get past YouTube's player challenges. |
 
 The first time it starts, MyTube downloads whichever of them it cannot find on
-your system — about 150 MB in all, straight from each publisher's own releases,
-each checked against its published SHA-256 before it is installed — into your
-local data folder:
+your system — about 150 MB to download, straight from each publisher's own
+releases, each checked against its published SHA-256 before it is installed —
+into your local data folder. Unpacked, all three take roughly 500 MB on disk;
+the static `ffmpeg` and `ffprobe` builds are about 350 MB of that. Any tool
+already on your system is used instead and costs nothing.
 
 | OS | Managed tools |
 | --- | --- |
@@ -93,6 +95,19 @@ Deleting that folder resets MyTube to a clean state. Downloads go to
 `~/Videos/mytube` (`~/Movies/mytube` on macOS) unless you choose another folder.
 **Settings → Backup & transfer** exports the whole library to a zip that another
 MyTube, on any OS, can import.
+
+### Uninstalling
+
+Uninstalling MyTube removes the app, not your data or the tools it downloaded.
+Delete these folders as well to remove everything:
+
+| OS | Settings, library and thumbnails | Downloaded tools |
+| --- | --- | --- |
+| Windows | `%APPDATA%\mytube` | `%LOCALAPPDATA%\mytube\bin` — the uninstaller leaves it |
+| macOS | `~/Library/Application Support/mytube` | `~/Library/Application Support/mytube/bin` |
+| Linux | `~/.config/mytube` | `~/.local/share/mytube/bin` |
+
+Downloaded videos stay wherever you saved them.
 
 ## Building from source
 
@@ -164,9 +179,10 @@ After any new major feature, or if the user asks you to "release", make sure to 
 
 Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it checks the tag
 against the version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and
-`package.json` (bump all three together), builds on Ubuntu 22.04, Windows and
-macOS, runs `--version` and `--self-test` on each, and publishes the bundles
-with `SHA256SUMS.txt`. Running the workflow by hand builds and tests without
+`package.json` (bump all three together), builds on Windows, macOS and Linux —
+the last inside an `ubuntu:22.04` container, which keeps the glibc floor at 2.35
+— runs `--version` and `--self-test` on each, and publishes the bundles with
+`SHA256SUMS.txt`. Running the workflow by hand builds and tests without
 publishing. `.github/workflows/ci.yml` runs the test suites on all three OSes
 for every push to `main` and every pull request.
 

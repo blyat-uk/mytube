@@ -23,7 +23,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04      # the release is built here too: glibc 2.35
+          # Tests only, so the glibc floor does not matter here: release.yml
+          # builds the shipped Linux bundles inside an ubuntu:22.04 container.
+          - runner: ubuntu-24.04
             os_name: linux
           - runner: windows-latest
             os_name: windows

@@ -55,7 +55,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04      # glibc 2.35 and webkit2gtk-4.1: the oldest base worth building on
+          # The GitHub-hosted ubuntu-22.04 image is being retired
+          # (actions/runner-images#14254), but it is still the oldest base with
+          # webkit2gtk-4.1, and building on it is what holds the glibc floor
+          # at 2.35. So the job runs on a current runner inside a plain
+          # ubuntu:22.04 container.
+          - runner: ubuntu-24.04
+            container: ubuntu:22.04
             os_name: linux
             bundles: deb,rpm,appimage
           - runner: windows-latest
@@ -65,28 +71,54 @@ jobs:
             os_name: macos
             bundles: app,dmg
     runs-on: ${{ matrix.runner }}
+    # An empty image runs the job on the runner itself (Windows, macOS). The
+    # `|| ''` form is what gets an empty value past the schema check.
+    container:
+      image: ${{ matrix.container || '' }}
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.version.outputs.version }}
       TAG: v${{ needs.version.outputs.version }}
+      # A container has no /dev/fuse, so no AppImage can mount itself: this
+      # makes linuxdeploy and its plugins extract and run instead. The Tauri
+      # bundler sets it for linuxdeploy too; this covers anything it spawns.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       # Same reason as ci.yml: the RSS fixtures are embedded byte for byte.
       - name: Keep line endings as committed
         if: matrix.os_name == 'windows'
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v7
-
-      # Tauri's Debian prerequisites (no appindicator: the Linux tray is ksni).
-      # No libfuse2: the bundler runs linuxdeploy with APPIMAGE_EXTRACT_AND_RUN=1,
-      # and the AppImage smoke test below extracts rather than mounts.
+      # Runs as root in the bare ubuntu:22.04 container, which has no sudo and
+      # almost nothing else, so it comes before checkout: without git >= 2.18
+      # on PATH, actions/checkout falls back to a REST download with no .git.
+      # Tauri's Debian prerequisites (which include `file`; no appindicator:
+      # the Linux tray is ksni), plus what the bare image lacks: git for
+      # checkout, unzip for setup-bun, curl for the rustup bootstrap in
+      # dtolnay/rust-toolchain, pkg-config for linuxdeploy's GTK plugin,
+      # xdg-utils because the AppImage bundler copies /usr/bin/xdg-open into
+      # the image and fails without it (the hosted runner image ships it),
+      # xz-utils and ca-certificates for the self-test's tool downloads. No
+      # libfuse2: nothing here mounts an AppImage (see APPIMAGE_EXTRACT_AND_RUN).
       - name: Linux build dependencies
         if: matrix.os_name == 'linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev librsvg2-dev patchelf
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget git unzip xz-utils file xdg-utils \
+            build-essential pkg-config \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev patchelf
+
+      - uses: actions/checkout@v7
+
+      # The workspace is owned by the runner's user, not the container's root,
+      # and git refuses to read a repository owned by someone else. checkout
+      # only trusts it for its own commands.
+      - name: Trust the workspace (Linux container)
+        if: matrix.os_name == 'linux'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: oven-sh/setup-bun@v2
 
@@ -139,8 +171,11 @@ jobs:
         timeout-minutes: 10
         run: |
           deb=$(ls src-tauri/target/release/bundle/deb/mytube_"$VERSION"_*.deb)
-          sudo apt-get install -y "./$deb"
-          /usr/bin/mytube --version
+          # Root in the container already, and no sudo there to call.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y "./$deb"
+          out=$(/usr/bin/mytube --version)
+          echo "$out"
+          [[ "$out" == "mytube $VERSION" ]] || { echo "::error::expected 'mytube $VERSION', got '$out'"; exit 1; }
 
       # -------------------------------------------------------------- Windows
       # The release exe is a GUI-subsystem program: PowerShell's `&` would not
@@ -156,9 +191,12 @@ jobs:
           $exe = Resolve-Path 'src-tauri\target\release\mytube.exe'
           $out = Join-Path $env:RUNNER_TEMP 'version.txt'
           $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
-          $line = (Get-Content $out -Raw).Trim()
+          # Get-Content -Raw returns $null for an empty file, and $null.Trim()
+          # throws something unreadable; the string cast keeps it a string.
+          $line = "$(Get-Content $out -Raw)".Trim()
           Write-Output $line
           if ($p.ExitCode -ne 0) { throw "mytube --version exited with $($p.ExitCode)" }
+          if (-not $line) { throw "mytube --version printed nothing" }
           if ($line -ne "mytube $env:VERSION") { throw "expected 'mytube $env:VERSION', got '$line'" }
 
       - name: Smoke test — self-test (Windows)
@@ -190,8 +228,11 @@ jobs:
           if (-not (Test-Path $exe)) { throw "installer did not install $exe" }
           $out = Join-Path $env:RUNNER_TEMP 'installed-version.txt'
           $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
-          Get-Content $out
+          $line = "$(Get-Content $out -Raw)".Trim()
+          Write-Output $line
           if ($p.ExitCode -ne 0) { throw "installed mytube --version exited with $($p.ExitCode)" }
+          if (-not $line) { throw "installed mytube --version printed nothing" }
+          if ($line -ne "mytube $env:VERSION") { throw "installed: expected 'mytube $env:VERSION', got '$line'" }
 
       # ---------------------------------------------------------------- macOS
       # Everything runs from inside the .app: that binary, not target/release's,
@@ -297,11 +338,12 @@ jobs:
 
           MyTube uses three programs it does not ship: **yt-dlp**, **ffmpeg** and **deno** (the JavaScript runtime
           yt-dlp needs for YouTube). The first time it starts it downloads whichever of them it cannot find on your
-          system — about 150 MB, straight from each publisher's own releases, each checked against its published
-          SHA-256 — into your local data folder:
+          system — about 150 MB to download, straight from each publisher's own releases, each checked against its
+          published SHA-256 — into your local data folder:
           `%LOCALAPPDATA%\mytube\bin` on Windows, `~/Library/Application Support/mytube/bin` on macOS,
-          `~/.local/share/mytube/bin` on Linux. Settings → Tools shows where each one came from; yt-dlp keeps
-          itself up to date once a day.
+          `~/.local/share/mytube/bin` on Linux. Unpacked, all three take roughly 500 MB on disk (the static ffmpeg
+          and ffprobe builds are about 350 MB of that); any tool already on your system is used instead and not
+          downloaded. Settings → Tools shows where each one came from; yt-dlp keeps itself up to date once a day.
 
           Downloads go out with the YouTube cookies of a browser you are signed in to (Settings → YouTube cookies;
           Automatic picks Firefox when it finds a profile) — that is what reaches members-only videos and keeps
@@ -315,13 +357,26 @@ jobs:
           - **macOS:** the app is not notarized. After copying it to Applications, open it with right-click → Open,
             or allow it under System Settings → Privacy & Security, or run
             `xattr -dr com.apple.quarantine /Applications/mytube.app`.
-          - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. The AppImage needs FUSE 2
-            (`libfuse2`) to mount, or run it with `--appimage-extract-and-run`. The tray icon needs a
-            StatusNotifierItem host (built into KDE; GNOME needs the AppIndicator extension).
+          - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. If the AppImage does not start,
+            install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with
+            `--appimage-extract-and-run`. The tray icon needs a StatusNotifierItem host (built into KDE; GNOME
+            needs the AppIndicator extension).
+
+          ## Uninstalling
+
+          Uninstalling removes the app but not your data or the tools it downloaded. Delete these folders as well
+          to remove everything:
+
+          | OS | Settings, library and thumbnails | Downloaded tools |
+          |---|---|---|
+          | Windows | `%APPDATA%\mytube` | `%LOCALAPPDATA%\mytube\bin` (the uninstaller leaves it) |
+          | macOS | `~/Library/Application Support/mytube` | `~/Library/Application Support/mytube/bin` |
+          | Linux | `~/.config/mytube` | `~/.local/share/mytube/bin` |
+
+          Downloaded videos stay wherever you saved them.
 
           Verify downloads against `SHA256SUMS.txt`.
           EOF
-          sed -i 's/^          //' notes.md
 
       - uses: softprops/action-gh-release@v3
         with:

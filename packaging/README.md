@@ -109,5 +109,7 @@ rm -f ~/.local/share/applications/mytube.desktop
 update-desktop-database ~/.local/share/applications
 ```
 
-Delete `~/.config/mytube/` as well to remove your data, and
-`~/.local/share/mytube/` to remove the tools MyTube downloaded.
+That removes the app only. Delete `~/.config/mytube/` as well to remove your
+settings, library and thumbnails, and `~/.local/share/mytube/` to remove the
+tools MyTube downloaded into `~/.local/share/mytube/bin` — roughly 500 MB when
+it had to fetch all three, most of it the static `ffmpeg` and `ffprobe`.
