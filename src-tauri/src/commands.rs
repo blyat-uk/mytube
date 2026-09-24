@@ -29,10 +29,28 @@ pub async fn save_settings(
     // changed while it was open, saving it verbatim would revert `view` to
     // that stale copy. A failed re-read (e.g. no file yet) just means there
     // is nothing on disk to defer to, so fall through and write as sent.
-    if let Ok(disk) = config::load() {
-        settings.keep_view_of(&disk);
+    let disk = config::load().ok();
+    if let Some(disk) = &disk {
+        settings.keep_view_of(disk);
     }
     config::save(&settings).map_err(e)?;
+    // A new update channel, auto-update switched on, or a changed override
+    // path should take effect now rather than at the next hourly tools tick.
+    let tools_changed = disk.as_ref().is_none_or(|d| {
+        d.ytdlp_channel != settings.ytdlp_channel
+            || d.ytdlp_auto_update != settings.ytdlp_auto_update
+            || d.ytdlp_path != settings.ytdlp_path
+            || d.ffmpeg_path != settings.ffmpeg_path
+            || d.deno_path != settings.deno_path
+    });
+    if tools_changed {
+        let tools = state.tools.clone();
+        let s = settings.clone();
+        tauri::async_runtime::spawn(async move {
+            tools.ensure_all(&s).await;
+            tools.maybe_update(&s).await;
+        });
+    }
     state
         .queue
         .set_concurrency(settings.max_concurrent_downloads)

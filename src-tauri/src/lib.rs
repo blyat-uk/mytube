@@ -86,6 +86,22 @@ pub fn run() {
 
             // Startup poll, then a repeating background timer.
             let handle = app.handle().clone();
+            // The external tools, on a clock of their own rather than the
+            // poll's: a first run downloads ~150 MB, and the startup poll must
+            // not sit behind that -- its RSS half needs no tool at all, and a
+            // listing that fails for want of yt-dlp is already swallowed.
+            // Hourly is often enough to retry a failed install; the update
+            // check inside `maybe_update` is itself gated to once a day.
+            let tools_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let s = config::load().unwrap_or_default();
+                    tools_state.tools.ensure_all(&s).await;
+                    tools_state.tools.maybe_update(&s).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            });
+
             tauri::async_runtime::spawn(async move {
                 // Replaces absent and approximate-bucket dates with real ones.
                 let fixed = poll::repair_dates(&state).await;
