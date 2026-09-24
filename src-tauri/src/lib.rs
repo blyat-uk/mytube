@@ -6,6 +6,7 @@ pub mod detect;
 pub mod models;
 pub mod player;
 pub mod poll;
+pub mod proc;
 pub mod queue;
 pub mod resolve;
 pub mod rss;
