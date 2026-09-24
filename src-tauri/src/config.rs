@@ -190,6 +190,34 @@ impl Settings {
     pub fn keep_view_of(&mut self, disk: &Settings) {
         self.view = disk.view.clone();
     }
+
+    /// Takes the portable half of `incoming`, keeping this machine's window
+    /// geometry and feed filters. The mirror of `keep_view_of`.
+    ///
+    /// The split is between settings that describe *the library* — where
+    /// downloads land, how they are named, what plays them, how hard to poll,
+    /// how big the cards are — and settings that describe *this screen*. An
+    /// archive written on a 4K desktop must not reopen a laptop's window at
+    /// 3840x2160, and the filters the feed happened to be wearing when the
+    /// archive was made are nobody else's business.
+    ///
+    /// `extra` is merged rather than replaced. Those keys are hand-written or
+    /// from a future version; dropping the ones already here to take an
+    /// archive's would lose settings this build cannot even name, and taking
+    /// none of the archive's would lose the same on the way in.
+    pub fn adopt_portable(&mut self, incoming: &Settings) {
+        self.download_dir = incoming.download_dir.clone();
+        self.filename_template = incoming.filename_template.clone();
+        self.player_command = incoming.player_command.clone();
+        self.max_concurrent_downloads = incoming.max_concurrent_downloads;
+        self.poll_interval_minutes = incoming.poll_interval_minutes;
+        self.poll_on_startup = incoming.poll_on_startup;
+        self.backfill_count = incoming.backfill_count;
+        self.card_size = incoming.card_size;
+        for (k, v) in &incoming.extra {
+            self.extra.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 /// `~/.config/mytube` — deliberately not Tauri's app_config_dir(), which would
@@ -216,17 +244,32 @@ pub fn ensure_dirs() -> Result<()> {
 }
 
 pub fn load() -> Result<Settings> {
-    let p = settings_path();
-    if !p.exists() {
-        return Ok(Settings::default());
-    }
-    let raw = std::fs::read_to_string(&p)?;
-    Settings::from_json_str(&raw)
+    load_from(&settings_path())
 }
 
 pub fn save(s: &Settings) -> Result<()> {
     ensure_dirs()?;
-    write_atomic(&settings_path(), s.to_json_string()?.as_bytes())
+    save_to(&settings_path(), s)
+}
+
+/// `load` against an explicit file. Split out for `transfer`, whose tests point
+/// at a temp directory: `config_dir()` is built from `$XDG_CONFIG_HOME`, which
+/// is process-wide, so a parameter is the only way two of them can run at once.
+pub fn load_from(path: &Path) -> Result<Settings> {
+    if !path.exists() {
+        return Ok(Settings::default());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    Settings::from_json_str(&raw)
+}
+
+/// `save` against an explicit file. Creates the parent directory, since the
+/// caller may be writing somewhere `ensure_dirs` knows nothing about.
+pub fn save_to(path: &Path, s: &Settings) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_atomic(path, s.to_json_string()?.as_bytes())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -415,5 +458,103 @@ mod tests {
 
         incoming.keep_view_of(&disk);
         assert_eq!(incoming.view.search, "disk");
+    }
+
+    /// A settings file as an archive from another machine would carry it: every
+    /// portable field moved off its default, and every this-machine field moved
+    /// too, so a test can tell "taken" from "happened to match".
+    fn an_incoming_file() -> Settings {
+        let mut s = Settings::from_json_str(
+            r#"{
+                "download_dir": "/mnt/OTHER/Videos",
+                "filename_template": "%(title)s.%(ext)s",
+                "player_command": "mpv --fs",
+                "max_concurrent_downloads": 9,
+                "poll_interval_minutes": 90,
+                "poll_on_startup": false,
+                "backfill_count": 120,
+                "card_size": 400,
+                "window_width": 3840,
+                "window_height": 2160,
+                "window_x": 1234,
+                "window_y": 56,
+                "window_maximized": true,
+                "from_the_other_machine": "kept"
+            }"#,
+        )
+        .unwrap();
+        s.view.search = "incoming".into();
+        s.view.grouped = true;
+        s
+    }
+
+    #[test]
+    fn adopt_portable_takes_everything_that_describes_the_library() {
+        let mut local = Settings::default();
+        local.adopt_portable(&an_incoming_file());
+        assert_eq!(local.download_dir, "/mnt/OTHER/Videos");
+        assert_eq!(local.filename_template, "%(title)s.%(ext)s");
+        assert_eq!(local.player_command, "mpv --fs");
+        assert_eq!(local.max_concurrent_downloads, 9);
+        assert_eq!(local.poll_interval_minutes, 90);
+        assert!(!local.poll_on_startup);
+        assert_eq!(local.backfill_count, 120);
+        assert_eq!(local.card_size, 400);
+    }
+
+    #[test]
+    fn adopt_portable_keeps_this_machines_window_geometry() {
+        let mut local = Settings::from_json_str(
+            r#"{"window_width":1400,"window_height":900,"window_x":-40,"window_y":7}"#,
+        )
+        .unwrap();
+        local.adopt_portable(&an_incoming_file());
+        assert_eq!((local.window_width, local.window_height), (1400, 900));
+        assert_eq!((local.window_x, local.window_y), (Some(-40), Some(7)));
+        assert!(!local.window_maximized);
+    }
+
+    #[test]
+    fn adopt_portable_keeps_this_machines_view_block() {
+        let mut local = Settings::default();
+        local.view.search = "local".into();
+        local.view.hide_watched = true;
+        local.adopt_portable(&an_incoming_file());
+        assert_eq!(local.view.search, "local");
+        assert!(local.view.hide_watched);
+        assert!(!local.view.grouped, "the archive's grouping chip came along");
+    }
+
+    #[test]
+    fn adopt_portable_merges_extra_keys_rather_than_replacing_them() {
+        let mut local = Settings::from_json_str(r#"{"only_here":1,"on_both":"local"}"#).unwrap();
+        let mut incoming = an_incoming_file();
+        incoming.extra.insert("on_both".into(), serde_json::json!("incoming"));
+
+        local.adopt_portable(&incoming);
+        assert_eq!(local.extra.get("only_here"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            local.extra.get("from_the_other_machine"),
+            Some(&serde_json::json!("kept")),
+            "an unknown key from the archive was dropped"
+        );
+        assert_eq!(local.extra.get("on_both"), Some(&serde_json::json!("incoming")));
+    }
+
+    #[test]
+    fn load_from_and_save_to_round_trip_outside_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("settings.json");
+
+        let mut s = Settings::default();
+        s.player_command = "mpv".into();
+        save_to(&path, &s).unwrap();
+
+        assert_eq!(load_from(&path).unwrap().player_command, "mpv");
+        // A file that is not there is the first-run case, not an error.
+        assert_eq!(
+            load_from(&dir.path().join("absent.json")).unwrap().player_command,
+            "smplayer"
+        );
     }
 }

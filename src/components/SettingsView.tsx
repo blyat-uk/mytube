@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { TEMPLATE_PRESETS, TOKEN_CHIPS, insertToken } from "../format";
-import { open } from "@tauri-apps/plugin-dialog";
+import { TEMPLATE_PRESETS, TOKEN_CHIPS, formatBytes, insertToken } from "../format";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import TransferDialog from "./TransferDialog";
+import { useTransferProgress } from "../events";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
-import type { Settings } from "../types";
+import type {
+  ArchiveSummary, ImportMode, Settings, TransferEstimate, TransferProgress,
+} from "../types";
 
 type NumField = "max_concurrent_downloads" | "poll_interval_minutes" | "backfill_count";
 
@@ -19,6 +23,15 @@ export default function SettingsView() {
   const [drafts, setDrafts] = useState<Partial<Record<NumField, string>>>({});
   const [savedAt, setSavedAt] = useState(0);
   const [failed, setFailed] = useState(false);
+
+  // Transfer state. `includeThumbs` is a choice about one archive, not a
+  // setting, so it deliberately never reaches `commit()`.
+  const [estimate, setEstimate] = useState<TransferEstimate | null>(null);
+  const [includeThumbs, setIncludeThumbs] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [archive, setArchive] = useState<{ path: string; summary: ArchiveSummary } | null>(null);
+  const [progress, setProgress] = useState<TransferProgress | null>(null);
 
   // Mirrors of the state, kept in sync synchronously so blur handlers never
   // read a stale value and so no side effect runs inside a state updater.
@@ -43,6 +56,21 @@ export default function SettingsView() {
       });
     return () => { alive = false; };
   }, [toast]);
+
+  useEffect(() => {
+    let alive = true;
+    api.transferEstimate()
+      .then((e) => { if (alive) setEstimate(e); })
+      // A missing estimate costs the tick its size and nothing else; an export
+      // that cannot be weighed can still be written.
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  // The import half runs inside TransferDialog, which draws its own bar.
+  useTransferProgress((p) => {
+    if (p.phase === "export") setProgress(p);
+  });
 
   const commit = useCallback(async (next: Settings) => {
     const serialised = JSON.stringify(next);
@@ -145,6 +173,86 @@ export default function SettingsView() {
     }
   }
 
+  /** Writes the whole configuration to one zip the user names. */
+  async function runExport() {
+    setExporting(true);
+    setProgress(null);
+    try {
+      const path = await save({
+        title: "Save a MyTube export",
+        defaultPath: `mytube-export-${todayStamp()}.zip`,
+        filters: [{ name: "Zip archive", extensions: ["zip"] }],
+      });
+      if (!path) return;
+      await api.exportConfig(path, includeThumbs);
+      toast.success(`Exported to ${path}.`);
+    } catch (err) {
+      toast.error(errText(err));
+    } finally {
+      setExporting(false);
+      setProgress(null);
+    }
+  }
+
+  /** Step one: read the archive's manifest and show the checklist. Nothing is
+   *  written to the library yet. */
+  async function pickArchive() {
+    setImporting(true);
+    try {
+      const path = await open({
+        multiple: false,
+        directory: false,
+        title: "Choose a MyTube export",
+        filters: [{ name: "Zip archive", extensions: ["zip"] }],
+      });
+      if (!path) return;
+      const summary = await api.readArchive(path as string);
+      setArchive({ path: path as string, summary });
+    } catch (err) {
+      toast.error(errText(err));
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  /** Step two: import exactly the channels that were ticked. */
+  async function runImport(channelIds: string[], mode: ImportMode, applySettings: boolean) {
+    if (!archive) return;
+    setImporting(true);
+    try {
+      const r = await api.importConfig(archive.path, channelIds, mode, applySettings);
+      setArchive(null);
+      toast.success(
+        `Imported ${count(r.channelsAdded, "channel")} and ${count(r.videosAdded, "video")}` +
+        (r.downloadsRelinked ? `, and found ${r.downloadsRelinked} already downloaded` : "") +
+        ".",
+      );
+      // Replace's removals are the one thing worth saying twice, because the
+      // number is the whole point of the mode and the toast above never shows it.
+      if (r.channelsRemoved || r.videosRemoved) {
+        toast.info(
+          `Removed ${count(r.videosRemoved, "video row")} and ` +
+          `${count(r.channelsRemoved, "channel")} from the library. No files were deleted.`,
+        );
+      }
+      if (r.downloadDirKept) {
+        toast.info("Kept this machine's download folder; the archive's is not here.");
+      }
+      if (r.settingsApplied) {
+        // settings.json was rewritten under us, so the fields on screen are
+        // stale until they are read back.
+        const s = await api.getSettings();
+        current.current = s;
+        persisted.current = JSON.stringify(s);
+        setSettings(s);
+      }
+    } catch (err) {
+      toast.error(errText(err));
+    } finally {
+      setImporting(false);
+    }
+  }
+
   if (failed) {
     return (
       <div className="page">
@@ -166,6 +274,10 @@ export default function SettingsView() {
 
   const s = settings;
   const numValue = (f: NumField) => drafts[f] ?? String(s[f]);
+  // One flag for both buttons: a file chooser is up, or an archive is being
+  // read or written, and neither transfer may start while the other is going.
+  const busy = exporting || importing;
+  const exportPct = progress && progress.total > 0 ? (progress.done / progress.total) * 100 : 0;
 
   return (
     <div className="page page-narrow">
@@ -297,12 +409,86 @@ export default function SettingsView() {
         </span>
       </label>
 
-      <p className="settings-foot">
-        Stored in <code>~/.config/mytube/settings.json</code>. Changes save when a field
-        loses focus.
-      </p>
+      <p className="settings-note">Changes save when a field loses focus.</p>
+
+      <div className="transfer-block">
+        <div className="field-label">Backup &amp; transfer</div>
+        <p className="field-hint">
+          Everything lives in <code>~/.config/mytube</code> — channels, videos, settings and
+          cached thumbnails. This packs it into one zip, enough to pick the library up on
+          another machine. Video files stay where they are.
+        </p>
+
+        <label className="switch-row transfer-thumbs">
+          <input
+            type="checkbox"
+            checked={includeThumbs}
+            disabled={busy}
+            onChange={(e) => setIncludeThumbs(e.currentTarget.checked)}
+          />
+          <span>
+            <span className="switch-label">
+              {/* No placeholder while the estimate is in flight: a number that
+                  later changes is worse than a label that briefly has none. */}
+              Include thumbnails{estimate ? ` (${formatBytes(estimate.thumbBytes)})` : ""}
+            </span>
+            <span className="field-hint">
+              Leave this off for a small archive — the other machine caches them again as
+              it polls.
+            </span>
+          </span>
+        </label>
+
+        <div className="row-inline transfer-actions">
+          <button type="button" className="btn" disabled={busy} onClick={() => void runExport()}>
+            Export…
+          </button>
+          <button type="button" className="btn" disabled={busy} onClick={() => void pickArchive()}>
+            Import…
+          </button>
+          {estimate && (
+            <span className="transfer-estimate">
+              {count(estimate.channelCount, "channel")} · {count(estimate.videoCount, "video")}
+            </span>
+          )}
+        </div>
+
+        {exporting && (
+          <div className="transfer-progress">
+            <div className="progress-track">
+              <div className="progress-fill" style={{ width: `${exportPct}%` }} />
+            </div>
+            <p className="progress-label">
+              {progress
+                ? `${progress.done} of ${progress.total} · ${progress.current}`
+                : "Starting…"}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {archive && (
+        <TransferDialog
+          summary={archive.summary}
+          importing={importing}
+          onImport={(ids, mode, apply) => void runImport(ids, mode, apply)}
+          onCancel={() => setArchive(null)}
+        />
+      )}
     </div>
   );
+}
+
+const count = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/**
+ * Today, for the export's default filename. Local rather than
+ * `toISOString`'s UTC: the stamp should match the calendar on the wall of the
+ * machine that wrote the file.
+ */
+function todayStamp(d = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {

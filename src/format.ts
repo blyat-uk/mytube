@@ -136,6 +136,33 @@ export function formatViews(n: number | null): string {
   return String(n);
 }
 
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+/**
+ * A size on disk, as the export tick quotes it: "112 MB", "1.4 GB", "0 B".
+ *
+ * Three significant figures at most -- a decimal under ten, none above it --
+ * because the number is there to answer "is this worth carrying?", and
+ * "117.4 MB" answers it no better than "117 MB" while reading as precision
+ * nobody asked for. 1024 to the step, matching what a file manager reports for
+ * the same directory; a thumbnail cache measured decimally would disagree with
+ * every other tool on the machine.
+ */
+export function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  let value = n;
+  let unit = 0;
+  // Promote a hair early: 1 048 575 B is 1023.999 KB, and rounding that for
+  // display would print "1024 KB" -- a unit that is really the next one up.
+  while (value >= 1023.95 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  if (unit === 0) return `${Math.round(value)} B`;
+  const shown = value < 9.95 ? value.toFixed(1) : String(Math.round(value));
+  return `${shown} ${BYTE_UNITS[unit]}`;
+}
+
 /**
  * Whether there is a file on disk to play or to delete. `done` alone is not
  * enough: the row keeps its state after the file is removed, and `file_path`

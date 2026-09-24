@@ -1172,7 +1172,9 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .switch-label { display: block; font-weight: 600; }
 .switch-row .field-hint { margin-top: 2px; }
 
-.settings-foot { color: var(--faint); font-size: 12.5px; margin-top: 22px; }
+/* Caption for the field stack above it, not a page foot: the Backup &
+   transfer block sits below it. */
+.settings-note { color: var(--faint); font-size: 12.5px; margin-top: 22px; }
 
 /* --- modal --------------------------------------------------------------- */
 
@@ -1436,10 +1438,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 
 /* ------------------------------------------------------------------ *
- * Takeout import checklist
+ * Import checklists
+ *
+ * Shared by the Takeout CSV and the transfer archive: both are a scrolling
+ * list of channels with a filter above it and a progress bar in its place
+ * while the import runs, so they are one set of rules rather than two.
  * ------------------------------------------------------------------ */
 
-.modal.takeout {
+.modal.takeout, .modal.transfer {
   width: min(620px, calc(100vw - 40px));
   padding: 20px;
   display: flex;
@@ -1479,6 +1485,9 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   color: var(--ok);
   font-size: 11px;
 }
+/* A tag for a fact rather than a good outcome: "not subscribed" is neutral,
+   and the green pill would read as an achievement. */
+.takeout-tag.is-quiet { background: var(--surface-2); color: var(--faint); }
 .takeout-none { padding: 14px; color: var(--faint); font-size: 13px; text-align: center; }
 
 .takeout-progress { padding: 18px 2px 6px; }
@@ -1495,6 +1504,71 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   transition: width 220ms ease-out;
 }
 .progress-label { margin: 10px 0 4px; font-size: 13px; }
+
+/* ------------------------------------------------------------------ *
+ * Backup & transfer
+ * ------------------------------------------------------------------ */
+
+/* Set off from the fields above it: everything else on the page edits one
+   setting, and this writes or rewrites the lot. */
+.transfer-block {
+  margin-top: 26px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}
+.transfer-block > .field-hint { margin: 0 0 14px; max-width: 62ch; }
+.transfer-thumbs { margin-bottom: 12px; }
+.transfer-actions { flex-wrap: wrap; }
+.transfer-estimate { color: var(--faint); font-size: 12.5px; }
+.transfer-progress { margin-top: 16px; max-width: 420px; }
+
+/* --- the archive checklist ----------------------------------------------- */
+
+.transfer-origin { margin: 0; font-size: 13px; color: var(--muted); }
+.transfer-host { color: var(--text); }
+.transfer-counts { margin: 4px 0 0; font-size: 12.5px; color: var(--faint); }
+
+/* Two options side by side, each keeping its own explanation under it — the
+   consequence of Replace must be readable before it is chosen, not after. */
+.transfer-modes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px 16px;
+  margin: 16px 0 4px;
+}
+.transfer-mode .field-hint { margin-top: 6px; }
+
+/* The archive's own count for a channel, which may differ from this library's. */
+.transfer-videos {
+  flex: none;
+  color: var(--faint);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.transfer-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.transfer-opt input[type="checkbox"] {
+  width: 16px; height: 16px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex: none;
+}
+.transfer-warn {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.transfer-warn code { word-break: break-all; }
 
 /* ------------------------------------------------------------------ *
  * Filename template presets

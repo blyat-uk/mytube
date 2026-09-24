@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::models::*;
 use crate::poll::{self, AppState};
-use crate::{config, player, resolve, ytdlp};
+use crate::{config, player, resolve, transfer, ytdlp};
 
 /// Backfills run a few at a time: enough to hide latency, few enough
 /// to stay clear of YouTube rate limiting.
@@ -467,4 +467,157 @@ pub fn delete_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<(
         let _ = std::fs::remove_file(p);
     }
     state.db.clear_file_path(&video_id).map_err(e)
+}
+
+// ---- config transfer ----
+
+/// What an export would weigh, so the "Include thumbnails" tick can offer a
+/// real number instead of a guess.
+#[tauri::command]
+pub fn transfer_estimate(state: State<'_, Arc<AppState>>) -> R<TransferEstimate> {
+    let channels = state.db.export_channels().map_err(e)?;
+    let videos = state.db.export_videos().map_err(e)?;
+    // `transfer` owns the sizing because it owns what actually goes in the zip:
+    // a thumbnail is counted only if the file is really there to be copied.
+    Ok(transfer::estimate(&channels, &videos))
+}
+
+#[tauri::command]
+pub async fn export_config(
+    path: String,
+    include_thumbs: bool,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<()> {
+    let channels = state.db.export_channels().map_err(e)?;
+    let videos = state.db.export_videos().map_err(e)?;
+    let settings = config::load().map_err(e)?;
+    let dest = std::path::PathBuf::from(path);
+
+    // Zipping thousands of thumbnails is blocking work. On the async runtime's
+    // own threads it would stall every other command behind it -- including the
+    // progress events this very call is emitting.
+    tauri::async_runtime::spawn_blocking(move || {
+        transfer::write_archive(
+            &dest,
+            &channels,
+            &videos,
+            &settings,
+            include_thumbs,
+            &|done, total, current| {
+                let _ = app.emit(
+                    "transfer://progress",
+                    TransferProgress {
+                        phase: TransferPhase::Export,
+                        done,
+                        total,
+                        current: current.to_string(),
+                    },
+                );
+            },
+        )
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+
+/// Parses the archive's manifest without writing anything, so the dialog can
+/// show what is inside before anything is committed to.
+#[tauri::command]
+pub async fn read_archive(
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> R<ArchiveSummary> {
+    // Every channel, not just the subscribed ones: an ad-hoc uploader already
+    // here is "already here", and saying otherwise would offer to re-add it.
+    let known: std::collections::HashSet<String> = state
+        .db
+        .export_channels()
+        .map_err(e)?
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    let p = std::path::PathBuf::from(path);
+    let mut summary = tauri::async_runtime::spawn_blocking(move || transfer::read_summary(&p, &known))
+        .await
+        .map_err(e)?
+        .map_err(e)?;
+
+    // What a Replace would remove, measured here because only the database can
+    // answer it. Against the archive's whole roster, never the ticked subset:
+    // unticking a row means "skip it", so the number the dialog shows must not
+    // move as the user works down the checklist.
+    let roster: Vec<String> = summary.channels.iter().map(|c| c.channel_id.clone()).collect();
+    let (local_only_channels, local_only_videos) = state.db.absent_from(&roster).map_err(e)?;
+    summary.local_only_channels = local_only_channels;
+    summary.local_only_videos = local_only_videos;
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn import_config(
+    path: String,
+    channel_ids: Vec<String>,
+    mode: ImportMode,
+    apply_settings: bool,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<ImportReport> {
+    let p = std::path::PathBuf::from(path);
+    let emitter = app.clone();
+
+    // Everything outside the database: settings, thumbnails, path re-rooting.
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        transfer::prepare_import(&p, &channel_ids, apply_settings, &|done, total, current| {
+            let _ = emitter.emit(
+                "transfer://progress",
+                TransferProgress {
+                    phase: TransferPhase::Import,
+                    done,
+                    total,
+                    current: current.to_string(),
+                },
+            );
+        })
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)?;
+
+    // And now the part that has to be atomic. One `Db` call, one transaction:
+    // the connection Mutex is not reentrant, so a loop over several public
+    // methods was never available, and a failure here must leave the library
+    // exactly as it was.
+    let mut report = state
+        .db
+        .apply_import(
+            &prepared.channels,
+            &prepared.videos,
+            mode,
+            &prepared.archive_channel_ids,
+        )
+        .map_err(e)?;
+
+    // `db` knows the row counts; `transfer` knows everything that happened
+    // outside SQL. Neither can fill the other's half.
+    report.downloads_relinked = prepared.report.downloads_relinked;
+    report.thumbs_written = prepared.report.thumbs_written;
+    report.settings_applied = prepared.report.settings_applied;
+    report.download_dir_kept = prepared.report.download_dir_kept;
+
+    // An imported settings block is a settings save, so the live queue has to
+    // hear about a changed limit the same way `save_settings` tells it.
+    if report.settings_applied {
+        if let Ok(s) = config::load() {
+            state.queue.set_concurrency(s.max_concurrent_downloads).await;
+        }
+    }
+
+    // The library changed underneath every view. `App.tsx` refetches on this,
+    // the same way it does after a poll -- deliberately a separate event from
+    // `poll://finished`, which would also fire the "N new videos" toast and the
+    // tray badge for videos that are not new to you at all.
+    let _ = app.emit("transfer://finished", report.clone());
+    Ok(report)
 }

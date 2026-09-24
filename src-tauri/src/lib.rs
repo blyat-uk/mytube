@@ -8,6 +8,7 @@ pub mod queue;
 pub mod resolve;
 pub mod rss;
 pub mod siblings;
+pub mod transfer;
 pub mod tray;
 pub mod upload_date;
 pub mod window;
@@ -127,6 +128,10 @@ pub fn run() {
             commands::cancel_download,
             commands::open_in_player,
             commands::delete_download,
+            commands::transfer_estimate,
+            commands::export_config,
+            commands::read_archive,
+            commands::import_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -7,7 +7,7 @@ import SettingsView from "./components/SettingsView";
 import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
-import { usePollEvents } from "./events";
+import { usePollEvents, useTransferFinished } from "./events";
 import type { Channel, SortOrder, Video, ViewState } from "./types";
 import "./App.css";
 
@@ -120,6 +120,16 @@ function Shell() {
   }, [toast]);
 
   useEffect(() => { void loadChannels(); }, [loadChannels]);
+
+  // An import rewrites channels and videos underneath every view, so the shell
+  // refetches exactly as it does after a poll. Deliberately its own event
+  // rather than `poll://finished`, which would also fire the "N new videos"
+  // toast and the tray badge for videos that are not new to you at all --
+  // and the toast for this belongs to the dialog that asked for the import.
+  useTransferFinished(() => {
+    void loadChannels();
+    reload();
+  });
 
   // A poll can also start on its own (startup and the interval timer), so the
   // spinner and the refetch are driven by events rather than by the button.

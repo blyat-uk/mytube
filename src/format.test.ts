@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  formatDuration, formatTotalRuntime, formatRelative, formatViews, cardAction, videoUrl,
-  hasDownloadedFile, seriesRuntime,
+  formatDuration, formatTotalRuntime, formatRelative, formatViews, formatBytes, cardAction,
+  videoUrl, hasDownloadedFile, seriesRuntime,
 } from "./format";
 
 describe("formatDuration", () => {
@@ -112,6 +112,38 @@ describe("formatViews", () => {
     expect(formatViews(1500)).toBe("1.5K");
     expect(formatViews(1_800_000)).toBe("1.8M");
     expect(formatViews(null)).toBe("");
+  });
+});
+
+/**
+ * The number beside "Include thumbnails" is the only thing standing between a
+ * tick and 112 MB of archive, so it has to read the way a file manager reads.
+ */
+describe("formatBytes", () => {
+  it("counts bytes whole, with nothing to abbreviate yet", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1)).toBe("1 B");
+    expect(formatBytes(999)).toBe("999 B");
+  });
+  it("keeps one decimal under ten units", () => {
+    expect(formatBytes(1024)).toBe("1.0 KB");
+    expect(formatBytes(Math.round(1.4 * 1024 ** 3))).toBe("1.4 GB");
+  });
+  it("drops the decimal above ten, where it is noise not precision", () => {
+    expect(formatBytes(812 * 1024)).toBe("812 KB");
+    expect(formatBytes(112 * 1024 ** 2)).toBe("112 MB");
+  });
+  it("rolls over rather than printing a size in units of its own successor", () => {
+    // 1023.999 KB must not round to "1024 KB", nor 1023.99 MB to "1024 MB".
+    expect(formatBytes(1024 ** 2 - 1)).toBe("1.0 MB");
+    expect(formatBytes(1024 ** 3 - 1)).toBe("1.0 GB");
+    expect(formatBytes(1023)).toBe("1023 B");
+  });
+  it("stops at terabytes rather than inventing a unit", () =>
+    expect(formatBytes(3 * 1024 ** 5)).toBe("3072 TB"));
+  it("treats nonsense as nothing", () => {
+    expect(formatBytes(-1)).toBe("0 B");
+    expect(formatBytes(Number.NaN)).toBe("0 B");
   });
 });
 

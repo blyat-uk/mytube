@@ -96,3 +96,67 @@ export interface DownloadProgress { videoId: string; percent: number; speed: str
 export interface DownloadStateEvent {
   videoId: string; state: DownloadState; filePath: string | null; error: string | null;
 }
+
+/* ------------------------------------------------------------------ *
+ * Config export / import
+ *
+ * All camelCase: the Rust payloads carry `#[serde(rename_all = "camelCase")]`,
+ * unlike `Channel`/`Video`/`Settings`, which cross the boundary snake_case.
+ * ------------------------------------------------------------------ */
+
+/** Merge keeps everything already here; replace makes the picked channels
+ *  exactly what the archive holds — database rows only, never files. */
+export type ImportMode = "merge" | "replace";
+/** Which half of the transfer a progress event belongs to. One event channel
+ *  carries both, and each side's progress bar ignores the other's. */
+export type TransferPhase = "export" | "import";
+
+export interface ArchiveChannel {
+  channelId: string; title: string; videoCount: number;
+  subscribed: boolean; member: boolean;
+  /** Already in this library, so importing it updates rather than adds. */
+  alreadyHere: boolean;
+}
+
+/**
+ * What an archive says about itself, read without unpacking it. Everything the
+ * import checklist needs to describe the file before anything is written.
+ */
+export interface ArchiveSummary {
+  format: number; appVersion: string; exportedAt: number; exportedFrom: string;
+  includesThumbs: boolean; thumbCount: number;
+  /** The exporting machine's download folder, and whether this machine has it.
+   *  Missing means the import keeps the local one rather than pointing the
+   *  library at a path that is not there. */
+  downloadDir: string; downloadDirExists: boolean;
+  channels: ArchiveChannel[]; videoCount: number;
+  /** How much of this library the archive never mentions — exactly what a
+   *  Replace would remove. Measured against the whole archive, not the ticked
+   *  subset, so it does not move as the checklist is worked through: unticking
+   *  a channel skips it entirely rather than marking it for deletion. */
+  localOnlyChannels: number; localOnlyVideos: number;
+}
+
+/**
+ * What an import actually did. The removal counts are rows, not files: an
+ * import never deletes a download or a cached thumbnail from disk.
+ */
+export interface ImportReport {
+  channelsAdded: number; channelsUpdated: number;
+  videosAdded: number; videosUpdated: number;
+  channelsRemoved: number; videosRemoved: number;
+  /** Videos whose file the archive named and this machine turned out to have. */
+  downloadsRelinked: number; thumbsWritten: number;
+  settingsApplied: boolean;
+  /** True when the archive's download folder was refused for a local one. */
+  downloadDirKept: boolean;
+}
+
+export interface TransferProgress {
+  phase: TransferPhase; done: number; total: number; current: string;
+}
+
+/** Sizes the Export tick quotes, so "Include thumbnails" names a real cost. */
+export interface TransferEstimate {
+  channelCount: number; videoCount: number; thumbCount: number; thumbBytes: number;
+}

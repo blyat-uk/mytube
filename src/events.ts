@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { DownloadProgress, DownloadStateEvent, PollSummary } from "./types";
+import type {
+  DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, TransferProgress,
+} from "./types";
 
 /**
  * Attaches Tauri event listeners for the lifetime of the calling component.
@@ -48,4 +50,23 @@ export function usePollEvents(handlers: {
 }) {
   useTauriEvent<null>("poll://started", () => handlers.onStarted?.());
   useTauriEvent<PollSummary>("poll://finished", handlers.onFinished);
+}
+
+/**
+ * Export and import progress.
+ *
+ * Deliberately its own channel rather than `import://progress`: TakeoutDialog
+ * subscribes to that one for as long as the Add dialog is open, so sharing it
+ * would light the Takeout progress bar up in the middle of an unrelated export.
+ * `phase` then separates the two halves, since one channel carries both.
+ */
+export function useTransferProgress(handler?: (p: TransferProgress) => void) {
+  useTauriEvent<TransferProgress>("transfer://progress", handler);
+}
+
+/** An import rewrites channels and videos underneath every view, and the view
+ *  that started it takes no props — so the shell hears about it here and
+ *  refetches. */
+export function useTransferFinished(handler?: (report: ImportReport) => void) {
+  useTauriEvent<ImportReport>("transfer://finished", handler);
 }

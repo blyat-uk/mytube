@@ -2,7 +2,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
-  ImportResult, TakeoutRow,
+  ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
 } from "./types";
 
 export const api = {
@@ -43,6 +43,17 @@ export const api = {
   cancelDownload: (videoId: string) => invoke<void>("cancel_download", { videoId }),
   openInPlayer: (videoId: string) => invoke<void>("open_in_player", { videoId }),
   deleteDownload: (videoId: string) => invoke<void>("delete_download", { videoId }),
+  /** What an export would weigh, so the thumbnails tick can quote a real size
+   *  rather than a guess the user has no way to check. */
+  transferEstimate: () => invoke<TransferEstimate>("transfer_estimate"),
+  exportConfig: (path: string, includeThumbs: boolean) =>
+    invoke<void>("export_config", { path, includeThumbs }),
+  /** Reads an archive's manifest without unpacking it: nothing is written until
+   *  `importConfig` runs, so the checklist can describe the file first. */
+  readArchive: (path: string) => invoke<ArchiveSummary>("read_archive", { path }),
+  importConfig: (
+    path: string, channelIds: string[], mode: ImportMode, applySettings: boolean,
+  ) => invoke<ImportReport>("import_config", { path, channelIds, mode, applySettings }),
   /** Hands a URL to the desktop's default browser. */
   openExternal: (url: string) => openUrl(url),
 };

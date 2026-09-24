@@ -39,3 +39,16 @@ regex = "1"
 # Only for `killpg`: cancelling a download has to signal yt-dlp *and* the ffmpeg
 # it shells out to, and std/tokio can only signal the direct child.
 libc = "0.2"
+# The export/import archive. Pure Rust, and deliberately stripped: the default
+# feature set drags in aes, bzip2, lzma, ppmd, zstd and xz — six codecs, two of
+# them C libraries — for a file that only ever holds a deflated manifest.json
+# and stored JPEGs. `deflate-flate2-zlib-rs` names flate2's zlib-rs backend
+# explicitly rather than leaning on feature unification with reqwest's gzip;
+# plain `deflate-flate2` takes flate2 with `default-features = false`, which on
+# its own has no backend at all and only compiles here by accident.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+# transfer.rs writes real archives and extracts them; every test that touches
+# the filesystem does it under a directory that deletes itself.
+tempfile = "3"

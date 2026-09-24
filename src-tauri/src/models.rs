@@ -314,3 +314,117 @@ pub struct ImportResult {
     pub skipped: usize,
     pub failed: Vec<String>,
 }
+
+// ---- config transfer (export / import) ----
+
+/// What an import does to rows the archive does not carry.
+///
+/// The choice is made in the import dialog rather than being a property of the
+/// archive: the same file is both "sync my other machine" and "restore this
+/// backup", and only the person importing knows which one this is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportMode {
+    /// Nothing local is lost. Missing rows are inserted whole; rows already
+    /// here have only their user-owned state lifted -- never their title,
+    /// dates, duration or status, because the local poll is the fresher
+    /// source for those.
+    Merge,
+    /// The picked channels' library becomes exactly what the archive holds.
+    /// Rows are deleted; **files on disk never are** -- neither downloads nor
+    /// cached thumbnails.
+    Replace,
+}
+
+/// One row of the import checklist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveChannel {
+    pub channel_id: String,
+    pub title: String,
+    pub video_count: usize,
+    /// False for an ad-hoc uploader, which travels only so its manually-added
+    /// videos have the parent row the foreign key demands.
+    pub subscribed: bool,
+    pub member: bool,
+    /// Whether this machine already has the channel, so the dialog can say so.
+    pub already_here: bool,
+}
+
+/// What reading an archive's manifest found, without writing anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSummary {
+    pub format: u32,
+    pub app_version: String,
+    pub exported_at: i64,
+    pub exported_from: String,
+    pub includes_thumbs: bool,
+    pub thumb_count: usize,
+    /// The exporting machine's download folder. Recorded even when its
+    /// *setting* is not applied, because it is the root every `rel_path` is
+    /// resolved against.
+    pub download_dir: String,
+    /// Whether that path exists here. False means the import keeps this
+    /// machine's own download folder and says so.
+    pub download_dir_exists: bool,
+    pub channels: Vec<ArchiveChannel>,
+    pub video_count: usize,
+    /// How much of *this* machine's library the archive never mentions, which
+    /// is exactly what a Replace would remove. Measured against the whole
+    /// archive rather than the ticked subset, so the number does not move as
+    /// the checklist is worked through -- which is what makes it safe to state
+    /// beside it. Filled in by `commands::read_archive`: only the database
+    /// knows this, and `transfer` never opens one.
+    pub local_only_channels: usize,
+    pub local_only_videos: usize,
+}
+
+/// What an import actually did, for the closing toast.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportReport {
+    pub channels_added: usize,
+    pub channels_updated: usize,
+    pub videos_added: usize,
+    pub videos_updated: usize,
+    pub channels_removed: usize,
+    pub videos_removed: usize,
+    /// Rows whose downloaded file was found on this machine and re-attached.
+    pub downloads_relinked: usize,
+    pub thumbs_written: usize,
+    pub settings_applied: bool,
+    /// True when the archive's download folder did not exist here, so this
+    /// machine's own was kept.
+    pub download_dir_kept: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferPhase {
+    Export,
+    Import,
+}
+
+/// Rides `transfer://progress`. Deliberately **not** `import://progress`:
+/// `TakeoutDialog` listens for that one globally and would light up in the
+/// middle of an unrelated export.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub phase: TransferPhase,
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
+}
+
+/// What an export would weigh, so the "Include thumbnails" tick can show a
+/// real number instead of a guess.
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferEstimate {
+    pub channel_count: usize,
+    pub video_count: usize,
+    pub thumb_count: usize,
+    pub thumb_bytes: u64,
+}

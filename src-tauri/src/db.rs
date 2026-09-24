@@ -2133,3 +2133,742 @@ mod tests {
     }
 
 }
+
+// ---- config transfer (export / import) ----
+
+/// How many ids one batched `DELETE ... WHERE id IN (...)` may bind.
+///
+/// A Replace import can be asked to drop a whole library at once -- thousands
+/// of rows in real use -- and one statement carrying a placeholder per id would
+/// walk straight into SQLite's parameter ceiling. Chunking costs one extra
+/// round trip per 500 rows and has no ceiling at all.
+const IMPORT_ID_BATCH: usize = 500;
+
+fn delete_ids_in_batches(conn: &Connection, table: &str, ids: &[&str]) -> Result<usize> {
+    let mut removed = 0;
+    for chunk in ids.chunks(IMPORT_ID_BATCH) {
+        let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM {table} WHERE id IN ({holes})");
+        removed += conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+    }
+    Ok(removed)
+}
+
+fn count_videos_of_channels(conn: &Connection, channel_ids: &[&str]) -> Result<usize> {
+    let mut total = 0i64;
+    for chunk in channel_ids.chunks(IMPORT_ID_BATCH) {
+        let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT COUNT(*) FROM videos WHERE channel_id IN ({holes})");
+        total += conn.query_row(&sql, rusqlite::params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))?;
+    }
+    Ok(total as usize)
+}
+
+/// A channel row written exactly as the archive carries it: every insert, and
+/// every update under [`ImportMode::Replace`].
+const PUT_CHANNEL: &str = "
+INSERT INTO channels (id,title,handle,url,thumb_path,subscribed,member,added_at,last_polled_at)
+VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+ON CONFLICT(id) DO UPDATE SET
+  title=excluded.title, handle=excluded.handle, url=excluded.url,
+  thumb_path=excluded.thumb_path, subscribed=excluded.subscribed,
+  member=excluded.member, added_at=excluded.added_at,
+  last_polled_at=excluded.last_polled_at";
+
+/// What a Merge does to a channel that is already here: the two flags are
+/// lifted and nothing else is. The local `title`, `handle` and `url` come from
+/// a poll that has run since the archive was written, and `added_at` /
+/// `last_polled_at` are this machine's own history, not the exporter's.
+///
+/// `member` is a one-way upgrade here, which is a deliberate departure from
+/// [`Db::upsert_channel`] -- that path omits the column entirely, because a
+/// poll's upsert carries no opinion about a membership and one can end. An
+/// import is not a poll: exporting a config in which you are a member is a
+/// statement of intent. The asymmetry of getting it wrong settles it. A stale
+/// `true` costs you some locked videos you cannot download -- exactly the state
+/// a lapsed membership already produces, and visible on the card. A missed
+/// `true` silently switches off the members-only ingest, and you find out
+/// months later that the uploads you paid for were never in the library.
+///
+/// The WHERE guard is what makes re-importing the same archive report an
+/// honest zero: without it every row would come back "updated" forever.
+const MERGE_CHANNEL: &str = "
+UPDATE channels
+   SET subscribed = MAX(subscribed, ?2),
+       member     = MAX(member, ?3)
+ WHERE id = ?1 AND (subscribed < ?2 OR member < ?3)";
+
+/// A video row written exactly as the archive carries it.
+const PUT_VIDEO: &str = "
+INSERT INTO videos
+  (id,channel_id,title,description,thumb_url,thumb_path,published_at,sort_at,feed_rank,
+   added_manually,duration_secs,view_count,status,hidden,watched,watched_at,
+   download_state,download_error,file_path,downloaded_at,first_seen_at,sibling_group)
+VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+ON CONFLICT(id) DO UPDATE SET
+  channel_id=excluded.channel_id, title=excluded.title, description=excluded.description,
+  thumb_url=excluded.thumb_url, thumb_path=excluded.thumb_path,
+  published_at=excluded.published_at, sort_at=excluded.sort_at,
+  feed_rank=excluded.feed_rank, added_manually=excluded.added_manually,
+  duration_secs=excluded.duration_secs, view_count=excluded.view_count,
+  status=excluded.status, hidden=excluded.hidden, watched=excluded.watched,
+  watched_at=excluded.watched_at, download_state=excluded.download_state,
+  download_error=excluded.download_error, file_path=excluded.file_path,
+  downloaded_at=excluded.downloaded_at, first_seen_at=excluded.first_seen_at,
+  sibling_group=excluded.sibling_group";
+
+/// What a Merge lifts onto a video that is already here: user-owned state only.
+///
+/// `title`, `description`, `thumb_url`, `published_at`, `sort_at`, `feed_rank`,
+/// `duration_secs`, `view_count`, `status`, `first_seen_at` and
+/// `download_error` are all deliberately absent. The local poll has re-read
+/// every one of them since the archive was written, so the archive is the
+/// staler source; only the columns that record what *you* did have no other
+/// authority.
+///
+/// **A local `done` is never downgraded.** Only an incoming `done` moves the
+/// three download columns, and it moves them together -- state, path and
+/// timestamp describe one file and splitting them would leave a row claiming a
+/// download that is not there. Anything else incoming (`none` from a machine
+/// that never fetched it, or a `failed`) leaves all three alone: a file on this
+/// disk is a fact, and an archive written elsewhere cannot contradict it.
+///
+/// `watched_at` takes the earliest of the two, since the question it answers is
+/// when you first watched the thing, and that is not a per-machine fact.
+///
+/// The WHERE guard repeats every rule above as a predicate so that `changes()`
+/// counts rows that actually moved. It is what makes a second run of the same
+/// archive report zero updates instead of rewriting the whole library.
+const MERGE_VIDEO: &str = "
+UPDATE videos SET
+  watched        = MAX(watched, ?2),
+  hidden         = MAX(hidden, ?3),
+  added_manually = MAX(added_manually, ?4),
+  watched_at     = CASE WHEN ?5 IS NULL        THEN watched_at
+                        WHEN watched_at IS NULL THEN ?5
+                        ELSE MIN(watched_at, ?5) END,
+  sibling_group  = COALESCE(sibling_group, ?6),
+  thumb_path     = COALESCE(thumb_path, ?7),
+  download_state = CASE WHEN ?8 = 'done' THEN ?8  ELSE download_state END,
+  file_path      = CASE WHEN ?8 = 'done' THEN ?9  ELSE file_path      END,
+  downloaded_at  = CASE WHEN ?8 = 'done' THEN ?10 ELSE downloaded_at  END
+WHERE id = ?1
+  AND ( watched < ?2
+     OR hidden < ?3
+     OR added_manually < ?4
+     OR (?5 IS NOT NULL AND (watched_at IS NULL OR watched_at > ?5))
+     OR (sibling_group IS NULL AND ?6 IS NOT NULL)
+     OR (thumb_path IS NULL AND ?7 IS NOT NULL)
+     OR (?8 = 'done' AND (download_state <> 'done'
+                          OR file_path IS NOT ?9
+                          OR downloaded_at IS NOT ?10)) )";
+
+impl Db {
+    /// Every channel, subscribed or not.
+    ///
+    /// The unsubscribed ad-hoc uploaders are not optional baggage: a manually
+    /// added video's parent row has to travel with it, or `videos.channel_id`'s
+    /// foreign key rejects the video on the importing machine.
+    pub fn export_channels(&self) -> Result<Vec<Channel>> {
+        // No lock taken here, for the same reason `list_channels` takes none:
+        // `channels_where` takes it, and this Mutex is not reentrant. Going
+        // through it also means an export can never drift from the projection
+        // the rest of the app reads.
+        self.channels_where("1=1")
+    }
+
+    /// Every video row, in a stable order so two libraries holding the same
+    /// rows export byte-identical lists.
+    pub fn export_videos(&self) -> Result<Vec<Video>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            &format!("{SELECT_VIDEO} ORDER BY v.first_seen_at ASC, v.id ASC"))?;
+        let rows = st.query_map([], map_video)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// `(channel_count, video_count)`, for the export dialog's size estimate.
+    pub fn transfer_estimate(&self) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let channels: i64 = conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))?;
+        let videos: i64 = conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))?;
+        Ok((channels as usize, videos as usize))
+    }
+
+    /// How much of this machine's library an archive does not mention at all,
+    /// so a Replace can say exactly what it would remove before it removes it.
+    /// Returns `(channels, videos)`; the videos are the ones hanging off those
+    /// channels, which a Replace takes with them through the cascade.
+    ///
+    /// Counted against every id the archive holds, ticked or not, for the same
+    /// reason [`Db::apply_import`] deletes against that set: leaving a channel
+    /// unticked withholds it from the import, it does not condemn the local
+    /// copy. So this number never moves as the user works down the checklist,
+    /// which is what makes it safe to show beside it.
+    pub fn absent_from(&self, archive_channel_ids: &[String]) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let in_archive: HashSet<&str> =
+            archive_channel_ids.iter().map(|s| s.as_str()).collect();
+        let absent: Vec<String> = {
+            let mut st = conn.prepare("SELECT id FROM channels")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|id| !in_archive.contains(id.as_str()))
+                .collect()
+        };
+        let refs: Vec<&str> = absent.iter().map(|s| s.as_str()).collect();
+        Ok((absent.len(), count_videos_of_channels(&conn, &refs)?))
+    }
+
+    /// Applies a whole archive in one transaction, so a failure halfway leaves
+    /// the library exactly as it was rather than half-imported.
+    ///
+    /// `archive_channel_ids` is every channel id the *archive* carries, ticked
+    /// or not, which is a different and wider set than `channels`. Only a
+    /// Replace reads it, to tell a channel the archive never mentioned from one
+    /// the user merely left unticked; under `Merge` nothing is deleted at all,
+    /// so it is unused and `&[]` is a fair thing to pass.
+    ///
+    /// `channels` and `videos` are already the subset the user ticked, and the
+    /// incoming rows' `file_path` / `download_state` / `downloaded_at` /
+    /// `thumb_path` have already been resolved for *this* machine by the
+    /// caller. Nothing here second-guesses them, and nothing here touches the
+    /// filesystem at all.
+    ///
+    /// The report's `downloads_relinked`, `thumbs_written`, `settings_applied`
+    /// and `download_dir_kept` are left at their defaults: they are the
+    /// caller's to fill in and merge.
+    pub fn apply_import(
+        &self,
+        channels: &[Channel],
+        videos: &[Video],
+        mode: ImportMode,
+        archive_channel_ids: &[String],
+    ) -> Result<ImportReport> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut report = ImportReport::default();
+
+        // What is here before anything is written. Read once: asking per row
+        // whether it exists would be one SELECT per video on a library of
+        // thousands, and inside the transaction nothing else can move these
+        // sets underneath us. They are what tells an insert from an update --
+        // an UPSERT's `changes()` reports 1 either way.
+        let mut local_channels: HashSet<String> = {
+            let mut st = tx.prepare("SELECT id FROM channels")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        let mut local_videos: HashMap<String, String> = {
+            let mut st = tx.prepare("SELECT id, channel_id FROM videos")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
+
+        let keep_channels: HashSet<&str> = channels.iter().map(|c| c.id.as_str()).collect();
+        let keep_videos: HashSet<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+
+        if mode == ImportMode::Replace {
+            // Replace deletes database ROWS and nothing else. Not a downloaded
+            // video, not a cached thumbnail -- the import dialog promises that
+            // in so many words, and the asymmetry is total: a deleted row comes
+            // back on the next poll or the next import, while a deleted
+            // recording is simply gone. Nothing in this branch, or anywhere
+            // else in this method, touches the filesystem.
+            //
+            // And only a channel the archive does not mention *at all* goes.
+            // The checklist is an inclusion control: unticking a channel says
+            // "don't import this one", never "destroy my copy of it". A channel
+            // that is in the archive but outside the picked subset is therefore
+            // skipped whole -- not imported, not deleted, not modified -- and
+            // its videos are not swept either, which is why `orphans` below is
+            // scoped to `keep_channels` and this is scoped to the archive.
+            let in_archive: HashSet<&str> =
+                archive_channel_ids.iter().map(|s| s.as_str()).collect();
+            let drop_channels: Vec<String> = local_channels
+                .iter()
+                .filter(|id| !in_archive.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let dropped: HashSet<&str> = drop_channels.iter().map(|s| s.as_str()).collect();
+
+            // Counted before the DELETE: `videos.channel_id` cascades, and
+            // SQLite's `changes()` never reports a cascaded row, so after the
+            // fact there is nothing left to count.
+            let cascaded: Vec<String> = local_videos
+                .iter()
+                .filter(|(_, ch)| dropped.contains(ch.as_str()))
+                .map(|(id, _)| id.clone())
+                .collect();
+            // A kept channel's library becomes exactly what the archive holds.
+            let orphans: Vec<String> = local_videos
+                .iter()
+                .filter(|(id, ch)| {
+                    keep_channels.contains(ch.as_str()) && !keep_videos.contains(id.as_str())
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            let refs: Vec<&str> = drop_channels.iter().map(|s| s.as_str()).collect();
+            report.channels_removed = delete_ids_in_batches(&tx, "channels", &refs)?;
+            let refs: Vec<&str> = orphans.iter().map(|s| s.as_str()).collect();
+            report.videos_removed =
+                cascaded.len() + delete_ids_in_batches(&tx, "videos", &refs)?;
+
+            for id in &drop_channels { local_channels.remove(id); }
+            for id in cascaded.iter().chain(orphans.iter()) { local_videos.remove(id); }
+        }
+
+        // Channels first, always: a video whose channel arrives in the same
+        // archive needs its parent row in place before `videos.channel_id`'s
+        // foreign key will accept it.
+        for c in channels {
+            let existed = local_channels.contains(&c.id);
+            if existed && mode == ImportMode::Merge {
+                report.channels_updated += tx.execute(
+                    MERGE_CHANNEL,
+                    params![c.id, c.subscribed as i64, c.member as i64],
+                )?;
+            } else {
+                tx.execute(
+                    PUT_CHANNEL,
+                    params![c.id, c.title, c.handle, c.url, c.thumb_path,
+                            c.subscribed as i64, c.member as i64, c.added_at,
+                            c.last_polled_at],
+                )?;
+                if existed { report.channels_updated += 1 } else { report.channels_added += 1 }
+            }
+            local_channels.insert(c.id.clone());
+        }
+
+        for v in videos {
+            let existed = local_videos.contains_key(&v.id);
+            if existed && mode == ImportMode::Merge {
+                report.videos_updated += tx.execute(
+                    MERGE_VIDEO,
+                    params![v.id, v.watched as i64, v.hidden as i64, v.added_manually as i64,
+                            v.watched_at, v.sibling_group, v.thumb_path,
+                            v.download_state.as_str(), v.file_path, v.downloaded_at],
+                )?;
+            } else {
+                tx.execute(
+                    PUT_VIDEO,
+                    params![v.id, v.channel_id, v.title, v.description, v.thumb_url,
+                            v.thumb_path, v.published_at, v.sort_at, v.feed_rank,
+                            v.added_manually as i64, v.duration_secs, v.view_count,
+                            v.status.as_str(), v.hidden as i64, v.watched as i64,
+                            v.watched_at, v.download_state.as_str(), v.download_error,
+                            v.file_path, v.downloaded_at, v.first_seen_at, v.sibling_group],
+                )?;
+                if existed { report.videos_updated += 1 } else { report.videos_added += 1 }
+            }
+            local_videos.insert(v.id.clone(), v.channel_id.clone());
+        }
+
+        tx.commit()?;
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    fn db() -> Db { Db::open_in_memory().unwrap() }
+
+    fn chan(id: &str, title: &str) -> Channel {
+        Channel { id: id.into(), title: title.into(), handle: Some(format!("@{id}")),
+                  url: format!("https://www.youtube.com/channel/{id}"),
+                  thumb_path: None, subscribed: true, member: false, added_at: 1_000,
+                  last_polled_at: Some(2_000) }
+    }
+
+    fn video(id: &str, ch: &str, ch_title: &str) -> Video {
+        Video { id: id.into(), channel_id: ch.into(), channel_title: ch_title.into(),
+                title: format!("t-{id}"), description: None, thumb_url: None,
+                thumb_path: None, published_at: Some(1_000), sort_at: Some(1_000),
+                feed_rank: 0, added_manually: false, duration_secs: Some(600),
+                view_count: Some(1), status: VideoStatus::Ready, hidden: false,
+                watched: false, watched_at: None, download_state: DownloadState::None,
+                download_error: None, file_path: None, downloaded_at: None,
+                first_seen_at: 500, sibling_group: None }
+    }
+
+    /// Every user-owned column set to something distinguishable, so a round
+    /// trip that drops one is a failed assertion rather than a coincidence.
+    fn rich(id: &str, ch: &str, ch_title: &str) -> Video {
+        let mut v = video(id, ch, ch_title);
+        v.watched = true;
+        v.watched_at = Some(9_999);
+        v.hidden = true;
+        v.added_manually = true;
+        v.sibling_group = Some("k-1".into());
+        v.thumb_path = Some(format!("/thumbs/{id}.jpg"));
+        v.download_state = DownloadState::Done;
+        v.file_path = Some(format!("/videos/{id}.mkv"));
+        v.downloaded_at = Some(4_242);
+        v.first_seen_at = 42;
+        v
+    }
+
+    fn seed(d: &Db, channels: &[Channel], videos: &[Video]) -> ImportReport {
+        d.apply_import(channels, videos, ImportMode::Merge, &[]).unwrap()
+    }
+
+    /// Every channel id an archive carries, which is what a Replace measures
+    /// itself against. Deliberately spelled out separately from the ticked
+    /// subset handed to `apply_import`: the two are different sets, and
+    /// conflating them is exactly the bug these tests exist to keep out.
+    fn archive(ids: &[&str]) -> Vec<String> { ids.iter().map(|s| (*s).to_string()).collect() }
+
+    #[test]
+    fn export_carries_the_ad_hoc_uploader_a_manual_video_hangs_from() {
+        let d = db();
+        let mut adhoc = chan("UC2", "Ad hoc");
+        adhoc.subscribed = false;
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.upsert_channel(&adhoc).unwrap();
+
+        let ids: Vec<String> = d.export_channels().unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 2, "both, not just the subscription");
+        assert!(ids.contains(&"UC2".to_string()));
+        assert_eq!(d.list_subscribed_channels().unwrap().len(), 1, "for contrast");
+    }
+
+    #[test]
+    fn the_estimate_counts_both_tables() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One"), video("b", "UC1", "One")]);
+        assert_eq!(d.transfer_estimate().unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn an_archive_into_an_empty_library_reproduces_every_user_owned_column() {
+        let src = db();
+        let mut c = chan("UC1", "One");
+        c.member = true;
+        c.thumb_path = Some("/thumbs/UC1.jpg".into());
+        seed(&src, &[c], &[rich("a", "UC1", "One")]);
+
+        let dst = db();
+        let report = dst
+            .apply_import(
+                &src.export_channels().unwrap(),
+                &src.export_videos().unwrap(),
+                ImportMode::Merge,
+                &[],
+            )
+            .unwrap();
+        assert_eq!((report.channels_added, report.videos_added), (1, 1));
+
+        assert_eq!(dst.export_channels().unwrap(), src.export_channels().unwrap());
+        assert_eq!(dst.export_videos().unwrap(), src.export_videos().unwrap());
+
+        let ch = dst.get_channel("UC1").unwrap().unwrap();
+        assert!(ch.subscribed && ch.member);
+        let v = dst.get_video("a").unwrap().unwrap();
+        assert!(v.watched && v.hidden && v.added_manually);
+        assert_eq!(v.watched_at, Some(9_999));
+        assert_eq!(v.sibling_group.as_deref(), Some("k-1"));
+        assert_eq!(v.download_state, DownloadState::Done);
+        assert_eq!(v.file_path.as_deref(), Some("/videos/a.mkv"));
+        assert_eq!(v.downloaded_at, Some(4_242));
+        assert_eq!(v.first_seen_at, 42);
+    }
+
+    #[test]
+    fn merging_lifts_watched_and_hidden_but_leaves_the_local_title_and_date_alone() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+
+        let mut incoming = video("a", "UC1", "One");
+        incoming.title = "the title the archive was written under".into();
+        incoming.published_at = Some(1);
+        incoming.sort_at = Some(1);
+        incoming.duration_secs = Some(3);
+        incoming.watched = true;
+        incoming.watched_at = Some(77);
+        incoming.hidden = true;
+        let report = d
+            .apply_import(&[chan("UC1", "One")], &[incoming], ImportMode::Merge, &[])
+            .unwrap();
+
+        assert_eq!(report.videos_added, 0);
+        assert_eq!(report.videos_updated, 1);
+        let v = d.get_video("a").unwrap().unwrap();
+        assert_eq!(v.title, "t-a", "the local poll is the fresher source");
+        assert_eq!(v.published_at, Some(1_000));
+        assert_eq!(v.duration_secs, Some(600));
+        assert!(v.watched && v.hidden);
+        assert_eq!(v.watched_at, Some(77));
+    }
+
+    #[test]
+    fn merging_never_un_watches_a_video() {
+        let d = db();
+        let mut local = video("a", "UC1", "One");
+        local.watched = true;
+        local.watched_at = Some(500);
+        seed(&d, &[chan("UC1", "One")], &[local]);
+
+        let report = d
+            .apply_import(
+                &[chan("UC1", "One")],
+                &[video("a", "UC1", "One")],
+                ImportMode::Merge,
+                &[],
+            )
+            .unwrap();
+
+        let v = d.get_video("a").unwrap().unwrap();
+        assert!(v.watched, "an unwatched archive row cannot clear a local watch");
+        assert_eq!(v.watched_at, Some(500));
+        assert_eq!(report.videos_updated, 0, "nothing moved, so nothing is reported");
+    }
+
+    #[test]
+    fn merging_never_downgrades_a_finished_download() {
+        let d = db();
+        let mut done = video("a", "UC1", "One");
+        done.download_state = DownloadState::Done;
+        done.file_path = Some("/videos/a.mkv".into());
+        done.downloaded_at = Some(800);
+        seed(&d, &[chan("UC1", "One")], &[done, video("b", "UC1", "One")]);
+
+        // 'a' is finished here and absent there; 'b' is the other way round.
+        let mut incoming_b = video("b", "UC1", "One");
+        incoming_b.download_state = DownloadState::Done;
+        incoming_b.file_path = Some("/videos/b.mkv".into());
+        incoming_b.downloaded_at = Some(900);
+        d.apply_import(
+            &[chan("UC1", "One")],
+            &[video("a", "UC1", "One"), incoming_b],
+            ImportMode::Merge,
+            &[],
+        )
+        .unwrap();
+
+        let a = d.get_video("a").unwrap().unwrap();
+        assert_eq!(a.download_state, DownloadState::Done);
+        assert_eq!(a.file_path.as_deref(), Some("/videos/a.mkv"));
+        assert_eq!(a.downloaded_at, Some(800));
+
+        let b = d.get_video("b").unwrap().unwrap();
+        assert_eq!(b.download_state, DownloadState::Done, "an incoming done does land");
+        assert_eq!(b.file_path.as_deref(), Some("/videos/b.mkv"));
+        assert_eq!(b.downloaded_at, Some(900));
+    }
+
+    #[test]
+    fn merging_joins_a_membership_and_never_ends_one() {
+        let d = db();
+        let joined = Channel { member: true, ..chan("UC2", "Two") };
+        seed(&d, &[chan("UC1", "One"), joined], &[]);
+
+        let report = d
+            .apply_import(
+                &[Channel { member: true, ..chan("UC1", "One") }, chan("UC2", "Two")],
+                &[],
+                ImportMode::Merge,
+                &[],
+            )
+            .unwrap();
+
+        assert!(d.get_channel("UC1").unwrap().unwrap().member, "false -> true");
+        assert!(d.get_channel("UC2").unwrap().unwrap().member, "true survives an incoming false");
+        assert_eq!(report.channels_updated, 1, "only UC1 actually moved");
+    }
+
+    #[test]
+    fn merging_the_same_archive_twice_changes_nothing_the_second_time() {
+        let src = db();
+        let c = Channel { member: true, ..chan("UC1", "One") };
+        seed(&src, &[c], &[rich("a", "UC1", "One"), video("b", "UC1", "One")]);
+        let archive_c = src.export_channels().unwrap();
+        let archive_v = src.export_videos().unwrap();
+
+        let dst = db();
+        let first = dst.apply_import(&archive_c, &archive_v, ImportMode::Merge, &[]).unwrap();
+        assert_eq!((first.channels_added, first.videos_added), (1, 2));
+        let channels = dst.export_channels().unwrap();
+        let videos = dst.export_videos().unwrap();
+
+        let second = dst.apply_import(&archive_c, &archive_v, ImportMode::Merge, &[]).unwrap();
+        assert_eq!(second, ImportReport::default(), "every count zero");
+        assert_eq!(dst.export_channels().unwrap(), channels);
+        assert_eq!(dst.export_videos().unwrap(), videos);
+    }
+
+    #[test]
+    fn replacing_removes_a_channel_the_archive_never_had_and_its_videos_with_it() {
+        let d = db();
+        seed(
+            &d,
+            &[chan("UC1", "One"), chan("UC2", "Two")],
+            &[video("a", "UC1", "One"), video("b", "UC1", "One"), video("c", "UC2", "Two")],
+        );
+
+        // UC2 is nowhere in the archive at all, which is the only thing that
+        // makes it removable.
+        let archive_ids = archive(&["UC1"]);
+        let report = d
+            .apply_import(
+                &[chan("UC1", "One")],
+                &[video("a", "UC1", "One"), video("b", "UC1", "One")],
+                ImportMode::Replace,
+                &archive_ids,
+            )
+            .unwrap();
+
+        assert_eq!(report.channels_removed, 1);
+        assert_eq!(report.videos_removed, 1, "the cascade is counted before it happens");
+        assert!(d.get_channel("UC2").unwrap().is_none());
+        assert!(d.get_video("c").unwrap().is_none());
+        assert!(d.get_video("a").unwrap().is_some());
+        assert_eq!(d.transfer_estimate().unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn replacing_removes_a_kept_channels_video_the_archive_lacks() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One"), video("b", "UC1", "One")]);
+
+        let archive_ids = archive(&["UC1"]);
+        let report = d
+            .apply_import(
+                &[chan("UC1", "One")],
+                &[video("a", "UC1", "One")],
+                ImportMode::Replace,
+                &archive_ids,
+            )
+            .unwrap();
+
+        assert_eq!(report.channels_removed, 0);
+        assert_eq!(report.videos_removed, 1);
+        assert_eq!(report.videos_updated, 1);
+        assert!(d.get_video("b").unwrap().is_none());
+        assert!(d.get_video("a").unwrap().is_some());
+    }
+
+    #[test]
+    fn replacing_never_removes_a_channel_the_user_merely_left_unticked() {
+        let d = db();
+        seed(
+            &d,
+            &[chan("UC1", "One"), chan("UC2", "Two"), chan("UC3", "Three")],
+            &[video("a", "UC1", "One"), video("b", "UC2", "Two"), video("c", "UC3", "Three")],
+        );
+
+        // The archive holds UC1 and UC2; the user ticked only UC1. UC3 is the
+        // one the archive never heard of.
+        let archive_ids = archive(&["UC1", "UC2"]);
+        let report = d
+            .apply_import(
+                &[chan("UC1", "One")],
+                &[video("a", "UC1", "One")],
+                ImportMode::Replace,
+                &archive_ids,
+            )
+            .unwrap();
+
+        assert!(d.get_channel("UC2").unwrap().is_some(), "unticked is withheld, not condemned");
+        assert!(d.get_video("b").unwrap().is_some(), "and its videos stay with it");
+        assert_eq!(d.get_channel("UC2").unwrap().unwrap().title, "Two", "nor is it rewritten");
+        assert!(d.get_channel("UC3").unwrap().is_none(), "absent from the archive, so it goes");
+        assert!(d.get_video("c").unwrap().is_none());
+        assert_eq!((report.channels_removed, report.videos_removed), (1, 1));
+    }
+
+    #[test]
+    fn absent_from_counts_the_channels_and_videos_an_archive_never_mentions() {
+        let d = db();
+        seed(
+            &d,
+            &[chan("UC1", "One"), chan("UC2", "Two")],
+            &[video("a", "UC1", "One"), video("b", "UC1", "One"), video("c", "UC2", "Two")],
+        );
+        assert_eq!(d.absent_from(&archive(&["UC1"])).unwrap(), (1, 1));
+        assert_eq!(d.absent_from(&archive(&["UC2"])).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn an_empty_archive_leaves_the_whole_library_absent() {
+        let d = db();
+        seed(
+            &d,
+            &[chan("UC1", "One"), chan("UC2", "Two")],
+            &[video("a", "UC1", "One"), video("b", "UC1", "One"), video("c", "UC2", "Two")],
+        );
+        assert_eq!(d.absent_from(&[]).unwrap(), (2, 3));
+    }
+
+    #[test]
+    fn an_archive_naming_more_than_is_here_leaves_nothing_absent() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+        assert_eq!(d.absent_from(&archive(&["UC1", "UC2", "UC3"])).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn replacing_overwrites_the_metadata_a_merge_would_have_kept() {
+        let d = db();
+        let mut local = video("a", "UC1", "One");
+        local.watched = true;
+        local.watched_at = Some(500);
+        seed(&d, &[chan("UC1", "One")], &[local]);
+
+        let mut incoming = video("a", "UC1", "One");
+        incoming.title = "the archive's title".into();
+        incoming.published_at = Some(1);
+        incoming.duration_secs = Some(3);
+        let archive_ids = archive(&["UC1"]);
+        let report = d
+            .apply_import(&[chan("UC1", "Renamed")], &[incoming], ImportMode::Replace, &archive_ids)
+            .unwrap();
+
+        assert_eq!((report.channels_updated, report.videos_updated), (1, 1));
+        let v = d.get_video("a").unwrap().unwrap();
+        assert_eq!(v.title, "the archive's title");
+        assert_eq!(v.published_at, Some(1));
+        assert_eq!(v.duration_secs, Some(3));
+        assert!(!v.watched, "incoming wins outright, unlike a merge");
+        assert_eq!(v.watched_at, None);
+        assert_eq!(d.get_channel("UC1").unwrap().unwrap().title, "Renamed");
+    }
+
+    #[test]
+    fn a_video_arrives_with_the_channel_it_hangs_from_in_the_same_archive() {
+        let d = db();
+        let report = d
+            .apply_import(
+                &[chan("UC9", "Nine")],
+                &[video("x", "UC9", "Nine")],
+                ImportMode::Merge,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!((report.channels_added, report.videos_added), (1, 1));
+        assert_eq!(d.get_video("x").unwrap().unwrap().channel_title, "Nine");
+    }
+
+    #[test]
+    fn a_failed_row_rolls_the_whole_archive_back() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+
+        // The second video names a channel neither the archive nor the library
+        // carries, so the foreign key refuses it and takes the first one down
+        // with it.
+        let err = d.apply_import(
+            &[chan("UC1", "One")],
+            &[video("b", "UC1", "One"), video("c", "UC404", "Gone")],
+            ImportMode::Merge,
+            &[],
+        );
+        assert!(err.is_err());
+        assert!(d.get_video("b").unwrap().is_none(), "half an import is no import");
+        assert_eq!(d.transfer_estimate().unwrap(), (1, 1));
+    }
+}
