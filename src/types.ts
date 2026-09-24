@@ -86,7 +86,25 @@ export interface Settings {
   window_x: number | null; window_y: number | null;
   window_maximized: boolean;
   view: ViewState;
+  /* Machine-local keys, never exported. Optional here, not because the backend
+   * ever omits them — `#[serde(default)]` fills each one — but so a caller that
+   * builds a Settings by hand is not forced to restate defaults it has no
+   * opinion on. The UI reads each through the same default Rust applies. */
+  /** `"auto"` (Firefox if a profile exists, else none), `""` for none, or a
+   *  `--cookies-from-browser` spec verbatim (`firefox`, `chrome:Profile 1`). */
+  cookies_browser?: string;
+  /** A Netscape cookies.txt. Non-empty wins over `cookies_browser`. */
+  cookies_file?: string;
+  /** `"nightly"` or `"stable"`; anything else reads as nightly. */
+  ytdlp_channel?: string;
+  ytdlp_auto_update?: boolean;
+  /** Hand-edit-only overrides. No control writes them; they ride through every
+   *  save untouched because `commit()` always spreads the whole object. */
+  ytdlp_path?: string; ffmpeg_path?: string; deno_path?: string;
 }
+
+/** The `cookies_browser` value meaning "Firefox if there is one, else none". */
+export const COOKIES_AUTO = "auto";
 
 export interface PollSummary {
   channelsPolled: number; newVideos: number; shortsRejected: number; errors: string[];
@@ -159,4 +177,41 @@ export interface TransferProgress {
 /** Sizes the Export tick quotes, so "Include thumbnails" names a real cost. */
 export interface TransferEstimate {
   channelCount: number; videoCount: number; thumbCount: number; thumbBytes: number;
+}
+
+/* ------------------------------------------------------------------ *
+ * Player, cookies and the external tools
+ *
+ * camelCase like every other new payload; the settings keys they feed are
+ * snake_case above.
+ * ------------------------------------------------------------------ */
+
+export type ToolKind = "ytdlp" | "ffmpeg" | "deno";
+/** Where a resolved tool came from. `override` is a `*_path` key in
+ *  settings.json, which is hand-edit-only. */
+export type ToolSource = "managed" | "system" | "override" | "missing";
+export type ToolState = "ready" | "installing" | "updating" | "error";
+
+/** One row of the Tools section, and (as a list of three) `tools://status`. */
+export interface ToolStatus {
+  kind: ToolKind; path: string | null; version: string | null;
+  source: ToolSource; state: ToolState;
+  error: string | null;
+  /** Unix seconds of the last update check; managed yt-dlp only. */
+  lastCheck: number | null;
+}
+
+/** `tools://progress`: bytes of one tool's download so far. */
+export interface ToolProgress {
+  tool: ToolKind; phase: "download" | "extract"; received: number; total: number | null;
+}
+
+/** A detected player. `command` is exactly what goes into `player_command`;
+ *  the "System default" entry, always first, has `""`. */
+export interface PlayerOption { id: string; label: string; command: string; }
+
+/** A browser whose cookies yt-dlp could read. `supported` is false where it
+ *  cannot on this OS; `note` says why, or what the OS will ask for. */
+export interface BrowserOption {
+  id: string; label: string; supported: boolean; note: string | null;
 }

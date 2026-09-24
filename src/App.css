@@ -1172,9 +1172,141 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .switch-label { display: block; font-weight: 600; }
 .switch-row .field-hint { margin-top: 2px; }
 
-/* Caption for the field stack above it, not a page foot: the Backup &
-   transfer block sits below it. */
+/* Caption for the field stack above it, not a page foot: the Tools and
+   Backup & transfer blocks sit below it. */
 .settings-note { color: var(--faint); font-size: 12.5px; margin-top: 22px; }
+
+/* A label naming a select is a <label>, which is inline by default. */
+label.field-label { display: block; }
+
+/* Pickers wear their value, and the longest ("Automatic (Firefox)", a
+   flatpak player's name) should not be cut off -- nor stretch to the page's
+   full width the way a path field does. */
+.settings-select { min-width: 220px; max-width: 100%; }
+.player-custom { margin-top: 8px; }
+
+.cookies-file {
+  display: block;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  word-break: break-all;
+}
+.field .cookies-unsupported { margin-top: 4px; }
+.field .cookies-unsupported:first-of-type { margin-top: 6px; }
+
+/* ------------------------------------------------------------------ *
+ * Tools
+ * ------------------------------------------------------------------ */
+
+/* Set off like Backup & transfer: these rows report on the machine rather
+   than edit a preference, and most of the time there is nothing to do. */
+.settings-block {
+  margin-top: 26px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}
+.settings-block > .field-hint { margin: 0 0 14px; max-width: 62ch; }
+
+.tools-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.tool-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.tool-row { padding: 11px 14px; }
+.tool-row + .tool-row { border-top: 1px solid var(--line-soft); }
+.tool-row.is-error { background: linear-gradient(90deg, var(--danger-soft), transparent 70%); }
+
+.tool-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.tool-name { font-weight: 600; }
+.tool-version {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* Pushed to the row's end so the three sources read down one column. */
+.tool-source {
+  margin-left: auto;
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.tool-source.is-managed { background: var(--accent-soft); color: #9ed3ff; }
+.tool-source.is-missing { color: var(--faint); }
+.tool-source.is-override { color: var(--text); border: 1px solid var(--line); }
+
+/* Small and quiet: the path is there to be checked when something is odd,
+   not read on every visit. The whole path is in the tooltip. */
+.tool-path {
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-progress { margin-top: 9px; max-width: 420px; }
+.tool-progress .progress-track { height: 6px; }
+.tool-status {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* No Content-Length, so no fraction to show: a sliver that travels says
+   "still going" without inventing a percentage. */
+.progress-track.is-indeterminate .progress-fill {
+  width: 30%;
+  animation: tool-indeterminate 1.3s ease-in-out infinite;
+}
+@keyframes tool-indeterminate {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(340%); }
+}
+
+.tool-error {
+  margin: 7px 0 0;
+  font-size: 12.5px;
+  color: #ffb9ba;
+  overflow-wrap: anywhere;
+}
+
+.tools-actions { margin-top: 12px; flex-wrap: wrap; }
+.tools-checked { color: var(--faint); font-size: 12.5px; }
+
+.tools-prefs { margin-top: 20px; }
 
 /* --- modal --------------------------------------------------------------- */
 

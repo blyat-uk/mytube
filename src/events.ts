@@ -1,7 +1,8 @@
 import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
-  DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, TransferProgress,
+  DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, ToolProgress, ToolStatus,
+  TransferProgress,
 } from "./types";
 
 /**
@@ -69,4 +70,15 @@ export function useTransferProgress(handler?: (p: TransferProgress) => void) {
  *  refetches. */
 export function useTransferFinished(handler?: (report: ImportReport) => void) {
   useTauriEvent<ImportReport>("transfer://finished", handler);
+}
+
+/** Bytes of a tool download in flight, for the Tools section's bar. */
+export function useToolsProgress(handler?: (p: ToolProgress) => void) {
+  useTauriEvent<ToolProgress>("tools://progress", handler);
+}
+
+/** All three tools' status, sent whenever any of them changes. The shell hears
+ *  it for the "ready" toast, the Tools section for its rows. */
+export function useToolsStatus(handler?: (list: ToolStatus[]) => void) {
+  useTauriEvent<ToolStatus[]>("tools://status", handler);
 }

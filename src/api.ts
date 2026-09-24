@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
+  PlayerOption, BrowserOption, ToolStatus,
 } from "./types";
 
 export const api = {
@@ -54,6 +55,14 @@ export const api = {
   importConfig: (
     path: string, channelIds: string[], mode: ImportMode, applySettings: boolean,
   ) => invoke<ImportReport>("import_config", { path, channelIds, mode, applySettings }),
+  /** Players installed on this machine, "System default" first. */
+  detectPlayers: () => invoke<PlayerOption[]>("detect_players"),
+  /** Browsers with a profile yt-dlp could read cookies from. */
+  detectBrowsers: () => invoke<BrowserOption[]>("detect_browsers"),
+  toolsStatus: () => invoke<ToolStatus[]>("tools_status"),
+  /** Forces the yt-dlp update check and retries any failed install. Rejects
+   *  while a download holds yt-dlp, since nothing is swapped under a live job. */
+  toolsUpdateNow: () => invoke<ToolStatus[]>("tools_update_now"),
   /** Hands a URL to the desktop's default browser. */
   openExternal: (url: string) => openUrl(url),
 };

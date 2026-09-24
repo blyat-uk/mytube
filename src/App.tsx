@@ -7,8 +7,9 @@ import SettingsView from "./components/SettingsView";
 import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
-import { usePollEvents, useTransferFinished } from "./events";
-import type { Channel, SortOrder, Video, ViewState } from "./types";
+import { usePollEvents, useToolsStatus, useTransferFinished } from "./events";
+import { toolsReadyMessage } from "./components/ToolsSection";
+import type { Channel, SortOrder, ToolKind, ToolState, Video, ViewState } from "./types";
 import "./App.css";
 
 export default function App() {
@@ -129,6 +130,31 @@ function Shell() {
   useTransferFinished(() => {
     void loadChannels();
     reload();
+  });
+
+  // First-run provisioning is silent by design -- no dialog, no banner -- so
+  // the one thing said about it is a toast the moment a tool finishes
+  // installing. Heard here rather than in SettingsView, which is unmounted
+  // whenever another tab is showing, and the install runs regardless.
+  const toolStates = useRef(new Map<ToolKind, ToolState>());
+  // Provisioning starts before the webview has loaded, so the "installing"
+  // event can go out before this listener exists; seeding from the command
+  // means a tool that was already installing still gets its toast. Seeded only
+  // while empty, so a late answer cannot overwrite a newer event's states.
+  useEffect(() => {
+    Promise.resolve()
+      .then(() => api.toolsStatus())
+      .then((list) => {
+        if (toolStates.current.size === 0) {
+          toolStates.current = new Map(list.map((t) => [t.kind, t.state]));
+        }
+      })
+      .catch(() => {});
+  }, []);
+  useToolsStatus((list) => {
+    const message = toolsReadyMessage(toolStates.current, list);
+    toolStates.current = new Map(list.map((t) => [t.kind, t.state]));
+    if (message) toast.success(message);
   });
 
   // A poll can also start on its own (startup and the interval timer), so the

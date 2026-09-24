@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { TEMPLATE_PRESETS, TOKEN_CHIPS, formatBytes, insertToken } from "../format";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import TransferDialog from "./TransferDialog";
+import Field from "./Field";
+import PlayerField from "./PlayerField";
+import CookiesField from "./CookiesField";
+import ToolsSection from "./ToolsSection";
 import { useTransferProgress } from "../events";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
-import type {
-  ArchiveSummary, ImportMode, Settings, TransferEstimate, TransferProgress,
+import {
+  COOKIES_AUTO,
+  type ArchiveSummary, type ImportMode, type Settings, type TransferEstimate,
+  type TransferProgress,
 } from "../types";
 
 type NumField = "max_concurrent_downloads" | "poll_interval_minutes" | "backfill_count";
@@ -101,6 +107,17 @@ export default function SettingsView() {
     const base = current.current;
     if (!base) return;
     const next = { ...base, [key]: value };
+    current.current = next;
+    setSettings(next);
+    void commit(next);
+  }, [commit]);
+
+  /** Several keys that change together, in one save: a cookie choice sets the
+   *  browser and clears the file, and two writes would race each other. */
+  const patchAndSave = useCallback((patch: Partial<Settings>) => {
+    const base = current.current;
+    if (!base) return;
+    const next = { ...base, ...patch };
     current.current = next;
     setSettings(next);
     void commit(next);
@@ -346,18 +363,20 @@ export default function SettingsView() {
         </div>
       </Field>
 
-      <Field
-        label="Player command"
-        hint="Runs to open a downloaded file. Arguments are allowed, e.g. mpv --fullscreen."
-      >
-        <input
-          className="text-input mono"
-          value={s.player_command}
-          onChange={(e) => set("player_command", e.currentTarget.value)}
-          onBlur={blurCommit}
-          spellCheck={false}
-        />
-      </Field>
+      <PlayerField
+        value={s.player_command}
+        onEdit={(v) => set("player_command", v)}
+        onBlur={blurCommit}
+        onPick={(v) => setAndSave("player_command", v)}
+      />
+
+      {/* Rust fills both keys on every read; the fallbacks are its defaults,
+          for a Settings built by hand without them. */}
+      <CookiesField
+        browser={s.cookies_browser ?? COOKIES_AUTO}
+        file={s.cookies_file ?? ""}
+        onPick={patchAndSave}
+      />
 
       <div className="settings-grid">
         <Field label="Concurrent downloads" hint="1 – 16">
@@ -410,6 +429,13 @@ export default function SettingsView() {
       </label>
 
       <p className="settings-note">Changes save when a field loses focus.</p>
+
+      <ToolsSection
+        channel={s.ytdlp_channel ?? "nightly"}
+        autoUpdate={s.ytdlp_auto_update ?? true}
+        onChannel={(v) => setAndSave("ytdlp_channel", v)}
+        onAutoUpdate={(on) => setAndSave("ytdlp_auto_update", on)}
+      />
 
       <div className="transfer-block">
         <div className="field-label">Backup &amp; transfer</div>
@@ -489,14 +515,4 @@ const count = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function todayStamp(d = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return (
-    <div className="field">
-      <div className="field-label">{label}</div>
-      {children}
-      {hint && <div className="field-hint">{hint}</div>}
-    </div>
-  );
 }
