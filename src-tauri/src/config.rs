@@ -286,11 +286,23 @@ impl Settings {
 
 /// `~/.config/mytube` — deliberately not Tauri's app_config_dir(), which would
 /// give `~/.config/uk.blyat.mytube`.
+///
+/// `MYTUBE_CONFIG_DIR`, when set, replaces the whole path. It exists for tests
+/// and throwaway runs: `XDG_CONFIG_HOME` redirects this only on Linux, since
+/// macOS derives the folder from `$HOME` and Windows asks the Known Folder API,
+/// which reads no environment variable at all. Thumbnails under an overridden
+/// directory fall outside the asset-protocol scope, so the grid shows none.
 pub fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("mytube")
 }
+
+/// See [`config_dir`].
+pub const CONFIG_DIR_ENV: &str = "MYTUBE_CONFIG_DIR";
 pub fn settings_path() -> PathBuf {
     config_dir().join("settings.json")
 }

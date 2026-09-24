@@ -4,9 +4,10 @@
 //! fail to mean the same thing. This is the only test that carries a real
 //! library out through a zip and back into a different machine's database.
 //!
-//! `XDG_CONFIG_HOME` is redirected before anything else runs: `prepare_import`
-//! applies settings and extracts thumbnails for real, and pointing it at the
-//! developer's own `~/.config/mytube` would rewrite the library under test.
+//! The config directory is redirected (`MYTUBE_CONFIG_DIR`, which works on
+//! every OS where `XDG_CONFIG_HOME` works only on Linux) before anything else
+//! runs: `prepare_import` applies settings and extracts thumbnails for real, and
+//! pointing it at the developer's own library would rewrite it under test.
 
 use mytube_lib::{config, db::Db, models::*, transfer};
 use std::path::{Path, PathBuf};
@@ -63,7 +64,7 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     let theirs = tmp.path().join("theirs");
     let downloads = tmp.path().join("Videos");
     std::fs::create_dir_all(&downloads).unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &ours);
+    std::env::set_var(config::CONFIG_DIR_ENV, &ours);
     config::ensure_dirs().unwrap();
 
     // --- the exporting machine -------------------------------------------
@@ -148,7 +149,7 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     // From here on this process *is* the other computer: an empty thumbnail
     // cache and default settings, which is what makes `thumbs_written` and the
     // settings assertions below mean anything.
-    std::env::set_var("XDG_CONFIG_HOME", &theirs);
+    std::env::set_var(config::CONFIG_DIR_ENV, &theirs);
     config::ensure_dirs().unwrap();
     assert!(
         !config::thumbs_dir().join("vid_watched.jpg").exists(),
