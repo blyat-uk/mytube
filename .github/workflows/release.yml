@@ -5,12 +5,14 @@ name: Release
 # path: `mytube --self-test` downloads yt-dlp, ffmpeg and deno fresh from their
 # publishers into an empty directory, verifies each checksum, runs each one and
 # checks yt-dlp sees deno as a JS runtime — the only place the per-OS source
-# table is proven on a real machine. A manual run builds and tests without
-# releasing.
+# table is proven on a real machine. A manual run, or a push to the
+# `release-check` branch, builds and tests without releasing -- the branch is
+# for checking a release build from a machine with no `gh` to dispatch with.
 
 on:
   push:
     tags: ["v*"]
+    branches: [release-check]
   workflow_dispatch:
 
 permissions:
