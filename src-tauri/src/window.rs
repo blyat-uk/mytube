@@ -10,15 +10,28 @@
 //! read the same `CloseRequested` event: splitting them across two listeners
 //! would leave the order of "save the geometry" and "veto the close" up to the
 //! order the listeners happened to be registered in.
+//!
+//! One exit never reaches that handler: macOS's Cmd+Q (and the app menu's
+//! Quit) sends `terminate:`, which ends the event loop without closing any
+//! window, so neither `CloseRequested` nor `ExitRequested` fires -- only
+//! `RunEvent::Exit`. [`save_on_exit`] covers it, and only it: every other way
+//! out has already been through `CloseRequested` by then.
 
 use crate::config::{self, Settings};
 use crate::tray;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, WebviewWindow, WindowEvent};
 
 /// Set by [`quit`] so the `CloseRequested` handler lets that one close through.
 static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Set once a `CloseRequested` has let the window go -- the geometry has had
+/// its last word, and [`save_on_exit`] must not add another.
+static CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// The geometry [`track`] keeps current, shared with [`save_on_exit`].
+static LAST: OnceLock<Arc<Mutex<Geometry>>> = OnceLock::new();
 
 /// The window everything else means when it says "the window".
 ///
@@ -100,6 +113,7 @@ pub fn restore(win: &WebviewWindow, s: &Settings) {
 /// Follows the window and writes its geometry to `settings.json` on close.
 pub fn track(win: &WebviewWindow, start: Geometry) {
     let last = Arc::new(Mutex::new(start));
+    let _ = LAST.set(last.clone());
     let win_for_events = win.clone();
 
     win.on_window_event(move |event| match event {
@@ -133,12 +147,15 @@ pub fn track(win: &WebviewWindow, start: Geometry) {
             if has_tray && !QUITTING.load(Ordering::SeqCst) {
                 api.prevent_close();
                 let _ = win_for_events.hide();
+            } else {
+                CLOSED.store(true, Ordering::SeqCst);
             }
         }
         // Belt and braces beside the tray's own reset: however the window came
         // back — the menu item, the compositor — the badge has been read.
         WindowEvent::Focused(true) => {
             tray::clear();
+            #[cfg(target_os = "linux")]
             wake_decorations(&win_for_events);
         }
         _ => {}
@@ -160,9 +177,43 @@ pub fn track(win: &WebviewWindow, start: Geometry) {
 /// looking identical. Upstream: tauri-apps/tauri#11856, fixed by
 /// tauri-apps/tao#1218. Delete this once a Tauri release ships tao >= 0.36 —
 /// `tauri-runtime-wry` 2.11.4 still pins 0.35.
+///
+/// Linux only: it is a workaround for tao's Wayland decorations, and on macOS
+/// and Windows the system draws the titlebar, so there is nothing to wake.
+#[cfg(target_os = "linux")]
 fn wake_decorations(win: &WebviewWindow) {
     let _ = win.set_resizable(false);
     let _ = win.set_resizable(true);
+}
+
+/// Records the geometry when the app ends without closing its window.
+///
+/// Called on `RunEvent::Exit`, which every exit passes through, so it has to
+/// tell the one case it exists for from the rest:
+///
+/// - the window's close was let through (tray Quit, or an ordinary close with
+///   no tray) -- `CloseRequested` already saved, and by now the window may be
+///   destroyed, so this does nothing;
+/// - the window is hidden in the tray -- the hide saved, and the same rule as
+///   there applies: a hidden window can report itself unmaximized, and saving
+///   again would forget a maximized state;
+/// - otherwise, a visible window on its way out with nothing recorded: Cmd+Q
+///   on macOS. That one is saved, exactly once.
+///
+/// Unlike the close handler, an error reading visibility counts as hidden:
+/// this runs as the process ends, where a window that cannot answer is more
+/// likely gone than showing.
+pub fn save_on_exit(app: &AppHandle) {
+    if CLOSED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (Some(win), Some(last)) = (main_window(app), LAST.get()) else {
+        return;
+    };
+    if win.is_visible().unwrap_or(false) {
+        let geometry = *last.lock().unwrap();
+        persist(geometry, win.is_maximized().unwrap_or(false));
+    }
 }
 
 fn read(win: &WebviewWindow, prev: Geometry) -> Option<Geometry> {

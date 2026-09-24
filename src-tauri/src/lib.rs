@@ -145,6 +145,17 @@ pub fn run() {
             commands::tools_status,
             commands::tools_update_now,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            // Cmd+Q on macOS ends the loop without closing the window, so this
+            // is the only event that sees it; `save_on_exit` skips every exit
+            // that has already saved through `CloseRequested`.
+            tauri::RunEvent::Exit => window::save_on_exit(app),
+            // A Dock click. With the window closed to the tray it is the
+            // obvious way back, and without this it would do nothing at all.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => tray::show_window(app),
+            _ => {}
+        });
 }

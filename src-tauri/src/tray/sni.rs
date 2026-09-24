@@ -1,5 +1,4 @@
-//! System tray icon: close-to-tray's other half, the unread badge, and
-//! click-to-toggle.
+//! The Linux tray backend: a StatusNotifierItem this app owns.
 //!
 //! This speaks the StatusNotifierItem spec directly (`ksni`) rather than going
 //! through Tauri's tray, which on Linux is libayatana-appindicator. That
@@ -8,7 +7,9 @@
 //! `scroll-event`: it answers the spec's `Activate` itself by opening the menu
 //! and never tells the application a click happened. Under it a left click
 //! could only ever raise the menu, which is exactly what it used to do here.
-//! Owning the item is what makes a left click ours to interpret.
+//! Owning the item is what makes a left click ours to interpret. Don't go back
+//! to `TrayIconBuilder` on Linux expecting clicks -- which is also why Tauri's
+//! `tray-icon` feature is enabled only for the other targets.
 //!
 //! Right click still opens the menu -- the host builds it from [`Tray::menu`].
 
@@ -18,26 +19,8 @@ use ksni::menu::StandardItem;
 use ksni::{Handle, Icon, MenuItem, Tray, TrayMethods};
 use tauri::AppHandle;
 
+use super::{badge_slot, show_window, toggle_window, ICONS, TRAY_ID};
 use crate::window;
-
-pub const TRAY_ID: &str = "mytube";
-
-/// Baked into the binary rather than read from disk: eleven small PNGs cost
-/// ~40KB, and an icon the packaging step forgot to install would be a tray
-/// that silently stops updating.
-const ICONS: [&[u8]; 11] = [
-    include_bytes!("../icons/tray.png"),
-    include_bytes!("../icons/tray-1.png"),
-    include_bytes!("../icons/tray-2.png"),
-    include_bytes!("../icons/tray-3.png"),
-    include_bytes!("../icons/tray-4.png"),
-    include_bytes!("../icons/tray-5.png"),
-    include_bytes!("../icons/tray-6.png"),
-    include_bytes!("../icons/tray-7.png"),
-    include_bytes!("../icons/tray-8.png"),
-    include_bytes!("../icons/tray-9.png"),
-    include_bytes!("../icons/tray-9plus.png"),
-];
 
 /// The registered item, once it exists.
 ///
@@ -45,20 +28,6 @@ const ICONS: [&[u8]; 11] = [
 /// [`window`] then treats a close as a real close -- a tray that never
 /// appeared must not strand the window off screen.
 static TRAY: OnceLock<Handle<MyTube>> = OnceLock::new();
-
-/// Which icon a pending count should show: 0 is the plain icon, 1..=9 are the
-/// numbered badges, and 10 is "9+".
-pub fn badge_slot(count: u32) -> usize {
-    count.min(10) as usize
-}
-
-/// The pending count after a poll that found `new` videos.
-pub fn next_count(current: u32, new: usize, window_visible: bool) -> u32 {
-    if window_visible {
-        return 0;
-    }
-    current.saturating_add(new.min(u32::MAX as usize) as u32)
-}
 
 /// PNG decodes to RGBA; the spec wants ARGB32 in network byte order.
 fn rgba_to_argb(mut data: Vec<u8>) -> Vec<u8> {
@@ -134,59 +103,18 @@ impl Tray for MyTube {
     }
 }
 
-/// Registers the tray. An `Err` leaves the app running without one.
-pub fn init(app: &AppHandle) -> Result<(), ksni::Error> {
+pub(super) fn init(app: &AppHandle) -> Result<(), String> {
     let tray = MyTube { app: app.clone(), pending: 0 };
     // Blocking so that `init` returning means the item is really up: the very
     // next thing the caller does is wire the window, whose close handler asks
     // [`is_available`] whether there is anywhere to close *to*.
-    let handle = tauri::async_runtime::block_on(tray.spawn())?;
+    let handle = tauri::async_runtime::block_on(tray.spawn()).map_err(|e| e.to_string())?;
     let _ = TRAY.set(handle);
     Ok(())
 }
 
-/// Whether a tray actually registered, and is still there.
-pub fn is_available() -> bool {
+pub(super) fn is_available() -> bool {
     TRAY.get().is_some_and(|h| !h.is_closed())
-}
-
-/// Raises the window and clears the badge, which is what "read them" means.
-pub fn show_window(app: &AppHandle) {
-    let Some(win) = window::main_window(app) else {
-        return;
-    };
-    let _ = win.unminimize();
-    let _ = win.show();
-    let _ = win.set_focus();
-    clear();
-}
-
-/// Left click: put it away if you can see it, raise it if you cannot.
-///
-/// Hiding goes through `close()` rather than `hide()` so it takes the same
-/// `CloseRequested` path the window's own close button does. That handler is
-/// what records the geometry, and a tray toggle should not become the one way
-/// of putting the window away that forgets where it was.
-fn toggle_window(app: &AppHandle) {
-    let Some(win) = window::main_window(app) else {
-        return;
-    };
-    if window::is_showing(win.clone()) {
-        let _ = win.close();
-    } else {
-        show_window(app);
-    }
-}
-
-/// Adds a poll's haul to the badge, or does nothing if the window is on screen.
-pub fn note_new_videos(app: &AppHandle, new: usize) {
-    let showing = window::main_window(app).is_some_and(window::is_showing);
-    update(move |t| t.pending = next_count(t.pending, new, showing));
-}
-
-/// Back to the plain icon, with nothing outstanding.
-pub fn clear() {
-    update(|t| t.pending = 0);
 }
 
 /// Fire-and-forget, for two reasons. The callers arrive from three different
@@ -195,54 +123,18 @@ pub fn clear() {
 /// the service lock, which that third caller is already holding. Waiting for
 /// it there would deadlock; handing it to the runtime lets the menu callback
 /// return and release the lock first.
-fn update(f: impl FnOnce(&mut MyTube) + Send + 'static) {
+pub(super) fn update(f: impl FnOnce(&mut u32) + Send + 'static) {
     let Some(handle) = TRAY.get() else {
         return;
     };
     tauri::async_runtime::spawn(async move {
-        handle.update(f).await;
+        handle.update(move |t: &mut MyTube| f(&mut t.pending)).await;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nothing_pending_uses_the_plain_icon() {
-        assert_eq!(badge_slot(0), 0);
-    }
-
-    #[test]
-    fn a_single_digit_count_uses_its_own_badge() {
-        assert_eq!(badge_slot(1), 1);
-        assert_eq!(badge_slot(9), 9);
-    }
-
-    #[test]
-    fn ten_and_beyond_share_the_nine_plus_badge() {
-        assert_eq!(badge_slot(10), 10);
-        assert_eq!(badge_slot(999), 10);
-    }
-
-    #[test]
-    fn new_videos_accumulate_while_the_window_is_hidden() {
-        assert_eq!(next_count(0, 3, false), 3);
-        assert_eq!(next_count(3, 2, false), 5);
-    }
-
-    #[test]
-    fn a_poll_that_found_nothing_leaves_the_count_alone() {
-        assert_eq!(next_count(3, 0, false), 3);
-    }
-
-    #[test]
-    fn a_visible_window_keeps_the_count_at_zero() {
-        // The grid already refetches on `poll://finished`, so anything found
-        // while you are looking at it has been read by definition.
-        assert_eq!(next_count(0, 3, true), 0);
-        assert_eq!(next_count(3, 2, true), 0);
-    }
 
     #[test]
     fn rgba_to_argb_moves_alpha_to_the_front() {
