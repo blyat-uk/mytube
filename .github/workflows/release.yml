@@ -73,6 +73,11 @@ jobs:
             os_name: macos
             bundles: app,dmg
     runs-on: ${{ matrix.runner }}
+    # Bash everywhere a step names no shell. Inside the Linux container the
+    # default is `sh` -- dash, which has no `[[` -- and the smoke tests use it.
+    defaults:
+      run:
+        shell: bash
     # An empty image runs the job on the runner itself (Windows, macOS). The
     # `|| ''` form is what gets an empty value past the schema check.
     container:
@@ -272,9 +277,12 @@ jobs:
           mkdir -p out
           # Exactly one match per pattern: the version in the glob keeps a
           # stale bundle from an older build out, and two matches is an error.
+          # No `mapfile`: macOS runners ship bash 3.2. The pattern is
+          # expanded unquoted on purpose; bundle paths hold no spaces.
           take() {
-            local matches=()
-            mapfile -t matches < <(compgen -G "$1" || true)
+            shopt -s nullglob
+            local matches=( $1 )
+            shopt -u nullglob
             if (( ${#matches[@]} != 1 )); then
               echo "::error::expected one file for $1, found ${#matches[@]}: ${matches[*]:-none}"
               exit 1
