@@ -168,15 +168,85 @@ fn is_format_stream(rest: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) && !ext.is_empty()
 }
 
-/// Deletes everything a cancelled download left in the output directory.
-fn remove_leftovers(out_path: &Path) {
-    let Some(dir) = out_path.parent() else { return };
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+/// Deletes everything a cancelled download left in the output directory, in
+/// one pass. Returns what it could not delete.
+fn remove_leftovers(out_path: &Path) -> Vec<PathBuf> {
+    let Some(dir) = out_path.parent() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut stuck = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name();
         if name.to_str().is_some_and(|n| is_leftover(out_path, n)) {
-            let _ = std::fs::remove_file(e.path());
+            if let Err(err) = std::fs::remove_file(e.path()) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    stuck.push(e.path());
+                }
+            }
         }
+    }
+    stuck
+}
+
+/// How often, and how many times, a leftover that would not delete is tried
+/// again. Windows only: a file another process still has open cannot be
+/// unlinked there, and a yt-dlp or ffmpeg that has been told to die may take
+/// a moment to let go even once the job reports it empty (antivirus scanners
+/// open freshly written files too). Unix unlinks an open file without fuss.
+#[cfg(windows)]
+const SWEEP_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(windows)]
+const SWEEP_ATTEMPTS: u32 = 10;
+
+/// `remove_leftovers`, then on Windows the files that would not go are tried
+/// again a few times. The waits are async, so this can run on a runtime
+/// worker; `retry_stuck_blocking` is the same loop for a caller that cannot
+/// await.
+async fn sweep_leftovers(out_path: &Path) {
+    #[allow(unused_mut, unused_variables)]
+    let mut stuck = remove_leftovers(out_path);
+    #[cfg(windows)]
+    for _ in 0..SWEEP_ATTEMPTS {
+        if stuck.is_empty() {
+            break;
+        }
+        tokio::time::sleep(SWEEP_RETRY).await;
+        stuck = remove_stuck(stuck);
+    }
+}
+
+/// Tries each path once more; returns the ones still there.
+#[cfg(windows)]
+fn remove_stuck(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|p| match std::fs::remove_file(p) {
+            Ok(()) => false,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        })
+        .collect()
+}
+
+/// The retry loop for files `CleanupGuard` could not delete, on a blocking
+/// thread: it runs from a `Drop`, which cannot await, and sleeping there would
+/// stall a runtime worker.
+#[cfg(windows)]
+fn retry_stuck_blocking(stuck: Vec<PathBuf>) {
+    if stuck.is_empty() {
+        return;
+    }
+    let work = move || {
+        let mut stuck = stuck;
+        for _ in 0..SWEEP_ATTEMPTS {
+            if stuck.is_empty() {
+                break;
+            }
+            std::thread::sleep(SWEEP_RETRY);
+            stuck = remove_stuck(stuck);
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => drop(h.spawn_blocking(work)),
+        Err(_) => work(),
     }
 }
 
@@ -203,7 +273,13 @@ impl Drop for CleanupGuard {
         // used to leave one of these in /tmp for the life of the machine.
         let _ = std::fs::remove_file(&self.print_file);
         if self.job.is_cancelled() {
-            remove_leftovers(&self.out_path);
+            // Normally `run_one` has already swept, with the waits it needs on
+            // Windows, and this pass finds nothing; it is the backstop for the
+            // exits that skip that -- an abort, an error, a late cancel.
+            #[allow(unused_variables)]
+            let stuck = remove_leftovers(&self.out_path);
+            #[cfg(windows)]
+            retry_stuck_blocking(stuck);
         }
     }
 }
@@ -223,6 +299,10 @@ impl Drop for ClaimGuard {
 /// delete its part files. That is milliseconds of real work; the allowance is
 /// wide only so an unlink stalled on a busy disk is not cut short.
 const CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a cancelled download waits for every process in its tree to be
+/// gone before it deletes anything. Windows only; see `KillTree::wait_empty`.
+const TREE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct Queue {
     db: Arc<Db>,
@@ -481,9 +561,20 @@ async fn run_one(
     let _ = pump.await;
     let stderr_text = err_collect.await.unwrap_or_default();
 
-    // `_cleanup` deletes the part files on the way out; the row is left alone
-    // because `Queue::cancel` owns it.
+    // The part files are deleted here, before the task ends, because that is
+    // what `Queue::cancel` is waiting for; the row is left alone because
+    // `Queue::cancel` owns it. On Windows the leader being reaped does not mean
+    // the tree is: the kill has only been *started* for the real yt-dlp and
+    // its ffmpeg, and their open handles make a part file undeletable until
+    // they are gone -- so wait for the job to empty first (bounded, well
+    // inside `CLEANUP_GRACE`), then sweep with retries. `_cleanup` makes one
+    // more pass on the way out, which finds nothing. On unix both steps are
+    // what they always were: no wait, one pass.
     if cancel.is_cancelled() {
+        if !tree.wait_empty(TREE_EXIT_GRACE).await {
+            eprintln!("[mytube] {video_id}: yt-dlp's processes outlived the cancel's grace; sweeping anyway");
+        }
+        sweep_leftovers(&out_path).await;
         return Ok(());
     }
 
@@ -504,6 +595,11 @@ async fn run_one(
         ));
     }
 
+    // yt-dlp appends to this file with `open(..., 'a', encoding='utf-8',
+    // newline='')` and ends each value with `os.linesep` (checked in
+    // `YoutubeDL._forceprint`, yt-dlp 2026.08.19) -- UTF-8 on every OS,
+    // whatever `--encoding` says, and `\r\n` on Windows. So: read as UTF-8,
+    // take the last line, trim the `\r`.
     let path = std::fs::read_to_string(&print_file)
         .map_err(|_| anyhow!("yt-dlp finished but reported no output file"))?
         .lines()
@@ -636,7 +732,7 @@ mod tests {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
 
-        remove_leftovers(&out);
+        assert!(remove_leftovers(&out).is_empty(), "nothing is held open here");
 
         let mut left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -645,6 +741,52 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec!["Part 1.5.mkv".to_string(), "Part 2.mkv".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_async_sweep_clears_the_same_files() {
+        let dir = std::env::temp_dir().join(format!("mytube-async-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("V.mkv");
+        for n in ["V.mkv.part", "V.f137.mp4", "W.mkv"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        sweep_leftovers(&out).await;
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["W.mkv".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Windows failure this retry exists for: a part file still open in a
+    /// process that is on its way out. Opened here with no sharing at all --
+    /// std's default would allow the delete -- and let go of 500 ms later, the
+    /// way a dying ffmpeg lets go of the stream it was writing.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_part_file_still_held_open_is_deleted_once_it_is_let_go() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("mytube-held-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("V.mkv");
+        let part = dir.join("V.f251.webm.part");
+        std::fs::write(&part, b"x").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&part).unwrap();
+
+        assert_eq!(remove_leftovers(&out), vec![part.clone()], "held open, so it cannot go yet");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(held);
+        });
+        sweep_leftovers(&out).await;
+        release.join().unwrap();
+        assert!(!part.exists(), "the retry should have deleted it once it was closed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

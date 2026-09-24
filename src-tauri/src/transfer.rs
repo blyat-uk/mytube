@@ -197,17 +197,51 @@ fn portable_path(file_path: &str, download_dir: &str) -> (Option<String>, Option
 }
 
 /// The inverse: where this machine would keep the file the manifest describes.
-/// `None` when the row carried no path at all.
+/// `None` when the row carried no path at all -- or one that does not say
+/// what an exporter writes.
+///
+/// An archive is a file anybody can hand you, so its paths are checked before
+/// they are joined to anything. `rel_path` must stay inside `download_dir`:
+/// no `..` or `.` segment, no empty one (a leading `/` makes one), nothing
+/// that is a root or a drive prefix on *this* OS (`C:` on Windows), and not
+/// blank. `abs_path` must actually be absolute here. Either failing imports
+/// the row with no file -- exactly what a file that is simply not there gets
+/// -- rather than a row whose "downloaded" file is something like
+/// `../../.ssh/id_ed25519`, which Play would hand to the player and "Delete
+/// download" would unlink. `portable_path` never writes any of these shapes,
+/// so an honest archive loses nothing.
 fn rejoin_path(v: &ArchiveVideo, download_dir: &str) -> Option<PathBuf> {
     match (&v.rel_path, &v.abs_path) {
-        (Some(rel), _) => Some(
-            rel.split('/')
-                .filter(|c| !c.is_empty())
-                .fold(PathBuf::from(download_dir), |p, c| p.join(c)),
-        ),
-        (None, Some(abs)) => Some(PathBuf::from(abs)),
+        (Some(rel), _) => {
+            if rel.trim().is_empty() {
+                return None;
+            }
+            let mut p = PathBuf::from(download_dir);
+            for seg in rel.split('/') {
+                if !is_plain_segment(seg) {
+                    return None;
+                }
+                p.push(seg);
+            }
+            Some(p)
+        }
+        (None, Some(abs)) => Some(PathBuf::from(abs)).filter(|p| p.is_absolute()),
         (None, None) => None,
     }
+}
+
+/// One `/`-separated piece of a `rel_path`: a name and nothing else, by this
+/// OS's own reading of it. On Windows `\` is a separator too, so a segment
+/// like `..\x` parses into a parent step and is refused here; and Windows
+/// drops trailing dots and spaces from a name, which makes `.. ` a parent step
+/// in disguise, so those are measured with them stripped.
+fn is_plain_segment(seg: &str) -> bool {
+    use std::path::Component;
+    let bare = if cfg!(windows) { seg.trim_end_matches(['.', ' ']) } else { seg };
+    if matches!(seg, "" | "." | "..") || bare.is_empty() {
+        return false;
+    }
+    Path::new(seg).components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 // ------------------------------------------------------------------- export
@@ -755,6 +789,80 @@ mod tests {
             rejoin_path(&v, &root.to_string_lossy()),
             Some(root.join("Some Channel").join("A Title [v1].mkv"))
         );
+    }
+
+    #[test]
+    fn a_rel_path_that_climbs_or_roots_itself_is_refused() {
+        let root = std::env::temp_dir();
+        let with_rel = |rel: &str| {
+            let mut v = ArchiveVideo::of(&video("v1", "UC1"), "/unused");
+            v.rel_path = Some(rel.into());
+            v.abs_path = Some("/also/ignored.mkv".into());
+            rejoin_path(&v, &root.to_string_lossy())
+        };
+        for bad in [
+            "../x.mkv",
+            "a/../../x.mkv",
+            "..",
+            "./x.mkv",
+            "a/./x.mkv",
+            "",
+            "   ",
+            "/etc/passwd",
+            "a//x.mkv",
+            "a/",
+        ] {
+            assert_eq!(with_rel(bad), None, "{bad:?} must not be joined to the download folder");
+        }
+        // Names that merely contain dots are names.
+        assert_eq!(with_rel("Ch/Part 1..5 [x].mkv"), Some(root.join("Ch").join("Part 1..5 [x].mkv")));
+        assert_eq!(with_rel(".hidden/x.mkv"), Some(root.join(".hidden").join("x.mkv")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rel_path_is_read_with_windows_rules_on_windows() {
+        let root = std::env::temp_dir();
+        let with_rel = |rel: &str| {
+            let mut v = ArchiveVideo::of(&video("v1", "UC1"), "/unused");
+            v.rel_path = Some(rel.into());
+            rejoin_path(&v, &root.to_string_lossy())
+        };
+        for bad in [r"..\x.mkv", r"a\..\..\x.mkv", "C:/Windows/x.mkv", r"C:\x.mkv", "C:x.mkv", ".. /x.mkv", "a/../x", r"\\server\share\x"] {
+            assert_eq!(with_rel(bad), None, "{bad:?} must be refused on Windows");
+        }
+    }
+
+    #[test]
+    fn an_abs_path_that_is_not_absolute_here_is_refused() {
+        let with_abs = |abs: &str| {
+            let mut v = ArchiveVideo::of(&video("v1", "UC1"), "/unused");
+            v.rel_path = None;
+            v.abs_path = Some(abs.into());
+            rejoin_path(&v, "/unused")
+        };
+        for bad in ["x.mkv", "../x.mkv", "", "Ch/x.mkv"] {
+            assert_eq!(with_abs(bad), None, "{bad:?}");
+        }
+        let abs = std::env::temp_dir().join("stray.mkv");
+        assert_eq!(with_abs(&abs.to_string_lossy()), Some(abs.clone()));
+        // A path from the other OS family is not absolute here either.
+        let foreign = if cfg!(windows) { "/home/u/x.mkv" } else { r"C:\Users\u\x.mkv" };
+        assert_eq!(with_abs(foreign), None);
+    }
+
+    #[test]
+    fn a_crafted_rel_path_imports_with_no_file_even_when_the_target_exists() {
+        // A row pointing outside the download folder at a file that *does*
+        // exist still lands as `None`, exactly like a missing file.
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("videos");
+        std::fs::create_dir_all(&dl).unwrap();
+        touch(&tmp.path().join("secret.txt"), b"not a video");
+        let mut v = ArchiveVideo::of(&video("v1", "UC1"), "/unused");
+        v.download_state = DownloadState::Done;
+        v.rel_path = Some("../secret.txt".into());
+        assert_eq!(rejoin_path(&v, &dl.to_string_lossy()), None);
     }
 
     #[test]

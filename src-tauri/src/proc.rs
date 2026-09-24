@@ -62,6 +62,40 @@ impl KillTree {
         self.inner.kill();
     }
 
+    /// Waits, at most `limit`, until nothing in the tree is still running.
+    /// Returns whether it got there.
+    ///
+    /// Only Windows has anything to wait for. `TerminateJobObject` *starts*
+    /// the kill and returns: the leader's handle is signalled once it is dead,
+    /// but a grandchild -- the real yt-dlp behind PyInstaller's bootloader, the
+    /// ffmpeg doing the merge -- can still be tearing down, and until it is gone
+    /// its open handles keep the `.part` files it was writing undeletable
+    /// (a sharing violation, not a race the sweep could win by trying first).
+    /// The job's own count of active processes is the one authority on when
+    /// that is over. It is polled with an async sleep, so the wait never
+    /// blocks a runtime worker.
+    ///
+    /// Unix returns at once: SIGKILL to the group is delivered before `killpg`
+    /// returns, and an unlink does not care who has the file open.
+    pub async fn wait_empty(&self, limit: std::time::Duration) -> bool {
+        #[cfg(windows)]
+        {
+            let started = std::time::Instant::now();
+            loop {
+                match self.inner.active_processes() {
+                    Some(0) | None => return true,
+                    Some(_) if started.elapsed() >= limit => return false,
+                    Some(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = limit;
+            true
+        }
+    }
+
     /// The leader has been reaped.
     ///
     /// On unix the group id is the leader's pid, which the kernel can hand to
@@ -143,6 +177,26 @@ impl Tree {
         unsafe {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
         }
+    }
+
+    /// How many processes in the job are still alive, from the kernel's own
+    /// accounting. `None` if the query failed, which there is no waiting out.
+    fn active_processes(&self) -> Option<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.job,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(info.ActiveProcesses)
     }
 }
 
@@ -363,6 +417,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_empty_does_not_wait_on_unix() {
+        // SIGKILL is delivered by the time `killpg` returns, and an unlink
+        // does not care who holds the file: there is nothing to wait for.
+        let tc = spawn_tree(&mut sh_tree(&secs(307))).expect("sh is available");
+        let tree = tc.tree();
+        let started = std::time::Instant::now();
+        assert!(tree.wait_empty(Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(tc);
+        let _ = std::process::Command::new("pkill").arg("-f").arg(secs(307)).status();
+    }
+
+    #[tokio::test]
     async fn output_captures_both_streams_and_the_status() {
         let mut cmd = command("sh");
         cmd.arg("-c").arg("echo out; echo err >&2; exit 3");
@@ -455,5 +522,27 @@ mod windows_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("something in {pids:?} outlived the job kill");
+    }
+
+    #[tokio::test]
+    async fn wait_empty_returns_once_the_job_has_no_process_left() {
+        let mut cmd = command("cmd");
+        cmd.args(["/C", "ping -n 300 127.0.0.1 > NUL"]);
+        let mut tc = spawn_tree(&mut cmd).expect("cmd is available");
+        let tree = tc.tree();
+        for _ in 0..100 {
+            if pids_in(&tree).len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Still running: the wait gives up at its limit rather than hanging.
+        assert!(!tree.wait_empty(Duration::from_millis(200)).await);
+        assert!(tree.inner.active_processes().unwrap() >= 1);
+
+        tree.kill();
+        let _ = tokio::time::timeout(Duration::from_secs(10), tc.wait()).await;
+        assert!(tree.wait_empty(Duration::from_secs(5)).await, "the job never emptied");
+        assert_eq!(tree.inner.active_processes(), Some(0));
     }
 }

@@ -136,6 +136,12 @@ pub fn managed(kind: ToolKind, bin: &Path, t: Target) -> Option<PathBuf> {
 
 /// Runs `cmd` to the end within `limit`, killing it if it overruns.
 ///
+/// Built on `proc::output`, so an overrun kills the whole tree. The standalone
+/// yt-dlp is a PyInstaller bootloader whose child is the real program, and a
+/// `--version` that hangs -- a first run stuck behind Defender, a broken
+/// unpack -- would otherwise leave that child running with nothing to reap
+/// it: `kill_on_drop` reaches the bootloader alone.
+///
 /// Retries a spawn that fails with `ETXTBSY`. A binary written a moment ago
 /// -- an install, or a test's fake script -- can be refused with "Text file
 /// busy" when another thread forks in the window between that write and the
@@ -146,10 +152,9 @@ pub async fn output_of(
     cmd: &mut tokio::process::Command,
     limit: Duration,
 ) -> std::io::Result<std::process::Output> {
-    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
     let mut attempt = 0u64;
     loop {
-        match tokio::time::timeout(limit, cmd.output()).await {
+        match tokio::time::timeout(limit, proc::output(cmd)).await {
             Err(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -376,6 +381,41 @@ mod tests {
         assert_eq!(managed(ToolKind::Ffmpeg, tmp.path(), host()), None);
         fake::tool(tmp.path(), "ffprobe", "ffprobe version x Copyright");
         assert_eq!(managed(ToolKind::Ffmpeg, tmp.path(), host()), Some(tmp.path().join("ffmpeg")));
+    }
+
+    #[tokio::test]
+    async fn a_version_check_that_hangs_is_killed_with_everything_it_started() {
+        // The shape of PyInstaller's bootloader: the process we spawn starts
+        // the one that does the work. A timeout must take both.
+        let secs = format!("308.{}", std::process::id());
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("yt-dlp");
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"printf '%s\n' "$1" > "$2" && chmod 755 "$2""#)
+            .arg("sh")
+            .arg(format!("#!/bin/sh\nsleep {secs} & sleep {secs}"))
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let alive = || {
+            !std::process::Command::new("pgrep").arg("-f").arg(&secs).output().unwrap().stdout.is_empty()
+        };
+        let err = output_of(proc::command(&p).arg("--version"), Duration::from_millis(500))
+            .await
+            .expect_err("a 300 s sleep cannot answer in 500 ms");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let mut gone = false;
+        for _ in 0..80 {
+            if !alive() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = std::process::Command::new("pkill").arg("-f").arg(&secs).status();
+        assert!(gone, "a child of the version check outlived its timeout");
     }
 
     #[tokio::test]

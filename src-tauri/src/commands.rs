@@ -32,16 +32,18 @@ pub async fn save_settings(
     let disk = config::load().ok();
     if let Some(disk) = &disk {
         settings.keep_view_of(disk);
+        // The tool overrides have no UI, only hand edits, so the snapshot's
+        // copy can only ever be stale; see `keep_machine_overrides_of`.
+        settings.keep_machine_overrides_of(disk);
     }
     config::save(&settings).map_err(e)?;
-    // A new update channel, auto-update switched on, or a changed override
-    // path should take effect now rather than at the next hourly tools tick.
+    // A new update channel or auto-update switched on should take effect now
+    // rather than at the next hourly tools tick. The override paths cannot
+    // differ from the file's any more; a hand edit to one is picked up by the
+    // next resolution, which is keyed on them.
     let tools_changed = disk.as_ref().is_none_or(|d| {
         d.ytdlp_channel != settings.ytdlp_channel
             || d.ytdlp_auto_update != settings.ytdlp_auto_update
-            || d.ytdlp_path != settings.ytdlp_path
-            || d.ffmpeg_path != settings.ffmpeg_path
-            || d.deno_path != settings.deno_path
     });
     if tools_changed {
         let tools = state.tools.clone();

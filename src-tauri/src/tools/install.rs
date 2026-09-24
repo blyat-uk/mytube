@@ -80,22 +80,36 @@ pub struct Staged {
 }
 
 impl Staged {
-    /// Moves every staged file to its final name. An existing file is first
-    /// renamed to `<name>.old`: Windows lets a running exe be renamed but not
-    /// overwritten, and on unix a rename keeps any running copy's inode alive.
+    /// Moves every staged file to its final name, never leaving a moment in
+    /// which the tool is missing: the old binary is only ever deleted once the
+    /// new one is in its place.
+    ///
+    /// - unix: one `rename(new, final)`, which replaces the old file
+    ///   atomically. A running copy keeps its inode, so nothing needs moving
+    ///   aside first.
+    /// - Windows: a running exe can be renamed but not overwritten, so the old
+    ///   one goes to `<name>.old` first, then the new one to the final name --
+    ///   and if *that* fails the old one is renamed straight back. `.old` is
+    ///   deleted only after success, best effort: a running exe cannot be
+    ///   deleted, and `sweep` gets it at the next start.
+    ///
+    /// On failure the files not yet placed are removed from `.staging/`.
     pub fn place(self, bin: &Path) -> Result<Vec<PathBuf>> {
+        self.place_with(bin, &|from, to| std::fs::rename(from, to))
+    }
+
+    /// [`place`](Self::place) with the rename supplied, so a test can make
+    /// one of them fail.
+    fn place_with(self, bin: &Path, rename: &dyn Fn(&Path, &Path) -> io::Result<()>) -> Result<Vec<PathBuf>> {
         let mut placed = Vec::new();
-        for (from, dest) in &self.files {
+        for (i, (from, dest)) in self.files.iter().enumerate() {
             let to = bin.join(dest);
-            if to.exists() {
-                let old = free_old_name(bin, dest);
-                std::fs::rename(&to, &old)
-                    .with_context(|| format!("moving the old {dest} aside"))?;
-                // Best effort: a running Windows exe cannot be deleted, and
-                // `sweep` gets it at the next start.
-                let _ = std::fs::remove_file(&old);
+            if let Err(e) = place_one(bin, from, dest, &to, rename) {
+                for (p, _) in &self.files[i..] {
+                    let _ = std::fs::remove_file(p);
+                }
+                return Err(e);
             }
-            std::fs::rename(from, &to).with_context(|| format!("installing {dest}"))?;
             placed.push(to);
         }
         Ok(placed)
@@ -108,8 +122,31 @@ impl Staged {
     }
 }
 
+#[cfg(not(windows))]
+fn place_one(_bin: &Path, from: &Path, dest: &str, to: &Path, rename: &dyn Fn(&Path, &Path) -> io::Result<()>) -> Result<()> {
+    rename(from, to).with_context(|| format!("installing {dest}"))
+}
+
+#[cfg(windows)]
+fn place_one(bin: &Path, from: &Path, dest: &str, to: &Path, rename: &dyn Fn(&Path, &Path) -> io::Result<()>) -> Result<()> {
+    if !to.exists() {
+        return rename(from, to).with_context(|| format!("installing {dest}"));
+    }
+    let old = free_old_name(bin, dest);
+    rename(to, &old).with_context(|| format!("moving the old {dest} aside"))?;
+    if let Err(e) = rename(from, to) {
+        // Put the working binary back before reporting: a failed update must
+        // leave the tool exactly as it was, not missing.
+        let _ = rename(&old, to);
+        return Err(e).with_context(|| format!("installing {dest}"));
+    }
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
 /// `<dest>.old`, or `<dest>.<n>.old` when an earlier `.old` is still held
 /// open by a process that has not exited (Windows).
+#[cfg(windows)]
 fn free_old_name(bin: &Path, dest: &str) -> PathBuf {
     let first = bin.join(format!("{dest}.old"));
     if !first.exists() || std::fs::remove_file(&first).is_ok() {
@@ -719,6 +756,66 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = install(&client(), tmp.path(), &bare_plan(&base, "yt-dlp_linux")).await.unwrap_err();
         assert!(err.to_string().contains("lists no checksum for yt-dlp_linux"), "{err:#}");
+    }
+
+    /// The step that puts the new binary at its final name fails (a full
+    /// disk, a scanner holding the file, a permissions surprise). The working
+    /// binary must still be there, under its own name, afterwards.
+    #[test]
+    fn a_failed_final_rename_leaves_the_old_binary_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path();
+        let staging = bin.join(STAGING);
+        std::fs::create_dir_all(&staging).unwrap();
+        let new = staging.join("yt-dlp.new");
+        std::fs::write(&new, b"new").unwrap();
+        std::fs::write(bin.join("yt-dlp"), b"old").unwrap();
+        let staged = Staged { files: vec![(new.clone(), "yt-dlp".into())] };
+
+        let err = staged
+            .place_with(bin, &|from, to| {
+                if from == new.as_path() {
+                    Err(io::Error::other("simulated: the final rename failed"))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("simulated"), "{err:#}");
+        assert_eq!(std::fs::read(bin.join("yt-dlp")).unwrap(), b"old");
+        let mut names: Vec<String> = std::fs::read_dir(bin)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != STAGING)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["yt-dlp"], "no .old left beside it");
+        assert!(staging_is_empty(bin), "the unplaced file is not left in staging");
+    }
+
+    /// The same, for real: the destination is a non-empty directory, which no
+    /// rename can replace.
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_no_rename_can_replace_is_an_error_and_touches_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path();
+        std::fs::create_dir_all(bin.join(STAGING)).unwrap();
+        let new_ff = bin.join(STAGING).join("ffmpeg.new");
+        let new_probe = bin.join(STAGING).join("ffprobe.new");
+        std::fs::write(&new_ff, b"new ffmpeg").unwrap();
+        std::fs::write(&new_probe, b"new ffprobe").unwrap();
+        std::fs::write(bin.join("ffmpeg"), b"old ffmpeg").unwrap();
+        std::fs::create_dir_all(bin.join("ffprobe").join("in the way")).unwrap();
+        let staged = Staged {
+            files: vec![(new_ff, "ffmpeg".into()), (new_probe, "ffprobe".into())],
+        };
+        assert!(staged.place(bin).is_err());
+        // ffmpeg was replaced whole before ffprobe failed; nothing was ever
+        // missing, and nothing is left staged.
+        assert_eq!(std::fs::read(bin.join("ffmpeg")).unwrap(), b"new ffmpeg");
+        assert!(bin.join("ffprobe").join("in the way").is_dir());
+        assert!(staging_is_empty(bin));
     }
 
     #[tokio::test]

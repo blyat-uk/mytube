@@ -35,6 +35,16 @@ use sources::{FfmpegSource, Hosts, Target};
 /// How stale the managed yt-dlp's last update check may get.
 const UPDATE_EVERY_SECS: i64 = 24 * 60 * 60;
 
+/// A verified update that finds yt-dlp in use tries the swap again this
+/// often...
+const SWAP_RETRY: Duration = Duration::from_secs(15);
+/// ...for this long, before it is given up until the next check. On a
+/// machine that is always downloading, giving up at the first busy lease
+/// meant every day's 40 MB was fetched, verified and thrown away, and the
+/// update never landed at all; a queue drains between jobs often enough for
+/// one of these tries to find the lease free.
+const SWAP_PATIENCE: Duration = Duration::from_secs(30 * 60);
+
 /// Where managed copies live: `dirs::data_local_dir()/mytube/bin`. Not
 /// `config_dir()`, which on Windows is the roaming profile.
 pub fn bin_dir() -> PathBuf {
@@ -76,6 +86,25 @@ fn channel_of(s: &Settings) -> &'static str {
     }
 }
 
+/// What `--ffmpeg-location` should say for a resolved ffmpeg.
+///
+/// A managed or system copy is called `ffmpeg` with `ffprobe` beside it, and
+/// its directory is what yt-dlp has always been given. An override is a file
+/// the person named, and it need not be called `ffmpeg` at all
+/// (`ffmpeg-7.exe`, `ffmpeg.git`): handed its directory, yt-dlp would look for
+/// `ffmpeg` in there and run some other build or none. So an override passes
+/// the binary itself, which `--ffmpeg-location` accepts -- yt-dlp then runs
+/// exactly that file and finds ffprobe beside it by the same name with
+/// `ffmpeg` swapped for `ffprobe` (checked in `postprocessor/ffmpeg.py`,
+/// `_determine_executables`).
+fn ffmpeg_location(f: &locate::Found) -> Option<PathBuf> {
+    if f.source == ToolSource::Override {
+        Some(f.path.clone())
+    } else {
+        f.path.parent().map(Path::to_path_buf)
+    }
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -100,6 +129,10 @@ struct Activity {
     busy: Option<ToolState>,
     /// The last install or update failure, until one succeeds.
     error: Option<String>,
+    /// `error` is a failed *update* of a copy that still works. The status
+    /// then says `ready` and carries the message as a note: nothing is
+    /// broken, the newest build just has not arrived.
+    update_failed: bool,
 }
 
 struct Cache {
@@ -136,6 +169,10 @@ pub struct Tools {
     /// second `ensure_all` while one is running has nothing to add.
     work: Mutex<()>,
     state: Mutex<State>,
+    /// How often and for how long a staged update waits for the lease
+    /// ([`SWAP_RETRY`], [`SWAP_PATIENCE`]); shortened by the tests.
+    swap_retry: Duration,
+    swap_patience: Duration,
 }
 
 impl Tools {
@@ -156,6 +193,8 @@ impl Tools {
             lease: Arc::new(RwLock::new(())),
             work: Mutex::new(()),
             state: Mutex::new(State { cache: None, activity: Default::default(), manifest }),
+            swap_retry: SWAP_RETRY,
+            swap_patience: SWAP_PATIENCE,
         }
     }
 
@@ -191,9 +230,9 @@ impl Tools {
                 bail!("yt-dlp is not available yet: {why}");
             }
         };
-        let ffmpeg_dir = res[1].found().and_then(|f| f.path.parent().map(Path::to_path_buf));
+        let ffmpeg_location = res[1].found().and_then(ffmpeg_location);
         let deno = res[2].found().map(|f| f.path.clone());
-        Ok(Invocation { runner: Runner { program, ffmpeg_dir, deno, cookies }, _lease: lease })
+        Ok(Invocation { runner: Runner { program, ffmpeg_location, deno, cookies }, _lease: lease })
     }
 
     /// The cached resolution for `s`, redone when the override keys changed
@@ -246,7 +285,14 @@ impl Tools {
                     Resolution::Missing => (None, None, ToolSource::Missing, None),
                 };
                 let error = a.error.clone().or(bad);
-                let state = a.busy.unwrap_or(if error.is_some() { ToolState::Error } else { ToolState::Ready });
+                // A failed update check on a copy that resolved and runs is a
+                // note, not a fault: downloads go on working with it.
+                let usable_anyway = a.update_failed && matches!(res[i], Resolution::Found(_));
+                let state = a.busy.unwrap_or(if error.is_some() && !usable_anyway {
+                    ToolState::Error
+                } else {
+                    ToolState::Ready
+                });
                 let last_check = (kind == ToolKind::Ytdlp && source == ToolSource::Managed)
                     .then(|| managed_record.and_then(|r| r.last_check))
                     .flatten();
@@ -273,7 +319,9 @@ impl Tools {
     }
 
     async fn set_error(&self, kind: ToolKind, error: Option<String>) {
-        self.state.lock().await.activity[idx(kind)].error = error;
+        let a = &mut self.state.lock().await.activity[idx(kind)];
+        a.error = error;
+        a.update_failed = false;
     }
 
     /// Downloads whatever resolves to nothing. Never fails: errors land in the
@@ -300,7 +348,7 @@ impl Tools {
     async fn ensure_locked(&self, s: &Settings) {
         for kind in ToolKind::ALL {
             if self.needs_install(kind, s).await {
-                let _ = self.install(kind, s, ToolState::Installing, None, false).await;
+                let _ = self.install(kind, s, ToolState::Installing, None, None).await;
             } else if kind != ToolKind::Ytdlp {
                 // Resolved some other way since (a system package, an
                 // override): an old download failure no longer applies.
@@ -313,9 +361,20 @@ impl Tools {
     }
 
     /// The daily yt-dlp update check (managed copy only, `ytdlp_auto_update`).
+    ///
+    /// A verified download that finds yt-dlp in use waits for it, trying the
+    /// swap every [`SWAP_RETRY`] for up to [`SWAP_PATIENCE`]. Only `work` is
+    /// held meanwhile, which polls and downloads never touch -- they take
+    /// read leases, and nothing here holds the lease between tries -- and
+    /// which keeps a second install or update from starting alongside.
     pub async fn maybe_update(&self, s: &Settings) {
         let Ok(_work) = self.work.try_lock() else { return };
-        let _ = self.update_ytdlp(s, false).await;
+        if let Outcome::Busy = self.update_ytdlp(s, false, self.swap_patience).await {
+            eprintln!(
+                "[mytube] yt-dlp: the update stayed busy for {} min; trying again at the next check",
+                self.swap_patience.as_secs() / 60
+            );
+        }
     }
 
     /// "Check for updates" / "Retry": forces the check and retries failed
@@ -329,7 +388,9 @@ impl Tools {
             Err(_) => bail!("busy: a download or refresh is using yt-dlp; try again when it finishes"),
         }
         self.ensure_locked(s).await;
-        if let Outcome::Busy = self.update_ytdlp(s, true).await {
+        // No patience here: the button is waiting on this answer, and "busy,
+        // try again" is the honest one when a job started mid-download.
+        if let Outcome::Busy = self.update_ytdlp(s, true, Duration::ZERO).await {
             bail!("busy: a download or refresh started using yt-dlp; try again when it finishes");
         }
         Ok(self.status(s).await)
@@ -338,7 +399,8 @@ impl Tools {
     /// Checks the chosen channel's latest yt-dlp and installs it if it is not
     /// the one we have. `force` skips the 24 h gate and the auto-update
     /// setting (the "Check for updates" button). Only ever the managed copy.
-    async fn update_ytdlp(&self, s: &Settings, force: bool) -> Outcome {
+    /// `patience` is how long a staged download may wait for the lease.
+    async fn update_ytdlp(&self, s: &Settings, force: bool, patience: Duration) -> Outcome {
         const K: ToolKind = ToolKind::Ytdlp;
         if !s.ytdlp_path.trim().is_empty() || locate::managed(K, &self.bin, self.target).is_none() {
             return Outcome::Skipped;
@@ -367,10 +429,10 @@ impl Tools {
                 st.manifest.save(&self.bin)?;
                 return Ok(Outcome::UpToDate);
             }
-            self.install_inner(K, s, Some(tag), true).await
+            self.install_inner(K, s, Some(tag), Some(patience)).await
         }
         .await;
-        self.finish(K, s, result).await
+        self.finish(K, s, result, true).await
     }
 
     /// A first install (or an update when `guarded`), start to finish, with
@@ -381,15 +443,18 @@ impl Tools {
         s: &Settings,
         busy: ToolState,
         tag: Option<String>,
-        guarded: bool,
+        guarded: Option<Duration>,
     ) -> Outcome {
         self.set_busy(kind, Some(busy)).await;
         self.emit_status(s).await;
         let result = self.install_inner(kind, s, tag, guarded).await;
-        self.finish(kind, s, result).await
+        self.finish(kind, s, result, false).await
     }
 
-    async fn finish(&self, kind: ToolKind, s: &Settings, result: Result<Outcome>) -> Outcome {
+    /// Records how an install or update ended. `update` marks the update of
+    /// a copy that is already installed, whose failure the status shows as a
+    /// note on a `ready` tool rather than as an error.
+    async fn finish(&self, kind: ToolKind, s: &Settings, result: Result<Outcome>, update: bool) -> Outcome {
         let outcome = match result {
             Ok(o) => {
                 if !matches!(o, Outcome::Busy) {
@@ -398,9 +463,11 @@ impl Tools {
                 o
             }
             Err(e) => {
-                let msg = format!("{e:#}");
+                let msg = if update { format!("Update check failed: {e:#}") } else { format!("{e:#}") };
                 eprintln!("[mytube] {}: {msg}", kind.label());
-                self.set_error(kind, Some(msg)).await;
+                let a = &mut self.state.lock().await.activity[idx(kind)];
+                a.error = Some(msg);
+                a.update_failed = update;
                 Outcome::Skipped
             }
         };
@@ -409,13 +476,22 @@ impl Tools {
         outcome
     }
 
-    async fn install_inner(&self, kind: ToolKind, s: &Settings, tag: Option<String>, guarded: bool) -> Result<Outcome> {
+    /// `guarded`: `Some(patience)` swaps only while no yt-dlp holds a lease,
+    /// waiting up to `patience` for one to be free; `None` places at once (a
+    /// first install, which nothing can be running).
+    async fn install_inner(
+        &self,
+        kind: ToolKind,
+        s: &Settings,
+        tag: Option<String>,
+        guarded: Option<Duration>,
+    ) -> Result<Outcome> {
         let plan = self.plan(kind, s, tag).await?;
         let progress = |p: ToolProgress| self.emit_progress(p);
         let staged = install::stage(&self.http, &self.bin, &plan, &progress).await?;
-        let placed = if guarded {
+        let placed = if let Some(patience) = guarded {
             // The swap itself: only while no yt-dlp is running.
-            let Ok(guard) = self.lease.clone().try_write_owned() else {
+            let Some(guard) = self.write_lease_within(patience).await else {
                 staged.discard();
                 return Ok(Outcome::Busy);
             };
@@ -441,6 +517,26 @@ impl Tools {
         }
         st.manifest.save(&self.bin).context("writing tools.json")?;
         Ok(Outcome::Done)
+    }
+
+    /// The write lease, tried now and then every `swap_retry` until
+    /// `patience` has passed. Never *waited* on: a queued `write().await`
+    /// would make every new read lease -- every probe, download and listing --
+    /// queue behind it until the running jobs finished, which is exactly the
+    /// stall the lease design exists to avoid. The sleep is async, and no
+    /// lease is held between tries.
+    async fn write_lease_within(&self, patience: Duration) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(g) = self.lease.clone().try_write_owned() {
+                return Some(g);
+            }
+            let left = patience.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return None;
+            }
+            tokio::time::sleep(self.swap_retry.min(left)).await;
+        }
     }
 
     /// The tag `releases/latest` redirects to. A GET rather than a HEAD (see
@@ -564,7 +660,7 @@ pub async fn self_test(dir: &Path) -> Result<String> {
     for kind in ToolKind::ALL {
         let started = std::time::Instant::now();
         tools
-            .install_inner(kind, &s, None, false)
+            .install_inner(kind, &s, None, None)
             .await
             .with_context(|| format!("installing {}", kind.label()))?;
         report.push(format!("installed {} in {:.1}s", kind.label(), started.elapsed().as_secs_f64()));
@@ -666,6 +762,15 @@ mod tests {
         assert!(update_due(Some(&rec(None, "nightly")), "nightly", t));
     }
 
+    #[test]
+    fn an_ffmpeg_override_is_located_by_its_file_and_anything_else_by_its_directory() {
+        let found = |source| locate::Found { path: PathBuf::from("/opt/ff/ffmpeg-7"), source, version: None };
+        assert_eq!(ffmpeg_location(&found(ToolSource::Override)), Some(PathBuf::from("/opt/ff/ffmpeg-7")));
+        for source in [ToolSource::Managed, ToolSource::System] {
+            assert_eq!(ffmpeg_location(&found(source)), Some(PathBuf::from("/opt/ff")));
+        }
+    }
+
     #[tokio::test]
     async fn an_unknown_target_is_an_error_in_the_status_not_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
@@ -752,7 +857,7 @@ mod tests {
 
             let inv = tools.invocation(&s, Cookies::Browser("firefox".into())).await.unwrap();
             assert_eq!(inv.runner.program, sys.join("yt-dlp"));
-            assert_eq!(inv.runner.ffmpeg_dir.as_deref(), Some(sys.as_path()));
+            assert_eq!(inv.runner.ffmpeg_location.as_deref(), Some(sys.as_path()));
             assert_eq!(inv.runner.deno, Some(sys.join("deno")));
             assert_eq!(inv.runner.cookies, Cookies::Browser("firefox".into()));
             let st = &tools.status(&s).await[0];
@@ -778,6 +883,28 @@ mod tests {
             // With the lease back, update_now gets as far as the (offline) network.
             let statuses = tools.update_now(&s).await.unwrap();
             assert!(statuses[0].error.as_deref().unwrap().contains("404"), "{statuses:?}");
+            // And that failure is a note on a yt-dlp that still works, not a fault.
+            assert_eq!(statuses[0].state, ToolState::Ready, "{statuses:?}");
+            assert!(statuses[0].error.as_deref().unwrap().starts_with("Update check failed: "), "{statuses:?}");
+        }
+
+        #[tokio::test]
+        async fn an_ffmpeg_override_is_handed_to_yt_dlp_as_the_binary_itself() {
+            // Named something other than `ffmpeg`: given only its directory,
+            // yt-dlp would look for `ffmpeg` in there and never find it.
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("bin");
+            let own = tmp.path().join("own");
+            fake::all(&bin, "2026.09.16");
+            let mine = fake::tool(&own, "ffmpeg-7", "ffmpeg version 7.1 Copyright");
+            let tools = tools_at(&bin, &offline().await, Search::only(vec![]));
+            let s = Settings { ffmpeg_path: mine.display().to_string(), ..Settings::default() };
+            let inv = tools.invocation(&s, Cookies::None).await.unwrap();
+            assert_eq!(inv.runner.ffmpeg_location, Some(mine));
+            // Without the override it is the managed copy's directory, as ever.
+            drop(inv);
+            let inv = tools.invocation(&Settings::default(), Cookies::None).await.unwrap();
+            assert_eq!(inv.runner.ffmpeg_location.as_deref(), Some(bin.as_path()));
         }
 
         #[tokio::test]
@@ -881,7 +1008,7 @@ mod tests {
 
             let inv = tools.invocation(&s, Cookies::None).await.unwrap();
             assert_eq!(inv.runner.program, bin.join("yt-dlp"));
-            assert_eq!(inv.runner.ffmpeg_dir.as_deref(), Some(bin.as_path()));
+            assert_eq!(inv.runner.ffmpeg_location.as_deref(), Some(bin.as_path()));
             assert_eq!(inv.runner.deno, Some(bin.join("deno")));
 
             let m = Manifest::load(&bin);
@@ -963,6 +1090,91 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_verified_update_that_finds_yt_dlp_busy_waits_and_then_swaps() {
+            let routes = Routes::default();
+            let base = start(routes.clone()).await;
+            publish_all(&routes);
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("bin");
+            let mut tools = tools_at(&bin, &base, Search::only(vec![]));
+            tools.swap_retry = Duration::from_millis(50);
+            tools.swap_patience = Duration::from_secs(20);
+            let s = Settings::default();
+            tools.ensure_all(&s).await;
+            let before = std::fs::read(bin.join("yt-dlp")).unwrap();
+            {
+                let mut st = tools.state.lock().await;
+                st.manifest.entry(ToolKind::Ytdlp).last_check = Some(now() - 2 * UPDATE_EVERY_SECS);
+                st.manifest.save(&bin).unwrap();
+            }
+            // A newer build that takes ~1.6 s to arrive, so a download can
+            // start in the middle of it and hold its lease past the swap.
+            let newer = script("echo 2026.09.20");
+            publish_ytdlp(&routes, "yt-dlp/yt-dlp-nightly-builds", "2026.09.20", &newer);
+            routes.set(
+                "/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.09.20/yt-dlp_linux",
+                Reply::Slow(newer.clone()),
+            );
+
+            let download = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let inv = tools.invocation(&s, Cookies::None).await.unwrap();
+                // The update's download has finished well before this; its
+                // swap has been finding the lease taken.
+                tokio::time::sleep(Duration::from_millis(2700)).await;
+                let during = std::fs::read(bin.join("yt-dlp")).unwrap();
+                let state = tools.status(&s).await[0].state;
+                drop(inv);
+                (during, state)
+            };
+            let ((), (during, state)) = tokio::join!(tools.maybe_update(&s), download);
+
+            assert_eq!(during, before, "never swapped under a live job");
+            assert_eq!(state, ToolState::Updating, "the wait shows as updating");
+            assert_eq!(std::fs::read(bin.join("yt-dlp")).unwrap(), newer, "swapped once the lease was free");
+            let st = &tools.status(&s).await[0];
+            assert_eq!((st.version.as_deref(), st.state, st.error.as_deref()), (Some("2026.09.20"), ToolState::Ready, None));
+            assert!(!bin.join(install::STAGING).read_dir().map(|mut d| d.next().is_some()).unwrap_or(false));
+        }
+
+        #[tokio::test]
+        async fn a_staged_update_is_given_up_once_its_patience_runs_out() {
+            let routes = Routes::default();
+            let base = start(routes.clone()).await;
+            publish_all(&routes);
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("bin");
+            let mut tools = tools_at(&bin, &base, Search::only(vec![]));
+            tools.swap_retry = Duration::from_millis(50);
+            tools.swap_patience = Duration::from_millis(400);
+            let s = Settings::default();
+            tools.ensure_all(&s).await;
+            let before = std::fs::read(bin.join("yt-dlp")).unwrap();
+            {
+                let mut st = tools.state.lock().await;
+                st.manifest.entry(ToolKind::Ytdlp).last_check = Some(now() - 2 * UPDATE_EVERY_SECS);
+                st.manifest.save(&bin).unwrap();
+            }
+            let newer = script("echo 2026.09.20");
+            publish_ytdlp(&routes, "yt-dlp/yt-dlp-nightly-builds", "2026.09.20", &newer);
+            routes.set(
+                "/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.09.20/yt-dlp_linux",
+                Reply::Slow(newer),
+            );
+            let download = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let inv = tools.invocation(&s, Cookies::None).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                drop(inv);
+            };
+            tokio::join!(tools.maybe_update(&s), download);
+            assert_eq!(std::fs::read(bin.join("yt-dlp")).unwrap(), before);
+            let st = &tools.status(&s).await[0];
+            assert_eq!((st.state, st.error.as_deref()), (ToolState::Ready, None), "busy is not a failure");
+            assert!(!bin.join(install::STAGING).read_dir().map(|mut d| d.next().is_some()).unwrap_or(false));
+        }
+
+        #[tokio::test]
         async fn a_failed_update_keeps_the_working_binary() {
             let routes = Routes::default();
             let base = start(routes.clone()).await;
@@ -981,7 +1193,10 @@ mod tests {
 
             assert_eq!(std::fs::read(bin.join("yt-dlp")).unwrap(), before);
             let st = &tools.status(&s).await[0];
-            assert_eq!((st.source, st.state), (ToolSource::Managed, ToolState::Error));
+            // The old binary works, so the tool is ready; the failure rides
+            // along as a note for the Settings view to show quietly.
+            assert_eq!((st.source, st.state), (ToolSource::Managed, ToolState::Ready), "{st:?}");
+            assert!(st.error.as_deref().unwrap().starts_with("Update check failed: "), "{st:?}");
             assert_eq!(st.version.as_deref(), Some("2026.09.16.232951"));
             assert!(tools.invocation(&s, Cookies::None).await.is_ok());
             assert!(!bin.join(install::STAGING).read_dir().map(|mut d| d.next().is_some()).unwrap_or(false));

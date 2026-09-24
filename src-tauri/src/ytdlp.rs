@@ -26,8 +26,13 @@ pub enum Cookies {
 #[derive(Debug, Clone)]
 pub struct Runner {
     pub program: PathBuf,
-    /// The directory holding ffmpeg (and ffprobe): `--ffmpeg-location`.
-    pub ffmpeg_dir: Option<PathBuf>,
+    /// `--ffmpeg-location`: the directory holding ffmpeg and ffprobe, or --
+    /// for an `ffmpeg_path` override -- the ffmpeg binary itself, which yt-dlp
+    /// accepts too ("either the path to the binary or its containing
+    /// directory"). A binary path is what lets an override name a file that is
+    /// not called `ffmpeg`: yt-dlp then runs that file, and looks for ffprobe
+    /// beside it under the same name with `ffmpeg` swapped for `ffprobe`.
+    pub ffmpeg_location: Option<PathBuf>,
     /// `--js-runtimes deno:<path>`.
     pub deno: Option<PathBuf>,
     pub cookies: Cookies,
@@ -47,15 +52,15 @@ pub fn thumb_url_for(video_id: &str) -> String {
 
 fn s(x: &str) -> String { x.to_string() }
 
-/// What every yt-dlp run is told about this machine: where ffmpeg and deno
-/// are, so it uses exactly what MyTube resolved rather than searching `PATH`
+/// What every yt-dlp run is told about this machine: how to encode its
+/// output (see [`encoding_args`]), and where ffmpeg and deno are, so it uses exactly what MyTube resolved rather than searching `PATH`
 /// for itself (a GUI launch on macOS or Windows sees a much shorter one).
 /// Each is left out when it resolved to nothing, and yt-dlp then searches on
 /// its own.
 fn runtime_args(r: &Runner) -> Vec<String> {
-    let mut a = Vec::new();
-    if let Some(dir) = &r.ffmpeg_dir {
-        a.extend([s("--ffmpeg-location"), dir.to_string_lossy().into_owned()]);
+    let mut a = encoding_args();
+    if let Some(loc) = &r.ffmpeg_location {
+        a.extend([s("--ffmpeg-location"), loc.to_string_lossy().into_owned()]);
     }
     if let Some(deno) = &r.deno {
         // `RUNTIME:PATH`, where PATH may be the binary or its directory. deno
@@ -64,6 +69,30 @@ fn runtime_args(r: &Runner) -> Vec<String> {
         a.extend([s("--js-runtimes"), format!("deno:{}", deno.to_string_lossy())]);
     }
     a
+}
+
+/// How yt-dlp is to encode what it writes to our pipes.
+///
+/// On Windows, yt-dlp's `write_string` encodes stdout and stderr with the
+/// stream's own encoding, and Python gives a *pipe* the ANSI code page
+/// (cp1252 on most Western installs) -- with `errors='ignore'`, so anything
+/// outside it is not even mangled but silently dropped: a Japanese title
+/// arrives as an empty line, and a probed path loses the same characters --
+/// and is then forced back on the download as its `-o`. `--encoding` is the value that function takes before the stream's
+/// (checked in yt-dlp 2026.08.19, `utils/_utils.py` and
+/// `YoutubeDL._write_string`), and it covers `--print`, `-j`, progress and
+/// error lines alike. It changes nothing about filenames on disk.
+///
+/// Off Windows the locale is UTF-8 in practice, and the flag is left out so
+/// the argv stays what it has always been. `--print-to-file` needs nothing:
+/// yt-dlp opens that file with `encoding='utf-8'` whatever the platform
+/// (see `run_one`'s read of it).
+fn encoding_args() -> Vec<String> {
+    if cfg!(windows) {
+        vec![s("--encoding"), s("utf-8")]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The cookie flag, if any. No cookie source means no flag at all: a
@@ -350,7 +379,7 @@ mod tests {
 
     /// A machine where nothing resolved but yt-dlp itself.
     fn bare() -> Runner {
-        Runner { program: PathBuf::from("yt-dlp"), ffmpeg_dir: None, deno: None,
+        Runner { program: PathBuf::from("yt-dlp"), ffmpeg_location: None, deno: None,
                  cookies: Cookies::None }
     }
 
@@ -359,7 +388,7 @@ mod tests {
     fn full() -> Runner {
         Runner {
             program: PathBuf::from("/bin/dir/yt-dlp"),
-            ffmpeg_dir: Some(PathBuf::from("/tools/ffmpeg dir")),
+            ffmpeg_location: Some(PathBuf::from("/tools/ffmpeg dir")),
             deno: Some(PathBuf::from("/tools/deno")),
             cookies: Cookies::Browser("firefox".into()),
         }
@@ -441,6 +470,19 @@ mod tests {
         for a in video_argvs(&r).iter().chain([&listing]) {
             assert!(!a.contains(&"--ffmpeg-location".to_string()), "{a:?}");
             assert!(!a.contains(&"--js-runtimes".to_string()), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn every_run_asks_for_utf8_output_on_windows_and_only_there() {
+        // A Windows pipe otherwise gets the ANSI code page, and yt-dlp drops
+        // every character outside it from titles and paths.
+        for r in [bare(), full()] {
+            let listing = flat_playlist_args(&r, "UC1", 30);
+            for a in video_argvs(&r).iter().chain([&listing]) {
+                assert_eq!(value_of(a, "--encoding").as_deref(),
+                           cfg!(windows).then_some("utf-8"), "{a:?}");
+            }
         }
     }
 

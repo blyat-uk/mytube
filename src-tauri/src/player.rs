@@ -25,6 +25,13 @@ pub(crate) fn split_for(os: Os, cmd: &str, env: &dyn Env) -> Result<(String, Vec
 /// `C:Program Files...`, and people paste paths with spaces unquoted.
 ///
 /// - The whole string naming an existing file is the program, spaces and all.
+/// - Otherwise, an unquoted string whose longest whitespace-delimited prefix
+///   names an existing file has that prefix as the program and the rest as its
+///   arguments: `C:\Program Files\VideoLAN\VLC\vlc.exe --fullscreen` starts
+///   VLC with `--fullscreen`, where splitting on spaces would try to run
+///   `C:\Program`. Longest first, so a stray `C:\Program` file cannot win over
+///   the player. A string opening with a quote has said where its program
+///   ends, and is only ever split.
 /// - `\` is always literal.
 /// - `"…"` groups anywhere in a token, as `CommandLineToArgvW` does.
 /// - `'…'` groups too, but only when it opens a token: a Windows path can hold
@@ -37,6 +44,25 @@ fn split_windows(cmd: &str, env: &dyn Env) -> Result<Vec<String>> {
     if env.is_file(cmd) {
         return Ok(vec![cmd.to_string()]);
     }
+    if !cmd.starts_with(['"', '\'']) {
+        let ends = cmd
+            .char_indices()
+            .filter(|&(i, c)| c.is_whitespace() && !cmd[..i].ends_with(char::is_whitespace))
+            .map(|(i, _)| i);
+        for end in ends.collect::<Vec<_>>().into_iter().rev() {
+            let program = &cmd[..end];
+            if env.is_file(program) {
+                let mut parts = vec![program.to_string()];
+                parts.extend(split_windows_tokens(&cmd[end..])?);
+                return Ok(parts);
+            }
+        }
+    }
+    split_windows_tokens(cmd)
+}
+
+/// The tokenising half of [`split_windows`]: quotes and whitespace only.
+fn split_windows_tokens(cmd: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     // A token has started even if it is still empty: `""` is an empty argument.
@@ -200,6 +226,49 @@ mod tests {
         let env = win().file(VLC);
         assert_eq!(wsplit(VLC, &env), (VLC.to_string(), vec![]));
         assert_eq!(wsplit(&format!("  {VLC}  "), &env), (VLC.to_string(), vec![]));
+    }
+
+    #[test]
+    fn windows_an_unquoted_path_to_an_existing_file_can_take_arguments() {
+        let env = win().file(VLC);
+        assert_eq!(
+            wsplit(&format!("{VLC} --fullscreen"), &env),
+            (VLC.to_string(), vec!["--fullscreen".to_string()])
+        );
+        let (bin, args) = wsplit(&format!("{VLC}   --fullscreen --meta-title=\"my film\" x\\y"), &env);
+        assert_eq!(bin, VLC);
+        assert_eq!(args, vec!["--fullscreen", "--meta-title=my film", r"x\y"]);
+        assert!(resolves_for(Os::Windows, &format!("{VLC} --fullscreen"), &env));
+    }
+
+    #[test]
+    fn windows_the_longest_existing_prefix_is_the_program() {
+        // A stray `C:\Program` file is exactly what makes unquoted paths with
+        // spaces dangerous; it must not be picked over the real player.
+        let env = win().file(r"C:\Program").file(VLC);
+        assert_eq!(wsplit(&format!("{VLC} --fs"), &env), (VLC.to_string(), vec!["--fs".to_string()]));
+        // With no player there, `C:\Program` is all that exists.
+        let env = win().file(r"C:\Program");
+        let (bin, args) = wsplit(&format!("{VLC} --fs"), &env);
+        assert_eq!(bin, r"C:\Program");
+        assert_eq!(args, vec![r"Files\VideoLAN\VLC\vlc.exe", "--fs"]);
+    }
+
+    #[test]
+    fn windows_with_no_existing_prefix_it_is_plain_splitting() {
+        let (bin, args) = wsplit(&format!("{VLC} --fullscreen"), &win());
+        assert_eq!(bin, r"C:\Program");
+        assert_eq!(args, vec![r"Files\VideoLAN\VLC\vlc.exe", "--fullscreen"]);
+        assert!(!resolves_for(Os::Windows, &format!("{VLC} --fullscreen"), &win()));
+    }
+
+    #[test]
+    fn windows_a_quoted_command_is_never_prefix_matched() {
+        // The quotes say where the program ends, even if a longer file exists.
+        let env = win().file(r"C:\mpv.exe --fs");
+        let (bin, args) = wsplit(r#""C:\mpv.exe" --fs --x"#, &env);
+        assert_eq!(bin, r"C:\mpv.exe");
+        assert_eq!(args, vec!["--fs", "--x"]);
     }
 
     #[test]

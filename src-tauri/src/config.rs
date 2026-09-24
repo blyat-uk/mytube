@@ -232,6 +232,18 @@ impl Settings {
         self.view = disk.view.clone();
     }
 
+    /// The same snapshot problem for the three tool overrides, which have no
+    /// UI at all: they are set by editing settings.json by hand. A Settings
+    /// view mounted before that edit still holds the old value, and saving
+    /// anything from it -- a new download folder, the update channel -- would
+    /// silently put the old path back. Nothing in the app ever changes these,
+    /// so the file's copy always wins.
+    pub fn keep_machine_overrides_of(&mut self, disk: &Settings) {
+        self.ytdlp_path = disk.ytdlp_path.clone();
+        self.ffmpeg_path = disk.ffmpeg_path.clone();
+        self.deno_path = disk.deno_path.clone();
+    }
+
     /// Takes the portable half of `incoming`, keeping this machine's window
     /// geometry and feed filters. The mirror of `keep_view_of`.
     ///
@@ -537,6 +549,25 @@ mod tests {
 
         incoming.keep_view_of(&disk);
         assert_eq!(incoming.view.search, "disk");
+    }
+
+    #[test]
+    fn hand_edited_tool_overrides_survive_a_save_from_a_stale_view() {
+        // The view mounted with no overrides; since then, settings.json was
+        // edited by hand to point at a yt-dlp and an ffmpeg of the user's own,
+        // and a deno override was removed.
+        let mut incoming = Settings::from_json_str(r#"{"deno_path":"/old/deno"}"#).unwrap();
+        incoming.download_dir = "/new/videos".into();
+        let disk = Settings::from_json_str(
+            r#"{"ytdlp_path":"/opt/yt-dlp","ffmpeg_path":"C:\\ff\\ffmpeg-7.exe"}"#,
+        )
+        .unwrap();
+
+        incoming.keep_machine_overrides_of(&disk);
+        assert_eq!(incoming.ytdlp_path, "/opt/yt-dlp");
+        assert_eq!(incoming.ffmpeg_path, r"C:\ff\ffmpeg-7.exe");
+        assert_eq!(incoming.deno_path, "", "a removed override stays removed");
+        assert_eq!(incoming.download_dir, "/new/videos", "what the view did change is kept");
     }
 
     /// A settings file as an archive from another machine would carry it: every
