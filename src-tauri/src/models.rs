@@ -428,3 +428,103 @@ pub struct TransferEstimate {
     pub thumb_count: usize,
     pub thumb_bytes: u64,
 }
+/// One of the three external programs MyTube runs. Serialised as the IPC
+/// spells it: `ytdlp`, `ffmpeg`, `deno`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolKind {
+    Ytdlp,
+    Ffmpeg,
+    Deno,
+}
+
+impl ToolKind {
+    pub const ALL: [ToolKind; 3] = [ToolKind::Ytdlp, ToolKind::Ffmpeg, ToolKind::Deno];
+
+    /// The name a person reads, and the one in error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolKind::Ytdlp => "yt-dlp",
+            ToolKind::Ffmpeg => "ffmpeg",
+            ToolKind::Deno => "deno",
+        }
+    }
+}
+
+/// Where a resolved tool came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolSource {
+    /// Downloaded and kept by MyTube, in `tools::bin_dir()`.
+    Managed,
+    /// Found on PATH or one of the directories a GUI launch misses.
+    System,
+    /// `ytdlp_path` / `ffmpeg_path` / `deno_path` in settings.json.
+    Override,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolState {
+    Ready,
+    Installing,
+    Updating,
+    Error,
+}
+
+/// One row of the Settings view's Tools section, and the payload of
+/// `tools://status` (as a list of three).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolStatus {
+    pub kind: ToolKind,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub source: ToolSource,
+    pub state: ToolState,
+    pub error: Option<String>,
+    /// Unix seconds of the last update check; managed yt-dlp only.
+    pub last_check: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPhase {
+    Download,
+    Extract,
+}
+
+/// `tools://progress`: bytes of one tool's download so far.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolProgress {
+    pub tool: ToolKind,
+    pub phase: ToolPhase,
+    pub received: u64,
+    pub total: Option<u64>,
+}
+
+/// A player the Settings view can offer. `command` is exactly what goes into
+/// `player_command`; `""` is the OS default app.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerOption {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+}
+
+/// A browser whose cookies yt-dlp could read. `id` is the
+/// `--cookies-from-browser` name; `supported` is false where yt-dlp cannot read
+/// it on this OS (Chromium-family on Windows), and `note` says why or what the
+/// OS will ask for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserOption {
+    pub id: String,
+    pub label: String,
+    pub supported: bool,
+    pub note: Option<String>,
+}
+

@@ -8,6 +8,29 @@ pub const PROGRESS_PREFIX: &str = "MYTUBE|";
 const PROGRESS_TEMPLATE: &str =
     "MYTUBE|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s";
 
+/// Where yt-dlp gets YouTube cookies from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cookies {
+    None,
+    /// A `--cookies-from-browser` spec, verbatim (`firefox`, `chrome:Profile 1`).
+    Browser(String),
+    /// A Netscape cookies.txt, passed as `--cookies`.
+    File(PathBuf),
+}
+
+/// Everything one yt-dlp run needs to know about this machine: which binary,
+/// where ffmpeg and deno are, and whose cookies to present. Built by
+/// `tools::Tools::ytdlp`.
+#[derive(Debug, Clone)]
+pub struct Runner {
+    pub program: PathBuf,
+    /// The directory holding ffmpeg (and ffprobe): `--ffmpeg-location`.
+    pub ffmpeg_dir: Option<PathBuf>,
+    /// `--js-runtimes deno:<path>`.
+    pub deno: Option<PathBuf>,
+    pub cookies: Cookies,
+}
+
 pub fn watch_url(video_id: &str) -> String {
     format!("https://www.youtube.com/watch?v={video_id}")
 }

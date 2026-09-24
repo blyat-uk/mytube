@@ -3,10 +3,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// The OS's own videos folder -- `~/Videos` on Linux and Windows, `~/Movies`
+/// on macOS -- falling back to `~/Videos` where the desktop names none.
 fn d_download_dir() -> String {
-    dirs::home_dir()
+    dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Videos")
         .join("mytube")
         .to_string_lossy()
         .into_owned()
@@ -14,9 +16,25 @@ fn d_download_dir() -> String {
 fn d_filename_template() -> String {
     "%(uploader)s/%(title)s [%(id)s].%(ext)s".into()
 }
+/// Empty means "whatever this OS opens the file with" -- the one default that
+/// is right on every machine. The Settings view offers the players it detects.
 fn d_player_command() -> String {
-    "smplayer".into()
+    String::new()
 }
+/// `auto` resolves at call time to Firefox when a Firefox profile exists and to
+/// no cookies otherwise; see `detect::resolve_cookies`.
+fn d_cookies_browser() -> String {
+    COOKIES_AUTO.into()
+}
+fn d_ytdlp_channel() -> String {
+    "nightly".into()
+}
+fn d_true() -> bool {
+    true
+}
+
+/// The `cookies_browser` value that means "pick for me".
+pub const COOKIES_AUTO: &str = "auto";
 fn d_max_concurrent() -> usize {
     5
 }
@@ -133,6 +151,26 @@ pub struct Settings {
     pub poll_on_startup: bool,
     #[serde(default = "d_backfill_count")]
     pub backfill_count: u32,
+    /// `auto`, `""` for none, or a `--cookies-from-browser` spec verbatim
+    /// (`firefox`, `chrome:Profile 1`). Machine-local: never exported.
+    #[serde(default = "d_cookies_browser")]
+    pub cookies_browser: String,
+    /// A Netscape cookies.txt. Non-empty wins over `cookies_browser`.
+    #[serde(default)]
+    pub cookies_file: String,
+    /// `nightly` or `stable`; anything else is repaired to nightly on load.
+    #[serde(default = "d_ytdlp_channel")]
+    pub ytdlp_channel: String,
+    #[serde(default = "d_true")]
+    pub ytdlp_auto_update: bool,
+    /// Hand-edit-only overrides for the three external tools. Non-empty always
+    /// wins over both the managed and the system copy.
+    #[serde(default)]
+    pub ytdlp_path: String,
+    #[serde(default)]
+    pub ffmpeg_path: String,
+    #[serde(default)]
+    pub deno_path: String,
     #[serde(default = "d_card_size")]
     pub card_size: u32,
     #[serde(default = "d_window_width")]
@@ -175,6 +213,9 @@ impl Settings {
         // corrupt value would otherwise restore a window too small to use.
         v.window_width = v.window_width.clamp(720, 16_384);
         v.window_height = v.window_height.clamp(480, 16_384);
+        if v.ytdlp_channel != "stable" {
+            v.ytdlp_channel = "nightly".into();
+        }
         v.view.sanitize();
         Ok(v)
     }
@@ -290,9 +331,36 @@ mod tests {
         assert_eq!(s.poll_interval_minutes, 30);
         assert_eq!(s.backfill_count, 30);
         assert_eq!(s.card_size, 260);
-        assert_eq!(s.player_command, "smplayer");
+        assert_eq!(s.player_command, "", "empty = the OS default app");
+        assert_eq!(s.cookies_browser, COOKIES_AUTO);
+        assert_eq!(s.cookies_file, "");
+        assert_eq!(s.ytdlp_channel, "nightly");
+        assert!(s.ytdlp_auto_update);
+        assert_eq!((s.ytdlp_path.as_str(), s.ffmpeg_path.as_str(), s.deno_path.as_str()), ("", "", ""));
+        assert!(s.download_dir.ends_with("mytube"));
         assert!(s.poll_on_startup);
         assert_eq!(s.filename_template, "%(uploader)s/%(title)s [%(id)s].%(ext)s");
+    }
+
+    #[test]
+    fn an_unknown_update_channel_reads_as_nightly() {
+        let s = Settings::from_json_str(r#"{"ytdlp_channel":"master"}"#).unwrap();
+        assert_eq!(s.ytdlp_channel, "nightly");
+        let s = Settings::from_json_str(r#"{"ytdlp_channel":"stable"}"#).unwrap();
+        assert_eq!(s.ytdlp_channel, "stable");
+    }
+
+    #[test]
+    fn tool_and_cookie_keys_are_named_fields_not_extra() {
+        let s = Settings::from_json_str(
+            r#"{"cookies_browser":"chrome:Profile 1","cookies_file":"/c.txt","ytdlp_path":"/y","ytdlp_auto_update":false}"#,
+        )
+        .unwrap();
+        assert_eq!(s.cookies_browser, "chrome:Profile 1");
+        assert_eq!(s.cookies_file, "/c.txt");
+        assert_eq!(s.ytdlp_path, "/y");
+        assert!(!s.ytdlp_auto_update);
+        assert!(s.extra.is_empty(), "{:?}", s.extra);
     }
 
     #[test]
@@ -554,7 +622,7 @@ mod tests {
         // A file that is not there is the first-run case, not an error.
         assert_eq!(
             load_from(&dir.path().join("absent.json")).unwrap().player_command,
-            "smplayer"
+            ""
         );
     }
 }

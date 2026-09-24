@@ -1,6 +1,8 @@
+pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod db;
+pub mod detect;
 pub mod models;
 pub mod player;
 pub mod poll;
@@ -8,6 +10,7 @@ pub mod queue;
 pub mod resolve;
 pub mod rss;
 pub mod siblings;
+pub mod tools;
 pub mod transfer;
 pub mod tray;
 pub mod upload_date;
@@ -62,6 +65,9 @@ pub fn run() {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?;
 
+            let tools = tools::Tools::new(tools::bin_dir(), http.clone());
+            tools.set_app(app.handle().clone());
+
             let queue = Arc::new(queue::Queue::new(
                 db.clone(),
                 app.handle().clone(),
@@ -73,6 +79,7 @@ pub fn run() {
                 http,
                 queue,
                 poll_lock: Arc::new(tokio::sync::Mutex::new(())),
+                tools,
             });
             app.manage(state.clone());
 
@@ -132,6 +139,10 @@ pub fn run() {
             commands::export_config,
             commands::read_archive,
             commands::import_config,
+            commands::detect_players,
+            commands::detect_browsers,
+            commands::tools_status,
+            commands::tools_update_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

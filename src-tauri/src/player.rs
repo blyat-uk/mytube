@@ -12,6 +12,16 @@ pub fn split_command(cmd: &str) -> Result<(String, Vec<String>)> {
     Ok((bin, it.collect()))
 }
 
+/// Whether `cmd` would start something on this machine: `""` (the OS default
+/// app) always does; otherwise its program must resolve. Used to decide
+/// whether an imported archive's `player_command` means anything here.
+///
+/// FOUNDATION STUB: the detect task implements this.
+pub fn command_resolves(cmd: &str) -> bool {
+    let _ = cmd;
+    todo!("detect task")
+}
+
 /// Spawns the player detached: stdio is nulled and the child is never awaited,
 /// so it keeps running after MyTube exits.
 pub fn launch(player_command: &str, file_path: &str) -> Result<()> {

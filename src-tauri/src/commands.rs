@@ -621,3 +621,28 @@ pub async fn import_config(
     let _ = app.emit("transfer://finished", report.clone());
     Ok(report)
 }
+
+/// Players installed on this machine, "System default" first.
+#[tauri::command]
+pub fn detect_players() -> Vec<PlayerOption> {
+    crate::detect::detect_players()
+}
+
+/// Browsers yt-dlp could read cookies from, as found on this machine.
+#[tauri::command]
+pub fn detect_browsers() -> Vec<BrowserOption> {
+    crate::detect::detect_browsers()
+}
+
+#[tauri::command]
+pub async fn tools_status(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>> {
+    let s = config::load().unwrap_or_default();
+    Ok(state.tools.status(&s).await)
+}
+
+/// "Check for updates" / "Retry" in the Tools section.
+#[tauri::command]
+pub async fn tools_update_now(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>> {
+    let s = config::load().unwrap_or_default();
+    state.tools.update_now(&s).await.map_err(e)
+}

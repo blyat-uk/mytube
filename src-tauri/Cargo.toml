@@ -22,7 +22,6 @@ tauri = { version = "2", features = ["protocol-asset", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
-ksni = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -36,9 +35,6 @@ dirs = "5"
 anyhow = "1"
 chrono = "0.4"
 regex = "1"
-# Only for `killpg`: cancelling a download has to signal yt-dlp *and* the ffmpeg
-# it shells out to, and std/tokio can only signal the direct child.
-libc = "0.2"
 # The export/import archive. Pure Rust, and deliberately stripped: the default
 # feature set drags in aes, bzip2, lzma, ppmd, zstd and xz — six codecs, two of
 # them C libraries — for a file that only ever holds a deflated manifest.json
@@ -47,6 +43,34 @@ libc = "0.2"
 # plain `deflate-flate2` takes flate2 with `default-features = false`, which on
 # its own has no backend at all and only compiles here by accident.
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# Managed tools (tools/): every download is checked against its publisher's
+# SHA-256 before it is installed; ffmpeg for Linux arrives as .tar.xz, decoded
+# in pure Rust so no C liblzma has to build on three CI runners.
+sha2 = "0.10"
+tar = "0.4"
+lzma-rust2 = "0.21"
+# PATH lookup that knows about PATHEXT on Windows.
+which = "8"
+
+# The tray. Linux speaks StatusNotifierItem itself (see tray/sni.rs for why
+# Tauri's libayatana-backed tray cannot report a left click); macOS and Windows
+# use Tauri's own tray, which can.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"
+
+# Only for `killpg`: cancelling a download has to signal yt-dlp *and* the ffmpeg
+# it shells out to, and std/tokio can only signal the direct child.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tauri = { version = "2", features = ["protocol-asset", "image-png", "tray-icon"] }
+
+# Cancelling a download on Windows: a Job Object is the only handle that
+# reaches yt-dlp's whole process tree (PyInstaller's bootloader, the real
+# yt-dlp, and the ffmpeg and deno it starts).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
 [dev-dependencies]
 # transfer.rs writes real archives and extracts them; every test that touches

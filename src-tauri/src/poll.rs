@@ -18,6 +18,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub queue: Arc<Queue>,
     pub poll_lock: Arc<Mutex<()>>,
+    pub tools: Arc<crate::tools::Tools>,
 }
 
 pub fn cache_thumb_path(video_id: &str) -> std::path::PathBuf {
