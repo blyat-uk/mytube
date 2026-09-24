@@ -25,6 +25,8 @@ const SETTINGS: Settings = {
   poll_on_startup: true, backfill_count: 30, card_size: 260,
   window_width: 1280, window_height: 880, window_x: null, window_y: null,
   window_maximized: false,
+  cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
+  ytdlp_path: "", ffmpeg_path: "", deno_path: "",
   view: {
     channel_id: null, search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, sort: "newest",

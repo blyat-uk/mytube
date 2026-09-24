@@ -29,3 +29,6 @@ src-tauri/target
 
 # python bytecode from scripts/
 __pycache__/
+
+# agent worktrees
+.claude/worktrees/

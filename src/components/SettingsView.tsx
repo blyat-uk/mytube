@@ -10,7 +10,6 @@ import { useTransferProgress } from "../events";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import {
-  COOKIES_AUTO,
   type ArchiveSummary, type ImportMode, type Settings, type TransferEstimate,
   type TransferProgress,
 } from "../types";
@@ -373,8 +372,8 @@ export default function SettingsView() {
       {/* Rust fills both keys on every read; the fallbacks are its defaults,
           for a Settings built by hand without them. */}
       <CookiesField
-        browser={s.cookies_browser ?? COOKIES_AUTO}
-        file={s.cookies_file ?? ""}
+        browser={s.cookies_browser}
+        file={s.cookies_file}
         onPick={patchAndSave}
       />
 
@@ -431,8 +430,8 @@ export default function SettingsView() {
       <p className="settings-note">Changes save when a field loses focus.</p>
 
       <ToolsSection
-        channel={s.ytdlp_channel ?? "nightly"}
-        autoUpdate={s.ytdlp_auto_update ?? true}
+        channel={s.ytdlp_channel}
+        autoUpdate={s.ytdlp_auto_update}
         onChannel={(v) => setAndSave("ytdlp_channel", v)}
         onAutoUpdate={(on) => setAndSave("ytdlp_auto_update", on)}
       />

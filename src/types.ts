@@ -86,21 +86,19 @@ export interface Settings {
   window_x: number | null; window_y: number | null;
   window_maximized: boolean;
   view: ViewState;
-  /* Machine-local keys, never exported. Optional here, not because the backend
-   * ever omits them — `#[serde(default)]` fills each one — but so a caller that
-   * builds a Settings by hand is not forced to restate defaults it has no
-   * opinion on. The UI reads each through the same default Rust applies. */
+  /* Machine-local keys, never exported. Always present: `#[serde(default)]`
+   * fills each one before the object ever crosses the IPC boundary. */
   /** `"auto"` (Firefox if a profile exists, else none), `""` for none, or a
    *  `--cookies-from-browser` spec verbatim (`firefox`, `chrome:Profile 1`). */
-  cookies_browser?: string;
+  cookies_browser: string;
   /** A Netscape cookies.txt. Non-empty wins over `cookies_browser`. */
-  cookies_file?: string;
+  cookies_file: string;
   /** `"nightly"` or `"stable"`; anything else reads as nightly. */
-  ytdlp_channel?: string;
-  ytdlp_auto_update?: boolean;
+  ytdlp_channel: string;
+  ytdlp_auto_update: boolean;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
-  ytdlp_path?: string; ffmpeg_path?: string; deno_path?: string;
+  ytdlp_path: string; ffmpeg_path: string; deno_path: string;
 }
 
 /** The `cookies_browser` value meaning "Firefox if there is one, else none". */
