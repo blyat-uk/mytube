@@ -175,11 +175,20 @@ struct FormatProbe {
 /// written with a trailing slash and one written without produce the same
 /// answer — which matters, because that string is hand-editable in
 /// settings.json and both forms occur in the wild.
+///
+/// `rel_path` is always written with `/`, whatever the exporting OS: it is a
+/// file format, and a Windows archive re-rooted on Linux must not arrive as one
+/// file named `Some Channel\A Title.mkv`. `rejoin_path` splits it again.
 fn portable_path(file_path: &str, download_dir: &str) -> (Option<String>, Option<String>) {
     let rel = Path::new(file_path)
         .strip_prefix(Path::new(download_dir))
         .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
         .filter(|s| !s.is_empty());
     match rel {
         Some(r) => (Some(r), None),
@@ -191,7 +200,11 @@ fn portable_path(file_path: &str, download_dir: &str) -> (Option<String>, Option
 /// `None` when the row carried no path at all.
 fn rejoin_path(v: &ArchiveVideo, download_dir: &str) -> Option<PathBuf> {
     match (&v.rel_path, &v.abs_path) {
-        (Some(rel), _) => Some(Path::new(download_dir).join(rel)),
+        (Some(rel), _) => Some(
+            rel.split('/')
+                .filter(|c| !c.is_empty())
+                .fold(PathBuf::from(download_dir), |p, c| p.join(c)),
+        ),
         (None, Some(abs)) => Some(PathBuf::from(abs)),
         (None, None) => None,
     }
@@ -731,6 +744,17 @@ mod tests {
         let slashed = portable_path(file, "/mnt/STORAGE/Videos/");
         assert_eq!(bare, slashed);
         assert_eq!(bare, (Some("Some Channel/A Title [abc].mkv".into()), None));
+    }
+
+    #[test]
+    fn rel_path_is_rejoined_with_this_machines_separator() {
+        let mut v = ArchiveVideo::of(&video("v1", "UC1"), "/unused");
+        v.rel_path = Some("Some Channel/A Title [v1].mkv".into());
+        let root = std::env::temp_dir();
+        assert_eq!(
+            rejoin_path(&v, &root.to_string_lossy()),
+            Some(root.join("Some Channel").join("A Title [v1].mkv"))
+        );
     }
 
     #[test]
