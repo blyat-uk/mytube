@@ -1,0 +1,334 @@
+name: Release
+
+# A v* tag builds the three bundles, smoke-tests each on its own OS and
+# publishes a GitHub Release with them. The smoke test is the real first-run
+# path: `mytube --self-test` downloads yt-dlp, ffmpeg and deno fresh from their
+# publishers into an empty directory, verifies each checksum, runs each one and
+# checks yt-dlp sees deno as a JS runtime — the only place the per-OS source
+# table is proven on a real machine. A manual run builds and tests without
+# releasing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        name: Tag matches tauri.conf.json, Cargo.toml and package.json
+        shell: bash
+        run: |
+          tauri=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          cargo=$(python3 -c 'import tomllib; print(tomllib.load(open("src-tauri/Cargo.toml", "rb"))["package"]["version"])')
+          npm=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+          echo "tauri.conf.json: $tauri"
+          echo "Cargo.toml:      $cargo"
+          echo "package.json:    $npm"
+          if [[ "$cargo|$npm" != "$tauri|$tauri" ]]; then
+            echo "::error::versions disagree: tauri.conf.json $tauri, Cargo.toml $cargo, package.json $npm"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$tauri" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the app version ($tauri)"
+            exit 1
+          fi
+          echo "version=$tauri" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.os_name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04      # glibc 2.35 and webkit2gtk-4.1: the oldest base worth building on
+            os_name: linux
+            bundles: deb,rpm,appimage
+          - runner: windows-latest
+            os_name: windows
+            bundles: nsis
+          - runner: macos-latest      # Apple Silicon
+            os_name: macos
+            bundles: app,dmg
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: v${{ needs.version.outputs.version }}
+    steps:
+      # Same reason as ci.yml: the RSS fixtures are embedded byte for byte.
+      - name: Keep line endings as committed
+        if: matrix.os_name == 'windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      # Tauri's Debian prerequisites (no appindicator: the Linux tray is ksni).
+      # No libfuse2: the bundler runs linuxdeploy with APPIMAGE_EXTRACT_AND_RUN=1,
+      # and the AppImage smoke test below extracts rather than mounts.
+      - name: Linux build dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev librsvg2-dev patchelf
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: release
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # beforeBuildCommand runs `bun run build` (tsc + vite) first.
+      - name: Build
+        timeout-minutes: 60
+        run: bun run tauri build --ci --bundles ${{ matrix.bundles }}
+
+      # ---------------------------------------------------------------- Linux
+
+      - name: Smoke test — version (Linux)
+        if: matrix.os_name == 'linux'
+        timeout-minutes: 5
+        run: |
+          out=$(src-tauri/target/release/mytube --version)
+          echo "$out"
+          [[ "$out" == "mytube $VERSION" ]] || { echo "::error::expected 'mytube $VERSION', got '$out'"; exit 1; }
+
+      - name: Smoke test — self-test (Linux)
+        if: matrix.os_name == 'linux'
+        timeout-minutes: 20
+        run: |
+          dir="$RUNNER_TEMP/tools"
+          code=0
+          src-tauri/target/release/mytube --self-test "$dir" || code=$?
+          echo "--- $dir/self-test.txt"
+          cat "$dir/self-test.txt" || echo "::error::self-test.txt was not written"
+          exit $code
+
+      - name: Smoke test — AppImage starts
+        if: matrix.os_name == 'linux'
+        timeout-minutes: 5
+        run: |
+          appimage=$(ls src-tauri/target/release/bundle/appimage/mytube_"$VERSION"_*.AppImage)
+          chmod +x "$appimage"
+          "$appimage" --appimage-extract-and-run --version
+
+      - name: Smoke test — .deb installs and runs
+        if: matrix.os_name == 'linux'
+        timeout-minutes: 10
+        run: |
+          deb=$(ls src-tauri/target/release/bundle/deb/mytube_"$VERSION"_*.deb)
+          sudo apt-get install -y "./$deb"
+          /usr/bin/mytube --version
+
+      # -------------------------------------------------------------- Windows
+      # The release exe is a GUI-subsystem program: PowerShell's `&` would not
+      # wait for it, and it has no console of its own. Start-Process -Wait gives
+      # the exit code, a redirect gives it a stdout handle (cli.rs attaches to a
+      # console only when it has none), and self-test.txt is the record anyway.
+
+      - name: Smoke test — version (Windows)
+        if: matrix.os_name == 'windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'src-tauri\target\release\mytube.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'version.txt'
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
+          $line = (Get-Content $out -Raw).Trim()
+          Write-Output $line
+          if ($p.ExitCode -ne 0) { throw "mytube --version exited with $($p.ExitCode)" }
+          if ($line -ne "mytube $env:VERSION") { throw "expected 'mytube $env:VERSION', got '$line'" }
+
+      - name: Smoke test — self-test (Windows)
+        if: matrix.os_name == 'windows'
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'src-tauri\target\release\mytube.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'tools'
+          $out = Join-Path $env:RUNNER_TEMP 'self-test-stdout.txt'
+          # Start-Process joins ArgumentList with spaces and quotes nothing.
+          $p = Start-Process -FilePath $exe -ArgumentList '--self-test', "`"$dir`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
+          $report = Join-Path $dir 'self-test.txt'
+          Write-Output "--- $report"
+          if (Test-Path $report) { Get-Content $report } else { Write-Output "::error::self-test.txt was not written"; Get-Content $out -ErrorAction SilentlyContinue }
+          if ($p.ExitCode -ne 0) { throw "mytube --self-test exited with $($p.ExitCode)" }
+
+      - name: Smoke test — installer (Windows)
+        if: matrix.os_name == 'windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem "src-tauri\target\release\bundle\nsis\mytube_$($env:VERSION)_*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "no NSIS installer for $env:VERSION" }
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
+          # installMode currentUser: Tauri's NSIS template installs to $LOCALAPPDATA\<productName>.
+          $exe = Join-Path $env:LOCALAPPDATA 'mytube\mytube.exe'
+          if (-not (Test-Path $exe)) { throw "installer did not install $exe" }
+          $out = Join-Path $env:RUNNER_TEMP 'installed-version.txt'
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
+          Get-Content $out
+          if ($p.ExitCode -ne 0) { throw "installed mytube --version exited with $($p.ExitCode)" }
+
+      # ---------------------------------------------------------------- macOS
+      # Everything runs from inside the .app: that binary, not target/release's,
+      # is what a user gets.
+
+      - name: Smoke test — the .app (macOS)
+        if: matrix.os_name == 'macos'
+        timeout-minutes: 5
+        run: |
+          app=src-tauri/target/release/bundle/macos/mytube.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          out=$("$app/Contents/MacOS/mytube" --version)
+          echo "$out"
+          [[ "$out" == "mytube $VERSION" ]] || { echo "::error::expected 'mytube $VERSION', got '$out'"; exit 1; }
+          hdiutil verify src-tauri/target/release/bundle/dmg/mytube_"$VERSION"_*.dmg
+
+      - name: Smoke test — self-test (macOS)
+        if: matrix.os_name == 'macos'
+        timeout-minutes: 20
+        run: |
+          dir="$RUNNER_TEMP/tools"
+          code=0
+          src-tauri/target/release/bundle/macos/mytube.app/Contents/MacOS/mytube --self-test "$dir" || code=$?
+          echo "--- $dir/self-test.txt"
+          cat "$dir/self-test.txt" || echo "::error::self-test.txt was not written"
+          exit $code
+
+      # ------------------------------------------------------------ artifacts
+
+      - name: Collect and rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle=src-tauri/target/release/bundle
+          mkdir -p out
+          # Exactly one match per pattern: the version in the glob keeps a
+          # stale bundle from an older build out, and two matches is an error.
+          take() {
+            local matches=()
+            mapfile -t matches < <(compgen -G "$1" || true)
+            if (( ${#matches[@]} != 1 )); then
+              echo "::error::expected one file for $1, found ${#matches[@]}: ${matches[*]:-none}"
+              exit 1
+            fi
+            cp "${matches[0]}" "out/$2"
+            echo "$2  <-  ${matches[0]}"
+          }
+          case "${{ matrix.os_name }}" in
+            linux)
+              take "$bundle/deb/mytube_${VERSION}_*.deb"             "mytube-$TAG-linux-x86_64.deb"
+              take "$bundle/rpm/mytube-${VERSION}-*.rpm"             "mytube-$TAG-linux-x86_64.rpm"
+              take "$bundle/appimage/mytube_${VERSION}_*.AppImage"   "mytube-$TAG-linux-x86_64.AppImage"
+              ;;
+            windows)
+              take "$bundle/nsis/mytube_${VERSION}_*-setup.exe"      "mytube-$TAG-windows-x64-setup.exe"
+              ;;
+            macos)
+              take "$bundle/dmg/mytube_${VERSION}_*.dmg"             "mytube-$TAG-macos-arm64.dmg"
+              ;;
+          esac
+          ls -l out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mytube-${{ matrix.os_name }}
+          path: out/mytube-v*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum mytube-v* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          cat > notes.md <<'EOF'
+          ## Downloads
+
+          | OS | File |
+          |---|---|
+          | Windows 10/11 (x64) | `mytube-${{ github.ref_name }}-windows-x64-setup.exe` (installs for you only, no admin rights needed) |
+          | macOS 11+ (Apple Silicon) | `mytube-${{ github.ref_name }}-macos-arm64.dmg` |
+          | Linux x86_64, Debian / Ubuntu 22.04+ | `mytube-${{ github.ref_name }}-linux-x86_64.deb` |
+          | Linux x86_64, Fedora / openSUSE | `mytube-${{ github.ref_name }}-linux-x86_64.rpm` |
+          | Linux x86_64, anything else | `mytube-${{ github.ref_name }}-linux-x86_64.AppImage` |
+
+          ## First run
+
+          MyTube uses three programs it does not ship: **yt-dlp**, **ffmpeg** and **deno** (the JavaScript runtime
+          yt-dlp needs for YouTube). The first time it starts it downloads whichever of them it cannot find on your
+          system — about 150 MB, straight from each publisher's own releases, each checked against its published
+          SHA-256 — into your local data folder:
+          `%LOCALAPPDATA%\mytube\bin` on Windows, `~/Library/Application Support/mytube/bin` on macOS,
+          `~/.local/share/mytube/bin` on Linux. Settings → Tools shows where each one came from; yt-dlp keeps
+          itself up to date once a day.
+
+          Downloads go out with the YouTube cookies of a browser you are signed in to (Settings → YouTube cookies;
+          Automatic picks Firefox when it finds a profile) — that is what reaches members-only videos and keeps
+          YouTube's bot checks at bay. Firefox works on every OS and is the recommendation. Chrome, Edge and other
+          Chromium browsers cannot be read on Windows; on macOS they ask for Keychain access. A `cookies.txt` file
+          works everywhere.
+
+          ## Notes
+
+          - **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
+          - **macOS:** the app is not notarized. After copying it to Applications, open it with right-click → Open,
+            or allow it under System Settings → Privacy & Security, or run
+            `xattr -dr com.apple.quarantine /Applications/mytube.app`.
+          - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. The AppImage needs FUSE 2
+            (`libfuse2`) to mount, or run it with `--appimage-extract-and-run`. The tray icon needs a
+            StatusNotifierItem host (built into KDE; GNOME needs the AppIndicator extension).
+
+          Verify downloads against `SHA256SUMS.txt`.
+          EOF
+          sed -i 's/^          //' notes.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: MyTube ${{ github.ref_name }}
+          body_path: notes.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/mytube-v*
+            dist/SHA256SUMS.txt

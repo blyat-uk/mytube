@@ -70,7 +70,7 @@ tauri = { version = "2", features = ["protocol-asset", "image-png", "tray-icon"]
 # reaches yt-dlp's whole process tree (PyInstaller's bootloader, the real
 # yt-dlp, and the ffmpeg and deno it starts).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Console"] }
 
 [dev-dependencies]
 # transfer.rs writes real archives and extracts them; every test that touches

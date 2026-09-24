@@ -1,0 +1,74 @@
+name: CI
+
+# Every push to main and every pull request runs the frontend and backend
+# suites on the three OSes MyTube ships for. Bundling and the tool self-test
+# live in release.yml; this is the fast check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04      # the release is built here too: glibc 2.35
+            os_name: linux
+          - runner: windows-latest
+            os_name: windows
+          - runner: macos-latest      # Apple Silicon
+            os_name: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      # The Windows image checks out with autocrlf=true, which would rewrite the
+      # RSS fixtures `include_str!` embeds byte for byte.
+      - name: Keep line endings as committed
+        if: matrix.os_name == 'windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      # Tauri's Debian prerequisites, minus libayatana-appindicator3-dev: the
+      # Linux tray speaks StatusNotifierItem itself (ksni) and links no
+      # appindicator library.
+      - name: Linux build dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev librsvg2-dev patchelf
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend tests
+        run: bun run test
+
+      # Also makes dist/, which `tauri::generate_context!` needs to exist
+      # before the Rust half will compile.
+      - name: Frontend type-check and build
+        run: bun run build
+
+      - name: Backend tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml

@@ -1,6 +1,13 @@
 # Packaging MyTube for Linux
 
-MyTube installs entirely into your home directory. Nothing here needs `sudo`.
+**Most people want a release instead.** Ready-made builds for Linux (`.deb`,
+`.rpm`, AppImage), Windows and macOS are on the
+[Releases page](https://github.com/blyat-uk/mytube/releases/latest); the
+[top-level README](../README.md#install) says which file to pick. This page is
+for building from source and installing the result into your home directory,
+which is how a development checkout stays launchable.
+
+A home install lives entirely under your home directory. Nothing here needs `sudo`.
 
 ## Install
 
@@ -70,20 +77,24 @@ vanish from the menu entirely. Hence the `sh -c` form.)
 
 ## Runtime requirements
 
-These are not bundled; install them with your distribution's package manager.
+These are not bundled, and most of them no longer need installing by hand.
 
-| Requirement    | Why                                                                                                                                              |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `yt-dlp`       | Fetches video metadata and performs all downloads. Keep it current — YouTube changes break old versions.                                         |
-| `ffmpeg`       | Required by `yt-dlp` to merge the separate video and audio streams into the `.mkv` output and to embed thumbnails.                               |
-| Firefox        | Downloads run with `--cookies-from-browser firefox`, so a Firefox profile with your YouTube cookies must exist on the machine.                   |
-| A video player | Used to play downloaded files. The default is `smplayer`; change it in Settings (`player_command`) if you prefer `mpv`, `vlc`, or anything else. |
+| Requirement    | Why                                                                                                                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `yt-dlp`       | Fetches video metadata and performs all downloads. MyTube downloads and updates its own copy in `~/.local/share/mytube/bin` and prefers it over a system one, so YouTube fixes arrive. |
+| `ffmpeg`       | Required by `yt-dlp` to merge the separate video and audio streams into the `.mkv` output. A system copy is used if present; otherwise MyTube downloads one.                           |
+| `deno`         | The JavaScript runtime `yt-dlp` needs for YouTube. A system copy (2.3 or newer) is used if present; otherwise MyTube downloads one.                                                    |
+| YouTube cookies | Settings → YouTube cookies. The default, Automatic, reads Firefox's cookies when a Firefox profile exists; a `cookies.txt` file works too.                                          |
+| A video player | Used to play downloaded files. Settings → Player lists the ones installed (mpv, SMPlayer, VLC, Celluloid, Haruna, flatpak exports…), or "System default" for your desktop's choice. |
+
+See [the top-level README](../README.md#first-run) for where the managed tools
+come from and how to override them.
 
 ## Configuration
 
 MyTube keeps everything under `~/.config/mytube/`:
 
-- `settings.json` — player command, download directory, concurrency, and so on
+- `settings.json` — player command, cookie source, download directory, concurrency, and so on
 - `mytube.db` — the SQLite database of channels, videos, and watch history
 - `thumbs/` — cached channel and video thumbnails
 
@@ -98,4 +109,5 @@ rm -f ~/.local/share/applications/mytube.desktop
 update-desktop-database ~/.local/share/applications
 ```
 
-Delete `~/.config/mytube/` as well to remove your data.
+Delete `~/.config/mytube/` as well to remove your data, and
+`~/.local/share/mytube/` to remove the tools MyTube downloaded.

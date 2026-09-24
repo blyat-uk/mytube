@@ -2,6 +2,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // `--version` / `--self-test` first: they must not start GTK, touch the
+    // WebKit environment or trip the single-instance plugin. `args_os` rather
+    // than `args`, which panics on an argument that is not UTF-8.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Some(code) = mytube_lib::cli::run(&args) {
+        std::process::exit(code);
+    }
     #[cfg(target_os = "linux")]
     linux_webkit_workaround();
     mytube_lib::run()

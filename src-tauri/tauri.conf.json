@@ -26,17 +26,29 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/.config/mytube/thumbs/**"
+          "$CONFIG/mytube/thumbs/**"
         ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "deb",
-      "rpm"
-    ],
+    "targets": "all",
+    "publisher": "blyat-uk",
+    "homepage": "https://github.com/blyat-uk/mytube",
+    "copyright": "Copyright © 2026 blyat-uk",
+    "category": "Video",
+    "shortDescription": "A desktop YouTube subscription feed and downloader",
+    "longDescription": "MyTube — a desktop YouTube subscription feed and downloader. It follows channels without a Google account, downloads videos with yt-dlp, hands playback to the video player you already use, and keeps track of what you have watched. Nothing is ever written back to YouTube.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
