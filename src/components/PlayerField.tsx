@@ -45,16 +45,15 @@ export default function PlayerField({ value, onEdit, onBlur, onPick }: Props) {
   const custom = players !== null && (customOpen || !match);
   const selected = players === null ? "" : custom ? CUSTOM : match!.id;
 
-  // Once the text field is up it stays up until another entry is picked from
-  // the list. Left to `!match` alone it would vanish the moment the typing
-  // happened to spell a detected command — `mpv --fullscreen` backspaced to
-  // `mpv`, or cleared to `""`, the System default — and an unmounted input
-  // never fires its blur, so the edit was never saved while the select showed
-  // a choice settings.json did not hold.
-  useEffect(() => {
-    if (custom && !customOpen) setCustomOpen(true);
-  }, [custom, customOpen]);
-
+  // Once the text field has been focused it stays up until another entry is
+  // picked from the list. Left to `!match` alone it would vanish the moment
+  // the typing happened to spell a detected command — `mpv --fullscreen`
+  // backspaced to `mpv`, or cleared to `""`, the System default — and an
+  // unmounted input never fires its blur, so the edit was never saved while
+  // the select showed a choice settings.json did not hold. Focus, not mere
+  // display, is the trigger: typing always starts with it, and an effect
+  // keyed on display re-opened the field whenever a pick's `setCustomOpen
+  // (false)` rendered a moment before the picked value arrived.
   function choose(id: string) {
     if (id === CUSTOM) {
       setCustomOpen(true);
