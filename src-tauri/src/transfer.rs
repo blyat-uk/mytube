@@ -210,6 +210,12 @@ fn portable_path(file_path: &str, download_dir: &str) -> (Option<String>, Option
 /// `../../.ssh/id_ed25519`, which Play would hand to the player and "Delete
 /// download" would unlink. `portable_path` never writes any of these shapes,
 /// so an honest archive loses nothing.
+///
+/// `abs_path` is how a file kept outside `download_dir` travels, so it cannot
+/// be confined to a folder; it is confined to what a download can *be*
+/// instead -- a media file by extension (`is_media_file`). That keeps
+/// `/home/you/.ssh/id_ed25519` out while every file yt-dlp could have written
+/// still relinks.
 fn rejoin_path(v: &ArchiveVideo, download_dir: &str) -> Option<PathBuf> {
     match (&v.rel_path, &v.abs_path) {
         (Some(rel), _) => {
@@ -225,9 +231,22 @@ fn rejoin_path(v: &ArchiveVideo, download_dir: &str) -> Option<PathBuf> {
             }
             Some(p)
         }
-        (None, Some(abs)) => Some(PathBuf::from(abs)).filter(|p| p.is_absolute()),
+        (None, Some(abs)) => {
+            Some(PathBuf::from(abs)).filter(|p| p.is_absolute() && is_media_file(p))
+        }
         (None, None) => None,
     }
+}
+
+/// Containers and audio formats yt-dlp can leave as a finished download.
+fn is_media_file(p: &Path) -> bool {
+    const MEDIA: [&str; 14] = [
+        "mkv", "mp4", "webm", "m4v", "mov", "avi", "flv", "3gp", "ts", "m4a", "mp3", "opus",
+        "ogg", "wav",
+    ];
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| MEDIA.iter().any(|m| m.eq_ignore_ascii_case(e)))
 }
 
 /// One `/`-separated piece of a `rel_path`: a name and nothing else, by this
@@ -778,6 +797,18 @@ mod tests {
         let slashed = portable_path(file, "/mnt/STORAGE/Videos/");
         assert_eq!(bare, slashed);
         assert_eq!(bare, (Some("Some Channel/A Title [abc].mkv".into()), None));
+    }
+
+    #[test]
+    fn an_absolute_path_relinks_only_a_media_file() {
+        let root = std::env::temp_dir();
+        let mut v = ArchiveVideo::of(&video("v1", "UC1"), "/unused");
+        v.rel_path = None;
+        for (name, ok) in [("clip.mkv", true), ("clip.MP4", true), ("id_ed25519", false), ("notes.txt", false)] {
+            let abs = root.join("elsewhere").join(name);
+            v.abs_path = Some(abs.to_string_lossy().into_owned());
+            assert_eq!(rejoin_path(&v, "/dl").is_some(), ok, "{name}");
+        }
     }
 
     #[test]
