@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -109,6 +109,18 @@ fn migrate(conn: &Connection) -> Result<()> {
                 "ALTER TABLE channels ADD COLUMN member INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+    }
+
+    // How deep each channel's back catalogue has been read. NULL on every row
+    // that predates the column: nobody recorded how far those were backfilled,
+    // so the next poll reads each one to the current `backfill_count` once.
+    // That costs a listing per channel and a watch page per video it did not
+    // have -- nothing for a video it did -- and it is the only way a raised
+    // setting could reach channels already subscribed before this existed.
+    if version < 6 {
+        if !column_exists(conn, "channels", "backfill_depth")? {
+            conn.execute("ALTER TABLE channels ADD COLUMN backfill_depth INTEGER", [])?;
         }
     }
 
@@ -377,6 +389,32 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE channels SET member=?2 WHERE id=?1", params![id, member as i64])?;
         Ok(())
+    }
+
+    /// Records that a channel's listing has been read `depth` entries deep.
+    ///
+    /// Only ever raised: lowering `backfill_count` removes nothing, so the
+    /// catalogue is still as deep as it ever was, and raising the setting again
+    /// to anything short of that must not read the listing a second time.
+    pub fn set_backfill_depth(&self, id: &str, depth: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE channels SET backfill_depth=MAX(COALESCE(backfill_depth, 0), ?2) WHERE id=?1",
+            params![id, depth],
+        )?;
+        Ok(())
+    }
+
+    /// Subscribed channels backfilled less than `depth` deep -- the ones a poll
+    /// has to deepen for a raised `backfill_count` to reach them. NULL is a row
+    /// whose depth was never recorded, which counts as shallower than anything.
+    pub fn channels_shallower_than(&self, depth: u32) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT id FROM channels
+             WHERE subscribed=1 AND COALESCE(backfill_depth, 0) < ?1")?;
+        let rows = st.query_map(params![depth], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
     pub fn set_channel_polled(&self, id: &str) -> Result<()> {
@@ -896,6 +934,47 @@ mod tests {
                    sort_at: published, feed_rank: 0, added_manually: false,
                    duration_secs: Some(600), view_count: Some(1),
                    status: VideoStatus::Ready }
+    }
+
+    #[test]
+    fn a_raised_backfill_count_reaches_channels_read_shallower() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.upsert_channel(&chan("UC2", "Two")).unwrap();
+        // Never recorded, as every channel predating the column is: shallower
+        // than anything, so the first poll reads it to the setting.
+        assert_eq!(d.channels_shallower_than(30).unwrap().len(), 2);
+
+        d.set_backfill_depth("UC1", 30).unwrap();
+        d.set_backfill_depth("UC2", 30).unwrap();
+        assert!(d.channels_shallower_than(30).unwrap().is_empty(), "read once, then left alone");
+        assert_eq!(d.channels_shallower_than(300).unwrap().len(), 2, "raised: both deepen");
+
+        d.set_backfill_depth("UC1", 300).unwrap();
+        let left: Vec<_> = d.channels_shallower_than(300).unwrap().into_iter().collect();
+        assert_eq!(left, vec!["UC2".to_string()]);
+    }
+
+    #[test]
+    fn lowering_the_backfill_count_never_lowers_the_recorded_depth() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.set_backfill_depth("UC1", 300).unwrap();
+        // 300 -> 50 -> 200 must not read the listing again: it is already 300 deep.
+        d.set_backfill_depth("UC1", 50).unwrap();
+        assert!(d.channels_shallower_than(200).unwrap().is_empty());
+        // And a poll's upsert, which carries no depth, keeps it.
+        d.upsert_channel(&chan("UC1", "Renamed")).unwrap();
+        assert!(d.channels_shallower_than(300).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unsubscribed_uploader_is_never_deepened() {
+        let d = db();
+        let mut c = chan("UC1", "Ad hoc");
+        c.subscribed = false;
+        d.upsert_channel(&c).unwrap();
+        assert!(d.channels_shallower_than(300).unwrap().is_empty());
     }
 
     #[test]

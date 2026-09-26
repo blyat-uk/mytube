@@ -486,6 +486,7 @@ pub async fn poll_channels(
     };
     let _ = app.emit("poll://started", ());
     let backfill = config::load().map(|s| s.backfill_count).unwrap_or(30);
+    let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
 
     // Each Channel is moved into its own future rather than borrowed from the
     // iterator: returning a future that borrows the closure argument produces a
@@ -515,6 +516,9 @@ pub async fn poll_channels(
         }
     }
     eprintln!("mytube: {}", summary_line(&summary, via_listing));
+    // Before `poll://finished`, so the refetch it drives shows the deeper
+    // catalogue on the same poll.
+    deepen(state, &ids, backfill).await;
     let _ = app.emit("poll://finished", summary.clone());
     // Polls only. A backfill or a manually added video is something you asked
     // for with the window in front of you, so it is read the moment it lands.
@@ -522,21 +526,42 @@ pub async fn poll_channels(
     summary
 }
 
-/// One flat-playlist call seeds a newly added channel's back catalogue.
+/// One flat-playlist call reads a channel's back catalogue `count` deep.
+///
+/// Seeds a newly added channel, and deepens an existing one when
+/// `backfill_count` has been raised past what it was read with -- see
+/// [`deepen`]. Either way the depth is recorded on success, which is what tells
+/// a later poll whether there is anything left to reach.
+///
+/// Locked entries are taken only for a channel you have joined, the same rule
+/// [`ingestable`] keeps: the listing serves members-only videos to anyone, and
+/// without it a deep read of a channel that sells a membership fills the feed
+/// with videos you cannot download.
 pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) -> Result<usize> {
+    let member = state.db.get_channel(channel_id)?.map(|c| c.member).unwrap_or(false);
     let entries = listing(&state.tools, channel_id, count).await?;
+
+    // Collected up front: an iterator borrowing `entries` across the await
+    // makes the resulting future fail Tauri's higher-ranked lifetime bounds.
+    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let known = state.db.existing_video_ids(&ids)?;
+    let fresh: Vec<(usize, FlatEntry)> = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(_, e)| !known.contains(&e.id))
+        .filter(|(_, e)| member || e.availability.as_deref() != Some(MEMBERS_ONLY))
+        .collect();
 
     // The listing carries only `approximate_date` buckets, so ask each watch
     // page for the real instant before these rows are written. Ids that fail
     // keep the bucket and get picked up by `repair_dates` on a later start.
-    //
-    // Collected up front: an iterator borrowing `entries` across the await
-    // makes the resulting future fail Tauri's higher-ranked lifetime bounds.
-    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
-    let real = upload_date::fetch_many(&state.http, ids).await;
+    // Only for rows about to be written: deepening a 30-video channel to 300
+    // must not refetch the 30 it already has.
+    let fresh_ids: Vec<String> = fresh.iter().map(|(_, e)| e.id.clone()).collect();
+    let real = upload_date::fetch_many(&state.http, fresh_ids).await;
 
     let mut added = 0;
-    for (rank, e) in entries.iter().enumerate() {
+    for (rank, e) in &fresh {
         let status = ytdlp::status_from(e.live_status.as_deref(), e.duration_secs);
         let inserted = state.db.insert_video_if_new(&NewVideo {
             id: e.id.clone(),
@@ -549,7 +574,7 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
             // feed instead of piling it up at the bottom.
             published_at: real.get(&e.id).copied().or(e.published_at),
             sort_at: real.get(&e.id).copied().or(e.published_at),
-            feed_rank: rank as i64,
+            feed_rank: *rank as i64,
             added_manually: false,
             duration_secs: e.duration_secs,
             view_count: e.view_count,
@@ -561,10 +586,49 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
     }
     cache_thumbs(
         state,
-        entries.iter().map(|e| (e.id.clone(), ytdlp::thumb_url_for(&e.id))),
+        fresh.iter().map(|(_, e)| (e.id.clone(), ytdlp::thumb_url_for(&e.id))),
     )
     .await;
+    state.db.set_backfill_depth(channel_id, count)?;
     Ok(added)
+}
+
+/// Reads each of `channel_ids` that was backfilled shallower than `depth` down
+/// to it, so raising `backfill_count` reaches channels already subscribed
+/// instead of only the ones added afterwards.
+///
+/// Once per raise: the depth is recorded on success, so every later poll finds
+/// nothing to do until the setting goes up again. Lowering it does nothing --
+/// no row is removed, and the recorded depth stays where it was.
+///
+/// One channel at a time, after the poll proper: each can be hundreds of watch
+/// pages the first time, and `fetch_many` already runs eight abreast, so eight
+/// channels at once would be 64 concurrent requests at YouTube. A failure is
+/// logged and left for the next poll to retry; it is not the poll's error.
+///
+/// Returns how many rows were added. They are deliberately not a poll's new
+/// videos: the back catalogue is something you asked for, not something that
+/// was published while you were away, so the toast and the tray badge stay out
+/// of it.
+async fn deepen(state: &AppState, channel_ids: &[String], depth: u32) -> usize {
+    let shallow = match state.db.channels_shallower_than(depth) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("mytube: could not read backfill depths: {err}");
+            return 0;
+        }
+    };
+    let mut total = 0;
+    for id in channel_ids.iter().filter(|id| shallow.contains(*id)) {
+        match backfill_channel(state, id, depth).await {
+            Ok(n) => {
+                eprintln!("mytube: backfilled {id} to {depth}, {n} new");
+                total += n;
+            }
+            Err(err) => eprintln!("mytube: backfill of {id} to {depth} failed: {err}"),
+        }
+    }
+    total
 }
 
 #[cfg(test)]

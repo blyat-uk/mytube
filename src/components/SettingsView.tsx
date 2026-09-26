@@ -402,7 +402,7 @@ export default function SettingsView() {
           />
         </Field>
 
-        <Field label="Backfill count" hint="Videos fetched when subscribing. 1 – 500">
+        <Field label="Backfill count" hint="How far back each channel is read. Raising it deepens existing channels on the next refresh. 1 – 500">
           <input
             className="text-input"
             type="number"
