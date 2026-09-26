@@ -38,6 +38,8 @@ function props(over: Partial<Props> = {}): Props {
     onShowHidden: vi.fn(),
     grouped: false,
     onGrouped: vi.fn(),
+    groupsOnly: false,
+    onGroupsOnly: vi.fn(),
     sort: "newest",
     onSort: vi.fn(),
     series: null,
@@ -312,6 +314,28 @@ describe("the most-parts sort option", () => {
     const p = renderNav({ grouped: true });
     fireEvent.change(screen.getByLabelText("Sort order"), { target: { value: "parts" } });
     expect(p.onSort).toHaveBeenCalledWith("parts");
+  });
+});
+
+/** "Only groups" filters cards that exist only while grouped. */
+describe("the only-groups filter", () => {
+  it("is absent until siblings are grouped", () => {
+    renderNav();
+    expect(screen.queryByRole("button", { name: "Only groups" })).toBeNull();
+  });
+
+  it("joins the filters once they are, and toggles", () => {
+    const p = renderNav({ grouped: true });
+    const chip = screen.getByRole("button", { name: "Only groups" });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(p.onGroupsOnly).toHaveBeenCalledWith(true);
+  });
+
+  it("is switched off while a series is open, like the other filters", () => {
+    renderNav({ grouped: true, groupsOnly: true, series: SERIES });
+    const chip = screen.getByRole("button", { name: "Only groups" }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
   });
 });
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconClose, IconDownload, IconHidden, IconSeries, IconSettings,
+  IconClose, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconSettings,
   IconSubscriptions, IconUnwatched,
 } from "./Icons";
 import type { Channel, SortOrder } from "../types";
@@ -56,6 +56,8 @@ interface Props {
   onShowHidden: (v: boolean) => void;
   grouped: boolean;
   onGrouped: (v: boolean) => void;
+  groupsOnly: boolean;
+  onGroupsOnly: (v: boolean) => void;
   /** The open series, or null for the ordinary feed. Replaces the tab strip. */
   series: SeriesCrumb | null;
   onExitSeries: () => void;
@@ -252,6 +254,22 @@ export default function TopNav(p: Props) {
                 <span className="seg-glyph" aria-hidden="true"><IconHidden /></span>
                 <span className="seg-label">Include hidden</span>
               </button>
+              {/* A filter over cards that only exist grouped, so it is offered
+                  only then -- ungrouped, every card is a lone video. */}
+              {p.grouped && (
+                <button
+                  type="button"
+                  className={`seg-btn${p.groupsOnly ? " is-on" : ""}`}
+                  aria-pressed={p.groupsOnly}
+                  aria-label="Only groups"
+                  disabled={off}
+                  title={offHint ?? "Show only multi-part series, not lone videos"}
+                  onClick={() => p.onGroupsOnly(!p.groupsOnly)}
+                >
+                  <span className="seg-glyph" aria-hidden="true"><IconGroupsOnly /></span>
+                  <span className="seg-label">Only groups</span>
+                </button>
+              )}
             </div>
 
             <div className="search">

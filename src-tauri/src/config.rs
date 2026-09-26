@@ -88,6 +88,8 @@ pub struct ViewState {
     pub show_hidden: bool,
     #[serde(default)]
     pub grouped: bool,
+    #[serde(default)]
+    pub groups_only: bool,
     #[serde(default = "d_sort")]
     pub sort: SortOrder,
 }
@@ -101,6 +103,7 @@ impl Default for ViewState {
             downloaded_only: false,
             show_hidden: false,
             grouped: false,
+            groups_only: false,
             sort: SortOrder::Newest,
         }
     }
@@ -117,6 +120,10 @@ impl ViewState {
         // `Parts` only exists in the picker while Group siblings is on.
         if self.sort == SortOrder::Downloaded || (self.sort == SortOrder::Parts && !self.grouped) {
             self.sort = SortOrder::Newest;
+        }
+        // Likewise "Only groups": the chip is not on screen while ungrouped.
+        if !self.grouped {
+            self.groups_only = false;
         }
         let trimmed = self.search.trim();
         self.search = if trimmed.chars().count() > 200 {
@@ -486,6 +493,7 @@ mod tests {
             downloaded_only: true,
             show_hidden: true,
             grouped: true,
+            groups_only: true,
             sort: SortOrder::Length,
         };
         let json = s.to_json_string().unwrap();
@@ -519,6 +527,14 @@ mod tests {
     fn sort_parts_with_grouped_true_is_kept() {
         let s = Settings::from_json_str(r#"{"view":{"sort":"parts","grouped":true}}"#).unwrap();
         assert_eq!(s.view.sort, SortOrder::Parts);
+    }
+
+    #[test]
+    fn groups_only_survives_only_while_grouped() {
+        let off = Settings::from_json_str(r#"{"view":{"groups_only":true,"grouped":false}}"#).unwrap();
+        assert!(!off.view.groups_only);
+        let on = Settings::from_json_str(r#"{"view":{"groups_only":true,"grouped":true}}"#).unwrap();
+        assert!(on.view.groups_only);
     }
 
     #[test]

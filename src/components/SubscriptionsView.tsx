@@ -63,6 +63,8 @@ interface Props {
   showHidden: boolean;
   /** Collapse each channel's multi-part uploads behind one card. */
   grouped: boolean;
+  /** Grouped only: leave out lone videos, keeping the multi-part series. */
+  groupsOnly: boolean;
   /** When set, the grid shows this video's series instead of the feed. */
   siblingOf: Video | null;
   /** The stem comes from a series card; a lone card has only its title. */
@@ -100,12 +102,13 @@ export default function SubscriptionsView(p: Props) {
   // A series view is a flat list of parts on purpose, so grouping stands down
   // while one is open rather than collapsing the very series being shown.
   const grouped = p.grouped && siblingOf === null;
+  const groupsOnly = grouped && p.groupsOnly;
 
   // What makes this list this list. A series, a filter, a sort and a search
   // each make a different one; `grouped` is the derived value above, so opening
   // a series out of the grouped feed counts as one change of list, not two.
   const listKey = JSON.stringify([
-    channelId, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped,
+    channelId, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped, groupsOnly,
     siblingOf?.id ?? null,
   ]);
   // Where each list this view has shown was left. Coming back to one -- leaving
@@ -158,6 +161,7 @@ export default function SubscriptionsView(p: Props) {
       hideWatched,
       downloadedOnly,
       showHidden,
+      groupsOnly,
       search: search.trim() ? search.trim() : null,
       siblingOf: siblingOf?.id ?? null,
       sort,
@@ -183,7 +187,7 @@ export default function SubscriptionsView(p: Props) {
     } finally {
       if (id === request.current) setLoading(false);
     }
-  }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped,
+  }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, groupsOnly,
       listKey, scrollRef, toast]);
 
   useEffect(() => { void fetchPage(0); }, [fetchPage, reloadToken]);
@@ -463,7 +467,8 @@ export default function SubscriptionsView(p: Props) {
     setMenu({ video, x, y });
   }, [menuItems]);
 
-  const filtered = channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly;
+  const filtered =
+    channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly;
 
   return (
     <>

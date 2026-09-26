@@ -648,6 +648,11 @@ impl Db {
             for m in &members { consumed.insert(m.clone()); }
             groups.push(members);
         }
+        // After the walk, not in it: a lone video must still strike itself off
+        // and claim nothing, and only the finished walk knows who is alone.
+        if f.groups_only {
+            groups.retain(|members| members.len() > 1);
+        }
 
         // Two of the sort orders rank a card by something only the finished
         // group knows -- how many parts it holds, or how long they run in
@@ -1145,6 +1150,46 @@ mod tests {
             grouped(&d, &VideoFilter::default()),
             vec![("p3".to_string(), 3), ("other".to_string(), 1)],
         );
+    }
+
+    #[test]
+    fn groups_only_drops_every_lone_video() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("other", "A Completely Different Story"),
+            ("p2", "(2) The Blackwood Tapes"),
+        ]);
+        let f = VideoFilter { groups_only: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn groups_only_counts_the_whole_series_not_the_parts_left_after_filters() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+        ]);
+        d.set_watched("p1", true).unwrap();
+        // One part survives "Unwatched", but the card it leads is still a series.
+        let f = VideoFilter { hide_watched: true, groups_only: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn groups_only_is_applied_before_the_page_is_cut() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("lone1", "A Completely Different Story"),
+            ("lone2", "Yet Another Unrelated Upload"),
+        ]);
+        // Newest first puts both lone videos ahead of the series. Filtering
+        // after the cut would return an empty first page and hide the series.
+        let f = VideoFilter { groups_only: true, limit: 1, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
     }
 
     #[test]

@@ -58,6 +58,8 @@ export interface VideoGroup {
 export interface VideoFilter {
   channelId: string | null; hideWatched: boolean; downloadedOnly: boolean;
   showHidden: boolean;
+  /** Grouped feed only: drop lone videos, keeping multi-part series. */
+  groupsOnly: boolean;
   search: string | null;
   /** Id of the video whose siblings to show; overrides every filter above. */
   siblingOf: string | null;
@@ -76,7 +78,7 @@ export interface ImportProgress { done: number; total: number; current: string; 
 export interface ViewState {
   channel_id: string | null; search: string;
   hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
-  grouped: boolean; sort: SortOrder;
+  grouped: boolean; groups_only: boolean; sort: SortOrder;
 }
 
 export interface Settings {

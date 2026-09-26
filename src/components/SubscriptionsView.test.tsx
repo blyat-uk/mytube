@@ -28,12 +28,12 @@ const markSiblings = vi.fn(() => Promise.resolve(2));
 const unlinkSiblings = vi.fn(() => Promise.resolve());
 // Typed with the filter so a test can page through a library with it.
 const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
-const listVideoGroups = vi.fn(() => Promise.resolve(groups));
+const listVideoGroups = vi.fn<(f: VideoFilter) => Promise<VideoGroup[]>>(() => Promise.resolve(groups));
 
 vi.mock("../api", () => ({
   api: {
     listVideos: (...a: unknown[]) => listVideos(...(a as [VideoFilter])),
-    listVideoGroups: (...a: unknown[]) => listVideoGroups(...(a as [])),
+    listVideoGroups: (filter: VideoFilter) => listVideoGroups(filter),
     setWatched: (...a: unknown[]) => setWatched(...(a as [])),
     deleteDownload: (...a: unknown[]) => deleteDownload(...(a as [])),
     markSiblings: (...a: unknown[]) => markSiblings(...(a as [])),
@@ -75,7 +75,7 @@ function renderView(over: ViewProps = {}) {
     <ToastProvider>
       <SubscriptionsView
         channelId={null} search="" hideWatched={false} downloadedOnly={false}
-        sort="newest" showHidden={false} grouped={false} siblingOf={null}
+        sort="newest" showHidden={false} grouped={false} groupsOnly={false} siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
         channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
@@ -248,6 +248,18 @@ describe("the grouped feed", () => {
     groups = [{ videos: [video()], stem: null }];
     renderView({ grouped: true });
     expect(menuLabels(await openMenu())).toContain("Find siblings");
+  });
+
+  it("asks for only groups when that filter is on", async () => {
+    renderView({ grouped: true, groupsOnly: true });
+    await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
+    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({ groupsOnly: true });
+  });
+
+  it("drops only-groups with the grouping it filters", async () => {
+    renderView({ grouped: false, groupsOnly: true });
+    await waitFor(() => expect(listVideos).toHaveBeenCalled());
+    expect(listVideos.mock.calls[0][0]).toMatchObject({ groupsOnly: false });
   });
 
   // A series view is a flat list of its parts. Grouping there would collapse

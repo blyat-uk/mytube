@@ -164,6 +164,12 @@ pub struct VideoFilter {
     pub hide_watched: bool,
     pub downloaded_only: bool,
     pub show_hidden: bool,
+    /// Grouped feed only: drop every card that is a lone video, leaving the
+    /// multi-part series. A card's size is its whole group, not the parts that
+    /// survived the other filters, so a series with one unwatched part left
+    /// still counts. `list_videos` ignores it -- ungrouped, every card is one.
+    #[serde(default)]
+    pub groups_only: bool,
     pub search: Option<String>,
     /// Id of the video whose siblings to show. When set it replaces every other
     /// filter above: the point of the view is the whole series, so a watched,
@@ -181,6 +187,7 @@ impl Default for VideoFilter {
             hide_watched: false,
             downloaded_only: false,
             show_hidden: false,
+            groups_only: false,
             search: None,
             sibling_of: None,
             sort: SortOrder::Newest,

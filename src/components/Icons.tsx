@@ -8,6 +8,7 @@
  */
 import { ArrowClockwise } from "@phosphor-icons/react/dist/icons/ArrowClockwise";
 import { ArrowSquareOut } from "@phosphor-icons/react/dist/icons/ArrowSquareOut";
+import { CardsThree } from "@phosphor-icons/react/dist/icons/CardsThree";
 import { CheckCircle } from "@phosphor-icons/react/dist/icons/CheckCircle";
 import { Circle } from "@phosphor-icons/react/dist/icons/Circle";
 import { DownloadSimple } from "@phosphor-icons/react/dist/icons/DownloadSimple";
@@ -29,6 +30,8 @@ export const IconCancel = () => <X className="icon" weight="bold" />;
 export const IconRetry = () => <ArrowClockwise className="icon" weight="bold" />;
 export const IconExternal = () => <ArrowSquareOut className="icon" weight="bold" />;
 export const IconSeries = () => <Stack className="icon" weight="fill" />;
+/** "Only groups": a fanned hand of cards, distinct from Grouped's stack. */
+export const IconGroupsOnly = () => <CardsThree className="icon" weight="bold" />;
 export const IconDelete = () => <Trash className="icon" weight="bold" />;
 /** Ticked off: an outline while it is still to watch, filled once it is done —
  *  the counterpart of IconUnwatched's dot. */

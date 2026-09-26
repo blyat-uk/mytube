@@ -67,11 +67,11 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
       const [recent, done] = await Promise.all([
         api.listVideos({
           channelId: null, hideWatched: false, downloadedOnly: false, showHidden: true,
-          search: null, siblingOf: null, sort: "downloaded", limit: SWEEP, offset: 0,
+          groupsOnly: false, search: null, siblingOf: null, sort: "downloaded", limit: SWEEP, offset: 0,
         }),
         api.listVideos({
           channelId: null, hideWatched: false, downloadedOnly: true, showHidden: true,
-          search: null, siblingOf: null, sort: "downloaded", limit: SWEEP, offset: 0,
+          groupsOnly: false, search: null, siblingOf: null, sort: "downloaded", limit: SWEEP, offset: 0,
         }),
       ]);
       const byId = new Map<string, Video>();

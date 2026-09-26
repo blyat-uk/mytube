@@ -48,7 +48,7 @@ import App from "./App";
 function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_id: null, search: "", hide_watched: false, downloaded_only: false,
-    show_hidden: false, grouped: false, sort: "newest",
+    show_hidden: false, grouped: false, groups_only: false, sort: "newest",
     ...over,
   };
 }
