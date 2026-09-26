@@ -249,7 +249,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
     <>
     <div className="modal-backdrop" onClick={onClose}>
       <div
-        className="modal"
+        className="modal add-dialog"
         role="dialog"
         aria-modal="true"
         aria-label="Add a channel or video"

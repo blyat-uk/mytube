@@ -1376,12 +1376,25 @@ label.field-label { display: block; }
 }
 .add-hint.is-warn { color: #ffb9ba; }
 
+/* The Add dialog runs as tall as the window allows, and the subscription list
+   takes whatever the form above it leaves: a library of tens of channels
+   should read as a list, not a peephole. The backdrop pads 8vh above and 20px
+   below, which is what the max-height subtracts. */
+.modal.add-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 8vh - 20px);
+}
+.modal.add-dialog > :not(.channel-list) { flex: none; }
 .channel-list {
   list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 260px;
+  margin: 0 -6px 0 0;
+  padding: 0 6px 0 0;
+  flex: 1 1 auto;
+  min-height: 160px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--card-hover) transparent;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1422,7 +1435,7 @@ label.field-label { display: block; }
    line up down the column. */
 .channel-row .icon-btn.is-placeholder { visibility: hidden; }
 
-/* A row of glyphs, no words: the list is a scroll box 260px tall, so a row that
+/* A row of glyphs, no words: the list is a scroll box, so a row that
    wore three labelled buttons would show half the channels a row of circles
    does. The star among them IS the membership status, read down the column. */
 .channel-row .icon-btn { width: 28px; height: 28px; }
