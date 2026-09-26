@@ -320,6 +320,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history and tags: the changelog is every commit since the
+      # previous tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -331,68 +337,38 @@ jobs:
           sha256sum mytube-v* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # The release page is the Downloads table and the changelog, nothing
+      # else. First run, platform notes and uninstalling live in README.md.
       - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          cat > notes.md <<'EOF'
+          cat > notes.md <<EOF
           ## Downloads
 
-          | OS | File |
+          | File | For |
           |---|---|
-          | Windows 10/11 (x64) | `mytube-${{ github.ref_name }}-windows-x64-setup.exe` (installs for you only, no admin rights needed) |
-          | macOS 11+ (Apple Silicon) | `mytube-${{ github.ref_name }}-macos-arm64.dmg` |
-          | Linux x86_64, Debian / Ubuntu 22.04+ | `mytube-${{ github.ref_name }}-linux-x86_64.deb` |
-          | Linux x86_64, Fedora / openSUSE | `mytube-${{ github.ref_name }}-linux-x86_64.rpm` |
-          | Linux x86_64, anything else | `mytube-${{ github.ref_name }}-linux-x86_64.AppImage` |
+          | \`mytube-$TAG-windows-x64-setup.exe\` | Windows 10/11 (x64). Installs for you only, no admin rights needed |
+          | \`mytube-$TAG-macos-arm64.dmg\` | macOS 11+ (Apple Silicon) |
+          | \`mytube-$TAG-linux-x86_64.deb\` | Linux x86_64: Debian, Ubuntu 22.04+ and derivatives |
+          | \`mytube-$TAG-linux-x86_64.rpm\` | Linux x86_64: Fedora, openSUSE |
+          | \`mytube-$TAG-linux-x86_64.AppImage\` | Linux x86_64: any other distribution |
+          | \`SHA256SUMS.txt\` | SHA-256 checksums of every file above |
 
-          ## First run
+          ## Changelog
 
-          MyTube uses three programs it does not ship: **yt-dlp**, **ffmpeg** and **deno** (the JavaScript runtime
-          yt-dlp needs for YouTube). The first time it starts it downloads whichever of them it cannot find on your
-          system — about 150 MB to download, straight from each publisher's own releases, each checked against its
-          published SHA-256 — into your local data folder:
-          `%LOCALAPPDATA%\mytube\bin` on Windows, `~/Library/Application Support/mytube/bin` on macOS,
-          `~/.local/share/mytube/bin` on Linux. Unpacked, all three take roughly 500 MB on disk (the static ffmpeg
-          and ffprobe builds are about 350 MB of that); any tool already on your system is used instead and not
-          downloaded. Settings → Tools shows where each one came from; yt-dlp keeps itself up to date once a day.
-
-          Downloads go out with the YouTube cookies of a browser you are signed in to (Settings → YouTube cookies;
-          Automatic picks Firefox when it finds a profile) — that is what reaches members-only videos and keeps
-          YouTube's bot checks at bay. Firefox works on every OS and is the recommendation. Chrome, Edge and other
-          Chromium browsers cannot be read on Windows; on macOS they ask for Keychain access. A `cookies.txt` file
-          works everywhere.
-
-          ## Notes
-
-          - **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
-          - **macOS:** the app is not notarized. After copying it to Applications, open it with right-click → Open,
-            or allow it under System Settings → Privacy & Security, or run
-            `xattr -dr com.apple.quarantine /Applications/mytube.app`.
-          - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. If the AppImage does not start,
-            install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with
-            `--appimage-extract-and-run`. The tray icon needs a StatusNotifierItem host (built into KDE; GNOME
-            needs the AppIndicator extension).
-
-          ## Uninstalling
-
-          Uninstalling removes the app but not your data or the tools it downloaded. Delete these folders as well
-          to remove everything:
-
-          | OS | Settings, library and thumbnails | Downloaded tools |
-          |---|---|---|
-          | Windows | `%APPDATA%\mytube` | `%LOCALAPPDATA%\mytube\bin` (the uninstaller leaves it) |
-          | macOS | `~/Library/Application Support/mytube` | `~/Library/Application Support/mytube/bin` |
-          | Linux | `~/.config/mytube` | `~/.local/share/mytube/bin` |
-
-          Downloaded videos stay wherever you saved them.
-
-          Verify downloads against `SHA256SUMS.txt`.
           EOF
+          # Since the previous v* tag, or all history for the first release.
+          # "Release X.Y.Z" is the version bump the tag sits on, not a change.
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$TAG" \
+            | grep -Ev '^- Release [0-9]' >> notes.md || echo "- No changes." >> notes.md
+          cat notes.md
 
       - uses: softprops/action-gh-release@v3
         with:
           name: MyTube ${{ github.ref_name }}
           body_path: notes.md
-          generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
             dist/mytube-v*
