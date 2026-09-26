@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
-  DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, ToolProgress, ToolStatus,
+  AppUpdate, DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, ToolProgress, ToolStatus,
   TransferProgress,
 } from "./types";
 
@@ -81,4 +81,10 @@ export function useToolsProgress(handler?: (p: ToolProgress) => void) {
  *  it for the "ready" toast, the Tools section for its rows. */
 export function useToolsStatus(handler?: (list: ToolStatus[]) => void) {
   useTauriEvent<ToolStatus[]>("tools://status", handler);
+}
+
+/** A newer MyTube release. The backend sends each version at most once, ever,
+ *  so the shell can toast it without keeping any record of its own. */
+export function useAppUpdate(handler?: (update: AppUpdate) => void) {
+  useTauriEvent<AppUpdate>("app://update-available", handler);
 }

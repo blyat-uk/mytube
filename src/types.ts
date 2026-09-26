@@ -100,10 +100,18 @@ export interface Settings {
   /** `"nightly"` or `"stable"`; anything else reads as nightly. */
   ytdlp_channel: string;
   ytdlp_auto_update: boolean;
+  /** Ask GitHub once a day whether a newer MyTube release exists. Off means no
+   *  request at all. */
+  check_app_updates: boolean;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;
 }
+
+/** `app://update-available`: a newer release on GitHub. `version` carries no
+ *  leading `v`; `url` is the release page, since how to update depends on how
+ *  MyTube was installed. */
+export interface AppUpdate { version: string; url: string }
 
 /** The `cookies_browser` value meaning "Firefox if there is one, else none". */
 export const COOKIES_AUTO = "auto";

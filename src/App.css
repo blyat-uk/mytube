@@ -1452,18 +1452,38 @@ label.field-label { display: block; }
 .toast {
   pointer-events: auto;
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  text-align: left;
-  font: inherit;
+  align-items: center;
+  gap: 4px;
   color: var(--text);
-  padding: 11px 14px;
   border-radius: var(--radius);
   border: 1px solid var(--line);
   background: var(--card);
   box-shadow: var(--shadow);
-  cursor: pointer;
   animation: toast-in 180ms ease;
+}
+/* The body is the dismiss target and fills the toast, so a toast without an
+   action still dismisses wherever it is clicked. */
+.toast-body {
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  padding: 11px 14px;
+  border: 0;
+  border-radius: inherit;
+  background: none;
+  cursor: pointer;
+}
+.toast-action {
+  flex: none;
+  margin-right: 10px;
+  font-size: 13px;
+  padding: 5px 13px;
 }
 @keyframes toast-in {
   from { opacity: 0; transform: translateX(14px); }

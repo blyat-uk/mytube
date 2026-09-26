@@ -7,7 +7,7 @@ import SettingsView from "./components/SettingsView";
 import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
-import { usePollEvents, useToolsStatus, useTransferFinished } from "./events";
+import { useAppUpdate, usePollEvents, useToolsStatus, useTransferFinished } from "./events";
 import { toolsReadyMessage } from "./components/ToolsSection";
 import type {
   Channel, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
@@ -183,6 +183,19 @@ function Shell() {
   useToolsStatus((list) => {
     if (toolsSeeded.current) applyToolStatus(list);
     else heldToolEvents.current.push(list);
+  });
+
+  // Notify only: MyTube never installs itself, because the way to update
+  // depends on how it was installed (deb, rpm, AppImage, NSIS, dmg), so the
+  // action opens the release page. Missed while the window is hidden, the
+  // tray menu's update item still says it.
+  useAppUpdate((u) => {
+    toast.info(`MyTube ${u.version} is available.`, {
+      label: "Download",
+      onClick: () => {
+        api.openExternal(u.url).catch((err) => toast.error(errText(err)));
+      },
+    });
   });
 
   // A poll can also start on its own (startup and the interval timer), so the

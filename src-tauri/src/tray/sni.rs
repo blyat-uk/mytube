@@ -19,7 +19,9 @@ use ksni::menu::StandardItem;
 use ksni::{Handle, Icon, MenuItem, Tray, TrayMethods};
 use tauri::AppHandle;
 
-use super::{badge_slot, show_window, toggle_window, ICONS, TRAY_ID};
+use super::{
+    badge_slot, open_release_page, show_window, toggle_window, update_label, ICONS, TRAY_ID,
+};
 use crate::window;
 
 /// The registered item, once it exists.
@@ -64,6 +66,10 @@ struct MyTube {
     /// when the pixmap actually differs, which is why nothing here has to
     /// dedupe a poll that moves 12 to 13 by hand.
     pending: u32,
+    /// A newer release as `(version, url)`, shown as a menu item. Held here
+    /// for the same reason as `pending`: ksni diffs the menu too, and emits
+    /// `LayoutUpdated` only when it changed.
+    update: Option<(String, String)>,
 }
 
 impl Tray for MyTube {
@@ -85,26 +91,44 @@ impl Tray for MyTube {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
-            StandardItem {
-                label: "Open MyTube".into(),
-                activate: Box::new(|t: &mut Self| show_window(&t.app)),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
+        let mut items = vec![StandardItem {
+            label: "Open MyTube".into(),
+            activate: Box::new(|t: &mut Self| show_window(&t.app)),
+            ..Default::default()
+        }
+        .into()];
+        if let Some((version, _)) = &self.update {
+            items.push(
+                StandardItem {
+                    label: update_label(version),
+                    // Read from the item when clicked rather than captured
+                    // now, so a menu built before a newer check still opens
+                    // the page that is current.
+                    activate: Box::new(|t: &mut Self| {
+                        if let Some((_, url)) = &t.update {
+                            open_release_page(url);
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        items.push(
             StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|t: &mut Self| window::quit(&t.app)),
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
 }
 
 pub(super) fn init(app: &AppHandle) -> Result<(), String> {
-    let tray = MyTube { app: app.clone(), pending: 0 };
+    let tray = MyTube { app: app.clone(), pending: 0, update: None };
     // Blocking so that `init` returning means the item is really up: the very
     // next thing the caller does is wire the window, whose close handler asks
     // [`is_available`] whether there is anywhere to close *to*.
@@ -129,6 +153,17 @@ pub(super) fn update(f: impl FnOnce(&mut u32) + Send + 'static) {
     };
     tauri::async_runtime::spawn(async move {
         handle.update(move |t: &mut MyTube| f(&mut t.pending)).await;
+    });
+}
+
+/// Fire-and-forget for the same reasons as [`update`]. No need to compare
+/// with what is showing first: ksni rebuilds and diffs the menu itself.
+pub(super) fn set_update(release: Option<(String, String)>) {
+    let Some(handle) = TRAY.get() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        handle.update(move |t: &mut MyTube| t.update = release).await;
     });
 }
 

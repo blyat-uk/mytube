@@ -1,3 +1,4 @@
+pub mod app_update;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -99,6 +100,23 @@ pub fn run() {
                     let s = config::load().unwrap_or_default();
                     tools_state.tools.ensure_all(&s).await;
                     tools_state.tools.maybe_update(&s).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            });
+
+            // MyTube's own releases, on a third clock. The first check waits a
+            // minute so it never competes with the startup poll or a first
+            // run's tool downloads; after that hourly, which only reads a file
+            // -- `app_update::tick` asks GitHub at most once a day. Not folded
+            // into the tools loop: `ensure_all` can spend minutes downloading,
+            // and that would hold the check up behind it.
+            let update_app = app.handle().clone();
+            let update_http = state.http.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                loop {
+                    let s = config::load().unwrap_or_default();
+                    app_update::tick(&update_app, &update_http, &s).await;
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 }
             });

@@ -24,6 +24,7 @@ pub fn get_settings() -> R<config::Settings> {
 pub async fn save_settings(
     mut settings: config::Settings,
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
 ) -> R<()> {
     // The Settings view sends a snapshot taken at mount, so if a filter
     // changed while it was open, saving it verbatim would revert `view` to
@@ -51,6 +52,16 @@ pub async fn save_settings(
         tauri::async_runtime::spawn(async move {
             tools.ensure_all(&s).await;
             tools.maybe_update(&s).await;
+        });
+    }
+    // Likewise the release check: switching it off should take the tray item
+    // away now, and switching it on should look now, not up to an hour later.
+    // `tick` still gates the request itself on `due`.
+    if disk.as_ref().is_none_or(|d| d.check_app_updates != settings.check_app_updates) {
+        let http = state.http.clone();
+        let s = settings.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::app_update::tick(&app, &http, &s).await;
         });
     }
     state

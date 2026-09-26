@@ -29,6 +29,7 @@ const saveViewState = vi.fn(() => Promise.resolve());
 const listVideos = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() => Promise.resolve([]));
 const listVideoGroups = vi.fn(() => Promise.resolve([]));
 const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([]));
+const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
 
 vi.mock("./api", () => ({
   api: {
@@ -38,6 +39,7 @@ vi.mock("./api", () => ({
     listVideos: (filter: VideoFilter) => listVideos(filter),
     listVideoGroups: (...a: unknown[]) => listVideoGroups(...(a as [])),
     toolsStatus: () => toolsStatus(),
+    openExternal: (url: string) => openExternal(url),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
@@ -61,6 +63,7 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
     window_width: 1280, window_height: 840, window_x: null, window_y: null,
     window_maximized: false,
     cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
+    check_app_updates: true,
     ytdlp_path: "", ffmpeg_path: "", deno_path: "",
     view: defaultView(view),
   };
@@ -327,5 +330,22 @@ describe("the tools-ready toast", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(screen.queryByText("yt-dlp is ready.")).toBeNull();
+  });
+});
+
+describe("a newer MyTube release", () => {
+  const RELEASE = "https://github.com/blyat-uk/mytube/releases/tag/v0.1.2";
+
+  it("toasts it with a Download button that opens the release page", async () => {
+    render(<App />);
+    await waitFor(() => expect(listeners.has("app://update-available")).toBe(true));
+
+    listeners.get("app://update-available")!({ payload: { version: "0.1.2", url: RELEASE } });
+
+    expect(await screen.findByText("MyTube 0.1.2 is available.")).toBeDefined();
+    fireEvent.click(button("Download"));
+    expect(openExternal).toHaveBeenCalledWith(RELEASE);
+    // Acting on the toast is also done with it.
+    await waitFor(() => expect(screen.queryByText("MyTube 0.1.2 is available.")).toBeNull());
   });
 });

@@ -427,6 +427,18 @@ export default function SettingsView() {
         </span>
       </label>
 
+      <label className="switch-row">
+        <input
+          type="checkbox"
+          checked={s.check_app_updates}
+          onChange={(e) => setAndSave("check_app_updates", e.currentTarget.checked)}
+        />
+        <span>
+          <span className="switch-label">Check GitHub for new MyTube releases</span>
+          <span className="field-hint">Once a day. MyTube only tells you; it never updates itself.</span>
+        </span>
+      </label>
+
       <p className="settings-note">Changes save when a field loses focus.</p>
 
       <ToolsSection

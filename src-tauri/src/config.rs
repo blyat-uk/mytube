@@ -170,6 +170,11 @@ pub struct Settings {
     pub ytdlp_channel: String,
     #[serde(default = "d_true")]
     pub ytdlp_auto_update: bool,
+    /// Whether to ask GitHub once a day for a newer MyTube release (see
+    /// `app_update`). Machine-local: `adopt_portable` does not take it, since
+    /// whether this machine may phone GitHub is nobody else's decision.
+    #[serde(default = "d_true")]
+    pub check_app_updates: bool,
     /// Hand-edit-only overrides for the three external tools. Non-empty always
     /// wins over both the managed and the system copy.
     #[serde(default)]
@@ -638,6 +643,21 @@ mod tests {
         assert!(!local.poll_on_startup);
         assert_eq!(local.backfill_count, 120);
         assert_eq!(local.card_size, 400);
+    }
+
+    #[test]
+    fn adopt_portable_leaves_the_app_update_check_alone() {
+        let mut local = Settings::default();
+        let mut incoming = an_incoming_file();
+        incoming.check_app_updates = false;
+        local.adopt_portable_with(&incoming, |_| true);
+        assert!(local.check_app_updates, "another machine turned this one's check off");
+    }
+
+    #[test]
+    fn app_update_check_defaults_on() {
+        assert!(Settings::default().check_app_updates);
+        assert!(!Settings::from_json_str(r#"{"check_app_updates":false}"#).unwrap().check_app_updates);
     }
 
     #[test]

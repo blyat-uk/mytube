@@ -26,6 +26,7 @@ const SETTINGS: Settings = {
   window_width: 1280, window_height: 880, window_x: null, window_y: null,
   window_maximized: false,
   cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
+  check_app_updates: true,
   ytdlp_path: "", ffmpeg_path: "", deno_path: "",
   view: {
     channel_id: null, search: "", hide_watched: false, downloaded_only: false,
@@ -425,6 +426,17 @@ describe("Tools", () => {
     fireEvent.click(auto);
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
     expect(lastSaved().ytdlp_auto_update).toBe(false);
+  });
+});
+
+describe("checking for MyTube releases", () => {
+  it("is on by default and saves when switched off", async () => {
+    await renderSettings();
+    const check = screen.getByLabelText(/Check GitHub for new MyTube releases/) as HTMLInputElement;
+    expect(check.checked).toBe(true);
+    fireEvent.click(check);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(lastSaved().check_app_updates).toBe(false);
   });
 });
 

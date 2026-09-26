@@ -11,8 +11,9 @@
 //!
 //! Everything the two share lives here: the eleven badge icons, the pure count
 //! rules, and what "show" and "toggle" mean for the window. A backend supplies
-//! only `init`, `is_available` and `update` -- the one place the pending count
-//! is read and written -- so the badge behaves identically on every OS.
+//! only `init`, `is_available`, `update` -- the one place the pending count is
+//! read and written -- and `set_update` for the release menu item, so the badge
+//! and the menu behave identically on every OS.
 
 use tauri::AppHandle;
 
@@ -118,6 +119,29 @@ pub fn clear() {
     backend::update(|pending| *pending = 0);
 }
 
+/// A newer MyTube release as `(version, url)`, or `None` for no menu item.
+///
+/// While set, the menu carries `Update available: v{version}…` between "Open
+/// MyTube" and the separator, and picking it opens `url` in the browser. The
+/// item is the standing reminder: the toast fires once per release and may
+/// land while the window is hidden. Called hourly with the same value, so each
+/// backend ignores a value it already shows. A no-op when there is no tray.
+pub fn set_update(release: Option<(String, String)>) {
+    backend::set_update(release);
+}
+
+/// The menu label for an available update. The ellipsis says it leads
+/// somewhere else -- a browser, not an action taken in place.
+fn update_label(version: &str) -> String {
+    format!("Update available: v{version}\u{2026}")
+}
+
+fn open_release_page(url: &str) {
+    if let Err(err) = tauri_plugin_opener::open_url(url, None::<&str>) {
+        eprintln!("mytube: could not open {url}: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +180,11 @@ mod tests {
         // while you are looking at it has been read by definition.
         assert_eq!(next_count(0, 3, true), 0);
         assert_eq!(next_count(3, 2, true), 0);
+    }
+
+    #[test]
+    fn the_update_label_names_the_version_with_a_v() {
+        assert_eq!(update_label("0.1.2"), "Update available: v0.1.2\u{2026}");
     }
 
     #[test]
