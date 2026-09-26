@@ -162,6 +162,8 @@ pub fn run() {
             commands::poll_all,
             commands::poll_channel,
             commands::set_channel_member,
+            commands::auto_download_backlog_count,
+            commands::set_channel_auto_download,
             commands::list_videos,
             commands::list_video_groups,
             commands::mark_siblings,

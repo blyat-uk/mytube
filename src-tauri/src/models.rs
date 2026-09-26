@@ -18,6 +18,12 @@ pub struct Channel {
     /// polled. Only `Db::set_channel_terminated` sets it; any upsert clears it.
     #[serde(default)]
     pub terminated: bool,
+    /// New uploads from this channel are queued for download after each poll
+    /// (`channels.auto_download_since IS NOT NULL`). Like `member`, only
+    /// `Db::set_channel_auto_download` moves it: an upsert never touches it,
+    /// and an archive import neither writes it nor clears it.
+    #[serde(default)]
+    pub auto_download: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

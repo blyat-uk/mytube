@@ -17,6 +17,8 @@ export interface Channel {
   /** Whether you have joined this channel's membership, which is what lets a
    *  poll ingest its members-only uploads. */
   member: boolean;
+  /** New uploads are queued for download by the poll on their own. */
+  auto_download: boolean;
   added_at: number; last_polled_at: number | null;
   /** YouTube has terminated this channel's account, so it is no longer polled. */
   terminated: boolean;

@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import TakeoutDialog from "./TakeoutDialog";
-import { IconBusy, IconClose, IconDelete, IconExternal, IconMember } from "./Icons";
+import {
+  IconAutoDownload, IconBusy, IconCheck, IconClose, IconDelete, IconExternal, IconMember,
+} from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import type { AddKind, Channel, TakeoutRow } from "../types";
@@ -39,12 +41,17 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
   // By channel, not one at a time: joining reads a whole listing, and a slow
   // one must not lock the rest of the list.
   const [joining, setJoining] = useState<string[]>([]);
+  // The same, for auto-download: turning it on can queue a whole backlog.
+  const [switching, setSwitching] = useState<string[]>([]);
+  /** The channel whose "turn auto-download on" prompt is open, if any. */
+  const [autoPrompt, setAutoPrompt] = useState<Channel | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const classifyId = useRef(0);
 
   useEffect(() => {
     if (!isOpen) return;
     setConfirmRemove(null);
+    setAutoPrompt(null);
     inputRef.current?.focus();
   }, [isOpen]);
 
@@ -186,6 +193,39 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
     }
   }
 
+  /** Off is immediate and takes nothing back; on goes through the prompt. */
+  function toggleAutoDownload(c: Channel) {
+    if (switching.includes(c.id)) return;
+    if (c.auto_download) {
+      void setAutoDownload(c, false, null);
+    } else {
+      setConfirmRemove(null);
+      setAutoPrompt(c);
+    }
+  }
+
+  async function setAutoDownload(c: Channel, enabled: boolean, backlog: Backlog | null) {
+    if (switching.includes(c.id)) return;
+    setSwitching((ids) => [...ids, c.id]);
+    setAutoPrompt(null);
+    try {
+      const queued = await api.setChannelAutoDownload(c.id, enabled, backlog);
+      onChanged();
+      if (!enabled) {
+        toast.info(`Auto-download off for ${c.title}.`);
+      } else {
+        toast.success(
+          `Auto-download on for ${c.title}.` +
+          (queued > 0 ? ` ${queued} video${queued === 1 ? "" : "s"} queued.` : ""),
+        );
+      }
+    } catch (err) {
+      toast.error(errText(err));
+    } finally {
+      setSwitching((ids) => ids.filter((id) => id !== c.id));
+    }
+  }
+
   async function openChannel(c: Channel) {
     try {
       await api.openExternal(c.url);
@@ -279,7 +319,10 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
         ) : (
           <ul className="channel-list">
             {channels.map((c) => (
-              <li key={c.id} className="channel-row">
+              <li
+                key={c.id}
+                className={`channel-row${autoPrompt?.id === c.id ? " has-prompt" : ""}`}
+              >
                 <span
                   className={`channel-name${c.terminated ? " is-terminated" : ""}`}
                   title={c.terminated
@@ -333,12 +376,35 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                       <IconMember joined={c.member} />
                     </ChannelAction>
                     <ChannelAction
+                      label={`Auto-download — ${c.title}`}
+                      tone={c.auto_download ? "is-on" : undefined}
+                      pressed={c.auto_download}
+                      busy={switching.includes(c.id)}
+                      // Nothing new will ever arrive from a terminated account.
+                      hidden={c.terminated}
+                      title={
+                        c.auto_download
+                          ? `New uploads from ${c.title} download on their own. Click to stop; nothing already queued or downloaded is touched.`
+                          : `Download new uploads from ${c.title} automatically.`
+                      }
+                      onClick={() => toggleAutoDownload(c)}
+                    >
+                      <IconAutoDownload on={c.auto_download} />
+                    </ChannelAction>
+                    <ChannelAction
                       label={`Remove ${c.title}`}
-                      onClick={() => setConfirmRemove(c.id)}
+                      onClick={() => { setAutoPrompt(null); setConfirmRemove(c.id); }}
                     >
                       <IconDelete />
                     </ChannelAction>
                   </span>
+                )}
+                {autoPrompt?.id === c.id && (
+                  <AutoDownloadPrompt
+                    channel={c}
+                    onConfirm={(backlog) => void setAutoDownload(c, true, backlog)}
+                    onCancel={() => setAutoPrompt(null)}
+                  />
                 )}
               </li>
             ))}
@@ -362,14 +428,200 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
   );
 }
 
+type Backlog = { includeWatched: boolean; includeHidden: boolean };
+
+/**
+ * Asks how far back turning auto-download on should reach. "From now on" is
+ * the default and queues nothing today; "Everything so far" takes what is
+ * already in the library — never a fresh listing — and quotes a live count so
+ * the confirm button says exactly how much it is about to start.
+ */
+function AutoDownloadPrompt({ channel, onConfirm, onCancel }: {
+  channel: Channel;
+  onConfirm: (backlog: Backlog | null) => void;
+  onCancel: () => void;
+}) {
+  const [scope, setScope] = useState<"new" | "all">("new");
+  const [includeWatched, setIncludeWatched] = useState(false);
+  const [includeHidden, setIncludeHidden] = useState(false);
+  const [count, setCount] = useState<number | null>(null);
+  const [countError, setCountError] = useState<string | null>(null);
+  // Every tick fires a count; only the newest one may land.
+  const countReq = useRef(0);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const titleId = `auto-dl-${channel.id}`;
+
+  // It opens inside the scrolling channel list, often below the fold.
+  useEffect(() => {
+    boxRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, []);
+
+  useEffect(() => {
+    const id = ++countReq.current;
+    if (scope !== "all") return;
+    setCount(null);
+    setCountError(null);
+    api.autoDownloadBacklogCount(channel.id, includeWatched, includeHidden).then(
+      (n) => { if (id === countReq.current) setCount(n); },
+      (err) => { if (id === countReq.current) setCountError(errText(err)); },
+    );
+  }, [scope, includeWatched, includeHidden, channel.id]);
+
+  const all = scope === "all";
+  const label = all && count ? `Turn on & download ${count}` : "Turn on";
+  const summary = !all
+    ? "Nothing is queued today."
+    : countError
+      ? countError
+      : count === null
+        ? "Counting…"
+        : count === 0
+          ? "Nothing in the library left to fetch."
+          : null;
+
+  return (
+    <div
+      ref={boxRef}
+      className="auto-dl-prompt"
+      role="group"
+      aria-labelledby={titleId}
+      onKeyDown={(e) => {
+        // Escape backs out of the prompt, not the whole dialog.
+        if (e.key === "Escape") { e.stopPropagation(); onCancel(); }
+      }}
+    >
+      <div className="auto-dl-head">
+        <span className="auto-dl-badge" aria-hidden="true"><IconAutoDownload on /></span>
+        <div className="auto-dl-heading">
+          <p id={titleId} className="auto-dl-title">Auto-download {channel.title}</p>
+          <p className="auto-dl-sub">New uploads join the download queue after every refresh.</p>
+        </div>
+      </div>
+
+      <div className="auto-dl-scope" role="radiogroup" aria-label="Which videos">
+        <ScopeOption
+          id={`${titleId}-new`}
+          name={`${titleId}-scope`}
+          checked={!all}
+          onSelect={() => setScope("new")}
+          title="From now on"
+          detail="Only what is uploaded next."
+        />
+        <ScopeOption
+          id={`${titleId}-all`}
+          name={`${titleId}-scope`}
+          checked={all}
+          onSelect={() => setScope("all")}
+          title="Everything so far as well"
+          detail="Plus what is already in your library."
+        />
+      </div>
+
+      {all && (
+        <div className="auto-dl-backlog">
+          <span className="auto-dl-backlog-label">Also include</span>
+          <ToggleChip label="Include watched" checked={includeWatched} onChange={setIncludeWatched}>
+            Watched
+          </ToggleChip>
+          <ToggleChip label="Include hidden" checked={includeHidden} onChange={setIncludeHidden}>
+            Hidden
+          </ToggleChip>
+        </div>
+      )}
+
+      <div className="auto-dl-foot">
+        <span className={`auto-dl-count${countError ? " is-error" : ""}`} aria-live="polite">
+          {summary ?? (
+            <>
+              <strong>{count}</strong> video{count === 1 ? "" : "s"} will be queued
+            </>
+          )}
+        </span>
+        <div className="auto-dl-buttons">
+          <button
+            type="button"
+            className="btn btn-quiet"
+            aria-label={`Cancel auto-download for ${channel.title}`}
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            // Waiting for the count keeps the button from starting a number the
+            // user never saw.
+            disabled={all && count === null && !countError}
+            onClick={() => onConfirm(all ? { includeWatched, includeHidden } : null)}
+          >
+            {label}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** One of the two answers to "how far back?", as a selectable card. The input
+ *  is the real control — only its title names it; the detail describes it. */
+function ScopeOption({ id, name, checked, onSelect, title, detail }: {
+  id: string;
+  name: string;
+  checked: boolean;
+  onSelect: () => void;
+  title: string;
+  detail: string;
+}) {
+  return (
+    <label className={`auto-dl-opt${checked ? " is-on" : ""}`}>
+      <input
+        type="radio"
+        className="sr-only"
+        name={name}
+        checked={checked}
+        onChange={onSelect}
+        aria-labelledby={`${id}-t`}
+        aria-describedby={`${id}-d`}
+      />
+      <span className="auto-dl-radio" aria-hidden="true" />
+      <span className="auto-dl-opt-text">
+        <span id={`${id}-t`} className="auto-dl-opt-title">{title}</span>
+        <span id={`${id}-d`} className="auto-dl-opt-detail">{detail}</span>
+      </span>
+    </label>
+  );
+}
+
+/** A real checkbox worn as a pill, ticked with a check glyph. */
+function ToggleChip({ label, checked, onChange, children }: {
+  label: string;
+  checked: boolean;
+  onChange: (on: boolean) => void;
+  children: string;
+}) {
+  return (
+    <label className={`auto-dl-chip${checked ? " is-on" : ""}`}>
+      <input
+        type="checkbox"
+        className="sr-only"
+        aria-label={label}
+        checked={checked}
+        onChange={(e) => onChange(e.currentTarget.checked)}
+      />
+      <span className="auto-dl-chip-box" aria-hidden="true">{checked && <IconCheck />}</span>
+      {children}
+    </label>
+  );
+}
+
 /**
  * One glyph in a channel row. The rows are narrow and every channel carries the
- * same three actions, so the words live in the tooltip and the screen-reader
+ * same four actions, so the words live in the tooltip and the screen-reader
  * name instead of on the button — and the name has to name the channel, since
  * a list of them reads as one column of identical buttons otherwise.
  *
  * DownloadsView has a `RowAction` of its own; this one additionally carries the
- * pressed and busy states the membership toggle needs.
+ * pressed and busy states the membership and auto-download toggles need.
  */
 function ChannelAction({ label, title, tone, pressed, busy, hidden, onClick, children }: {
   label: string;

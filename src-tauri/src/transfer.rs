@@ -385,7 +385,11 @@ pub fn write_archive(
         // counts rather than trusts.
         includes_thumbs: include_thumbs,
         settings: PortableSettings::of(settings),
-        channels: channels.to_vec(),
+        // Auto-download does not travel (yet): switching it on is a promise to
+        // fetch every new upload into *this* machine's disk, and an import
+        // never writes the column anyway. Written as false so the archive
+        // does not claim a state it will not restore.
+        channels: channels.iter().map(|c| Channel { auto_download: false, ..c.clone() }).collect(),
         videos: videos.iter().map(|v| ArchiveVideo::of(v, &settings.download_dir)).collect(),
     };
     let json = serde_json::to_vec_pretty(&manifest)?;
@@ -739,7 +743,7 @@ mod tests {
             member: false,
             added_at: 1_700_000_000,
             last_polled_at: Some(1_758_000_000),
-            terminated: false,
+            terminated: false, auto_download: false,
         }
     }
 
@@ -965,6 +969,21 @@ mod tests {
         let p = prepare_import_in(&zipped, &["UC1".into()], false, &dirs_in(&cfg), &noop).unwrap();
         assert_eq!(p.videos[0].file_path.as_deref(), Some(&*stray.to_string_lossy()));
         assert_eq!(p.videos[0].download_state, DownloadState::Done);
+    }
+
+    #[test]
+    fn auto_download_is_not_exported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("videos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let on = Channel { auto_download: true, ..channel("UC1", "Chan") };
+
+        let zipped = tmp.path().join("a.zip");
+        let s = settings_with_download_dir(&dl);
+        write_archive(&zipped, &[on], &[], &s, false, &noop).unwrap();
+
+        let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
+        assert!(!m.channels[0].auto_download);
     }
 
     // ---------------------------------------------------------- full manifest

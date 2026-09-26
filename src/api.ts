@@ -28,6 +28,17 @@ export const api = {
    *  then and resolves with the number of members-only videos it found. */
   setChannelMember: (channelId: string, member: boolean) =>
     invoke<number>("set_channel_member", { channelId, member }),
+  /** How many videos already in the library "Everything so far" would queue.
+   *  Read-only: the turn-on prompt's live count. */
+  autoDownloadBacklogCount: (channelId: string, includeWatched: boolean, includeHidden: boolean) =>
+    invoke<number>("auto_download_backlog_count", { channelId, includeWatched, includeHidden }),
+  /** Switches auto-download. Off removes and cancels nothing. On with a
+   *  `backlog` also queues what is already in the library, and resolves with
+   *  how many that was; otherwise 0. */
+  setChannelAutoDownload: (
+    channelId: string, enabled: boolean,
+    backlog: { includeWatched: boolean; includeHidden: boolean } | null,
+  ) => invoke<number>("set_channel_auto_download", { channelId, enabled, backlog }),
   listVideos: (filter: VideoFilter) => invoke<Video[]>("list_videos", { filter }),
   /** The same feed with each channel's series collapsed. `limit`/`offset` count
    *  groups here, not videos. */

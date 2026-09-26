@@ -453,7 +453,9 @@ pub async fn poll_one(
 /// `via_listing` is how many channels this poll read from the channel listing
 /// because their feed failed. It is deliberately not a [`PollSummary`] field:
 /// a fallback shows nothing on screen, and this line is the whole record of it.
-fn summary_line(s: &PollSummary, via_listing: usize) -> String {
+/// `auto_queued` is the same kind of number: what the post-poll auto-download
+/// sweep queued, visible on screen only as rows turning "queued".
+fn summary_line(s: &PollSummary, via_listing: usize, auto_queued: usize) -> String {
     let mut line = format!("polled {} {}", s.channels_polled, plural(s.channels_polled, "channel"));
     match s.new_videos {
         0 => line.push_str(", nothing new"),
@@ -465,6 +467,9 @@ fn summary_line(s: &PollSummary, via_listing: usize) -> String {
     }
     if via_listing > 0 {
         line.push_str(&format!(", {via_listing} via yt-dlp (RSS down)"));
+    }
+    if auto_queued > 0 {
+        line.push_str(&format!(", {auto_queued} auto-queued"));
     }
     if !s.errors.is_empty() {
         let word = plural(s.errors.len(), "error");
@@ -489,7 +494,7 @@ pub async fn poll_channels(
             errors: vec!["A refresh is already running".into()],
             ..Default::default()
         };
-        eprintln!("mytube: {}", summary_line(&refused, 0));
+        eprintln!("mytube: {}", summary_line(&refused, 0, 0));
         return refused;
     };
     // A terminated channel's feed 404s and its listing refuses, every time, so
@@ -527,15 +532,67 @@ pub async fn poll_channels(
             Err(e) => summary.errors.push(format!("{title}: {e}")),
         }
     }
-    eprintln!("mytube: {}", summary_line(&summary, via_listing));
     // Before `poll://finished`, so the refetch it drives shows the deeper
     // catalogue on the same poll.
     deepen(state, &ids, backfill).await;
+    // After `deepen`, though what it inserts is never a candidate (it aired
+    // before the switch-on): the order just means the sweep sees the library
+    // as this poll leaves it. Before `poll://finished`, so the refetch shows
+    // the rows already queued.
+    let auto_queued = auto_download(state).await;
+    eprintln!("mytube: {}", summary_line(&summary, via_listing, auto_queued));
     let _ = app.emit("poll://finished", summary.clone());
     // Polls only. A backfill or a manually added video is something you asked
     // for with the window in front of you, so it is read the moment it lands.
     tray::note_new_videos(app, summary.new_videos);
     summary
+}
+
+/// Queues every auto-download candidate (see `Db::auto_download_candidates`)
+/// into the ordinary download queue, and returns how many.
+///
+/// Rows are flagged `auto_queued` *before* they are handed to the queue: the
+/// flag is the promise that a video is taken automatically at most once, so a
+/// download that fails, is cancelled, or whose file is later deleted is never
+/// silently fetched again. A sweep that fails is logged and costs nothing but
+/// this poll's auto-downloads; the next poll retries whatever it missed.
+pub async fn auto_download(state: &AppState) -> usize {
+    let ids = match state.db.auto_download_candidates() {
+        Ok(ids) if ids.is_empty() => return 0,
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("mytube: auto-download sweep failed: {err}");
+            return 0;
+        }
+    };
+    let s = match config::load() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("mytube: auto-download skipped, settings unreadable: {err}");
+            return 0;
+        }
+    };
+    queue_auto(state, ids, &s.download_dir, &s.filename_template).await
+}
+
+/// Flags `ids` auto-queued and enqueues each, returning how many made it into
+/// the queue. Shared by the post-poll sweep and a switch-on's backlog, so both
+/// keep the same "flag first, then queue" order.
+pub async fn queue_auto(state: &AppState, ids: Vec<String>, dir: &str, template: &str) -> usize {
+    if let Err(err) = state.db.mark_auto_queued(&ids) {
+        eprintln!("mytube: auto-download could not flag {} videos: {err}", ids.len());
+        return 0;
+    }
+    let mut queued = 0;
+    // Owned ids, moved one at a time: nothing borrowed from an iterator lives
+    // across the await (see "Async gotchas" in CLAUDE.md).
+    for id in ids {
+        match state.queue.enqueue(id.clone(), dir.to_string(), template.to_string()).await {
+            Ok(()) => queued += 1,
+            Err(err) => eprintln!("mytube: auto-download could not queue {id}: {err}"),
+        }
+    }
+    queued
 }
 
 /// One flat-playlist call reads a channel's back catalogue `count` deep.
@@ -667,7 +724,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         db.upsert_channel(&Channel {
             id: CHANNEL.into(), title: "Lumos Manhwa Recap".into(), handle: None,
             url: format!("https://www.youtube.com/channel/{CHANNEL}"), thumb_path: None,
-            subscribed: true, member: false, added_at: 0, last_polled_at: None, terminated: false,
+            subscribed: true, member: false, added_at: 0, last_polled_at: None, terminated: false, auto_download: false,
         })
         .unwrap();
         // Ready, so nothing is pending and the sweep runs at its shallowest.
@@ -766,7 +823,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         db.upsert_channel(&Channel {
             id: CH.into(), title: "One".into(), handle: None,
             url: format!("https://www.youtube.com/channel/{CH}"), thumb_path: None,
-            subscribed: true, member: true, added_at: 0, last_polled_at: None, terminated: false,
+            subscribed: true, member: true, added_at: 0, last_polled_at: None, terminated: false, auto_download: false,
         })
         .unwrap();
     }
@@ -876,25 +933,25 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
     fn a_quiet_poll_still_reports_that_it_ran() {
         // The whole point of the line: proving the loop is alive on a night
         // where nothing was published.
-        assert_eq!(summary_line(&summary(27, 0, 0), 0), "polled 27 channels, nothing new");
+        assert_eq!(summary_line(&summary(27, 0, 0), 0, 0), "polled 27 channels, nothing new");
     }
 
     #[test]
     fn a_haul_is_counted() {
-        assert_eq!(summary_line(&summary(27, 2, 0), 0), "polled 27 channels, 2 new");
+        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0), "polled 27 channels, 2 new");
     }
 
     #[test]
     fn rejected_shorts_are_only_mentioned_when_there_were_some() {
         assert_eq!(
-            summary_line(&summary(27, 2, 3), 0),
+            summary_line(&summary(27, 2, 3), 0, 0),
             "polled 27 channels, 2 new, 3 shorts rejected"
         );
     }
 
     #[test]
     fn one_channel_is_not_pluralised() {
-        assert_eq!(summary_line(&summary(1, 1, 1), 0), "polled 1 channel, 1 new, 1 short rejected");
+        assert_eq!(summary_line(&summary(1, 1, 1), 0, 0), "polled 1 channel, 1 new, 1 short rejected");
     }
 
     /// A fallback is invisible on screen by design -- no error toast, and the
@@ -904,11 +961,11 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
     #[test]
     fn channels_that_fell_back_to_the_listing_are_named_in_the_journal() {
         assert_eq!(
-            summary_line(&summary(36, 3, 0), 36),
+            summary_line(&summary(36, 3, 0), 36, 0),
             "polled 36 channels, 3 new, 36 via yt-dlp (RSS down)"
         );
         // A healthy poll says nothing about a fallback that did not happen.
-        assert_eq!(summary_line(&summary(36, 3, 0), 0), "polled 36 channels, 3 new");
+        assert_eq!(summary_line(&summary(36, 3, 0), 0, 0), "polled 36 channels, 3 new");
         // Both halves of a partial outage are on the line: 1 channel had no
         // feed *and* no listing, the other 35 were served by the listing.
         let partial = PollSummary {
@@ -916,10 +973,21 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             ..summary(36, 0, 0)
         };
         assert_eq!(
-            summary_line(&partial, 35),
+            summary_line(&partial, 35, 0),
             "polled 36 channels, nothing new, 35 via yt-dlp (RSS down), \
 1 error: Gone: feed 404; and the listing failed too: no such channel"
         );
+    }
+
+    /// Auto-downloads show on screen only as rows turning "queued", which a
+    /// window closed to the tray never shows, so the journal names them.
+    #[test]
+    fn auto_queued_downloads_are_counted_only_when_there_were_some() {
+        assert_eq!(
+            summary_line(&summary(27, 2, 0), 0, 2),
+            "polled 27 channels, 2 new, 2 auto-queued"
+        );
+        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0), "polled 27 channels, 2 new");
     }
 
     #[test]
@@ -931,7 +999,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             ..summary(0, 0, 0)
         };
         assert_eq!(
-            summary_line(&refused, 0),
+            summary_line(&refused, 0, 0),
             "polled 0 channels, nothing new, 1 error: A refresh is already running"
         );
     }
@@ -943,7 +1011,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             ..summary(27, 0, 0)
         };
         assert_eq!(
-            summary_line(&s, 0),
+            summary_line(&s, 0, 0),
             "polled 27 channels, nothing new, 2 errors: Alpha: boom; Beta: bang"
         );
     }

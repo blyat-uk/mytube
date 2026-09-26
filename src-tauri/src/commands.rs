@@ -158,7 +158,7 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
                 member: false,
                 added_at: chrono::Utc::now().timestamp(),
                 last_polled_at: None,
-                terminated: false,
+                terminated: false, auto_download: false,
             })
             .map_err(e)?;
 
@@ -228,7 +228,7 @@ pub async fn add_channel(
         member: false,
         added_at: chrono::Utc::now().timestamp(),
         last_polled_at: None,
-        terminated: false,
+        terminated: false, auto_download: false,
     };
     state.db.upsert_channel(&channel).map_err(e)?;
 
@@ -307,7 +307,7 @@ pub async fn import_takeout_csv(
             member: false,
             added_at: chrono::Utc::now().timestamp(),
             last_polled_at: None,
-            terminated: false,
+            terminated: false, auto_download: false,
         };
         if let Err(err) = state.db.upsert_channel(&channel) {
             result.failed.push(format!("{title}: {err}"));
@@ -420,6 +420,61 @@ pub async fn set_channel_member(
     }
     let depth = config::load().map(|s| s.backfill_count).unwrap_or(30);
     poll::ingest_members_only(&state, &channel_id, depth).await.map_err(e)
+}
+
+/// Which of a channel's existing videos "everything so far as well" takes,
+/// when auto-download is switched on.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Backlog {
+    pub include_watched: bool,
+    pub include_hidden: bool,
+}
+
+/// How many videos a switch-on with this backlog would queue. Read-only: it is
+/// the live count the prompt shows while the ticks move.
+#[tauri::command]
+pub fn auto_download_backlog_count(
+    channel_id: String,
+    include_watched: bool,
+    include_hidden: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<usize> {
+    state
+        .db
+        .auto_download_backlog(&channel_id, include_watched, include_hidden)
+        .map(|ids| ids.len())
+        .map_err(e)
+}
+
+/// Switches auto-download on or off for one channel, and returns how many
+/// backlog videos were queued.
+///
+/// Off is immediate and removes nothing: queued and running downloads carry
+/// on, and nothing on disk is touched. On with `backlog` also queues the
+/// videos already in the library that it selects, flagged `auto_queued` like
+/// anything the sweep takes. The library only -- no listing is read here.
+#[tauri::command]
+pub async fn set_channel_auto_download(
+    channel_id: String,
+    enabled: bool,
+    backlog: Option<Backlog>,
+    state: State<'_, Arc<AppState>>,
+) -> R<usize> {
+    if state.db.get_channel(&channel_id).map_err(e)?.is_none() {
+        return Err(format!("No such channel: {channel_id}"));
+    }
+    state.db.set_channel_auto_download(&channel_id, enabled).map_err(e)?;
+    let Some(b) = backlog.filter(|_| enabled) else { return Ok(0) };
+    let ids = state
+        .db
+        .auto_download_backlog(&channel_id, b.include_watched, b.include_hidden)
+        .map_err(e)?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let s = config::load().map_err(e)?;
+    Ok(poll::queue_auto(&state, ids, &s.download_dir, &s.filename_template).await)
 }
 
 #[tauri::command]

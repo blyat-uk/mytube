@@ -8,6 +8,13 @@ const setChannelMember =
   vi.fn<(id: string, member: boolean) => Promise<number>>(() => Promise.resolve(0));
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
 const removeChannel = vi.fn<(id: string) => Promise<void>>(() => Promise.resolve());
+type Backlog = { includeWatched: boolean; includeHidden: boolean };
+const setChannelAutoDownload =
+  vi.fn<(id: string, enabled: boolean, backlog: Backlog | null) => Promise<number>>(
+    () => Promise.resolve(0));
+const autoDownloadBacklogCount =
+  vi.fn<(id: string, includeWatched: boolean, includeHidden: boolean) => Promise<number>>(
+    () => Promise.resolve(0));
 
 vi.mock("../api", () => ({
   api: {
@@ -19,6 +26,10 @@ vi.mock("../api", () => ({
     importTakeoutCsv: () => Promise.resolve({ added: 0, skipped: 0, failed: [] }),
     setChannelMember: (id: string, member: boolean) => setChannelMember(id, member),
     openExternal: (url: string) => openExternal(url),
+    setChannelAutoDownload: (id: string, enabled: boolean, backlog: Backlog | null) =>
+      setChannelAutoDownload(id, enabled, backlog),
+    autoDownloadBacklogCount: (id: string, w: boolean, h: boolean) =>
+      autoDownloadBacklogCount(id, w, h),
   },
   errText: (e: unknown) => String(e),
 }));
@@ -29,7 +40,7 @@ import { ToastProvider } from "./Toast";
 function channel(over: Partial<Channel>): Channel {
   const c = {
     id: "UC1", title: "AnimeCapped Manga", handle: null, url: "", thumb_path: null,
-    subscribed: true, member: false, added_at: 0, last_polled_at: null,
+    subscribed: true, member: false, auto_download: false, added_at: 0, last_polled_at: null,
     terminated: false,
     ...over,
   };
@@ -65,6 +76,8 @@ beforeEach(() => {
   setChannelMember.mockReset().mockResolvedValue(0);
   openExternal.mockReset().mockResolvedValue(undefined);
   removeChannel.mockReset().mockResolvedValue(undefined);
+  setChannelAutoDownload.mockReset().mockResolvedValue(0);
+  autoDownloadBacklogCount.mockReset().mockResolvedValue(0);
 });
 afterEach(cleanup);
 
@@ -196,12 +209,154 @@ describe("a terminated channel", () => {
     expect(slot).not.toBeNull();
     expect(slot.disabled).toBe(true);
     expect(slot.tabIndex).toBe(-1);
-    expect(container.querySelectorAll(".channel-actions .icon-btn")).toHaveLength(3);
+    expect(container.querySelectorAll(".channel-actions .icon-btn")).toHaveLength(4);
+  });
+
+  it("hides the auto-download toggle too, keeping its slot", () => {
+    const { container } = render(
+      <ToastProvider>
+        <AddChannelDialog open onClose={vi.fn()} channels={[gone]} onChanged={vi.fn()} />
+      </ToastProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Auto-download — Free manhwa" })).toBeNull();
+    expect(container.querySelectorAll(".channel-actions .is-placeholder")).toHaveLength(2);
   });
 
   it("leaves a live channel's row alone", () => {
     renderDialog([channel({ id: "UC2", title: "Daily Comics" })]);
     expect(screen.getByText("Daily Comics").classList.contains("is-terminated")).toBe(false);
     expect(rowButton("Remove Daily Comics").disabled).toBe(false);
+  });
+});
+
+/**
+ * Auto-download is opt-in per channel. Off is immediate and removes nothing;
+ * on asks once whether the backlog already in the library comes too.
+ */
+describe("auto-download in the subscriptions list", () => {
+  const autoChip = (title: string) => rowButton(`Auto-download — ${title}`);
+  const AUTO = [
+    channel({ id: "UC1", title: "AnimeCapped Manga", auto_download: true }),
+    channel({ id: "UC2", title: "Daily Comics", auto_download: false }),
+  ];
+
+  it("shows which channels download on their own, naming each one", () => {
+    renderDialog(AUTO);
+    expect(autoChip("AnimeCapped Manga").getAttribute("aria-pressed")).toBe("true");
+    expect(autoChip("Daily Comics").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("turns off at once, with no prompt and no backlog", async () => {
+    const { onChanged } = renderDialog(AUTO);
+    fireEvent.click(autoChip("AnimeCapped Manga"));
+    await waitFor(() =>
+      expect(setChannelAutoDownload).toHaveBeenCalledWith("UC1", false, null));
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    expect(await screen.findByText("Auto-download off for AnimeCapped Manga.")).toBeTruthy();
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("asks before turning on, and does nothing until confirmed", () => {
+    renderDialog(AUTO);
+    fireEvent.click(autoChip("Daily Comics"));
+    expect(setChannelAutoDownload).not.toHaveBeenCalled();
+    expect(screen.getByText("Auto-download Daily Comics")).toBeTruthy();
+    const now = screen.getByRole("radio", { name: "From now on" }) as HTMLInputElement;
+    expect(now.checked).toBe(true);
+    // The count is only worth asking for once the backlog is in play.
+    expect(autoDownloadBacklogCount).not.toHaveBeenCalled();
+  });
+
+  it("turns on from now on without a backlog", async () => {
+    const { onChanged } = renderDialog(AUTO);
+    fireEvent.click(autoChip("Daily Comics"));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    await waitFor(() =>
+      expect(setChannelAutoDownload).toHaveBeenCalledWith("UC2", true, null));
+    expect(await screen.findByText("Auto-download on for Daily Comics.")).toBeTruthy();
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("counts the backlog, recounts on every tick, and queues what it said", async () => {
+    autoDownloadBacklogCount.mockImplementation((_id, w, h) =>
+      Promise.resolve(27 + (w ? 10 : 0) + (h ? 100 : 0)));
+    setChannelAutoDownload.mockResolvedValue(37);
+    renderDialog(AUTO);
+    fireEvent.click(autoChip("Daily Comics"));
+    fireEvent.click(screen.getByRole("radio", { name: "Everything so far as well" }));
+
+    await waitFor(() =>
+      expect(autoDownloadBacklogCount).toHaveBeenLastCalledWith("UC2", false, false));
+    expect(await screen.findByRole("button", { name: "Turn on & download 27" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include watched" }));
+    await waitFor(() =>
+      expect(autoDownloadBacklogCount).toHaveBeenLastCalledWith("UC2", true, false));
+    expect(await screen.findByRole("button", { name: "Turn on & download 37" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include hidden" }));
+    await waitFor(() =>
+      expect(autoDownloadBacklogCount).toHaveBeenLastCalledWith("UC2", true, true));
+    expect(await screen.findByRole("button", { name: "Turn on & download 137" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include hidden" }));
+    const confirm = await screen.findByRole("button", { name: "Turn on & download 37" });
+
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(setChannelAutoDownload).toHaveBeenCalledWith(
+        "UC2", true, { includeWatched: true, includeHidden: false }));
+    expect(await screen.findByText("Auto-download on for Daily Comics. 37 videos queued.")).toBeTruthy();
+  });
+
+  it("keeps the newest count when an older one lands late", async () => {
+    const pending: Array<(n: number) => void> = [];
+    autoDownloadBacklogCount.mockImplementation(() => new Promise((res) => { pending.push(res); }));
+    renderDialog(AUTO);
+    fireEvent.click(autoChip("Daily Comics"));
+    fireEvent.click(screen.getByRole("radio", { name: "Everything so far as well" }));
+    await waitFor(() => expect(pending).toHaveLength(1));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include watched" }));
+    await waitFor(() => expect(pending).toHaveLength(2));
+
+    pending[1](40);
+    expect(await screen.findByRole("button", { name: "Turn on & download 40" })).toBeTruthy();
+    pending[0](5);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.getByRole("button", { name: "Turn on & download 40" })).toBeTruthy();
+  });
+
+  it("with nothing to fetch, still reads plain Turn on", async () => {
+    autoDownloadBacklogCount.mockResolvedValue(0);
+    renderDialog(AUTO);
+    fireEvent.click(autoChip("Daily Comics"));
+    fireEvent.click(screen.getByRole("radio", { name: "Everything so far as well" }));
+    await waitFor(() => expect(autoDownloadBacklogCount).toHaveBeenCalled());
+    fireEvent.click(await screen.findByRole("button", { name: "Turn on" }));
+    await waitFor(() =>
+      expect(setChannelAutoDownload).toHaveBeenCalledWith(
+        "UC2", true, { includeWatched: false, includeHidden: false }));
+  });
+
+  it("cancels without calling anything", () => {
+    renderDialog(AUTO);
+    fireEvent.click(autoChip("Daily Comics"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel auto-download for Daily Comics" }));
+    expect(setChannelAutoDownload).not.toHaveBeenCalled();
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+  });
+
+  it("says it is working, and will not run twice", async () => {
+    let finish = (_n: number) => {};
+    setChannelAutoDownload.mockImplementation(() => new Promise((res) => { finish = res; }));
+    renderDialog(AUTO);
+    fireEvent.click(autoChip("AnimeCapped Manga"));
+    await waitFor(() => expect(autoChip("AnimeCapped Manga").disabled).toBe(true));
+    expect(autoChip("AnimeCapped Manga").getAttribute("aria-busy")).toBe("true");
+    fireEvent.click(autoChip("AnimeCapped Manga"));
+    expect(setChannelAutoDownload).toHaveBeenCalledTimes(1);
+    expect(autoChip("Daily Comics").disabled).toBe(false);
+    finish(0);
+    await waitFor(() => expect(autoChip("AnimeCapped Manga").disabled).toBe(false));
   });
 });

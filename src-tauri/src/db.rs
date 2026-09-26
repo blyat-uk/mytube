@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -129,6 +129,22 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 7 {
         if !column_exists(conn, "channels", "terminated_at")? {
             conn.execute("ALTER TABLE channels ADD COLUMN terminated_at INTEGER", [])?;
+        }
+    }
+
+    // Auto-download. `auto_download_since` is NULL (off) or the instant it was
+    // switched on, which is what tells a new upload from a backlog the user
+    // did not ask for. `auto_queued` marks a row the sweep has already queued
+    // once, so a failure or a deleted file never brings it back on its own.
+    if version < 8 {
+        if !column_exists(conn, "channels", "auto_download_since")? {
+            conn.execute("ALTER TABLE channels ADD COLUMN auto_download_since INTEGER", [])?;
+        }
+        if !column_exists(conn, "videos", "auto_queued")? {
+            conn.execute(
+                "ALTER TABLE videos ADD COLUMN auto_queued INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
     }
 
@@ -353,7 +369,8 @@ impl Db {
                -- upserts its channel to catch a rename, and none of those
                -- carries any opinion about a membership. `Channel::member` is
                -- therefore read-only through this path -- see
-               -- `set_channel_member`.",
+               -- `set_channel_member`. `auto_download_since` is absent for
+               -- the same reason: only `set_channel_auto_download` moves it.",
             params![c.id, c.title, c.handle, c.url, c.thumb_path, c.subscribed as i64,
                     if c.added_at == 0 { now() } else { c.added_at }, c.last_polled_at],
         )?;
@@ -375,7 +392,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(&format!(
             "SELECT id,title,handle,url,thumb_path,subscribed,added_at,last_polled_at,member,
-                    terminated_at IS NOT NULL
+                    terminated_at IS NOT NULL, auto_download_since IS NOT NULL
              FROM channels WHERE {cond} ORDER BY title COLLATE NOCASE ASC"))?;
         let rows = st.query_map([], |r| Ok(Channel {
             id: r.get(0)?, title: r.get(1)?, handle: r.get(2)?, url: r.get(3)?,
@@ -383,6 +400,7 @@ impl Db {
             added_at: r.get(6)?, last_polled_at: r.get(7)?,
             member: r.get::<_, i64>(8)? != 0,
             terminated: r.get::<_, i64>(9)? != 0,
+            auto_download: r.get::<_, i64>(10)? != 0,
         }))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -402,6 +420,70 @@ impl Db {
     pub fn set_channel_member(&self, id: &str, member: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE channels SET member=?2 WHERE id=?1", params![id, member as i64])?;
+        Ok(())
+    }
+
+    /// Switches auto-download on (stamping now as the instant new uploads are
+    /// counted from) or off. Switching on again restamps: whatever arrived while
+    /// it was off is backlog, which the caller offers separately.
+    pub fn set_channel_auto_download(&self, id: &str, on: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE channels SET auto_download_since=?2 WHERE id=?1",
+                     params![id, if on { Some(now()) } else { None }])?;
+        Ok(())
+    }
+
+    /// Videos the post-poll sweep should queue: new uploads, on channels with
+    /// auto-download on, never queued automatically before.
+    ///
+    /// "New" takes both clocks. `first_seen_at` after the switch keeps out
+    /// what was already in the library; `published_at` near or after it keeps
+    /// out what a deepened listing or a members-only join inserts now but which
+    /// aired long ago. The day of slack absorbs a listing-ingested row still
+    /// wearing its midnight-UTC bucket (see `upload_date::is_bucketed`), which
+    /// can sit up to a day before the real instant.
+    pub fn auto_download_candidates(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT v.id FROM videos v JOIN channels c ON c.id = v.channel_id
+              WHERE c.auto_download_since IS NOT NULL AND c.subscribed=1
+                AND c.terminated_at IS NULL
+                AND v.status='ready' AND v.hidden=0 AND v.watched=0 AND v.auto_queued=0
+                AND v.download_state='none'
+                AND v.first_seen_at >= c.auto_download_since
+                AND COALESCE(v.published_at, v.first_seen_at) >= c.auto_download_since - 86400
+              ORDER BY COALESCE(v.published_at, v.first_seen_at) ASC, v.id ASC")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// What "everything so far as well" would queue for one channel: rows
+    /// already in the library with nothing downloaded, queued or failed. A
+    /// failure is left out because retrying it is the user's call, one video
+    /// at a time. `auto_queued` is not consulted: this is an explicit ask.
+    pub fn auto_download_backlog(&self, channel_id: &str, include_watched: bool,
+                                 include_hidden: bool) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT id FROM videos
+              WHERE channel_id=?1 AND status='ready' AND download_state='none'
+                AND (?2 OR watched=0) AND (?3 OR hidden=0)
+              ORDER BY COALESCE(published_at, first_seen_at) ASC, id ASC")?;
+        let rows = st.query_map(params![channel_id, include_watched, include_hidden],
+                                |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Flags rows as queued by auto-download, so the sweep never takes them
+    /// again. One transaction: a backlog can be hundreds of rows.
+    pub fn mark_auto_queued(&self, ids: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut st = tx.prepare("UPDATE videos SET auto_queued=1 WHERE id=?1")?;
+            for id in ids { st.execute(params![id])?; }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -954,7 +1036,7 @@ mod tests {
         Channel { id: id.into(), title: title.into(), handle: None,
                   url: format!("https://www.youtube.com/channel/{id}"),
                   thumb_path: None, subscribed: true, member: false, added_at: 0,
-                  last_polled_at: None, terminated: false }
+                  last_polled_at: None, terminated: false, auto_download: false }
     }
 
     fn vid(id: &str, ch: &str, published: Option<i64>) -> NewVideo {
@@ -2645,7 +2727,7 @@ mod import_tests {
         Channel { id: id.into(), title: title.into(), handle: Some(format!("@{id}")),
                   url: format!("https://www.youtube.com/channel/{id}"),
                   thumb_path: None, subscribed: true, member: false, added_at: 1_000,
-                  last_polled_at: Some(2_000), terminated: false }
+                  last_polled_at: Some(2_000), terminated: false, auto_download: false }
     }
 
     fn video(id: &str, ch: &str, ch_title: &str) -> Video {
@@ -3034,5 +3116,256 @@ mod import_tests {
         assert!(err.is_err());
         assert!(d.get_video("b").unwrap().is_none(), "half an import is no import");
         assert_eq!(d.transfer_estimate().unwrap(), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod auto_download_tests {
+    use super::*;
+
+    fn db() -> Db { Db::open_in_memory().unwrap() }
+
+    fn chan(id: &str) -> Channel {
+        Channel { id: id.into(), title: format!("T-{id}"), handle: None,
+                  url: format!("https://www.youtube.com/channel/{id}"),
+                  thumb_path: None, subscribed: true, member: false, added_at: 0,
+                  last_polled_at: None, terminated: false, auto_download: false }
+    }
+
+    /// The switch-on instant, rewritten to something fixed so a test can place
+    /// rows either side of it without racing the clock.
+    const SINCE: i64 = 1_000_000;
+
+    fn switch_on(d: &Db, ch: &str) {
+        d.set_channel_auto_download(ch, true).unwrap();
+        let conn = d.conn.lock().unwrap();
+        conn.execute("UPDATE channels SET auto_download_since=?2 WHERE id=?1",
+                     params![ch, SINCE]).unwrap();
+    }
+
+    /// A ready, unwatched, visible, undownloaded row, first seen and published
+    /// at the given instants -- the two clocks the candidate rule turns on.
+    fn row(d: &Db, id: &str, ch: &str, first_seen: i64, published: Option<i64>) {
+        let conn = d.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO videos (id,channel_id,title,published_at,sort_at,status,first_seen_at)
+             VALUES (?1,?2,?3,?4,?4,'ready',?5)",
+            params![id, ch, format!("t-{id}"), published, first_seen]).unwrap();
+    }
+
+    fn set(d: &Db, id: &str, assignment: &str) {
+        let conn = d.conn.lock().unwrap();
+        conn.execute(&format!("UPDATE videos SET {assignment} WHERE id=?1"), params![id]).unwrap();
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> { v.sort(); v }
+
+    #[test]
+    fn migrating_a_v7_database_adds_both_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN downloaded_at INTEGER;
+             ALTER TABLE videos ADD COLUMN sibling_group TEXT;
+             ALTER TABLE channels ADD COLUMN member INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE channels ADD COLUMN backfill_depth INTEGER;
+             ALTER TABLE channels ADD COLUMN terminated_at INTEGER;",
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO videos (id,channel_id,title,published_at,sort_at,status,first_seen_at)
+             VALUES ('a','UC1','kept',100,100,'ready',1)",
+            [],
+        ).unwrap();
+
+        let db = Db::init(conn).unwrap();
+        {
+            let c = db.conn.lock().unwrap();
+            assert!(column_exists(&c, "channels", "auto_download_since").unwrap());
+            assert!(column_exists(&c, "videos", "auto_queued").unwrap());
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert_eq!(SCHEMA_VERSION, 8);
+        }
+        assert!(!db.list_channels().unwrap()[0].auto_download, "nothing is switched on by an upgrade");
+        assert!(db.auto_download_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn switching_on_and_off_is_read_back_on_the_channel() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        d.set_channel_auto_download("UC1", true).unwrap();
+        assert!(d.get_channel("UC1").unwrap().unwrap().auto_download);
+        d.set_channel_auto_download("UC1", false).unwrap();
+        assert!(!d.get_channel("UC1").unwrap().unwrap().auto_download);
+    }
+
+    #[test]
+    fn a_new_upload_first_seen_after_switch_on_is_a_candidate() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        switch_on(&d, "UC1");
+        row(&d, "new", "UC1", SINCE + 60, Some(SINCE + 30));
+        row(&d, "old", "UC1", SINCE - 60, Some(SINCE - 90));
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["new".to_string()]);
+    }
+
+    #[test]
+    fn candidates_skip_every_row_and_channel_the_rule_excludes() {
+        let d = db();
+        for ch in ["UC1", "UNSUB", "TERM", "OFF"] {
+            let mut c = chan(ch);
+            c.subscribed = ch != "UNSUB";
+            d.upsert_channel(&c).unwrap();
+        }
+        for ch in ["UC1", "UNSUB", "TERM"] { switch_on(&d, ch); }
+        d.set_channel_terminated("TERM").unwrap();
+
+        let fresh = (SINCE + 60, Some(SINCE + 30));
+        row(&d, "ok", "UC1", fresh.0, fresh.1);
+        for id in ["hidden", "watched", "queued_before", "pending", "done", "failed", "downloading"] {
+            row(&d, id, "UC1", fresh.0, fresh.1);
+        }
+        set(&d, "hidden", "hidden=1");
+        set(&d, "watched", "watched=1");
+        set(&d, "queued_before", "auto_queued=1");
+        set(&d, "pending", "status='pending'");
+        set(&d, "done", "download_state='done'");
+        set(&d, "failed", "download_state='failed'");
+        set(&d, "downloading", "download_state='downloading'");
+        row(&d, "unsub", "UNSUB", fresh.0, fresh.1);
+        row(&d, "term", "TERM", fresh.0, fresh.1);
+        row(&d, "off", "OFF", fresh.0, fresh.1);
+
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["ok".to_string()]);
+    }
+
+    /// A raised `backfill_count` or a members-only join inserts rows now that
+    /// aired long ago. First seen after the switch, but not new uploads.
+    #[test]
+    fn a_deepened_row_first_seen_now_but_published_long_ago_is_not_a_candidate() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        switch_on(&d, "UC1");
+        row(&d, "deep", "UC1", SINCE + 60, Some(SINCE - 30 * 86_400));
+        assert!(d.auto_download_candidates().unwrap().is_empty());
+    }
+
+    /// A listing-ingested upload wears a midnight-UTC bucket until its real
+    /// date arrives, which can land up to a day before the real instant.
+    #[test]
+    fn a_midnight_bucket_within_a_day_of_the_switch_is_still_a_candidate() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        switch_on(&d, "UC1");
+        let bucket = SINCE - SINCE % 86_400; // midnight on the switch-on day
+        row(&d, "bucketed", "UC1", SINCE + 60, Some(bucket));
+        row(&d, "undated", "UC1", SINCE + 60, None);
+        assert_eq!(sorted(d.auto_download_candidates().unwrap()),
+                   vec!["bucketed".to_string(), "undated".to_string()]);
+    }
+
+    #[test]
+    fn marking_rows_auto_queued_takes_them_out_of_the_candidates_for_good() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        switch_on(&d, "UC1");
+        row(&d, "a", "UC1", SINCE + 60, Some(SINCE + 30));
+        row(&d, "b", "UC1", SINCE + 60, Some(SINCE + 30));
+        d.mark_auto_queued(&["a".to_string()]).unwrap();
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["b".to_string()]);
+
+        // A failed download, or a deleted file, lands back on 'none'; the flag
+        // is what keeps the sweep from queueing it again.
+        d.mark_auto_queued(&["b".to_string()]).unwrap();
+        d.set_download_state("b", DownloadState::Failed, None, Some("boom")).unwrap();
+        d.set_download_state("b", DownloadState::None, None, None).unwrap();
+        assert!(d.auto_download_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_backlog_honours_its_ticks_and_skips_what_is_not_there_to_download() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        d.upsert_channel(&chan("UC2")).unwrap();
+        for id in ["plain", "watched", "hidden", "both", "done", "failed", "pending", "queued"] {
+            row(&d, id, "UC1", 10, Some(10));
+        }
+        row(&d, "other", "UC2", 10, Some(10));
+        set(&d, "watched", "watched=1");
+        set(&d, "hidden", "hidden=1");
+        set(&d, "both", "watched=1, hidden=1");
+        set(&d, "done", "download_state='done'");
+        set(&d, "failed", "download_state='failed'");
+        set(&d, "pending", "status='pending'");
+        // Already auto-queued once: the backlog is an explicit ask, so it counts.
+        set(&d, "queued", "auto_queued=1");
+
+        let s = |w, h| sorted(d.auto_download_backlog("UC1", w, h).unwrap());
+        assert_eq!(s(false, false), vec!["plain", "queued"]);
+        assert_eq!(s(true, false), vec!["plain", "queued", "watched"]);
+        assert_eq!(s(false, true), vec!["hidden", "plain", "queued"]);
+        assert_eq!(s(true, true), vec!["both", "hidden", "plain", "queued", "watched"]);
+    }
+
+    #[test]
+    fn an_upsert_does_not_switch_auto_download_off() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        switch_on(&d, "UC1");
+        d.upsert_channel(&Channel { title: "Renamed".into(), ..chan("UC1") }).unwrap();
+        let c = d.get_channel("UC1").unwrap().unwrap();
+        assert_eq!(c.title, "Renamed");
+        assert!(c.auto_download);
+        row(&d, "a", "UC1", SINCE + 60, Some(SINCE + 30));
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["a".to_string()],
+                   "and the switch-on instant is kept, not restamped");
+    }
+
+    fn archived_video(id: &str, ch: &str) -> Video {
+        Video { id: id.into(), channel_id: ch.into(), channel_title: String::new(),
+                title: format!("t-{id}"), description: None, thumb_url: None,
+                thumb_path: None, published_at: Some(SINCE + 30), sort_at: Some(SINCE + 30),
+                feed_rank: 0, added_manually: false, duration_secs: Some(600),
+                view_count: Some(1), status: VideoStatus::Ready, hidden: false,
+                watched: false, watched_at: None, download_state: DownloadState::None,
+                download_error: None, file_path: None, downloaded_at: None,
+                first_seen_at: SINCE + 60, sibling_group: None }
+    }
+
+    #[test]
+    fn an_import_leaves_auto_download_and_auto_queued_alone_on_existing_rows() {
+        for mode in [ImportMode::Merge, ImportMode::Replace] {
+            let d = db();
+            d.upsert_channel(&chan("UC1")).unwrap();
+            switch_on(&d, "UC1");
+            row(&d, "a", "UC1", SINCE + 60, Some(SINCE + 30));
+            row(&d, "b", "UC1", SINCE + 60, Some(SINCE + 30));
+            d.mark_auto_queued(&["a".to_string()]).unwrap();
+
+            // An archive claiming the opposite, from a machine that never
+            // switched anything on.
+            let incoming = Channel { member: true, ..chan("UC1") };
+            d.apply_import(&[incoming], &[archived_video("a", "UC1"), archived_video("b", "UC1")],
+                           mode, &["UC1".to_string()]).unwrap();
+
+            assert!(d.get_channel("UC1").unwrap().unwrap().auto_download, "{mode:?}");
+            assert_eq!(d.auto_download_candidates().unwrap(), vec!["b".to_string()],
+                       "{mode:?}: the switch-on instant and the auto_queued flag both survived");
+        }
+    }
+
+    #[test]
+    fn an_imported_channel_new_here_arrives_switched_off() {
+        let d = db();
+        let incoming = Channel { auto_download: true, ..chan("UC1") };
+        d.apply_import(&[incoming], &[], ImportMode::Merge, &[]).unwrap();
+        assert!(!d.get_channel("UC1").unwrap().unwrap().auto_download);
     }
 }

@@ -6,8 +6,10 @@
  * Components name the *action*, not the glyph, so swapping an icon later is a
  * one-line change here instead of a hunt through the components.
  */
+import { ArrowCircleDown } from "@phosphor-icons/react/dist/icons/ArrowCircleDown";
 import { ArrowClockwise } from "@phosphor-icons/react/dist/icons/ArrowClockwise";
 import { ArrowSquareOut } from "@phosphor-icons/react/dist/icons/ArrowSquareOut";
+import { Check } from "@phosphor-icons/react/dist/icons/Check";
 import { CardsThree } from "@phosphor-icons/react/dist/icons/CardsThree";
 import { CheckCircle } from "@phosphor-icons/react/dist/icons/CheckCircle";
 import { Circle } from "@phosphor-icons/react/dist/icons/Circle";
@@ -48,6 +50,13 @@ export const IconMember = ({ joined = false }: { joined?: boolean }) => (
   <Star className="icon" weight={joined ? "fill" : "bold"} />
 );
 
+/** Auto-download for a channel: an outline while off, filled once its new
+ *  uploads download on their own. Distinct from IconDownload's bare arrow,
+ *  which fetches one video now. */
+export const IconAutoDownload = ({ on = false }: { on?: boolean }) => (
+  <ArrowCircleDown className="icon" weight={on ? "fill" : "bold"} />
+);
+
 /* The nav wears these only once the window is too narrow for their words, so
    each one lives beside a label it has to stand in for on its own. */
 export const IconSubscriptions = () => <SquaresFour className="icon" weight="bold" />;
@@ -57,4 +66,5 @@ export const IconUnwatched = () => <Circle className="icon" weight="fill" />;
 /** A struck-through eye stands for hidden — the toggle brings those back. */
 export const IconHidden = () => <EyeSlash className="icon" weight="bold" />;
 /** Same glyph as IconCancel, named for dismissing rather than stopping. */
+export const IconCheck = () => <Check className="icon" weight="bold" />;
 export const IconClose = () => <X className="icon" weight="bold" />;
