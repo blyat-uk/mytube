@@ -23,6 +23,7 @@ fn chan(id: &str, title: &str) -> Channel {
         member: false,
         added_at: 1_000,
         last_polled_at: None,
+        terminated: false,
     }
 }
 

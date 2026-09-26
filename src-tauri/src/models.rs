@@ -14,6 +14,10 @@ pub struct Channel {
     pub member: bool,
     pub added_at: i64,
     pub last_polled_at: Option<i64>,
+    /// YouTube has terminated this channel's account, so it is no longer
+    /// polled. Only `Db::set_channel_terminated` sets it; any upsert clears it.
+    #[serde(default)]
+    pub terminated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

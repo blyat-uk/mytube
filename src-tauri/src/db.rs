@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -121,6 +121,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 6 {
         if !column_exists(conn, "channels", "backfill_depth")? {
             conn.execute("ALTER TABLE channels ADD COLUMN backfill_depth INTEGER", [])?;
+        }
+    }
+
+    // When YouTube was seen to have terminated the channel's account. NULL,
+    // which is every row, is a live channel. See `Db::set_channel_terminated`.
+    if version < 7 {
+        if !column_exists(conn, "channels", "terminated_at")? {
+            conn.execute("ALTER TABLE channels ADD COLUMN terminated_at INTEGER", [])?;
         }
     }
 
@@ -335,7 +343,11 @@ impl Db {
                thumb_path=COALESCE(excluded.thumb_path, channels.thumb_path),
                -- subscribing is a one-way upgrade: adding an ad-hoc video from a
                -- channel you already follow must not silently unsubscribe you.
-               subscribed=MAX(channels.subscribed, excluded.subscribed)
+               subscribed=MAX(channels.subscribed, excluded.subscribed),
+               -- An upsert means the channel was just seen alive (a feed that
+               -- answered) or added again by hand, which is also the only way
+               -- to retry one marked terminated.
+               terminated_at=NULL
                -- `member` is deliberately absent: a new row takes the column
                -- default and an existing one keeps what it had. Every poll
                -- upserts its channel to catch a rename, and none of those
@@ -362,13 +374,15 @@ impl Db {
     fn channels_where(&self, cond: &str) -> Result<Vec<Channel>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(&format!(
-            "SELECT id,title,handle,url,thumb_path,subscribed,added_at,last_polled_at,member
+            "SELECT id,title,handle,url,thumb_path,subscribed,added_at,last_polled_at,member,
+                    terminated_at IS NOT NULL
              FROM channels WHERE {cond} ORDER BY title COLLATE NOCASE ASC"))?;
         let rows = st.query_map([], |r| Ok(Channel {
             id: r.get(0)?, title: r.get(1)?, handle: r.get(2)?, url: r.get(3)?,
             thumb_path: r.get(4)?, subscribed: r.get::<_, i64>(5)? != 0,
             added_at: r.get(6)?, last_polled_at: r.get(7)?,
             member: r.get::<_, i64>(8)? != 0,
+            terminated: r.get::<_, i64>(9)? != 0,
         }))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -388,6 +402,16 @@ impl Db {
     pub fn set_channel_member(&self, id: &str, member: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE channels SET member=?2 WHERE id=?1", params![id, member as i64])?;
+        Ok(())
+    }
+
+    /// Marks a channel whose account YouTube has terminated. Its feed 404s and
+    /// its listing refuses outright, so polling it only ever produces the same
+    /// error; the poll skips it from here on. Only `upsert_channel` clears it.
+    pub fn set_channel_terminated(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE channels SET terminated_at=?2 WHERE id=?1 AND terminated_at IS NULL",
+                     params![id, now()])?;
         Ok(())
     }
 
@@ -925,7 +949,7 @@ mod tests {
         Channel { id: id.into(), title: title.into(), handle: None,
                   url: format!("https://www.youtube.com/channel/{id}"),
                   thumb_path: None, subscribed: true, member: false, added_at: 0,
-                  last_polled_at: None }
+                  last_polled_at: None, terminated: false }
     }
 
     fn vid(id: &str, ch: &str, published: Option<i64>) -> NewVideo {
@@ -1542,6 +1566,22 @@ mod tests {
 
         d.set_channel_member("UC1", false).unwrap();
         assert!(!d.list_channels().unwrap()[0].member);
+    }
+
+    /// A terminated account stays in the list (its videos are still yours) but
+    /// is marked, and the mark survives until the channel is seen alive again.
+    #[test]
+    fn a_terminated_channel_is_marked_until_it_is_upserted_again() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        assert!(!d.list_channels().unwrap()[0].terminated);
+
+        d.set_channel_terminated("UC1").unwrap();
+        let got = &d.list_subscribed_channels().unwrap()[0];
+        assert!(got.terminated && got.subscribed, "still listed, now marked");
+
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        assert!(!d.list_channels().unwrap()[0].terminated, "re-adding it retries it");
     }
 
     /// v4 is what shipped before memberships existed, so it is the upgrade a
@@ -2560,7 +2600,7 @@ mod import_tests {
         Channel { id: id.into(), title: title.into(), handle: Some(format!("@{id}")),
                   url: format!("https://www.youtube.com/channel/{id}"),
                   thumb_path: None, subscribed: true, member: false, added_at: 1_000,
-                  last_polled_at: Some(2_000) }
+                  last_polled_at: Some(2_000), terminated: false }
     }
 
     fn video(id: &str, ch: &str, ch_title: &str) -> Video {

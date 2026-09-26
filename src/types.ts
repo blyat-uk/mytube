@@ -18,6 +18,8 @@ export interface Channel {
    *  poll ingest its members-only uploads. */
   member: boolean;
   added_at: number; last_polled_at: number | null;
+  /** YouTube has terminated this channel's account, so it is no longer polled. */
+  terminated: boolean;
 }
 
 export interface Video {

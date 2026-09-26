@@ -739,6 +739,7 @@ mod tests {
             member: false,
             added_at: 1_700_000_000,
             last_polled_at: Some(1_758_000_000),
+            terminated: false,
         }
     }
 

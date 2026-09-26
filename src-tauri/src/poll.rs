@@ -394,6 +394,14 @@ pub async fn poll_one(
         // with both reasons: a feed 404 alone is an outage to wait out, while a
         // feed *and* a listing failing together is a channel that is really
         // gone -- renamed, deleted, or never a channel at all.
+        // A terminated account is not an outage to wait out: it is recorded on
+        // the channel, which takes it out of every later poll, and reported
+        // this once in words rather than as yt-dlp's stderr.
+        Err(listing_err) if ytdlp::is_terminated(&listing_err.to_string()) => {
+            state.db.set_channel_terminated(&channel.id)?;
+            return Err(anyhow::anyhow!(
+                "YouTube has terminated this account; it will not be polled again"));
+        }
         Err(listing_err) => match rss_error {
             Some(rss_err) => {
                 return Err(anyhow::anyhow!("{rss_err}; and the listing failed too: {listing_err}"))
@@ -484,6 +492,10 @@ pub async fn poll_channels(
         eprintln!("mytube: {}", summary_line(&refused, 0));
         return refused;
     };
+    // A terminated channel's feed 404s and its listing refuses, every time, so
+    // polling it would only repeat one error each tick. It stays in the list,
+    // struck through, so its videos and its name are not lost with it.
+    let channels: Vec<Channel> = channels.into_iter().filter(|c| !c.terminated).collect();
     let _ = app.emit("poll://started", ());
     let backfill = config::load().map(|s| s.backfill_count).unwrap_or(30);
     let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
@@ -655,7 +667,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         db.upsert_channel(&Channel {
             id: CHANNEL.into(), title: "Lumos Manhwa Recap".into(), handle: None,
             url: format!("https://www.youtube.com/channel/{CHANNEL}"), thumb_path: None,
-            subscribed: true, member: false, added_at: 0, last_polled_at: None,
+            subscribed: true, member: false, added_at: 0, last_polled_at: None, terminated: false,
         })
         .unwrap();
         // Ready, so nothing is pending and the sweep runs at its shallowest.
@@ -754,7 +766,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         db.upsert_channel(&Channel {
             id: CH.into(), title: "One".into(), handle: None,
             url: format!("https://www.youtube.com/channel/{CH}"), thumb_path: None,
-            subscribed: true, member: true, added_at: 0, last_polled_at: None,
+            subscribed: true, member: true, added_at: 0, last_polled_at: None, terminated: false,
         })
         .unwrap();
     }

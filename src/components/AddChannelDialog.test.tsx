@@ -30,6 +30,7 @@ function channel(over: Partial<Channel>): Channel {
   const c = {
     id: "UC1", title: "AnimeCapped Manga", handle: null, url: "", thumb_path: null,
     subscribed: true, member: false, added_at: 0, last_polled_at: null,
+    terminated: false,
     ...over,
   };
   // The URL follows the id, as it does in the backend — otherwise every row in
@@ -152,5 +153,55 @@ describe("channel row actions", () => {
     fireEvent.click(rowButton("Keep Daily Comics"));
     expect(removeChannel).not.toHaveBeenCalled();
     expect(screen.queryByText("Remove and delete its videos?")).toBeNull();
+  });
+});
+
+/**
+ * A channel whose account YouTube terminated stays listed — its videos are
+ * still in the library — but there is nothing left to do with it except look.
+ */
+describe("a terminated channel", () => {
+  const gone = channel({ id: "UC3", title: "Free manhwa", terminated: true });
+
+  it("is struck through, and says why to a screen reader", () => {
+    renderDialog([gone]);
+    const name = screen.getByText(/Free manhwa/, { selector: ".channel-name" });
+    expect(name.classList.contains("is-terminated")).toBe(true);
+    expect(name.textContent).toContain("terminated by YouTube");
+  });
+
+  it("can still be opened on YouTube", async () => {
+    renderDialog([gone]);
+    fireEvent.click(rowButton("Open Free manhwa on YouTube"));
+    await waitFor(() =>
+      expect(openExternal).toHaveBeenCalledWith("https://www.youtube.com/channel/UC3"));
+  });
+
+  it("can be removed, still asking first", async () => {
+    renderDialog([gone]);
+    fireEvent.click(rowButton("Remove Free manhwa"));
+    expect(removeChannel).not.toHaveBeenCalled();
+    fireEvent.click(rowButton("Remove Free manhwa and delete its videos"));
+    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC3"));
+  });
+
+  it("hides the members toggle but keeps its slot, so the glyphs still line up", () => {
+    const { container } = render(
+      <ToastProvider>
+        <AddChannelDialog open onClose={vi.fn()} channels={[gone]} onChanged={vi.fn()} />
+      </ToastProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Members — Free manhwa" })).toBeNull();
+    const slot = container.querySelector(".channel-actions .is-placeholder") as HTMLButtonElement;
+    expect(slot).not.toBeNull();
+    expect(slot.disabled).toBe(true);
+    expect(slot.tabIndex).toBe(-1);
+    expect(container.querySelectorAll(".channel-actions .icon-btn")).toHaveLength(3);
+  });
+
+  it("leaves a live channel's row alone", () => {
+    renderDialog([channel({ id: "UC2", title: "Daily Comics" })]);
+    expect(screen.getByText("Daily Comics").classList.contains("is-terminated")).toBe(false);
+    expect(rowButton("Remove Daily Comics").disabled).toBe(false);
   });
 });

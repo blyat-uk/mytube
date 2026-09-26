@@ -223,6 +223,15 @@ pub fn download_args(r: &Runner, video_id: &str, out_path: &Path, print_file: &P
 
 /// Runs phase 1 and returns the resolved metadata plus intended path.
 ///
+/// Whether a listing error is YouTube refusing a channel whose account it has
+/// terminated. The whole of what yt-dlp prints, seen on a real subscription:
+/// `ERROR: [youtube:tab] UC…: YouTube said: This account has been terminated
+/// for violating YouTube or Google's Terms of Service.` The reason after "for"
+/// varies (copyright strikes, spam, …), so only the fixed part is matched.
+pub fn is_terminated(listing_error: &str) -> bool {
+    listing_error.contains("This account has been terminated")
+}
+
 /// The caller holds `inv` for as long as this runs, which is what keeps the
 /// updater from swapping yt-dlp out from under it.
 pub async fn probe(inv: &Invocation, url: &str, download_dir: &str, filename_template: &str)
@@ -373,6 +382,19 @@ pub async fn flat_playlist(inv: &Invocation, channel_id: &str, limit: u32)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_terminated_account_is_recognised_by_what_youtube_said() {
+        let seen = "yt-dlp listing failed for UCUHMlS8-7okK-TVBcHDB5Yg: ERROR: [youtube:tab] \
+                    UCUHMlS8-7okK-TVBcHDB5Yg: YouTube said: This account has been terminated \
+                    for violating YouTube or Google's Terms of Service.";
+        assert!(super::is_terminated(seen));
+        assert!(super::is_terminated(
+            "YouTube said: This account has been terminated due to multiple third-party \
+             notifications of copyright infringement."));
+        assert!(!super::is_terminated("yt-dlp listing failed for UC1: HTTP Error 404: Not Found"));
+        assert!(!super::is_terminated("yt-dlp timed out after 120s"));
+    }
+
     use super::*;
     use crate::models::VideoStatus;
     use std::path::{Path, PathBuf};

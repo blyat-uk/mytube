@@ -280,7 +280,15 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
           <ul className="channel-list">
             {channels.map((c) => (
               <li key={c.id} className="channel-row">
-                <span className="channel-name" title={c.handle ?? c.url}>{c.title}</span>
+                <span
+                  className={`channel-name${c.terminated ? " is-terminated" : ""}`}
+                  title={c.terminated
+                    ? `YouTube has terminated ${c.title}'s account. It is no longer polled; the videos already collected stay.`
+                    : c.handle ?? c.url}
+                >
+                  {c.title}
+                  {c.terminated && <span className="sr-only"> (terminated by YouTube)</span>}
+                </span>
                 {confirmRemove === c.id ? (
                   <span className="inline-confirm">
                     <span className="inline-confirm-text">Remove and delete its videos?</span>
@@ -310,6 +318,11 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                       tone={c.member ? "is-on" : undefined}
                       pressed={c.member}
                       busy={joining.includes(c.id)}
+                      // A terminated account has no uploads left to collect,
+                      // members-only or otherwise. Hidden rather than dropped:
+                      // the circle keeps its slot so the glyphs still line up
+                      // down the column.
+                      hidden={c.terminated}
                       title={
                         c.member
                           ? `You are a member of ${c.title}. Its members-only uploads are collected with the rest.`
@@ -358,24 +371,28 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
  * DownloadsView has a `RowAction` of its own; this one additionally carries the
  * pressed and busy states the membership toggle needs.
  */
-function ChannelAction({ label, title, tone, pressed, busy, onClick, children }: {
+function ChannelAction({ label, title, tone, pressed, busy, hidden, onClick, children }: {
   label: string;
   /** The long explanation, when the tooltip has more to say than the name. */
   title?: string;
   tone?: "is-on" | "is-danger";
   pressed?: boolean;
   busy?: boolean;
+  /** Keeps the slot but shows nothing and takes no focus or clicks. */
+  hidden?: boolean;
   onClick: () => void;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
-      className={`icon-btn${tone ? ` ${tone}` : ""}${busy ? " is-spinning" : ""}`}
+      className={`icon-btn${tone ? ` ${tone}` : ""}${busy ? " is-spinning" : ""}${hidden ? " is-placeholder" : ""}`}
       title={title ?? label}
       aria-pressed={pressed}
       aria-busy={busy}
-      disabled={busy}
+      disabled={busy || hidden}
+      aria-hidden={hidden || undefined}
+      tabIndex={hidden ? -1 : undefined}
       onClick={onClick}
     >
       {/* `.is-spinning` turns this span, so the glyph has to sit inside one. */}

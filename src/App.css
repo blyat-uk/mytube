@@ -1404,12 +1404,23 @@ label.field-label { display: block; }
   white-space: nowrap;
 }
 
+/* YouTube terminated the account: kept in the list, since its videos are still
+   in the library, but struck through in red so it stands out as gone. */
+.channel-name.is-terminated {
+  text-decoration: line-through;
+  color: var(--danger);
+}
+
 .channel-actions {
   display: flex;
   align-items: center;
   gap: 4px;
   flex: none;
 }
+
+/* A glyph a row has no use for, kept as an empty slot so the others still
+   line up down the column. */
+.channel-row .icon-btn.is-placeholder { visibility: hidden; }
 
 /* A row of glyphs, no words: the list is a scroll box 260px tall, so a row that
    wore three labelled buttons would show half the channels a row of circles

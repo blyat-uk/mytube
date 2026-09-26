@@ -147,6 +147,7 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
                 member: false,
                 added_at: chrono::Utc::now().timestamp(),
                 last_polled_at: None,
+                terminated: false,
             })
             .map_err(e)?;
 
@@ -216,6 +217,7 @@ pub async fn add_channel(
         member: false,
         added_at: chrono::Utc::now().timestamp(),
         last_polled_at: None,
+        terminated: false,
     };
     state.db.upsert_channel(&channel).map_err(e)?;
 
@@ -294,6 +296,7 @@ pub async fn import_takeout_csv(
             member: false,
             added_at: chrono::Utc::now().timestamp(),
             last_polled_at: None,
+            terminated: false,
         };
         if let Err(err) = state.db.upsert_channel(&channel) {
             result.failed.push(format!("{title}: {err}"));
