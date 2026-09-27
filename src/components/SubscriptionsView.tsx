@@ -361,11 +361,15 @@ export default function SubscriptionsView(p: Props) {
     }
   }, [fetchPage, toast]);
 
+  // A dropped card waits here for its confirmation; see `confirmDrop`.
+  const [dropped, setDropped] = useState<Video[] | null>(null);
+
   const marking = useSiblingMarking(
     groups,
     useMemo(
       () => ({
         mark: (ids: string[]) => void markSiblings(ids),
+        confirmDrop: setDropped,
         refuse: (message: string) => toast.error(message),
       }),
       [markSiblings, toast],
@@ -538,6 +542,30 @@ export default function SubscriptionsView(p: Props) {
           const target = confirm.video;
           setConfirm(null);
           void deleteFile(target);
+        }}
+      />
+    )}
+
+    {dropped && (
+      <ConfirmDialog
+        title={
+          dropped.length === 2
+            ? "Mark these two as siblings?"
+            : `Mark ${dropped.length} videos as siblings?`
+        }
+        body={
+          (dropped.length === 2
+            ? `“${dropped[0].title}” and “${dropped[1].title}”`
+            : `${dropped.length - 1} videos and “${dropped[dropped.length - 1].title}”`) +
+          " will be shown as parts of one series. “Unlink from siblings” on any of them undoes it."
+        }
+        choices={[{ label: "Mark as siblings", value: "mark", primary: true }]}
+        onCancel={() => setDropped(null)}
+        onChoose={() => {
+          const ids = dropped.map((v) => v.id);
+          setDropped(null);
+          marking.clear();
+          void markSiblings(ids);
         }}
       />
     )}

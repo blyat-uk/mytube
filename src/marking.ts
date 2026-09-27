@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { VideoGroup } from "./types";
+import type { Video, VideoGroup } from "./types";
 
 /**
  * Selecting and dragging cards to mark them siblings by hand.
@@ -8,6 +8,10 @@ import type { VideoGroup } from "./types";
  * chase the algorithm, and this is how you tell it what it could not work out.
  * Two gestures, both operating on cards rather than on menus: ctrl+click a few
  * and mark them from the right-click menu, or drag one card onto another.
+ *
+ * Only the drag asks first. Picking a menu item is a decision; letting go of a
+ * card over its neighbour is just as often a slip of the mouse, and a link made
+ * by accident is invisible until a series turns up with a stranger in it.
  *
  * State lives here rather than in the view so the rules stay testable and
  * `SubscriptionsView` stays readable.
@@ -46,6 +50,9 @@ export const CROSS_CHANNEL = "Siblings must come from the same channel.";
 interface Options {
   /** Sends the ids on; the caller owns the toast and the refetch. */
   mark: (ids: string[]) => void;
+  /** A drop landed. The caller asks before marking, and calls `mark` itself
+   *  on a yes. Leaders in drag order, the card dropped on last. */
+  confirmDrop: (videos: Video[]) => void;
   /** Told why a gesture was declined. */
   refuse: (message: string) => void;
 }
@@ -148,7 +155,11 @@ export function useSiblingMarking(groups: VideoGroup[], o: Options): Marking {
             // selection, the way a file manager does.
             const ids = selected.has(id) && selected.size > 1 ? [...selected] : [id];
             dragged.current = ids;
-            e.dataTransfer.effectAllowed = "link";
+            // "move", not the more fitting "link": Wayland's drag protocol has
+            // no link action at all (copy, move, ask), so under WebKitGTK on a
+            // Wayland session a link-only drag is refused by every target and
+            // the drop never fires.
+            e.dataTransfer.effectAllowed = "move";
             // Some payload is required or the drag never starts in Firefox.
             e.dataTransfer.setData("text/plain", ids.join(" "));
           },
@@ -163,7 +174,7 @@ export function useSiblingMarking(groups: VideoGroup[], o: Options): Marking {
             // never lights up.
             if (src.length === 0 || src.includes(id) || !sameChannel(src, id)) return;
             e.preventDefault();
-            e.dataTransfer.dropEffect = "link";
+            e.dataTransfer.dropEffect = "move";
             setDropOn(id);
           },
           onDragLeave: () => setDropOn((prev) => (prev === id ? null : prev)),
@@ -177,12 +188,14 @@ export function useSiblingMarking(groups: VideoGroup[], o: Options): Marking {
               o.refuse(CROSS_CHANNEL);
               return;
             }
-            submit([...src, id]);
+            const videos = [...src, id].map((v) => byLeader.get(v));
+            if (videos.some((v) => v === undefined)) return;
+            o.confirmDrop(videos as Video[]);
           },
         },
       };
     },
-    [selected, dropOn, clear, sameChannel, submit, o],
+    [selected, dropOn, clear, sameChannel, byLeader, o],
   );
 
   return { selected, clear, markSelected, forGroup };

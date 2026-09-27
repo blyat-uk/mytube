@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, act, getByRole } from "@testing-library/react";
 import type { Video, VideoFilter, VideoGroup } from "../types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
@@ -412,7 +412,34 @@ describe("marking siblings by hand", () => {
     expect(cards()[1].className).toContain("is-drop-target");
 
     fireEvent.drop(b, { dataTransfer: data });
+    // A drop can be a slip of the mouse, so it asks before marking anything.
+    const dialog = await screen.findByRole("dialog", { name: "Mark these two as siblings?" });
+    expect(markSiblings).not.toHaveBeenCalled();
+
+    fireEvent.click(getByRole(dialog, "button", { name: "Mark as siblings" }));
     await waitFor(() => expect(markSiblings).toHaveBeenCalledWith(["a", "b"]));
+  });
+
+  it("cancelling the drop's confirmation marks nothing", async () => {
+    renderView();
+    const [a, b] = await cardsReady(3);
+    const data = dt();
+    fireEvent.dragStart(a, { dataTransfer: data });
+    fireEvent.dragOver(b, { dataTransfer: data });
+    fireEvent.drop(b, { dataTransfer: data });
+
+    const dialog = await screen.findByRole("dialog", { name: "Mark these two as siblings?" });
+    fireEvent.click(getByRole(dialog, "button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(markSiblings).not.toHaveBeenCalled();
+  });
+
+  it("offers the drag a move, since Wayland has no link action", async () => {
+    renderView();
+    const [a] = await cardsReady(3);
+    const data = dt();
+    fireEvent.dragStart(a, { dataTransfer: data });
+    expect(data.effectAllowed).toBe("move");
   });
 
   it("refuses a drop from another channel, and never lights the card up", async () => {
