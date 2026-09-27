@@ -532,23 +532,15 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .card.is-selected, .card[draggable="true"] { user-select: none; }
 
 /* A downloaded video is one you can watch right now, so the whole card says so
-   rather than a badge in a corner: green wash rising out of the thumbnail,
-   green face, green frame. */
+   rather than a badge in a corner: green face, green frame, green text. The
+   thumbnail itself is left untouched -- a wash over it only muddied the picture
+   the card is there to show. */
 .card.is-downloaded {
   background: var(--ok-face);
   border-color: var(--ok-line);
 }
 .card.is-downloaded:hover {
   border-color: var(--ok-line-strong);
-}
-.card.is-downloaded .card-thumb::after {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  left: 0; right: 0; bottom: 0;
-  height: 42%;
-  background: linear-gradient(180deg, rgba(86, 211, 100, 0), rgba(86, 211, 100, 0.26));
-  pointer-events: none;
 }
 .card.is-downloaded .card-body {
   background: linear-gradient(180deg, rgba(86, 211, 100, 0.1), rgba(86, 211, 100, 0) 70%);
