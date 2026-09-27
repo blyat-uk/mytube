@@ -86,7 +86,11 @@ pub struct ViewState {
     pub downloaded_only: bool,
     #[serde(default)]
     pub show_hidden: bool,
-    #[serde(default)]
+    /// On for a first run: grouped is the view the app is built around (series
+    /// cards, Continue watching). A saved view always carries the key, so an
+    /// existing user's choice is untouched -- only a file with no view block,
+    /// or a view block without the key, picks the default up.
+    #[serde(default = "d_true")]
     pub grouped: bool,
     #[serde(default)]
     pub groups_only: bool,
@@ -104,7 +108,7 @@ impl Default for ViewState {
             hide_watched: false,
             downloaded_only: false,
             show_hidden: false,
-            grouped: false,
+            grouped: true,
             groups_only: false,
             in_progress: false,
             sort: SortOrder::Newest,
@@ -557,6 +561,20 @@ mod tests {
     }
 
     #[test]
+    fn a_first_run_starts_grouped() {
+        let s = Settings::from_json_str(r#"{"player_command":"mpv"}"#).unwrap();
+        assert!(s.view.grouped);
+        let keyless = Settings::from_json_str(r#"{"view":{"hide_watched":true}}"#).unwrap();
+        assert!(keyless.view.grouped);
+    }
+
+    #[test]
+    fn a_saved_ungrouped_view_stays_ungrouped() {
+        let s = Settings::from_json_str(r#"{"view":{"grouped":false}}"#).unwrap();
+        assert!(!s.view.grouped);
+    }
+
+    #[test]
     fn sort_downloaded_sanitises_to_newest_regardless_of_grouped() {
         let ungrouped =
             Settings::from_json_str(r#"{"view":{"sort":"downloaded","grouped":false}}"#).unwrap();
@@ -641,7 +659,7 @@ mod tests {
         )
         .unwrap();
         s.view.search = "incoming".into();
-        s.view.grouped = true;
+        s.view.grouped = false;
         s
     }
 
@@ -702,7 +720,7 @@ mod tests {
         local.adopt_portable(&an_incoming_file());
         assert_eq!(local.view.search, "local");
         assert!(local.view.hide_watched);
-        assert!(!local.view.grouped, "the archive's grouping chip came along");
+        assert!(local.view.grouped, "the archive's grouping chip came along");
     }
 
     #[test]

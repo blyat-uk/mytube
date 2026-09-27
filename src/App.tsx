@@ -50,8 +50,12 @@ function Shell() {
   const [hideWatched, setHideWatched] = useState(false);
   const [downloadedOnly, setDownloadedOnly] = useState(false);
   const [showHidden, setShowHidden] = useState(false);
-  // Collapse each channel's multi-part uploads behind one card.
-  const [grouped, setGrouped] = useState(false);
+  // Collapse each channel's multi-part uploads behind one card. On by default,
+  // matching the backend's ViewState default: a view that never gets read back
+  // (a first run, or a failed get_settings) then shows the same grouped feed a
+  // saved one would, and the hydration guard below is seeded from this same
+  // value, so the default is not mistaken for a change and written back.
+  const [grouped, setGrouped] = useState(true);
   // Only the multi-part series. A filter over groups, so it lives and dies
   // with the Grouped chip.
   const [groupsOnly, setGroupsOnly] = useState(false);

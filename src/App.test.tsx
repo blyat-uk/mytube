@@ -268,6 +268,25 @@ describe("the continue-watching filter", () => {
   });
 });
 
+/**
+ * Group siblings is on for someone who has never saved a view. The backend's
+ * ViewState default says so too; this is the shell's own fallback, the one a
+ * failed settings read leaves in place.
+ */
+describe("the default grouping", () => {
+  it("starts grouped when no saved view could be read, and writes nothing back", async () => {
+    getSettings.mockImplementation(() => Promise.reject("no settings"));
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(button("Grouped").getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
+    expect(listVideos).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(saveViewState).not.toHaveBeenCalled();
+  });
+});
+
 /** One ready card, so the feed has something to open a series from. */
 function feedVideo(): Video {
   return {
