@@ -33,6 +33,13 @@
   --ok-line-strong: rgba(86, 211, 100, 0.72);
   --ok-text: #c6dbc8;
   --ok-text-dim: #9ab29c;
+  /* A series you have started and not finished: amber, the one warm colour the
+     palette leaves free (blue is picked, green downloaded, red failed, lavender
+     linked), and the colour Plex already uses for the same state. */
+  --resume: #ffb020;
+  --resume-face: #45381c;
+  --resume-text: #ecd6a6;
+  --resume-text-dim: #bba77c;
 
   --radius: 12px;
   --radius-sm: 8px;
@@ -676,6 +683,32 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 /* A finished series dims like a watched video, and the sheet edges behind it go
    with it — opacity on the card carries its pseudo-elements too. */
 .series-card.is-watched .series-count { background: rgba(0, 0, 0, 0.72); }
+
+/* A series with parts watched and parts left: the amber face, frame and panel
+   say "pick this back up". The picture gets no wash, as with downloaded cards.
+   The frame yields to the marking rings -- .is-selected and .is-drop-target
+   come earlier at equal specificity, and mid-drag they are what must read --
+   while the face stays amber under them. At 0,4,0 the frame also beats
+   .card:hover, so hovering keeps it amber. */
+.series-card.is-resumable { background: var(--resume-face); }
+.series-card.is-resumable:not(.is-selected):not(.is-drop-target) {
+  border-color: var(--resume);
+  box-shadow: 0 0 0 1px var(--resume) inset;
+}
+/* The near sheet edge is part of the face, hovered or not. */
+.series-card.is-resumable::before,
+.series-card.is-resumable:hover::before { background: var(--resume-face); }
+.series-card.is-resumable .series-count {
+  background: linear-gradient(180deg, rgba(91, 63, 11, 0.86), rgba(63, 44, 8, 0.9));
+}
+.series-card.is-resumable .series-tally-left.is-due { color: var(--resume); font-weight: 600; }
+.series-card.is-resumable .series-progress { background: rgba(255, 176, 32, 0.55); }
+.series-card.is-resumable .series-count-label,
+.series-card.is-resumable .series-runtime { color: rgba(255, 255, 255, 0.72); }
+/* 0,3,0 -- enough to beat .card-meta .card-channel's 0,2,0. */
+.series-card.is-resumable .card-channel { color: var(--resume-text); }
+.series-card.is-resumable .card-meta,
+.series-card.is-resumable .dot { color: var(--resume-text-dim); }
 
 .card-thumb {
   position: relative;

@@ -115,6 +115,37 @@ describe("SeriesCard watch progress", () => {
     render(<SeriesCard group={withWatched(3)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
     expect(screen.getByText("0 unwatched").className).not.toContain("is-due");
   });
+
+  // Started and not finished is the one state worth finding again weeks later.
+  it("marks a series with some parts watched and some left as resumable", () => {
+    for (const count of [1, 2]) {
+      render(<SeriesCard group={withWatched(count)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+      expect(document.querySelector(".series-card")!.className).toContain("is-resumable");
+      cleanup();
+    }
+  });
+
+  it("does not mark a series nothing of which has been watched", () => {
+    render(<SeriesCard group={withWatched(0)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+    expect(document.querySelector(".series-card")!.className).not.toContain("is-resumable");
+  });
+
+  // A finished series already dims as is-watched; it has nothing left to resume.
+  it("does not mark a finished series", () => {
+    render(<SeriesCard group={withWatched(3)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+    expect(document.querySelector(".series-card")!.className).not.toContain("is-resumable");
+  });
+
+  it("says a part-watched series is in progress, and no other", () => {
+    const label = () => screen.getByRole("button").getAttribute("aria-label");
+    render(<SeriesCard group={withWatched(1)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+    expect(label()).toContain("in progress");
+    for (const count of [0, 3]) {
+      cleanup();
+      render(<SeriesCard group={withWatched(count)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+      expect(label()).not.toContain("in progress");
+    }
+  });
 });
 
 /**

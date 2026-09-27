@@ -34,6 +34,10 @@ export default function SeriesCard({ group, onOpen, onContextMenu, mark }: Props
   // A series you have finished dims exactly as a finished video does. It takes
   // every part, not the leading one: the card stands for the whole series.
   const done = unwatched === 0;
+  // Started but not finished: coming back weeks later, these are the shows to
+  // spot among the rest, since they have parts left you meant to get to. The
+  // look is all CSS, under `.series-card.is-resumable` in App.css.
+  const resumable = watched > 0 && unwatched > 0;
 
   // The series' runtime, not the leading part's. A part whose duration has not
   // resolved yet contributes nothing, which would silently understate the
@@ -61,13 +65,14 @@ export default function SeriesCard({ group, onOpen, onContextMenu, mark }: Props
 
   return (
     <article
-      className={`card series-card${done ? " is-watched" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}`}
+      className={`card series-card${done ? " is-watched" : ""}${resumable ? " is-resumable" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}`}
       role="button"
       tabIndex={0}
       aria-label={
         `${title} — ${parts} parts, ` +
         (runtime ? `${runtime} total, ` : "") +
-        `${watched} watched, ${unwatched} unwatched`
+        `${watched} watched, ${unwatched} unwatched` +
+        (resumable ? ", in progress" : "")
       }
       onClick={(e) => {
         if (mark?.onClick(e)) return;
