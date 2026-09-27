@@ -15,6 +15,7 @@ export default defineConfig(async () => ({
     // Only this checkout's own tests: agent worktrees under .claude/ carry
     // full copies of the suite.
     include: ["src/**/*.test.{ts,tsx}"],
+    setupFiles: ["src/test-setup.ts"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

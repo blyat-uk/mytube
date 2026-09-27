@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
 import type { Channel } from "../types";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: () => Promise.resolve(null) }));
@@ -321,8 +321,7 @@ describe("auto-download in the subscriptions list", () => {
 
     pending[1](40);
     expect(await screen.findByRole("button", { name: "Turn on & download 40" })).toBeTruthy();
-    pending[0](5);
-    await new Promise((r) => setTimeout(r, 0));
+    await act(async () => { pending[0](5); });
     expect(screen.getByRole("button", { name: "Turn on & download 40" })).toBeTruthy();
   });
 

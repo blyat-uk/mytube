@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
 import type { Channel, Settings, ToolStatus, Video, ViewState, VideoFilter } from "./types";
 
 // Every listener the shell registers, by event name, so a test can deliver an
@@ -71,6 +71,14 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
 
 let settings: Settings = settingsWith();
 
+/**
+ * Waits real time, inside `act`. The shell's IPC mocks resolve on their own
+ * schedule, and on a slow CI runner one of them can land in the middle of a
+ * bare `setTimeout` wait -- a state update outside `act`, which React reports.
+ * Locally everything has settled long before, so a bare wait looks fine here.
+ */
+const pause = (ms: number) => act(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
 const button = (name: string) => screen.getByRole("button", { name }) as HTMLButtonElement;
 
 beforeEach(() => {
@@ -129,25 +137,25 @@ describe("restoring a channel filter while the channel list is still loading", (
     // The render gate waits only on getSettings, so the search box (and the
     // restored channelId behind it) exist well before listChannels resolves.
     await screen.findByLabelText("Search videos");
-    // Real time, not `act()`'s own flush loop: a missing guard prunes
+    // Real time, not a bare `act()` flush: a missing guard prunes
     // `channelId` through a cascade of renders (the newly-mounted
     // SubscriptionsView fetches with "UC1" before Shell's own effect corrects
     // it), and how much of that cascade a single `act()` pass settles is not
     // dependable. A real wait lets it fully play out one way or the other
     // before the channel list is ever introduced.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await pause(100);
 
     // Only now does the channel list resolve, containing the very channel the
     // restored filter points at.
-    resolveChannels([
+    act(() => resolveChannels([
       {
         id: "UC1", title: "Chills Narrated", handle: null,
         url: "https://youtube.com/channel/UC1", thumb_path: null,
         subscribed: true, member: false, auto_download: false, added_at: 0, last_polled_at: null,
         terminated: false,
       },
-    ]);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    ]));
+    await pause(100);
 
     const lastCall = listVideos.mock.calls[listVideos.mock.calls.length - 1];
     expect(lastCall?.[0]).toMatchObject({ channelId: "UC1" });
@@ -176,7 +184,7 @@ describe("saving the view back", () => {
     // `hydrated` is itself a dependency of the writer effect even though none
     // of the seven filter values actually moved -- so this is the run that
     // would catch a missing "skip when unchanged" guard.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await pause(500);
 
     expect(saveViewState).not.toHaveBeenCalled();
   });
@@ -189,7 +197,7 @@ describe("saving the view back", () => {
     // Well short of the 400ms debounce -- close enough to the click to rule
     // out an immediate write, far enough from 400ms that a loaded machine
     // can't turn this into a flake -- nothing has been written yet.
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await pause(150);
     expect(saveViewState).not.toHaveBeenCalled();
 
     await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
@@ -198,7 +206,7 @@ describe("saving the view back", () => {
     // `waitFor` only proves the call had landed by the time it settled --
     // that is "at least once", not "once". Give the writer effect a full
     // cycle beyond that and re-check the same count.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await pause(500);
     expect(saveViewState).toHaveBeenCalledTimes(1);
   });
 
@@ -221,10 +229,10 @@ describe("saving the view back", () => {
     render(<App />);
 
     // Past the debounce, well before getSettings resolves.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await pause(500);
     expect(saveViewState).not.toHaveBeenCalled();
 
-    resolveSettings(settings);
+    act(() => resolveSettings(settings));
     expect(await screen.findByLabelText("Search videos")).toHaveProperty("value", "python");
   });
 });
@@ -262,8 +270,10 @@ describe("the continue-watching filter", () => {
     await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
     expect(saveViewState).toHaveBeenCalledWith(defaultView());
 
-    // Grouping again must not bring the filter back on by itself.
-    fireEvent.click(button("Grouped"));
+    // Grouping again must not bring the filter back on by itself. Async `act`
+    // so the refetch this click starts has answered before the test ends --
+    // otherwise it lands after the last line, outside any `act`.
+    await act(async () => { fireEvent.click(button("Grouped")); });
     expect(button("Continue watching").getAttribute("aria-pressed")).toBe("false");
   });
 });
@@ -282,7 +292,7 @@ describe("the default grouping", () => {
     await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
     expect(listVideos).not.toHaveBeenCalled();
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await pause(500);
     expect(saveViewState).not.toHaveBeenCalled();
   });
 });
@@ -345,10 +355,11 @@ describe("the tools-ready toast", () => {
   function holdSeed() {
     let resolve!: (list: ToolStatus[]) => void;
     toolsStatus.mockImplementation(() => new Promise((r) => { resolve = r; }));
-    return (list: ToolStatus[]) => resolve(list);
+    return (list: ToolStatus[]) => act(() => resolve(list));
   }
 
-  const emit = (list: ToolStatus[]) => listeners.get("tools://status")!({ payload: list });
+  const emit = (list: ToolStatus[]) =>
+    act(() => listeners.get("tools://status")!({ payload: list }));
 
   it("still toasts when the ready event beats a seed read while installing", async () => {
     const seed = holdSeed();
@@ -369,7 +380,7 @@ describe("the tools-ready toast", () => {
     await waitFor(() => expect(toolsStatus).toHaveBeenCalled());
 
     seed(ytdlp("installing"));
-    await new Promise((r) => setTimeout(r, 0));
+    await pause(0);
     emit(ytdlp("ready"));
 
     expect(await screen.findByText("yt-dlp is ready.")).toBeDefined();
@@ -383,9 +394,9 @@ describe("the tools-ready toast", () => {
 
     emit(ytdlp("ready"));
     seed(ytdlp("ready"));
-    await new Promise((r) => setTimeout(r, 50));
+    await pause(50);
     emit(ytdlp("ready"));
-    await new Promise((r) => setTimeout(r, 50));
+    await pause(50);
 
     expect(screen.queryByText("yt-dlp is ready.")).toBeNull();
   });
@@ -398,7 +409,7 @@ describe("a newer MyTube release", () => {
     render(<App />);
     await waitFor(() => expect(listeners.has("app://update-available")).toBe(true));
 
-    listeners.get("app://update-available")!({ payload: { version: "0.1.2", url: RELEASE } });
+    act(() => listeners.get("app://update-available")!({ payload: { version: "0.1.2", url: RELEASE } }));
 
     expect(await screen.findByText("MyTube 0.1.2 is available.")).toBeDefined();
     fireEvent.click(button("Download"));
