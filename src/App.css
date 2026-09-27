@@ -596,7 +596,16 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   padding: 0 4px;
   background: rgba(0, 0, 0, 0.76);
   color: #fff;
+  transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
 }
+/* The panel covers 42% of the thumbnail, so pointing at the picture slides it
+   out to the right to show the picture whole. Pointing at the panel keeps it,
+   since that is where you are reading the tally. Once it has slid out, the
+   pointer over where it stood is over the picture, so it stays gone until the
+   pointer leaves the thumbnail. Keyboard focus never hides it: it is the count.
+   .card-thumb's overflow clips it on the way out, and the global reduced-motion
+   block below already cuts the transition to nothing. */
+.series-card .card-thumb:hover .series-count:not(:hover) { transform: translateX(101%); }
 /* Everything in the panel scales with the grid zoom, like the hover buttons. */
 .series-count-n {
   font-size: clamp(15px, calc(var(--card-w, 260px) * 0.075), 30px);
