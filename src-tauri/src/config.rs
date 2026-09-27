@@ -90,6 +90,8 @@ pub struct ViewState {
     pub grouped: bool,
     #[serde(default)]
     pub groups_only: bool,
+    #[serde(default)]
+    pub in_progress: bool,
     #[serde(default = "d_sort")]
     pub sort: SortOrder,
 }
@@ -104,6 +106,7 @@ impl Default for ViewState {
             show_hidden: false,
             grouped: false,
             groups_only: false,
+            in_progress: false,
             sort: SortOrder::Newest,
         }
     }
@@ -121,9 +124,11 @@ impl ViewState {
         if self.sort == SortOrder::Downloaded || (self.sort == SortOrder::Parts && !self.grouped) {
             self.sort = SortOrder::Newest;
         }
-        // Likewise "Only groups": the chip is not on screen while ungrouped.
+        // Likewise "Only groups" and "Continue watching": neither chip is on
+        // screen while ungrouped.
         if !self.grouped {
             self.groups_only = false;
+            self.in_progress = false;
         }
         let trimmed = self.search.trim();
         self.search = if trimmed.chars().count() > 200 {
@@ -499,6 +504,7 @@ mod tests {
             show_hidden: true,
             grouped: true,
             groups_only: true,
+            in_progress: true,
             sort: SortOrder::Length,
         };
         let json = s.to_json_string().unwrap();
@@ -540,6 +546,14 @@ mod tests {
         assert!(!off.view.groups_only);
         let on = Settings::from_json_str(r#"{"view":{"groups_only":true,"grouped":true}}"#).unwrap();
         assert!(on.view.groups_only);
+    }
+
+    #[test]
+    fn in_progress_survives_only_while_grouped() {
+        let off = Settings::from_json_str(r#"{"view":{"in_progress":true,"grouped":false}}"#).unwrap();
+        assert!(!off.view.in_progress);
+        let on = Settings::from_json_str(r#"{"view":{"in_progress":true,"grouped":true}}"#).unwrap();
+        assert!(on.view.in_progress);
     }
 
     #[test]

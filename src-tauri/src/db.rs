@@ -186,21 +186,23 @@ fn like_pattern(term: &str) -> String {
     format!("%{escaped}%")
 }
 
-/// Every ready video on a channel as the grouping rule sees it, plus each row's
-/// runtime.
+/// Every ready video on a channel as the grouping rule sees it, plus what each
+/// row contributes to its card as a whole.
 ///
 /// Matching runs in Rust rather than in SQL because it is fuzzy, and because a
 /// hand-marked group is a set of seed titles rather than a single stem (see
 /// [`crate::siblings::Atoms`]); one channel's titles are few enough that
 /// loading them to compare costs nothing. The runtimes ride along on the same
 /// query because [`SortOrder::Length`] has to total a group up while all it
-/// holds is ids, and the rows are already in hand.
+/// holds is ids, and the rows are already in hand. `watched` rides along for the
+/// same reason: "Continue watching" asks it of every part of a group, hidden and
+/// filtered-out parts included.
 fn channel_atoms(
     conn: &Connection,
     channel_id: &str,
-) -> Result<(siblings::Atoms, HashMap<String, i64>)> {
+) -> Result<(siblings::Atoms, HashMap<String, PartFacts>)> {
     let mut st = conn.prepare(
-        "SELECT id, title, duration_secs, sibling_group FROM videos
+        "SELECT id, title, duration_secs, sibling_group, watched FROM videos
          WHERE channel_id=?1 AND status='ready'",
     )?;
     let rows = st.query_map(params![channel_id], |r| {
@@ -209,19 +211,28 @@ fn channel_atoms(
             r.get::<_, String>(1)?,
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, bool>(4)?,
         ))
     })?;
 
     let mut entries = Vec::new();
-    let mut runtimes = HashMap::new();
+    let mut facts = HashMap::new();
     for row in rows {
-        let (id, title, secs, group) = row?;
+        let (id, title, secs, group, watched) = row?;
         // A row whose duration has not resolved yet contributes nothing to its
         // series rather than dropping the series out of the ordering.
-        runtimes.insert(id.clone(), secs.unwrap_or(0));
+        facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched });
         entries.push(siblings::Entry { id, title, group });
     }
-    Ok((siblings::Atoms::new(entries), runtimes))
+    Ok((siblings::Atoms::new(entries), facts))
+}
+
+/// What the grouped walk needs to know about one part once its card is built,
+/// beyond the id: its share of the card's runtime, and whether it was watched.
+#[derive(Clone, Copy)]
+struct PartFacts {
+    secs: i64,
+    watched: bool,
 }
 
 /// Ids of every ready video on the anchor's channel that belongs on the same
@@ -707,11 +718,11 @@ impl Db {
         // against the unfiltered set is the whole point: the filterbar must not
         // be able to shorten a series, only to hide one.
         let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
-        let mut runtimes: HashMap<String, i64> = HashMap::new();
+        let mut parts: HashMap<String, PartFacts> = HashMap::new();
         for (_, channel) in &seeds {
             if index.contains_key(channel) { continue; }
-            let (atoms, secs) = channel_atoms(&conn, channel)?;
-            runtimes.extend(secs);
+            let (atoms, facts) = channel_atoms(&conn, channel)?;
+            parts.extend(facts);
             index.insert(channel.clone(), atoms);
         }
 
@@ -735,6 +746,19 @@ impl Db {
         if f.groups_only {
             groups.retain(|members| members.len() > 1);
         }
+        // "Continue watching" is the very test the card uses for its amber
+        // in-progress look -- some part watched, some part not -- so the chip and
+        // the colour can never disagree. It asks it of the whole group, not the
+        // parts that survived the filters, which is what lets it combine with
+        // Hide watched: the series you are midway through, each card opening on
+        // its next unwatched part. A lone video is never both, so it drops out.
+        // Before the cut, like `groups_only`, so every page comes back full.
+        if f.in_progress {
+            let watched = |id: &String| parts.get(id).is_some_and(|p| p.watched);
+            groups.retain(|members| {
+                members.iter().any(watched) && !members.iter().all(watched)
+            });
+        }
 
         // Two of the sort orders rank a card by something only the finished
         // group knows -- how many parts it holds, or how long they run in
@@ -754,7 +778,7 @@ impl Db {
             SortOrder::Length => {
                 groups.sort_by_key(|members| {
                     let total: i64 = members.iter()
-                        .map(|id| runtimes.get(id).copied().unwrap_or(0))
+                        .map(|id| parts.get(id).map_or(0, |p| p.secs))
                         .sum();
                     std::cmp::Reverse(total)
                 });
@@ -1272,6 +1296,61 @@ mod tests {
         // after the cut would return an empty first page and hide the series.
         let f = VideoFilter { groups_only: true, limit: 1, ..Default::default() };
         assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn in_progress_keeps_only_series_part_watched() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("a1", "Alpha Chronicle"),
+            ("a2", "Alpha Chronicle - Part 2"),
+            ("z1", "Zephyr Diaries"),
+            ("z2", "Zephyr Diaries - Part 2"),
+            ("m1", "Midway Journal"),
+            ("m2", "Midway Journal - Part 2"),
+            ("lone", "A Completely Different Story"),
+        ]);
+        // Alpha finished, Zephyr unstarted, Midway half watched; the lone video
+        // is watched too, and one part cannot be both watched and not.
+        for id in ["a1", "a2", "m1", "lone"] {
+            d.set_watched(id, true).unwrap();
+        }
+        let f = VideoFilter { in_progress: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("m2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn in_progress_counts_the_whole_series_not_the_parts_left_after_filters() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+        ]);
+        d.set_watched("p1", true).unwrap();
+        d.set_watched("p3", true).unwrap();
+        // Only p2 survives "Unwatched", so what is left of the series is all
+        // unwatched -- but the series itself is midway, and it opens on p2.
+        let f = VideoFilter { hide_watched: true, in_progress: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 3)]);
+    }
+
+    #[test]
+    fn in_progress_is_applied_before_the_page_is_cut() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("m1", "Midway Journal"),
+            ("m2", "Midway Journal - Part 2"),
+            ("z1", "Zephyr Diaries"),
+            ("z2", "Zephyr Diaries - Part 2"),
+            ("lone", "A Completely Different Story"),
+        ]);
+        d.set_watched("m1", true).unwrap();
+        // Newest first puts the lone video and the unstarted series ahead of
+        // the one in progress. Filtering after the cut would return an empty
+        // first page.
+        let f = VideoFilter { in_progress: true, limit: 1, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("m2".to_string(), 2)]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconClose, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconSettings,
+  IconClose, IconContinue, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconSettings,
   IconSubscriptions, IconUnwatched,
 } from "./Icons";
 import type { Channel, SortOrder } from "../types";
@@ -58,6 +58,8 @@ interface Props {
   onGrouped: (v: boolean) => void;
   groupsOnly: boolean;
   onGroupsOnly: (v: boolean) => void;
+  inProgress: boolean;
+  onInProgress: (v: boolean) => void;
   /** The open series, or null for the ordinary feed. Replaces the tab strip. */
   series: SeriesCrumb | null;
   onExitSeries: () => void;
@@ -254,9 +256,10 @@ export default function TopNav(p: Props) {
                 <span className="seg-glyph" aria-hidden="true"><IconHidden /></span>
                 <span className="seg-label">Include hidden</span>
               </button>
-              {/* A filter over cards that only exist grouped, so it is offered
+              {/* Filters over cards that only exist grouped, so they are offered
                   only then -- ungrouped, every card is a lone video. */}
               {p.grouped && (
+                <>
                 <button
                   type="button"
                   className={`seg-btn${p.groupsOnly ? " is-on" : ""}`}
@@ -269,6 +272,19 @@ export default function TopNav(p: Props) {
                   <span className="seg-glyph" aria-hidden="true"><IconGroupsOnly /></span>
                   <span className="seg-label">Only groups</span>
                 </button>
+                <button
+                  type="button"
+                  className={`seg-btn${p.inProgress ? " is-on" : ""}`}
+                  aria-pressed={p.inProgress}
+                  aria-label="Continue watching"
+                  disabled={off}
+                  title={offHint ?? "Show only series you have started and not finished"}
+                  onClick={() => p.onInProgress(!p.inProgress)}
+                >
+                  <span className="seg-glyph" aria-hidden="true"><IconContinue /></span>
+                  <span className="seg-label">Continue watching</span>
+                </button>
+                </>
               )}
             </div>
 

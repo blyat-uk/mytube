@@ -31,12 +31,12 @@ export default function App() {
 function buildViewState(
   channelId: string | null, search: string, hideWatched: boolean,
   downloadedOnly: boolean, showHidden: boolean, grouped: boolean, groupsOnly: boolean,
-  sort: SortOrder,
+  inProgress: boolean, sort: SortOrder,
 ): ViewState {
   return {
     channel_id: channelId, search,
     hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
-    grouped, groups_only: groupsOnly, sort,
+    grouped, groups_only: groupsOnly, in_progress: inProgress, sort,
   };
 }
 
@@ -55,6 +55,9 @@ function Shell() {
   // Only the multi-part series. A filter over groups, so it lives and dies
   // with the Grouped chip.
   const [groupsOnly, setGroupsOnly] = useState(false);
+  // Only the series you have started and not finished. A filter over groups
+  // too, so it goes wherever groupsOnly goes.
+  const [inProgress, setInProgress] = useState(false);
   const [cardSize, setCardSize] = useState(CARD_DEFAULT);
   const [sort, setSort] = useState<SortOrder>("newest");
   // The video whose series the grid is pinned to, or null for the normal feed.
@@ -72,8 +75,8 @@ function Shell() {
 
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
 
-  // "Most parts first" and "Only groups" only exist while the cards are
-  // groups, so ungrouping has to take both back with it -- otherwise the nav
+  // "Most parts first", "Only groups" and "Continue watching" only exist while
+  // the cards are groups, so ungrouping has to take them back with it -- otherwise the nav
   // is left holding a value it no longer offers, and the next time Grouped
   // goes on the feed would come back filtered by a chip nobody just pressed.
   const setGroupedAndSort = useCallback((on: boolean) => {
@@ -81,6 +84,7 @@ function Shell() {
     if (!on) {
       setSort((s) => (s === "parts" ? "newest" : s));
       setGroupsOnly(false);
+      setInProgress(false);
     }
   }, []);
 
@@ -266,11 +270,12 @@ function Shell() {
         setShowHidden(v.show_hidden);
         setGrouped(v.grouped);
         setGroupsOnly(v.groups_only);
+        setInProgress(v.in_progress);
         setSort(v.sort);
         persistedView.current = JSON.stringify(
           buildViewState(
             v.channel_id, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
-            v.groups_only, v.sort,
+            v.groups_only, v.in_progress, v.sort,
           ),
         );
       })
@@ -283,7 +288,8 @@ function Shell() {
         // never actually managed to read.
         persistedView.current = JSON.stringify(
           buildViewState(
-            channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly, sort,
+            channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
+            inProgress, sort,
           ),
         );
       })
@@ -308,11 +314,12 @@ function Shell() {
 
   // Debounced like saveCardSize, but there is no explicit call site for a
   // filter change -- every setter above is reachable straight from TopNav --
-  // so this watches the eight values instead of wrapping each setter.
+  // so this watches the nine values instead of wrapping each setter.
   useEffect(() => {
     if (!hydrated) return;
     const view = buildViewState(
-      channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly, sort,
+      channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
+      inProgress, sort,
     );
     const serialised = JSON.stringify(view);
     if (serialised === persistedView.current) return;
@@ -323,7 +330,7 @@ function Shell() {
     }, 400);
     return () => window.clearTimeout(t);
   }, [hydrated, channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      sort]);
+      inProgress, sort]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
   // rendering before the saved view lands would spend a query on the
@@ -350,6 +357,8 @@ function Shell() {
         onGrouped={setGroupedAndSort}
         groupsOnly={groupsOnly}
         onGroupsOnly={setGroupsOnly}
+        inProgress={inProgress}
+        onInProgress={setInProgress}
         sort={sort}
         onSort={setSort}
         series={siblingOf ? { name: seriesName, parts: 0, runtime: "", unknown: 0, ...tally } : null}
@@ -369,6 +378,7 @@ function Shell() {
             showHidden={showHidden}
             grouped={grouped}
             groupsOnly={groupsOnly}
+            inProgress={inProgress}
             cardSize={cardSize}
             onCardSize={saveCardSize}
             scrollRef={contentRef}

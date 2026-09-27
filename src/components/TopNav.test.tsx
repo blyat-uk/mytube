@@ -40,6 +40,8 @@ function props(over: Partial<Props> = {}): Props {
     onGrouped: vi.fn(),
     groupsOnly: false,
     onGroupsOnly: vi.fn(),
+    inProgress: false,
+    onInProgress: vi.fn(),
     sort: "newest",
     onSort: vi.fn(),
     series: null,
@@ -336,6 +338,35 @@ describe("the only-groups filter", () => {
     renderNav({ grouped: true, groupsOnly: true, series: SERIES });
     const chip = screen.getByRole("button", { name: "Only groups" }) as HTMLButtonElement;
     expect(chip.disabled).toBe(true);
+  });
+});
+
+/** "Continue watching" narrows to series, so like Only groups it exists only grouped. */
+describe("the continue-watching filter", () => {
+  it("is absent until siblings are grouped", () => {
+    renderNav();
+    expect(screen.queryByRole("button", { name: "Continue watching" })).toBeNull();
+  });
+
+  it("joins the filters once they are, and toggles", () => {
+    const p = renderNav({ grouped: true });
+    const chip = screen.getByRole("button", { name: "Continue watching" });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(p.onInProgress).toHaveBeenCalledWith(true);
+  });
+
+  it("shows itself pressed while on, and switches back off", () => {
+    const p = renderNav({ grouped: true, inProgress: true });
+    const chip = screen.getByRole("button", { name: "Continue watching" });
+    expect(chip.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(chip);
+    expect(p.onInProgress).toHaveBeenCalledWith(false);
+  });
+
+  it("is switched off while a series is open, like the other filters", () => {
+    renderNav({ grouped: true, inProgress: true, series: SERIES });
+    expect(button("Continue watching").disabled).toBe(true);
   });
 });
 

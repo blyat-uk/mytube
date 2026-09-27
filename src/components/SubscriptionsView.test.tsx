@@ -75,7 +75,8 @@ function renderView(over: ViewProps = {}) {
     <ToastProvider>
       <SubscriptionsView
         channelId={null} search="" hideWatched={false} downloadedOnly={false}
-        sort="newest" showHidden={false} grouped={false} groupsOnly={false} siblingOf={null}
+        sort="newest" showHidden={false} grouped={false} groupsOnly={false} inProgress={false}
+        siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
         channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
@@ -260,6 +261,18 @@ describe("the grouped feed", () => {
     renderView({ grouped: false, groupsOnly: true });
     await waitFor(() => expect(listVideos).toHaveBeenCalled());
     expect(listVideos.mock.calls[0][0]).toMatchObject({ groupsOnly: false });
+  });
+
+  it("asks for only started series when continue-watching is on", async () => {
+    renderView({ grouped: true, inProgress: true });
+    await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
+    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({ inProgress: true });
+  });
+
+  it("drops continue-watching with the grouping it filters", async () => {
+    renderView({ grouped: false, inProgress: true });
+    await waitFor(() => expect(listVideos).toHaveBeenCalled());
+    expect(listVideos.mock.calls[0][0]).toMatchObject({ inProgress: false });
   });
 
   // A series view is a flat list of its parts. Grouping there would collapse

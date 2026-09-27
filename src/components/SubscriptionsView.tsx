@@ -65,6 +65,8 @@ interface Props {
   grouped: boolean;
   /** Grouped only: leave out lone videos, keeping the multi-part series. */
   groupsOnly: boolean;
+  /** Grouped only: just the series with some parts watched and some not. */
+  inProgress: boolean;
   /** When set, the grid shows this video's series instead of the feed. */
   siblingOf: Video | null;
   /** The stem comes from a series card; a lone card has only its title. */
@@ -103,13 +105,14 @@ export default function SubscriptionsView(p: Props) {
   // while one is open rather than collapsing the very series being shown.
   const grouped = p.grouped && siblingOf === null;
   const groupsOnly = grouped && p.groupsOnly;
+  const inProgress = grouped && p.inProgress;
 
   // What makes this list this list. A series, a filter, a sort and a search
   // each make a different one; `grouped` is the derived value above, so opening
   // a series out of the grouped feed counts as one change of list, not two.
   const listKey = JSON.stringify([
     channelId, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped, groupsOnly,
-    siblingOf?.id ?? null,
+    inProgress, siblingOf?.id ?? null,
   ]);
   // Where each list this view has shown was left. Coming back to one -- leaving
   // a series, clearing a search -- comes back to your place in it; a list never
@@ -162,6 +165,7 @@ export default function SubscriptionsView(p: Props) {
       downloadedOnly,
       showHidden,
       groupsOnly,
+      inProgress,
       search: search.trim() ? search.trim() : null,
       siblingOf: siblingOf?.id ?? null,
       sort,
@@ -188,7 +192,7 @@ export default function SubscriptionsView(p: Props) {
       if (id === request.current) setLoading(false);
     }
   }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, groupsOnly,
-      listKey, scrollRef, toast]);
+      inProgress, listKey, scrollRef, toast]);
 
   useEffect(() => { void fetchPage(0); }, [fetchPage, reloadToken]);
 
@@ -468,7 +472,8 @@ export default function SubscriptionsView(p: Props) {
   }, [menuItems]);
 
   const filtered =
-    channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly;
+    channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
+    inProgress;
 
   return (
     <>

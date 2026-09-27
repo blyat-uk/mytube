@@ -27,7 +27,7 @@ const listChannels = vi.fn<() => Promise<Channel[]>>(() => Promise.resolve([]));
 const saveViewState = vi.fn(() => Promise.resolve());
 // Typed with a filter parameter so `.mock.calls[0][0]` below type-checks.
 const listVideos = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() => Promise.resolve([]));
-const listVideoGroups = vi.fn(() => Promise.resolve([]));
+const listVideoGroups = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() => Promise.resolve([]));
 const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([]));
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
 
@@ -37,7 +37,7 @@ vi.mock("./api", () => ({
     listChannels: () => listChannels(),
     saveViewState: (...a: unknown[]) => saveViewState(...(a as [])),
     listVideos: (filter: VideoFilter) => listVideos(filter),
-    listVideoGroups: (...a: unknown[]) => listVideoGroups(...(a as [])),
+    listVideoGroups: (filter: VideoFilter) => listVideoGroups(filter),
     toolsStatus: () => toolsStatus(),
     openExternal: (url: string) => openExternal(url),
   },
@@ -50,7 +50,7 @@ import App from "./App";
 function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_id: null, search: "", hide_watched: false, downloaded_only: false,
-    show_hidden: false, grouped: false, groups_only: false, sort: "newest",
+    show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
     ...over,
   };
 }
@@ -226,6 +226,45 @@ describe("saving the view back", () => {
 
     resolveSettings(settings);
     expect(await screen.findByLabelText("Search videos")).toHaveProperty("value", "python");
+  });
+});
+
+/**
+ * "Continue watching" is a filter over series, so it lives and dies with the
+ * Grouped chip exactly as "Only groups" does.
+ */
+describe("the continue-watching filter", () => {
+  it("restores from the saved view and is sent to the grouped feed", async () => {
+    settings = settingsWith({ grouped: true, in_progress: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(button("Continue watching").getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
+    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({ inProgress: true });
+  });
+
+  it("is saved into the view when switched on", async () => {
+    settings = settingsWith({ grouped: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+
+    fireEvent.click(button("Continue watching"));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView({ grouped: true, in_progress: true }));
+  });
+
+  it("is cleared, with Only groups, when Group siblings goes off", async () => {
+    settings = settingsWith({ grouped: true, groups_only: true, in_progress: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+
+    fireEvent.click(button("Grouped"));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView());
+
+    // Grouping again must not bring the filter back on by itself.
+    fireEvent.click(button("Grouped"));
+    expect(button("Continue watching").getAttribute("aria-pressed")).toBe("false");
   });
 });
 
