@@ -337,13 +337,23 @@ jobs:
           sha256sum mytube-v* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      # The release page is the Downloads table and the changelog, nothing
+      # The release page is the changelog, then the Downloads table, nothing
       # else. First run, platform notes and uninstalling live in README.md.
       - name: Release notes
         env:
           TAG: ${{ github.ref_name }}
         run: |
           cat > notes.md <<EOF
+          ## Changelog
+
+          EOF
+          # Since the previous v* tag, or all history for the first release.
+          # "Release X.Y.Z" is the version bump the tag sits on, not a change.
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$TAG" \
+            | grep -Ev '^- Release [0-9]' >> notes.md || echo "- No changes." >> notes.md
+          cat >> notes.md <<EOF
+
           ## Downloads
 
           | File | For |
@@ -354,15 +364,7 @@ jobs:
           | \`mytube-$TAG-linux-x86_64.rpm\` | Linux x86_64: Fedora, openSUSE |
           | \`mytube-$TAG-linux-x86_64.AppImage\` | Linux x86_64: any other distribution |
           | \`SHA256SUMS.txt\` | SHA-256 checksums of every file above |
-
-          ## Changelog
-
           EOF
-          # Since the previous v* tag, or all history for the first release.
-          # "Release X.Y.Z" is the version bump the tag sits on, not a change.
-          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
-          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$TAG" \
-            | grep -Ev '^- Release [0-9]' >> notes.md || echo "- No changes." >> notes.md
           cat notes.md
 
       - uses: softprops/action-gh-release@v3

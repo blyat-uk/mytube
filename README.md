@@ -71,7 +71,7 @@ cargo test --manifest-path src-tauri/Cargo.toml     # backend tests
 bun run tauri build                                 # release build for this OS
 ```
 
-Pushing a `vX.Y.Z` tag that matches the version in `tauri.conf.json`, `Cargo.toml` and `package.json` builds, tests and publishes a release for all three platforms. Its notes are the downloads table and the commits since the previous tag, nothing else, so anything a user needs to know goes in this README.
+Pushing a `vX.Y.Z` tag that matches the version in `tauri.conf.json`, `Cargo.toml` and `package.json` builds, tests and publishes a release for all three platforms. Its notes are the commits since the previous tag followed by the downloads table, nothing else, so anything a user needs to know goes in this README.
 
 ## License
 
