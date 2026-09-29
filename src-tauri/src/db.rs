@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::models::*;
+use crate::quality::Quality;
 use crate::siblings;
 
 pub struct Db { conn: Mutex<Connection> }
@@ -46,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -145,6 +146,17 @@ fn migrate(conn: &Connection) -> Result<()> {
                 "ALTER TABLE videos ADD COLUMN auto_queued INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+    }
+
+    // A one-off quality for one video's download, as `Quality` JSON; NULL,
+    // which is nearly every row, means "whatever Settings says when the job
+    // starts". It lives while the row is queued, downloading, failed or done
+    // -- so a Retry repeats a custom download exactly and resumes its part
+    // files -- and is cleared whenever the row goes back to `none`.
+    if version < 9 {
+        if !column_exists(conn, "videos", "download_quality")? {
+            conn.execute("ALTER TABLE videos ADD COLUMN download_quality TEXT", [])?;
         }
     }
 
@@ -938,6 +950,9 @@ impl Db {
     /// - `Done` and `Failed` overwrite it with the moment the attempt ended,
     /// - `None` -- a cancel -- clears it, since a row with nothing downloaded
     ///   has no place in that ordering at all.
+    ///
+    /// `None` also clears `download_quality`: a custom quality belongs to one
+    /// download, and the next plain Download of the row follows Settings.
     pub fn set_download_state(&self, id: &str, state: DownloadState,
                               file_path: Option<&str>, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -948,7 +963,10 @@ impl Db {
                                downloaded_at=CASE ?2
                                    WHEN 'none'        THEN NULL
                                    WHEN 'downloading' THEN downloaded_at
-                                   ELSE ?5 END
+                                   ELSE ?5 END,
+                               download_quality=CASE ?2
+                                   WHEN 'none' THEN NULL
+                                   ELSE download_quality END
              WHERE id=?1",
             params![id, state.as_str(), file_path, error, now()])?;
         Ok(())
@@ -957,9 +975,32 @@ impl Db {
     pub fn clear_file_path(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET file_path=NULL, download_state='none', download_error=NULL,
-                                        downloaded_at=NULL WHERE id=?1",
+                                        downloaded_at=NULL, download_quality=NULL WHERE id=?1",
                      params![id])?;
         Ok(())
+    }
+
+    /// Stores (or with `None`, clears) the quality one video's next download
+    /// is fetched at, overriding Settings. See the v9 migration step.
+    pub fn set_download_quality(&self, id: &str, q: Option<&Quality>) -> Result<()> {
+        let json = q.map(serde_json::to_string).transpose()?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE videos SET download_quality=?2 WHERE id=?1", params![id, json])?;
+        Ok(())
+    }
+
+    /// The video's own quality, if it carries one. JSON that no longer parses
+    /// -- a later build's shape, a hand edit -- reads as none, so the download
+    /// falls back to Settings rather than failing; what does parse is
+    /// sanitised on the way out, since it is about to become argv.
+    pub fn download_quality(&self, id: &str) -> Result<Option<Quality>> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row("SELECT download_quality FROM videos WHERE id=?1", params![id],
+                       |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|j| serde_json::from_str::<Quality>(&j).ok()).map(Quality::sanitized))
     }
 
     /// Tombstones a video so polling never surfaces it again. The row stays put,
@@ -1014,7 +1055,8 @@ impl Db {
     /// is reset to `none` and becomes clickable again.
     pub fn reset_stale_downloads(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE videos SET download_state='none', downloaded_at=NULL
+        conn.execute("UPDATE videos SET download_state='none', downloaded_at=NULL,
+                                        download_quality=NULL
                       WHERE download_state IN ('downloading','queued')", [])?;
         Ok(())
     }
@@ -1055,6 +1097,128 @@ mod tests {
     use super::*;
 
     fn db() -> Db { Db::open_in_memory().unwrap() }
+
+    mod download_quality {
+        use super::*;
+
+        fn one(d: &Db) {
+            d.upsert_channel(&chan("UC1", "One")).unwrap();
+            d.insert_video_if_new(&vid("a", "UC1", Some(1))).unwrap();
+        }
+
+        fn custom() -> Quality {
+            Quality { mode: "audio".into(), audio_format: "mp3".into(), format: "251".into(),
+                      ..Quality::default() }
+        }
+
+        #[test]
+        fn a_stored_quality_reads_back_and_none_is_the_default() {
+            let d = db();
+            one(&d);
+            assert_eq!(d.download_quality("a").unwrap(), None);
+            assert_eq!(d.download_quality("no such row").unwrap(), None);
+            d.set_download_quality("a", Some(&custom())).unwrap();
+            assert_eq!(d.download_quality("a").unwrap(), Some(custom()));
+            d.set_download_quality("a", None).unwrap();
+            assert_eq!(d.download_quality("a").unwrap(), None);
+        }
+
+        #[test]
+        fn it_lives_while_queued_downloading_failed_or_done() {
+            let d = db();
+            one(&d);
+            d.set_download_quality("a", Some(&custom())).unwrap();
+            for s in [DownloadState::Queued, DownloadState::Downloading, DownloadState::Failed,
+                      DownloadState::Done] {
+                d.set_download_state("a", s, Some("/x.mp3"), None).unwrap();
+                assert_eq!(d.download_quality("a").unwrap(), Some(custom()), "{s:?}");
+            }
+        }
+
+        #[test]
+        fn it_is_cleared_whenever_the_row_returns_to_none() {
+            let d = db();
+            one(&d);
+
+            d.set_download_quality("a", Some(&custom())).unwrap();
+            d.set_download_state("a", DownloadState::None, None, None).unwrap();
+            assert_eq!(d.download_quality("a").unwrap(), None, "a cancel");
+
+            d.set_download_quality("a", Some(&custom())).unwrap();
+            d.set_download_state("a", DownloadState::Done, Some("/x.mp3"), None).unwrap();
+            d.clear_file_path("a").unwrap();
+            assert_eq!(d.download_quality("a").unwrap(), None, "a deleted file");
+
+            d.set_download_quality("a", Some(&custom())).unwrap();
+            d.set_download_state("a", DownloadState::Downloading, None, None).unwrap();
+            d.reset_stale_downloads().unwrap();
+            assert_eq!(d.download_quality("a").unwrap(), None, "a restart mid-download");
+        }
+
+        #[test]
+        fn a_restart_leaves_a_failed_download_its_quality() {
+            let d = db();
+            one(&d);
+            d.set_download_quality("a", Some(&custom())).unwrap();
+            d.set_download_state("a", DownloadState::Failed, None, Some("boom")).unwrap();
+            d.reset_stale_downloads().unwrap();
+            assert_eq!(d.download_quality("a").unwrap(), Some(custom()), "Retry repeats it");
+        }
+
+        #[test]
+        fn unreadable_json_reads_as_none_and_odd_values_are_sanitised() {
+            let d = db();
+            one(&d);
+            {
+                let c = d.conn.lock().unwrap();
+                c.execute("UPDATE videos SET download_quality='{not json' WHERE id='a'", []).unwrap();
+            }
+            assert_eq!(d.download_quality("a").unwrap(), None);
+            {
+                let c = d.conn.lock().unwrap();
+                c.execute(r#"UPDATE videos SET download_quality='{"vcodec":"hevc"}' WHERE id='a'"#,
+                          []).unwrap();
+            }
+            assert_eq!(d.download_quality("a").unwrap(), Some(Quality::default()));
+        }
+
+        #[test]
+        fn migrating_a_v8_database_adds_the_column_empty() {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE videos ADD COLUMN downloaded_at INTEGER;
+                 ALTER TABLE videos ADD COLUMN sibling_group TEXT;
+                 ALTER TABLE channels ADD COLUMN member INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE channels ADD COLUMN backfill_depth INTEGER;
+                 ALTER TABLE channels ADD COLUMN terminated_at INTEGER;
+                 ALTER TABLE channels ADD COLUMN auto_download_since INTEGER;
+                 ALTER TABLE videos ADD COLUMN auto_queued INTEGER NOT NULL DEFAULT 0;",
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 8).unwrap();
+            conn.execute(
+                "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO videos (id,channel_id,title,published_at,sort_at,status,first_seen_at,
+                                     download_state,file_path)
+                 VALUES ('a','UC1','kept',100,100,'ready',1,'done','/x.mkv')",
+                [],
+            ).unwrap();
+
+            let db = Db::init(conn).unwrap();
+            {
+                let c = db.conn.lock().unwrap();
+                assert!(column_exists(&c, "videos", "download_quality").unwrap());
+                let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+                assert_eq!(v, 9);
+            }
+            assert_eq!(db.download_quality("a").unwrap(), None);
+            assert_eq!(db.get_video("a").unwrap().unwrap().file_path.as_deref(), Some("/x.mkv"));
+        }
+    }
 
     fn chan(id: &str, title: &str) -> Channel {
         Channel { id: id.into(), title: title.into(), handle: None,
@@ -2524,6 +2688,10 @@ UPDATE channels
  WHERE id = ?1 AND (subscribed < ?2 OR member < ?3)";
 
 /// A video row written exactly as the archive carries it.
+///
+/// `download_quality` is not in an archive; a row this lands on `none` loses
+/// its local one, keeping the rule that only a queued, running, failed or
+/// finished download carries a custom quality.
 const PUT_VIDEO: &str = "
 INSERT INTO videos
   (id,channel_id,title,description,thumb_url,thumb_path,published_at,sort_at,feed_rank,
@@ -2540,7 +2708,9 @@ ON CONFLICT(id) DO UPDATE SET
   watched_at=excluded.watched_at, download_state=excluded.download_state,
   download_error=excluded.download_error, file_path=excluded.file_path,
   downloaded_at=excluded.downloaded_at, first_seen_at=excluded.first_seen_at,
-  sibling_group=excluded.sibling_group";
+  sibling_group=excluded.sibling_group,
+  download_quality=CASE excluded.download_state WHEN 'none' THEN NULL
+                        ELSE download_quality END";
 
 /// What a Merge lifts onto a video that is already here: user-owned state only.
 ///
@@ -3269,7 +3439,6 @@ mod auto_download_tests {
             assert!(column_exists(&c, "videos", "auto_queued").unwrap());
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
             assert_eq!(v, SCHEMA_VERSION);
-            assert_eq!(SCHEMA_VERSION, 8);
         }
         assert!(!db.list_channels().unwrap()[0].auto_download, "nothing is switched on by an upgrade");
         assert!(db.auto_download_candidates().unwrap().is_empty());

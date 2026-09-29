@@ -8,6 +8,7 @@ pub mod models;
 pub mod player;
 pub mod poll;
 pub mod proc;
+pub mod quality;
 pub mod queue;
 pub mod resolve;
 pub mod rss;
@@ -170,6 +171,7 @@ pub fn run() {
             commands::unlink_siblings,
             commands::set_watched,
             commands::enqueue_download,
+            commands::probe_formats,
             commands::cancel_download,
             commands::open_in_player,
             commands::delete_download,

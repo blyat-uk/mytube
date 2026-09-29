@@ -1,4 +1,5 @@
 use crate::models::SortOrder;
+use crate::quality::{self, Quality};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -211,6 +212,12 @@ pub struct Settings {
     /// filters, not the download directory.
     #[serde(default, deserialize_with = "lenient_view")]
     pub view: ViewState,
+    /// What every download is fetched at unless the video carries its own
+    /// (`videos.download_quality`). Lenient for the same reason as `view`: a
+    /// malformed block costs the quality setting, not the download directory.
+    /// Portable: it describes the library, so `adopt_portable` takes it.
+    #[serde(default, deserialize_with = "quality::lenient")]
+    pub quality: Quality,
     /// Preserves keys written by future versions or by hand.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -238,6 +245,7 @@ impl Settings {
             v.ytdlp_channel = "nightly".into();
         }
         v.view.sanitize();
+        v.quality.sanitize();
         Ok(v)
     }
 
@@ -299,6 +307,7 @@ impl Settings {
         self.poll_on_startup = incoming.poll_on_startup;
         self.backfill_count = incoming.backfill_count;
         self.card_size = incoming.card_size;
+        self.quality = incoming.quality.clone();
         for (k, v) in &incoming.extra {
             self.extra.insert(k.clone(), v.clone());
         }
@@ -675,6 +684,52 @@ mod tests {
         assert!(!local.poll_on_startup);
         assert_eq!(local.backfill_count, 120);
         assert_eq!(local.card_size, 400);
+    }
+
+    #[test]
+    fn adopt_portable_takes_the_download_quality() {
+        let mut local = Settings::default();
+        let mut incoming = an_incoming_file();
+        incoming.quality.max_height = 720;
+        incoming.quality.container = "mp4".into();
+        local.adopt_portable_with(&incoming, |_| true);
+        assert_eq!(local.quality, incoming.quality);
+    }
+
+    #[test]
+    fn quality_defaults_when_absent_and_round_trips_when_set() {
+        assert_eq!(Settings::from_json_str("{}").unwrap().quality, Quality::default());
+        let mut s = Settings::default();
+        s.quality.mode = "audio".into();
+        s.quality.audio_format = "mp3".into();
+        s.quality.format = "251".into();
+        let back = Settings::from_json_str(&s.to_json_string().unwrap()).unwrap();
+        assert_eq!(back.quality, s.quality);
+        assert!(back.extra.is_empty(), "quality is a named field, not extra: {:?}", back.extra);
+    }
+
+    #[test]
+    fn a_broken_quality_block_costs_only_the_quality() {
+        let wrong_type =
+            Settings::from_json_str(r#"{"player_command":"mpv","quality":"1080p"}"#).unwrap();
+        assert_eq!(wrong_type.quality, Quality::default());
+        assert_eq!(wrong_type.player_command, "mpv");
+        let bad_number =
+            Settings::from_json_str(r#"{"quality":{"max_height":"tall"},"card_size":300}"#).unwrap();
+        assert_eq!(bad_number.quality, Quality::default());
+        assert_eq!(bad_number.card_size, 300);
+    }
+
+    #[test]
+    fn a_hand_edited_quality_is_sanitised_field_by_field() {
+        let s = Settings::from_json_str(
+            r#"{"quality":{"mode":"audio","vcodec":"hevc","max_height":1080,"format":"  22 "}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.quality.mode, "audio");
+        assert_eq!(s.quality.vcodec, "any");
+        assert_eq!(s.quality.max_height, 1080);
+        assert_eq!(s.quality.format, "22");
     }
 
     #[test]

@@ -26,6 +26,8 @@ const setWatched = vi.fn(() => Promise.resolve());
 const deleteDownload = vi.fn(() => Promise.resolve());
 const markSiblings = vi.fn(() => Promise.resolve(2));
 const unlinkSiblings = vi.fn(() => Promise.resolve());
+const enqueueDownload = vi.fn((_id: string, _q?: unknown) => Promise.resolve());
+const probeFormats = vi.fn((_id: string) => Promise.resolve(rickroll()));
 // Typed with the filter so a test can page through a library with it.
 const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn<(f: VideoFilter) => Promise<VideoGroup[]>>(() => Promise.resolve(groups));
@@ -38,12 +40,17 @@ vi.mock("../api", () => ({
     deleteDownload: (...a: unknown[]) => deleteDownload(...(a as [])),
     markSiblings: (...a: unknown[]) => markSiblings(...(a as [])),
     unlinkSiblings: (...a: unknown[]) => unlinkSiblings(...(a as [])),
+    enqueueDownload: (id: string, q?: unknown) => enqueueDownload(id, q),
+    probeFormats: (id: string) => probeFormats(id),
+    getSettings: () => Promise.resolve({ quality: DEFAULT_QUALITY }),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
 }));
 
 import SubscriptionsView from "./SubscriptionsView";
+import { DEFAULT_QUALITY } from "../quality";
+import { rickroll } from "../quality.fixture";
 import { ToastProvider } from "./Toast";
 
 function video(over: Partial<Video> = {}): Video {
@@ -106,6 +113,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   listVideos.mockImplementation(() => Promise.resolve(videos));
   listVideoGroups.mockImplementation(() => Promise.resolve(groups));
+  probeFormats.mockImplementation(() => Promise.resolve(rickroll()));
 });
 afterEach(cleanup);
 
@@ -194,6 +202,45 @@ describe("the right-click menu's delete-file entry", () => {
       expect(menuLabels(await openMenu())).not.toContain("Delete downloaded file");
       cleanup();
     }
+  });
+});
+
+describe("Download (custom)…", () => {
+  it("sits directly below Download, wherever Download is offered", async () => {
+    for (const download_state of ["none", "failed"] as const) {
+      videos = [video({ download_state, file_path: null })];
+      renderView();
+      const labels = menuLabels(await openMenu());
+      expect(labels[labels.indexOf("Download") + 1]).toBe("Download (custom)…");
+      cleanup();
+    }
+  });
+
+  it("is not offered for a video already downloaded or on its way", async () => {
+    for (const download_state of ["done", "queued", "downloading"] as const) {
+      videos = [video({ download_state })];
+      renderView();
+      expect(menuLabels(await openMenu())).not.toContain("Download (custom)…");
+      cleanup();
+    }
+  });
+
+  it("opens the dialog, and queues the exact pick with the card marked queued", async () => {
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView();
+    fireEvent.click(within(await openMenu(), "Download (custom)…"));
+
+    const dialog = await screen.findByRole("dialog", { name: "Custom download" });
+    expect(probeFormats).toHaveBeenCalledWith("vid1");
+    await screen.findByLabelText("Resolution");
+    // The card has a Download button of its own, underneath the dialog.
+    fireEvent.click(getByRole(dialog, "button", { name: "Download" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(enqueueDownload).toHaveBeenCalledWith(
+      "vid1", { ...DEFAULT_QUALITY, format: "401+251" },
+    );
+    expect(document.querySelector(".card")?.getAttribute("data-state")).toBe("queued");
   });
 });
 

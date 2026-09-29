@@ -4,6 +4,8 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import TransferDialog from "./TransferDialog";
 import Field from "./Field";
 import PlayerField from "./PlayerField";
+import QualityForm from "./QualityForm";
+import { sanitizeQuality } from "../quality";
 import CookiesField from "./CookiesField";
 import ToolsSection from "./ToolsSection";
 import { useTransferProgress } from "../events";
@@ -361,6 +363,23 @@ export default function SettingsView() {
           </div>
         </div>
       </Field>
+
+      <section className="field quality-section" aria-labelledby="quality-title">
+        <h3 className="field-label" id="quality-title">Download quality</h3>
+        <p className="field-hint quality-intro">
+          Every download follows this: the Download button, auto-download and the Add box.
+          Download (custom)… on a video's right-click menu overrides it for that video.
+        </p>
+        <QualityForm
+          source="generic"
+          // Rust fills the block on every read; sanitising here only covers a
+          // Settings built without one, so no select renders undefined.
+          value={sanitizeQuality(s.quality)}
+          onEdit={(q) => set("quality", q)}
+          onPick={(q) => setAndSave("quality", q)}
+          onBlur={blurCommit}
+        />
+      </section>
 
       <PlayerField
         value={s.player_command}

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
 import type { Channel, Settings, ToolStatus, Video, ViewState, VideoFilter } from "./types";
+import { DEFAULT_QUALITY } from "./quality";
 
 // Every listener the shell registers, by event name, so a test can deliver an
 // event exactly when it wants to.
@@ -65,6 +66,7 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
     cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
     check_app_updates: true,
     ytdlp_path: "", ffmpeg_path: "", deno_path: "",
+    quality: { ...DEFAULT_QUALITY },
     view: defaultView(view),
   };
 }

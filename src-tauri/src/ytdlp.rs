@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::models::{FlatEntry, ProbeInfo, VideoStatus};
 use crate::proc;
+use crate::quality::{self, Quality};
 use crate::tools::Invocation;
 
 pub const PROGRESS_PREFIX: &str = "MYTUBE|";
@@ -107,14 +108,15 @@ fn cookie_args(c: &Cookies) -> Vec<String> {
 }
 
 /// Flags shared by the probe and the real download, so the probe resolves the
-/// same extension the download will actually produce.
-pub fn common_format_args(r: &Runner) -> Vec<String> {
-    let mut a = vec![
-        s("-f"), s("bv*+ba/b"),
-        s("--merge-output-format"), s("mkv"),
+/// same extension the download will actually produce. The format selection is
+/// `q`'s (see `quality::format_args`); `Quality::default()` gives the
+/// `-f bv*+ba/b --merge-output-format mkv` every download had before it.
+pub fn common_format_args(r: &Runner, q: &Quality) -> Vec<String> {
+    let mut a = quality::format_args(q);
+    a.extend([
         s("--no-playlist"),
         s("--color"), s("no_color"),
-    ];
+    ]);
     a.extend(cookie_args(&r.cookies));
     a.extend(runtime_args(r));
     a.extend([
@@ -132,9 +134,9 @@ pub fn common_format_args(r: &Runner) -> Vec<String> {
 
 /// Phase 1. Resolves the output template to a concrete path and returns metadata.
 /// The `--print` order is load-bearing: `parse_probe_output` reads lines positionally.
-pub fn probe_args(r: &Runner, url: &str, download_dir: &str, filename_template: &str)
-    -> Vec<String> {
-    let mut a = common_format_args(r);
+pub fn probe_args(r: &Runner, q: &Quality, url: &str, download_dir: &str,
+                  filename_template: &str) -> Vec<String> {
+    let mut a = common_format_args(r, q);
     a.extend([
         s("--simulate"), s("--no-warnings"),
         s("--print"), s("%(id)s"),
@@ -205,12 +207,26 @@ pub fn unique_path(intended: &Path, is_taken: impl Fn(&Path) -> bool) -> PathBuf
 
 /// Phase 2. The output path is already decided, so it is forced as an absolute
 /// `-o`, which overrides `-P` (verified). yt-dlp never picks the final name.
-pub fn download_args(r: &Runner, video_id: &str, out_path: &Path, print_file: &Path)
-    -> Vec<String> {
-    let mut a = common_format_args(r);
+///
+/// The thumbnail is embedded only when `quality::final_ext` names the
+/// container, because yt-dlp cannot embed into webm and fails the *whole*
+/// download when asked to -- after the file is fully written. Verified
+/// 2026-09-29 (yt-dlp 2026.09.27, jNQXAC9IVRw): `-f 251 --embed-thumbnail`
+/// and `-f bv[ext=webm] --embed-thumbnail` both exit 1 with `ERROR:
+/// Postprocessing: Supported filetypes for thumbnail embedding are: mp3,
+/// mkv/mka, ogg/opus/flac, m4a/mp4/m4v/mov`. An `original`-audio pick or a
+/// single-stream raw format may well be webm, and `final_ext` is `None` for
+/// exactly those.
+pub fn download_args(r: &Runner, q: &Quality, video_id: &str, out_path: &Path,
+                     print_file: &Path) -> Vec<String> {
+    let mut a = common_format_args(r, q);
+    if quality::final_ext(q).is_some() {
+        a.extend([
+            s("--embed-thumbnail"),
+            s("--convert-thumbnails"), s("jpg"),
+        ]);
+    }
     a.extend([
-        s("--embed-thumbnail"),
-        s("--convert-thumbnails"), s("jpg"),
         s("--newline"),
         s("--progress-template"), s(PROGRESS_TEMPLATE),
         s("--print-to-file"), s("after_move:filepath"),
@@ -234,11 +250,11 @@ pub fn is_terminated(listing_error: &str) -> bool {
 
 /// The caller holds `inv` for as long as this runs, which is what keeps the
 /// updater from swapping yt-dlp out from under it.
-pub async fn probe(inv: &Invocation, url: &str, download_dir: &str, filename_template: &str)
-    -> Result<ProbeInfo> {
+pub async fn probe(inv: &Invocation, q: &Quality, url: &str, download_dir: &str,
+                   filename_template: &str) -> Result<ProbeInfo> {
     let r = &inv.runner;
     let mut cmd = proc::command(&r.program);
-    cmd.args(probe_args(r, url, download_dir, filename_template));
+    cmd.args(probe_args(r, q, url, download_dir, filename_template));
     // Cancelling during phase 1 aborts the task, which drops this future.
     // Without a kill on drop that leaves a yt-dlp behind with nothing left to
     // reap it -- the same trap `run_with_timeout` documents below -- and it has
@@ -380,6 +396,207 @@ pub async fn flat_playlist(inv: &Invocation, channel_id: &str, limit: u32)
         .lines().filter_map(parse_flat_entry).collect())
 }
 
+// ------------------------------------------------------------- formats
+
+/// Everything the "Download (custom)…" dialog can offer for one video, and
+/// what the Settings default would pick from it. A dialog payload, so
+/// camelCase, like `ArchiveSummary`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoFormats {
+    pub title: String,
+    /// Height descending, then size descending.
+    pub video: Vec<VideoTrack>,
+    /// Bitrate descending.
+    pub audio: Vec<AudioTrack>,
+    /// The format ids the Settings default resolves to, when they are among
+    /// the tracks listed -- a pre-muxed pick (`18`) is not, and leaves both
+    /// `None`, since there is no row for the dialog to pre-select.
+    pub default_video: Option<String>,
+    pub default_audio: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoTrack {
+    pub id: String,
+    pub height: u32,
+    pub fps: Option<f64>,
+    /// `av1`, `vp9`, `h264` or `other`.
+    pub vcodec: &'static str,
+    /// yt-dlp's raw vcodec string, `avc1.640028`.
+    pub codec: String,
+    pub hdr: bool,
+    pub ext: String,
+    /// Bytes; yt-dlp's `filesize`, else its `filesize_approx`.
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrack {
+    pub id: String,
+    /// `opus`, `aac` or `other`.
+    pub acodec: &'static str,
+    pub codec: String,
+    pub abr: Option<f64>,
+    pub language: Option<String>,
+    pub ext: String,
+    pub size: Option<u64>,
+}
+
+/// `-J` for one video, with the same format flags a download of it would get
+/// -- so `requested_formats` in the answer is what the Settings default would
+/// pick -- and the same cookies, since a members-only video lists nothing
+/// without them.
+pub fn formats_args(r: &Runner, q: &Quality, video_id: &str) -> Vec<String> {
+    let mut a = common_format_args(r, q);
+    a.extend([s("-J"), s("--no-warnings"), watch_url(video_id)]);
+    a
+}
+
+fn str_of<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
+}
+
+/// `"none"` is how yt-dlp spells "this stream has no video" (or audio); a
+/// missing or null codec is unknown, which is not the same thing.
+fn is_none_codec(v: &serde_json::Value, key: &str) -> bool {
+    str_of(v, key) == Some("none")
+}
+
+fn size_of(v: &serde_json::Value) -> Option<u64> {
+    ["filesize", "filesize_approx"].iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_f64()))
+        .filter(|n| *n > 0.0)
+        .map(|n| n as u64)
+}
+
+fn is_m3u8(v: &serde_json::Value) -> bool {
+    str_of(v, "protocol").is_some_and(|p| p.starts_with("m3u8"))
+}
+
+fn vcodec_family(codec: &str) -> &'static str {
+    let c = codec.to_ascii_lowercase();
+    if c.starts_with("av01") || c == "av1" {
+        "av1"
+    } else if c.starts_with("vp9") || c.starts_with("vp09") {
+        "vp9"
+    } else if c.starts_with("avc") || c.starts_with("h264") {
+        "h264"
+    } else {
+        "other"
+    }
+}
+
+fn acodec_family(codec: &str) -> &'static str {
+    let c = codec.to_ascii_lowercase();
+    if c == "opus" {
+        "opus"
+    } else if c.starts_with("mp4a") || c == "aac" {
+        "aac"
+    } else {
+        "other"
+    }
+}
+
+/// Keeps the non-HLS entries when there are any, else all of them: HLS
+/// duplicates the DASH formats where both exist, and is all there is where
+/// they do not (some live replays).
+fn prefer_non_m3u8(all: Vec<&serde_json::Value>) -> Vec<&serde_json::Value> {
+    if all.iter().any(|f| !is_m3u8(f)) {
+        all.into_iter().filter(|f| !is_m3u8(f)).collect()
+    } else {
+        all
+    }
+}
+
+/// Reads a `yt-dlp -J` dump. Video-only and audio-only streams are kept --
+/// the dialog combines them itself -- and storyboards (`mhtml`) and pre-muxed
+/// formats dropped.
+pub fn parse_formats(json: &str) -> Result<VideoFormats> {
+    let v: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| anyhow!("yt-dlp's format list is not JSON: {e}"))?;
+    let empty = Vec::new();
+    let formats = v.get("formats").and_then(|f| f.as_array()).unwrap_or(&empty);
+    let usable = |f: &&serde_json::Value| {
+        str_of(f, "ext") != Some("mhtml") && str_of(f, "format_id").is_some()
+    };
+
+    let video_raw: Vec<&serde_json::Value> = formats.iter().filter(usable)
+        .filter(|f| is_none_codec(f, "acodec") && !is_none_codec(f, "vcodec"))
+        .filter(|f| f.get("height").and_then(|h| h.as_u64()).is_some_and(|h| h > 0))
+        .collect();
+    let audio_raw: Vec<&serde_json::Value> = formats.iter().filter(usable)
+        .filter(|f| is_none_codec(f, "vcodec") && !is_none_codec(f, "acodec"))
+        .collect();
+
+    let mut video: Vec<VideoTrack> = prefer_non_m3u8(video_raw).into_iter().map(|f| {
+        let codec = str_of(f, "vcodec").unwrap_or_default().to_string();
+        VideoTrack {
+            id: str_of(f, "format_id").unwrap_or_default().to_string(),
+            height: f.get("height").and_then(|h| h.as_u64()).unwrap_or(0) as u32,
+            fps: f.get("fps").and_then(|x| x.as_f64()).filter(|x| *x > 0.0),
+            vcodec: vcodec_family(&codec),
+            codec,
+            hdr: str_of(f, "dynamic_range").is_some_and(|d| !d.eq_ignore_ascii_case("SDR")),
+            ext: str_of(f, "ext").unwrap_or_default().to_string(),
+            size: size_of(f),
+        }
+    }).collect();
+    video.sort_by(|a, b| b.height.cmp(&a.height).then(b.size.cmp(&a.size)));
+
+    let mut audio: Vec<AudioTrack> = prefer_non_m3u8(audio_raw).into_iter().map(|f| {
+        let codec = str_of(f, "acodec").unwrap_or_default().to_string();
+        AudioTrack {
+            id: str_of(f, "format_id").unwrap_or_default().to_string(),
+            acodec: acodec_family(&codec),
+            codec,
+            abr: f.get("abr").and_then(|x| x.as_f64()).filter(|x| *x > 0.0),
+            language: str_of(f, "language").filter(|l| !l.is_empty()).map(str::to_string),
+            ext: str_of(f, "ext").unwrap_or_default().to_string(),
+            size: size_of(f),
+        }
+    }).collect();
+    audio.sort_by(|a, b| b.abr.unwrap_or(0.0).total_cmp(&a.abr.unwrap_or(0.0)));
+
+    // What the default picked: `requested_formats` for a merge, else the one
+    // top-level `format_id`.
+    let picked: Vec<String> = match v.get("requested_formats").and_then(|r| r.as_array()) {
+        Some(r) if !r.is_empty() => r.iter()
+            .filter_map(|f| str_of(f, "format_id").map(str::to_string)).collect(),
+        _ => str_of(&v, "format_id").map(|id| vec![id.to_string()]).unwrap_or_default(),
+    };
+    let default_video = picked.iter().find(|id| video.iter().any(|t| &t.id == *id)).cloned();
+    let default_audio = picked.iter().find(|id| audio.iter().any(|t| &t.id == *id)).cloned();
+
+    Ok(VideoFormats {
+        title: str_of(&v, "title").unwrap_or_default().to_string(),
+        video,
+        audio,
+        default_video,
+        default_audio,
+    })
+}
+
+/// How long `formats` may take. A `-J` is one extraction, a few seconds; the
+/// ceiling only has to be finite, since a dialog is waiting on it.
+const FORMATS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Lists one video's formats. The caller holds `inv` for as long as this runs,
+/// which is what keeps the updater from swapping yt-dlp out from under it; a
+/// timeout kills the whole tree (see `run_with_timeout`).
+pub async fn formats(inv: &Invocation, video_id: &str, q: &Quality) -> Result<VideoFormats> {
+    let r = &inv.runner;
+    let out = run_with_timeout(&r.program, formats_args(r, q, video_id), FORMATS_TIMEOUT).await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("{}", err.lines().rev().find(|l| l.contains("ERROR"))
+            .unwrap_or("yt-dlp could not list that video's formats")));
+    }
+    parse_formats(&String::from_utf8_lossy(&out.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -417,8 +634,8 @@ mod tests {
     }
 
     fn args() -> Vec<String> {
-        download_args(&full(), "abc123", &PathBuf::from("/out/Some Title [abc123].mkv"),
-                      &PathBuf::from("/tmp/p.txt"))
+        download_args(&full(), &Quality::default(), "abc123",
+                      &PathBuf::from("/out/Some Title [abc123].mkv"), &PathBuf::from("/tmp/p.txt"))
     }
 
     fn value_of(a: &[String], flag: &str) -> Option<String> {
@@ -426,24 +643,194 @@ mod tests {
     }
 
     /// Every argv yt-dlp is ever given for a video, for a runner.
-    fn video_argvs(r: &Runner) -> [Vec<String>; 2] {
+    fn video_argvs(r: &Runner) -> [Vec<String>; 3] {
         [
-            download_args(r, "abc123", &PathBuf::from("/out/x.mkv"), &PathBuf::from("/tmp/p")),
-            probe_args(r, "https://www.youtube.com/watch?v=x", "/out", "%(title)s.%(ext)s"),
+            download_args(r, &Quality::default(), "abc123", &PathBuf::from("/out/x.mkv"),
+                          &PathBuf::from("/tmp/p")),
+            probe_args(r, &Quality::default(), "https://www.youtube.com/watch?v=x", "/out",
+                       "%(title)s.%(ext)s"),
+            formats_args(r, &Quality::default(), "x"),
         ]
     }
 
     #[test]
     fn every_required_flag_is_present() {
         for r in [bare(), full()] {
-            let a = download_args(&r, "abc123", &PathBuf::from("/out/x.mkv"),
-                                  &PathBuf::from("/tmp/p"));
+            let a = download_args(&r, &Quality::default(), "abc123",
+                                  &PathBuf::from("/out/x.mkv"), &PathBuf::from("/tmp/p"));
             for flag in ["-f", "bv*+ba/b", "--merge-output-format", "mkv",
                          "--embed-thumbnail", "--convert-thumbnails", "jpg",
                          "--no-playlist", "--color", "no_color", "--newline"] {
                 assert!(a.iter().any(|x| x == flag), "missing {flag} in {a:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_default_quality_gives_todays_download_argv() {
+        // Pinned from the argv before quality existed.
+        let a = download_args(&bare(), &Quality::default(), "abc123",
+                              &PathBuf::from("/out/x.mkv"), &PathBuf::from("/tmp/p"));
+        let mut want: Vec<String> = ["-f", "bv*+ba/b", "--merge-output-format", "mkv",
+                                     "--no-playlist", "--color", "no_color",
+                                     "--remote-components", "ejs:npm",
+                                     "--remote-components", "ejs:github"]
+            .iter().map(|x| x.to_string()).collect();
+        want.splice(7..7, encoding_args());
+        if !cfg!(windows) {
+            want.push("--no-windows-filenames".into());
+        }
+        want.extend(["--embed-thumbnail", "--convert-thumbnails", "jpg", "--newline",
+                     "--progress-template", PROGRESS_TEMPLATE,
+                     "--print-to-file", "after_move:filepath", "/tmp/p",
+                     "-o", "/out/x.mkv", "https://www.youtube.com/watch?v=abc123"]
+                    .iter().map(|x| x.to_string()));
+        assert_eq!(a, want);
+    }
+
+    #[test]
+    fn a_thumbnail_is_embedded_only_into_a_container_that_takes_one() {
+        let has = |q: &Quality| download_args(&bare(), q, "x", &PathBuf::from("/o/x"),
+                                              &PathBuf::from("/p"))
+            .contains(&"--embed-thumbnail".to_string());
+        let audio = |f: &str| Quality { mode: "audio".into(), audio_format: f.into(),
+                                        ..Quality::default() };
+        assert!(has(&Quality::default()));
+        assert!(has(&Quality { container: "mp4".into(), ..Quality::default() }));
+        assert!(has(&audio("mp3")) && has(&audio("m4a")) && has(&audio("opus")));
+        assert!(!has(&audio("original")), "original audio may be webm");
+        assert!(!has(&Quality { format: "251".into(), ..Quality::default() }),
+                "one raw stream may be webm");
+        assert!(has(&Quality { format: "399+251".into(), ..Quality::default() }));
+    }
+
+    #[test]
+    fn probe_and_download_share_the_quality_flags() {
+        let q = Quality { max_height: 720, vcodec: "h264".into(), container: "mp4".into(),
+                          ..Quality::default() };
+        let p = probe_args(&full(), &q, "u", "/out", "t");
+        let d = download_args(&full(), &q, "x", &PathBuf::from("/o/x.mp4"), &PathBuf::from("/p"));
+        let f = formats_args(&full(), &q, "x");
+        for a in [&p, &d, &f] {
+            assert_eq!(value_of(a, "-S").as_deref(), Some("res:720,vcodec:h264"), "{a:?}");
+            assert_eq!(value_of(a, "--merge-output-format").as_deref(), Some("mp4"), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn the_format_listing_is_one_json_dump_of_the_watch_page() {
+        let a = formats_args(&full(), &Quality::default(), "abc");
+        assert!(a.contains(&"-J".to_string()));
+        assert!(a.contains(&"--no-playlist".to_string()));
+        assert!(a.contains(&"--no-warnings".to_string()));
+        assert!(!a.contains(&"--embed-thumbnail".to_string()));
+        assert_eq!(a.last().unwrap(), "https://www.youtube.com/watch?v=abc");
+    }
+
+    /// A real `-J` of dQw4w9WgXcQ (2026-09-29), trimmed to a representative
+    /// subset: storyboard, muxed 18, audio 249/251/774/140, and video in all
+    /// three codecs from 360p to 2160p.
+    const FORMATS_FIXTURE: &str = include_str!("../tests/fixtures/dQw4w9WgXcQ_formats.json");
+
+    #[test]
+    fn a_real_format_dump_parses_into_tracks_and_defaults() {
+        let f = parse_formats(FORMATS_FIXTURE).unwrap();
+        assert_eq!(f.title, "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)");
+
+        let ids: Vec<&str> = f.video.iter().map(|t| t.id.as_str()).collect();
+        // Height descending, then size descending; no storyboard, no muxed 18.
+        assert_eq!(ids, vec!["313", "401", "137", "248", "399", "136", "134", "243", "396"]);
+        let v137 = f.video.iter().find(|t| t.id == "137").unwrap();
+        assert_eq!(v137.height, 1080);
+        assert_eq!(v137.vcodec, "h264");
+        assert_eq!(v137.codec, "avc1.640028");
+        assert_eq!(v137.fps, Some(25.0));
+        assert_eq!(v137.ext, "mp4");
+        assert_eq!(v137.size, Some(80911999));
+        assert!(!v137.hdr);
+        assert_eq!(f.video.iter().find(|t| t.id == "401").unwrap().vcodec, "av1");
+        assert_eq!(f.video.iter().find(|t| t.id == "313").unwrap().vcodec, "vp9");
+
+        let aids: Vec<&str> = f.audio.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(aids, vec!["774", "140", "251", "249"], "bitrate descending");
+        let a774 = &f.audio[0];
+        assert_eq!(a774.acodec, "opus");
+        assert_eq!(a774.language.as_deref(), Some("en"));
+        assert_eq!(a774.ext, "webm");
+        assert!(a774.abr.unwrap() > 257.0);
+        assert_eq!(f.audio[1].acodec, "aac");
+
+        assert_eq!(f.default_video.as_deref(), Some("401"));
+        assert_eq!(f.default_audio.as_deref(), Some("774"));
+    }
+
+    #[test]
+    fn the_payload_is_camel_case() {
+        let f = parse_formats(FORMATS_FIXTURE).unwrap();
+        let j = serde_json::to_value(&f).unwrap();
+        assert_eq!(j["defaultVideo"], "401");
+        assert_eq!(j["defaultAudio"], "774");
+        assert!(j["video"][0].get("hdr").is_some());
+        assert!(j["audio"][0].get("abr").is_some());
+    }
+
+    /// `probe_formats` end to end against YouTube:
+    ///
+    ///     cargo test --manifest-path src-tauri/Cargo.toml real_format_listing -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires network, yt-dlp and deno"]
+    async fn real_format_listing() {
+        let settings = crate::config::load().unwrap_or_default();
+        let tools = crate::tools::Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
+        let inv = tools.ytdlp(&settings).await.expect("a yt-dlp");
+        for q in [Quality::default(),
+                  Quality { max_height: 720, vcodec: "h264".into(), ..Quality::default() }] {
+            let f = formats(&inv, "dQw4w9WgXcQ", &q).await.expect("a format list");
+            println!("{q:?}: {} video, {} audio, default {:?}+{:?}", f.video.len(), f.audio.len(),
+                     f.default_video, f.default_audio);
+            assert!(!f.video.is_empty() && !f.audio.is_empty());
+            let dv = f.default_video.as_deref().expect("a default video pick");
+            assert!(f.default_audio.is_some());
+            if q.max_height == 720 {
+                let t = f.video.iter().find(|t| t.id == dv).unwrap();
+                assert_eq!((t.height, t.vcodec), (720, "h264"), "{t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hls_is_kept_only_when_it_is_all_there_is() {
+        let both = r#"{"title":"T","formats":[
+            {"format_id":"96","ext":"mp4","vcodec":"avc1","acodec":"mp4a","height":1080,"protocol":"m3u8_native"},
+            {"format_id":"301","ext":"mp4","vcodec":"avc1.4d","acodec":"none","height":1080,"protocol":"m3u8_native"},
+            {"format_id":"137","ext":"mp4","vcodec":"avc1.64","acodec":"none","height":1080,"protocol":"https"},
+            {"format_id":"140","ext":"m4a","vcodec":"none","acodec":"mp4a.40.2","abr":129,"protocol":"https"}
+        ],"format_id":"137+140"}"#;
+        let f = parse_formats(both).unwrap();
+        assert_eq!(f.video.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["137"]);
+
+        let only_hls = r#"{"title":"T","formats":[
+            {"format_id":"301","ext":"mp4","vcodec":"avc1.4d","acodec":"none","height":720,"protocol":"m3u8_native"},
+            {"format_id":"234","ext":"mp4","vcodec":"none","acodec":"mp4a.40.2","protocol":"m3u8_native"}
+        ]}"#;
+        let f = parse_formats(only_hls).unwrap();
+        assert_eq!(f.video.len(), 1);
+        assert_eq!(f.audio.len(), 1);
+        assert_eq!(f.default_video, None);
+    }
+
+    #[test]
+    fn hdr_and_a_single_audio_pick_are_recognised() {
+        let j = r#"{"title":"T","format_id":"251","vcodec":"none","formats":[
+            {"format_id":"337","ext":"webm","vcodec":"vp09.02.51.10","acodec":"none","height":2160,"fps":60,"dynamic_range":"HDR10"},
+            {"format_id":"251","ext":"webm","vcodec":"none","acodec":"opus","abr":130}
+        ]}"#;
+        let f = parse_formats(j).unwrap();
+        assert!(f.video[0].hdr);
+        assert_eq!(f.video[0].vcodec, "vp9");
+        assert_eq!(f.default_audio.as_deref(), Some("251"));
+        assert_eq!(f.default_video, None);
+        assert!(parse_formats("not json").is_err());
     }
 
     #[test]
@@ -545,8 +932,8 @@ mod tests {
 
     #[test]
     fn percent_signs_in_a_path_are_escaped_for_the_output_template() {
-        let a = download_args(&bare(), "x", &PathBuf::from("/out/100% real (2).mkv"),
-                              &PathBuf::from("/tmp/p.txt"));
+        let a = download_args(&bare(), &Quality::default(), "x",
+                              &PathBuf::from("/out/100% real (2).mkv"), &PathBuf::from("/tmp/p.txt"));
         let i = a.iter().position(|x| x == "-o").unwrap();
         assert_eq!(a[i + 1], "/out/100%% real (2).mkv");
         assert_eq!(escape_out_template(&PathBuf::from("/a/b.mkv")), "/a/b.mkv");
@@ -554,8 +941,8 @@ mod tests {
 
     #[test]
     fn the_probe_resolves_the_template_and_asks_for_every_field() {
-        let a = probe_args(&full(), "https://www.youtube.com/watch?v=x", "/out",
-                           "%(title)s.%(ext)s");
+        let a = probe_args(&full(), &Quality::default(), "https://www.youtube.com/watch?v=x",
+                           "/out", "%(title)s.%(ext)s");
         assert!(a.contains(&"--simulate".to_string()));
         let at = |flag: &str| a.iter().position(|x| x == flag).map(|i| a[i + 1].clone());
         assert_eq!(at("-P").as_deref(), Some("/out"));
@@ -845,7 +1232,8 @@ mod tests {
             let program = fake_ytdlp("probe-ok",
                 "printf 'abc\\nT\\n60\\nNA\\nCh\\nUC1\\n/out/T [abc].mkv\\n'");
             let inv = invocation(program.clone()).await;
-            let p = probe(&inv, "https://www.youtube.com/watch?v=abc", "/out", "%(title)s")
+            let p = probe(&inv, &Quality::default(), "https://www.youtube.com/watch?v=abc", "/out",
+                          "%(title)s")
                 .await;
             let _ = std::fs::remove_dir_all(program.parent().unwrap());
             let p = p.expect("the fake yt-dlp prints a full probe");
@@ -874,7 +1262,7 @@ mod tests {
             let program = fake_ytdlp("probe-abort", &format!("sleep {secs} & sleep {secs}"));
             let inv = invocation(program.clone()).await;
             let task = tokio::spawn(async move {
-                let _ = probe(&inv, "u", "/out", "t").await;
+                let _ = probe(&inv, &Quality::default(), "u", "/out", "t").await;
             });
             for _ in 0..80 {
                 if child_alive(&secs) {

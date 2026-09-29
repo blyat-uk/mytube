@@ -4,6 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::models::*;
 use crate::poll::{self, AppState};
+use crate::quality::Quality;
 use crate::{config, player, resolve, transfer, ytdlp};
 
 /// Backfills run a few at a time: enough to hide latency, few enough
@@ -126,6 +127,7 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
         let inv = state.tools.ytdlp(&s).await.map_err(e)?;
         let probe = ytdlp::probe(
             &inv,
+            &s.quality,
             &ytdlp::watch_url(&video_id),
             &s.download_dir,
             &s.filename_template,
@@ -517,14 +519,48 @@ pub fn set_watched(
     state.db.set_watched(&video_id, watched).map_err(e)
 }
 
+/// `quality` is "Download (custom)…": `Some` stores it on the row first, so
+/// the job -- which reads it when it starts -- and any Retry after a failure
+/// use it. `None` is a plain Download and leaves a stored one alone; the row
+/// only carries one while it is not back at `none` (see the v9 migration).
+///
+/// A video already queued or downloading is left exactly as it is: its job
+/// has settled (or will settle) its own quality, and storing a different one
+/// under it would make the row claim a quality the file was not fetched at.
 #[tauri::command]
-pub async fn enqueue_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+pub async fn enqueue_download(
+    video_id: String,
+    quality: Option<Quality>,
+    state: State<'_, Arc<AppState>>,
+) -> R<()> {
     let s = config::load().map_err(e)?;
+    if let Some(q) = quality {
+        if state.queue.is_active(&video_id).await {
+            return Ok(());
+        }
+        state
+            .db
+            .set_download_quality(&video_id, Some(&q.sanitized()))
+            .map_err(e)?;
+    }
     state
         .queue
         .enqueue(video_id, s.download_dir, s.filename_template)
         .await
         .map_err(e)
+}
+
+/// Every format one video offers, for the "Download (custom)…" dialog, and
+/// which of them the Settings default would pick. Runs with the same cookies,
+/// deno and ffmpeg a download would, under a tools lease.
+#[tauri::command]
+pub async fn probe_formats(
+    video_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> R<ytdlp::VideoFormats> {
+    let s = config::load().map_err(e)?;
+    let inv = state.tools.ytdlp(&s).await.map_err(e)?;
+    ytdlp::formats(&inv, &video_id, &s.quality).await.map_err(e)
 }
 
 #[tauri::command]

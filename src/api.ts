@@ -3,7 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
-  PlayerOption, BrowserOption, ToolStatus,
+  PlayerOption, BrowserOption, ToolStatus, Quality, VideoFormats,
 } from "./types";
 
 export const api = {
@@ -51,7 +51,14 @@ export const api = {
   unlinkSiblings: (videoId: string) => invoke<void>("unlink_siblings", { videoId }),
   setWatched: (videoId: string, watched: boolean) =>
     invoke<void>("set_watched", { videoId, watched }),
-  enqueueDownload: (videoId: string) => invoke<void>("enqueue_download", { videoId }),
+  /** A `quality` is stored on the row as its override and then queued; none
+   *  leaves any stored override alone, which is how Retry repeats a custom
+   *  download exactly. */
+  enqueueDownload: (videoId: string, quality?: Quality | null) =>
+    invoke<void>("enqueue_download", { videoId, quality: quality ?? null }),
+  /** Everything one video offers, and what the Settings default would pick
+   *  from it. Runs yt-dlp, so it takes a few seconds. */
+  probeFormats: (videoId: string) => invoke<VideoFormats>("probe_formats", { videoId }),
   cancelDownload: (videoId: string) => invoke<void>("cancel_download", { videoId }),
   openInPlayer: (videoId: string) => invoke<void>("open_in_player", { videoId }),
   deleteDownload: (videoId: string) => invoke<void>("delete_download", { videoId }),

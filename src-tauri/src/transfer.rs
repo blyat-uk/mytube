@@ -65,6 +65,14 @@ struct PortableSettings {
     poll_on_startup: bool,
     backfill_count: u32,
     card_size: u32,
+    /// `None` only in an archive from a build that predates download quality.
+    /// Such an archive says nothing about quality, so an import keeps the
+    /// local one rather than resetting it to the default (see
+    /// `prepare_import_in`). Lenient like `Settings.quality`: a mangled block
+    /// costs the quality, not the whole manifest.
+    #[serde(default, deserialize_with = "crate::quality::lenient_opt",
+            skip_serializing_if = "Option::is_none")]
+    quality: Option<crate::quality::Quality>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -80,6 +88,7 @@ impl PortableSettings {
             poll_on_startup: s.poll_on_startup,
             backfill_count: s.backfill_count,
             card_size: s.card_size,
+            quality: Some(s.quality.clone()),
             extra: s.extra.clone(),
         }
     }
@@ -633,7 +642,11 @@ fn prepare_import_in(
     let mut settings = config::load_from(&dirs.settings)?;
     if apply_settings {
         let mine = settings.download_dir.clone();
+        let my_quality = settings.quality.clone();
         settings.adopt_portable(&m.settings.to_settings()?);
+        if m.settings.quality.is_none() {
+            settings.quality = my_quality;
+        }
         if !Path::new(&settings.download_dir).is_dir() {
             // The other machine's folder does not exist here. Taking it anyway
             // would point every future download at a path that cannot be
@@ -1011,6 +1024,7 @@ mod tests {
         let player = format!("\"{}\" --fs", std::env::current_exe().unwrap().display());
         s.player_command = player.clone();
         s.backfill_count = 77;
+        s.quality.max_height = 480;
         s.window_width = 3840;
         s.view.search = "should not travel".into();
 
@@ -1030,6 +1044,7 @@ mod tests {
         // to travel — `PortableSettings` has no field for it.
         assert_eq!(m.settings.player_command, player);
         assert_eq!(m.settings.backfill_count, 77);
+        assert_eq!(m.settings.quality.as_ref(), Some(&s.quality), "quality is portable");
         let raw = serde_json::to_string(&m.settings).unwrap();
         for absent in ["window_width", "window_height", "window_x", "window_y", "view"] {
             assert!(!raw.contains(absent), "{absent} travelled in the settings block");
@@ -1090,8 +1105,45 @@ mod tests {
         let after = config::load_from(&cfg.join("settings.json")).unwrap();
         assert_eq!(after.player_command, player);
         assert_eq!(after.backfill_count, 77);
+        assert_eq!(after.quality.max_height, 480, "the download quality did not travel");
         assert_eq!(after.window_width, 1280, "the archive's window size was adopted");
         assert_eq!(after.view.search, "", "the archive's feed filters were adopted");
+    }
+
+    #[test]
+    fn an_archive_from_before_download_quality_keeps_the_local_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        let written = tmp.path().join("a.zip");
+        write_archive(&written, &[channel("UC1", "Chan")], &[],
+                      &settings_with_download_dir(&dl), false, &noop).unwrap();
+
+        // The same manifest as an older build would have written it: no
+        // `quality` key in the settings block at all.
+        let mut m: serde_json::Value = {
+            let mut z = open(&written).unwrap();
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut z.by_name(MANIFEST).unwrap(), &mut raw).unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        m["settings"].as_object_mut().unwrap().remove("quality").expect("export wrote one");
+        let old = tmp.path().join("old.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&old).unwrap());
+            z.start_file(MANIFEST, SimpleFileOptions::default()).unwrap();
+            z.write_all(m.to_string().as_bytes()).unwrap();
+            z.finish().unwrap();
+        }
+
+        let cfg = tmp.path().join("cfg");
+        let mut local = settings_with_download_dir(&dl);
+        local.quality.mode = "audio".into();
+        config::save_to(&cfg.join("settings.json"), &local).unwrap();
+
+        prepare_import_in(&old, &["UC1".into()], true, &dirs_in(&cfg), &noop).unwrap();
+        let after = config::load_from(&cfg.join("settings.json")).unwrap();
+        assert_eq!(after.quality.mode, "audio", "an archive silent on quality reset it");
     }
 
     // ------------------------------------------------------------- versioning

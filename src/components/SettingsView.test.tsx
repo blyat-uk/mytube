@@ -3,6 +3,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/re
 import type {
   BrowserOption, PlayerOption, Settings, ToolStatus, TransferEstimate,
 } from "../types";
+import { DEFAULT_QUALITY } from "../quality";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: () => Promise.resolve(() => {}),
@@ -28,6 +29,7 @@ const SETTINGS: Settings = {
   cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
   check_app_updates: true,
   ytdlp_path: "", ffmpeg_path: "", deno_path: "",
+  quality: { ...DEFAULT_QUALITY },
   view: {
     channel_id: null, search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
@@ -146,6 +148,49 @@ async function cookiesSelect() {
 
 const optionTexts = (select: HTMLSelectElement) =>
   [...select.options].map((o) => o.textContent);
+
+describe("Download quality", () => {
+  const pickOption = (select: HTMLSelectElement, text: string) => {
+    const i = optionTexts(select).indexOf(text);
+    fireEvent.change(select, { target: { value: String(i) } });
+  };
+
+  it("shows the saved preferences", async () => {
+    settings = { ...SETTINGS, quality: { ...DEFAULT_QUALITY, max_height: 1080, container: "mp4" } };
+    await renderSettings();
+    expect(screen.getByRole("heading", { name: "Download quality" })).toBeTruthy();
+    const res = screen.getByLabelText("Resolution") as HTMLSelectElement;
+    expect(res.options[res.selectedIndex].text).toBe("Up to 1080p");
+    const box = screen.getByLabelText("Container") as HTMLSelectElement;
+    expect(box.options[box.selectedIndex].text).toBe("MP4");
+  });
+
+  it("saves a select the moment it changes, with the rest of the settings", async () => {
+    await renderSettings();
+    pickOption(screen.getByLabelText("Codec") as HTMLSelectElement, "AV1 (smallest files)");
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(lastSaved()).toEqual({ ...SETTINGS, quality: { ...DEFAULT_QUALITY, vcodec: "av1" } });
+  });
+
+  it("saves the raw format on blur, not per keystroke", async () => {
+    await renderSettings();
+    const raw = screen.getByLabelText("Format (-f)");
+    fireEvent.change(raw, { target: { value: "bv*[height<=720]+ba/b" } });
+    expect(saveSettings).not.toHaveBeenCalled();
+    expect((screen.getByLabelText("Resolution") as HTMLSelectElement).disabled).toBe(true);
+    fireEvent.blur(raw);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(lastSaved().quality.format).toBe("bv*[height<=720]+ba/b");
+  });
+
+  it("draws the defaults for a settings object with no quality block", async () => {
+    const { quality: _, ...rest } = SETTINGS;
+    settings = rest as Settings;
+    await renderSettings();
+    const mode = screen.getByLabelText("Mode") as HTMLSelectElement;
+    expect(mode.options[mode.selectedIndex].text).toBe("Video");
+  });
+});
 
 describe("Player", () => {
   it("offers every detected player, and Custom for a command none of them is", async () => {

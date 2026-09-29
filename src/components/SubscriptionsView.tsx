@@ -4,6 +4,7 @@ import {
 import VideoGrid from "./VideoGrid";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
 import ConfirmDialog from "./ConfirmDialog";
+import CustomDownloadDialog from "./CustomDownloadDialog";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { useDownloadEvents } from "../events";
@@ -132,6 +133,8 @@ export default function SubscriptionsView(p: Props) {
    * "file" asks only whether to delete a watched video's download.
    */
   const [confirm, setConfirm] = useState<{ kind: "remove" | "file"; video: Video } | null>(null);
+  /** The video Download (custom)… is choosing formats for. */
+  const [custom, setCustom] = useState<Video | null>(null);
 
   const fetchPage = useCallback(async (from: number) => {
     const id = ++request.current;
@@ -434,6 +437,7 @@ export default function SubscriptionsView(p: Props) {
       items.push({ label: "Play", onSelect: () => void onAction("play", video) });
     } else if (video.download_state === "none" || video.download_state === "failed") {
       items.push({ label: "Download", onSelect: () => void onAction("download", video) });
+      items.push({ label: "Download (custom)…", onSelect: () => setCustom(video) });
     }
     // Offered for any downloaded file, watched or not: the prompt at
     // marking-time is easy to dismiss, and a video you decide *not* to watch
@@ -524,6 +528,16 @@ export default function SubscriptionsView(p: Props) {
         y={menu.y}
         items={menuItems(menu.video)}
         onClose={() => setMenu(null)}
+      />
+    )}
+
+    {custom && (
+      <CustomDownloadDialog
+        video={custom}
+        // The same optimistic mark a plain Download makes; the queue's own
+        // state events take over from here.
+        onQueued={(v) => patch(v.id, { download_state: "queued", download_error: null })}
+        onClose={() => setCustom(null)}
       />
     )}
 

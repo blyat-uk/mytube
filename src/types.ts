@@ -95,6 +95,9 @@ export interface Settings {
   window_x: number | null; window_y: number | null;
   window_maximized: boolean;
   view: ViewState;
+  /** How every download picks its formats, unless a video carries an override
+   *  from Download (custom)…. Portable: it travels in an export. */
+  quality: Quality;
   /* Machine-local keys, never exported. Always present: `#[serde(default)]`
    * fills each one before the object ever crosses the IPC boundary. */
   /** `"auto"` (Firefox if a profile exists, else none), `""` for none, or a
@@ -111,6 +114,61 @@ export interface Settings {
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Download quality
+ *
+ * `Quality` lives inside `Settings`, so it is snake_case like the rest of it.
+ * `VideoFormats` and its tracks are a dialog payload, camelCase like
+ * `ArchiveSummary`.
+ * ------------------------------------------------------------------ */
+
+export type QualityMode = "video" | "audio";
+/** A preference, not a filter: yt-dlp sorts by it and never fails over it. */
+export type QualityCodec = "any" | "av1" | "vp9" | "h264";
+export type QualityFps = "any" | "prefer60" | "max30";
+export type QualityContainer = "mkv" | "mp4";
+/** `original` keeps whatever audio stream was downloaded, unconverted. */
+export type QualityAudioFormat = "original" | "m4a" | "mp3" | "opus";
+
+export interface Quality {
+  mode: QualityMode;
+  /** 0 is "best available"; otherwise a ceiling in pixels. */
+  max_height: number;
+  vcodec: QualityCodec;
+  fps: QualityFps;
+  container: QualityContainer;
+  audio_format: QualityAudioFormat;
+  /** A raw yt-dlp `-f` string. Non-empty overrides the stream selects. */
+  format: string;
+}
+
+export interface VideoTrack {
+  id: string; height: number; fps: number | null;
+  vcodec: "av1" | "vp9" | "h264" | "other";
+  /** The raw vcodec string, e.g. `avc1.640028`. */
+  codec: string;
+  hdr: boolean; ext: string;
+  /** Bytes, possibly approximate; null when YouTube does not say. */
+  size: number | null;
+}
+
+export interface AudioTrack {
+  id: string; acodec: "opus" | "aac" | "other"; codec: string;
+  abr: number | null; language: string | null; ext: string; size: number | null;
+}
+
+/** What one video actually offers, from `probe_formats`. */
+export interface VideoFormats {
+  title: string;
+  /** Sorted by height, then size, descending. */
+  video: VideoTrack[];
+  /** Sorted by bitrate, descending. */
+  audio: AudioTrack[];
+  /** The format ids the Settings default would pick for this video. */
+  defaultVideo: string | null;
+  defaultAudio: string | null;
 }
 
 /** `app://update-available`: a newer release on GitHub. `version` carries no

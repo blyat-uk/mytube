@@ -1948,3 +1948,51 @@ label.field-label { display: block; }
 }
 .token-chip { font-size: 11.5px; color: var(--muted); }
 
+
+/* ------------------------------------------------------------------ *
+ * Download quality
+ *
+ * One form in two places: the Settings section edits preferences, the
+ * custom-download dialog picks exact tracks. The selects sit in the same
+ * auto-fit grid as the numeric settings, so a narrow window stacks them.
+ * ------------------------------------------------------------------ */
+
+.quality-section > .quality-intro { margin: 0 0 12px; max-width: 62ch; }
+.quality-form .field { margin-bottom: 12px; }
+/* The grid gives each select its column; the Settings pickers' 220px floor
+   would overflow a column that narrow. */
+.quality-form .quality-select { width: 100%; min-width: 0; }
+.quality-note { margin: 0 0 10px; }
+
+.quality-advanced { margin-top: 4px; }
+.quality-advanced > summary {
+  width: fit-content;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.quality-advanced > summary:hover { color: var(--text); }
+.quality-advanced .field { margin-bottom: 0; }
+
+.modal.quality-dialog { width: min(620px, calc(100vw - 40px)); padding: 20px; }
+.quality-dialog-video {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quality-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.quality-probe-error { margin: 0 0 6px; }
+/* Overridden by a raw -f: kept on screen, since the value still shows what
+   the selects would do once the raw field is cleared, but visibly inert. */
+.quality-select:disabled { opacity: 0.45; cursor: not-allowed; }

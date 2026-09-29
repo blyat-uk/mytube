@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::db::Db;
 use crate::models::{DownloadProgress, DownloadState, DownloadStateEvent};
+use crate::quality::{self, Quality};
 use crate::tools::Tools;
 use crate::{config, proc, ytdlp};
 
@@ -44,11 +45,42 @@ impl PathClaims {
     /// Picks a free path and reserves it atomically. `on_disk` reports files
     /// that already exist.
     pub fn claim_unique(&self, intended: &Path, on_disk: impl Fn(&Path) -> bool) -> PathBuf {
-        let mut guard = self.inner.lock().unwrap();
-        let chosen = ytdlp::unique_path(intended, |c| guard.contains(c) || on_disk(c));
-        guard.insert(chosen.clone());
-        chosen
+        self.claim_unique_with(intended, None, on_disk).0
     }
+
+    /// `claim_unique` for a download whose file passes through a second name
+    /// first: `-x --audio-format mp3` downloads `Name.m4a` and converts it to
+    /// `Name.mp3` (see `quality::final_ext`). Both names have to be free --
+    /// yt-dlp would take an existing `Name.m4a` for its own finished download
+    /// and convert *that* -- and both are reserved, so the cancel sweep may
+    /// safely delete the intermediate one. Returns the chosen path and, when
+    /// `via_ext` is given, its intermediate twin.
+    pub fn claim_unique_with(&self, intended: &Path, via_ext: Option<&str>,
+                             on_disk: impl Fn(&Path) -> bool) -> (PathBuf, Option<PathBuf>) {
+        let mut guard = self.inner.lock().unwrap();
+        let taken = |c: &Path| guard.contains(c) || on_disk(c);
+        let chosen = ytdlp::unique_path(intended, |c| {
+            taken(c) || via_ext.is_some_and(|e| taken(&c.with_extension(e)))
+        });
+        let via = via_ext.map(|e| chosen.with_extension(e));
+        guard.insert(chosen.clone());
+        if let Some(v) = &via {
+            guard.insert(v.clone());
+        }
+        (chosen, via)
+    }
+}
+
+/// Where the finished file is meant to land: the probe's path, with the
+/// extension post-processing will give it (`quality::final_ext`), since the
+/// probe prints the name from *before* it. Also returns the probe's own
+/// extension when that differs -- the name the file passes through on the way
+/// -- for `claim_unique_with`.
+fn intended_path(probed: &Path, final_ext: Option<&str>) -> (PathBuf, Option<String>) {
+    let Some(ext) = final_ext else { return (probed.to_path_buf(), None) };
+    let own = probed.extension().and_then(|e| e.to_str()).map(str::to_string);
+    let via = own.filter(|o| o != ext);
+    (probed.with_extension(ext), via)
 }
 
 /// One in-flight download's stop button.
@@ -264,7 +296,9 @@ fn retry_stuck_blocking(stuck: Vec<PathBuf>) {
 /// same path because the merged file it would collide with does not exist yet.
 struct CleanupGuard {
     job: Arc<Job>,
-    out_path: PathBuf,
+    /// The file the download is to produce, and the intermediate name an
+    /// audio conversion passes through (`intended_path`), when there is one.
+    out_paths: Vec<PathBuf>,
     print_file: PathBuf,
 }
 impl Drop for CleanupGuard {
@@ -277,21 +311,24 @@ impl Drop for CleanupGuard {
             // Windows, and this pass finds nothing; it is the backstop for the
             // exits that skip that -- an abort, an error, a late cancel.
             #[allow(unused_variables)]
-            let stuck = remove_leftovers(&self.out_path);
+            let stuck: Vec<PathBuf> = self.out_paths.iter().flat_map(|p| remove_leftovers(p))
+                .collect();
             #[cfg(windows)]
             retry_stuck_blocking(stuck);
         }
     }
 }
 
-/// Releases a claimed path however the job ends, including on panic or abort.
+/// Releases claimed paths however the job ends, including on panic or abort.
 struct ClaimGuard {
     claims: Arc<PathClaims>,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
-        self.claims.release(&self.path);
+        for p in &self.paths {
+            self.claims.release(p);
+        }
     }
 }
 
@@ -338,6 +375,11 @@ impl Queue {
             self.sem.add_permits(n - *cur);
         }
         *cur = n;
+    }
+
+    /// Whether the video is queued or downloading right now.
+    pub async fn is_active(&self, video_id: &str) -> bool {
+        self.running.lock().await.contains_key(video_id)
     }
 
     pub async fn cancel(&self, video_id: &str) -> Result<()> {
@@ -476,20 +518,30 @@ async fn run_one(
     // that sat in the queue gets whatever is installed when it starts. Its
     // lease is held until the download is reaped: the updater never swaps
     // yt-dlp while a job is using it. Not available yet is an ordinary failure.
-    let inv = tools.ytdlp(&config::load().unwrap_or_default()).await?;
+    let settings = config::load().unwrap_or_default();
+    let inv = tools.ytdlp(&settings).await?;
+
+    // The quality is settled now too, for the same reason: a job queued before
+    // Settings changed follows the new default. A video's own quality, from
+    // "Download (custom)…", wins; an unreadable one falls back to Settings.
+    let quality: Quality = db.download_quality(video_id).ok().flatten()
+        .unwrap_or_else(|| settings.quality.clone());
 
     // Phase 1: resolve the output template to a concrete path.
-    let probe = ytdlp::probe(&inv, &ytdlp::watch_url(video_id), dir, template).await?;
-    let intended = PathBuf::from(&probe.intended_path);
-    if intended.as_os_str().is_empty() {
+    let probe = ytdlp::probe(&inv, &quality, &ytdlp::watch_url(video_id), dir, template).await?;
+    let probed = PathBuf::from(&probe.intended_path);
+    if probed.as_os_str().is_empty() {
         return Err(anyhow!("yt-dlp could not resolve an output filename"));
     }
+    let (intended, via_ext) = intended_path(&probed, quality::final_ext(&quality));
 
     // Phase 2: claim a free path, appending " (N)" if this name is taken.
-    let out_path = claims.claim_unique(&intended, |c| c.exists());
+    let (out_path, via_path) =
+        claims.claim_unique_with(&intended, via_ext.as_deref(), |c| c.exists());
+    let out_paths: Vec<PathBuf> = std::iter::once(out_path.clone()).chain(via_path).collect();
     let _guard = ClaimGuard {
         claims: claims.clone(),
-        path: out_path.clone(),
+        paths: out_paths.clone(),
     };
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -499,12 +551,12 @@ async fn run_one(
     // it: yt-dlp is dead before a cancelled job unlinks anything.
     let _cleanup = CleanupGuard {
         job: cancel.clone(),
-        out_path: out_path.clone(),
+        out_paths: out_paths.clone(),
         print_file: print_file.clone(),
     };
 
     let mut cmd = proc::command(&inv.runner.program);
-    cmd.args(ytdlp::download_args(&inv.runner, video_id, &out_path, &print_file))
+    cmd.args(ytdlp::download_args(&inv.runner, &quality, video_id, &out_path, &print_file))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -574,7 +626,9 @@ async fn run_one(
         if !tree.wait_empty(TREE_EXIT_GRACE).await {
             eprintln!("[mytube] {video_id}: yt-dlp's processes outlived the cancel's grace; sweeping anyway");
         }
-        sweep_leftovers(&out_path).await;
+        for p in &out_paths {
+            sweep_leftovers(p).await;
+        }
         return Ok(());
     }
 
@@ -878,6 +932,106 @@ mod tests {
         assert_eq!(first, PathBuf::from("/out/Same Title.mkv"));
         assert_eq!(second, PathBuf::from("/out/Same Title (2).mkv"));
         assert_ne!(first, second);
+    }
+
+    /// Downloads a short video once per kind of quality, through the same
+    /// steps `run_one` takes -- probe, `intended_path`, claim, `download_args`,
+    /// read back the printed path -- and checks what lands on disk:
+    ///
+    ///     cargo test --manifest-path src-tauri/Cargo.toml real_download_in_each_mode -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires network, yt-dlp, ffmpeg and deno"]
+    async fn real_download_in_each_mode() {
+        const VIDEO: &str = "jNQXAC9IVRw"; // "Me at the zoo", 19 s
+        let settings = config::load().unwrap_or_default();
+        let tools = Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
+        let inv = tools.ytdlp(&settings).await.expect("a yt-dlp");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().into_owned();
+        let claims = PathClaims::default();
+
+        let audio = |f: &str| Quality { mode: "audio".into(), audio_format: f.into(),
+                                        ..Quality::default() };
+        let cases: Vec<(&str, Quality, Option<&str>)> = vec![
+            ("default", Quality::default(), Some("mkv")),
+            ("mp4 at 360p", Quality { container: "mp4".into(), max_height: 360,
+                                     ..Quality::default() }, Some("mp4")),
+            ("audio mp3", audio("mp3"), Some("mp3")),
+            ("audio opus", audio("opus"), Some("opus")),
+            ("audio original", audio("original"), None),
+        ];
+        for (name, q, want_ext) in cases {
+            let probe = ytdlp::probe(&inv, &q, &ytdlp::watch_url(VIDEO), &dir,
+                                     &format!("{name} [%(id)s].%(ext)s"))
+                .await.unwrap_or_else(|e| panic!("{name}: probe failed: {e}"));
+            let probed = PathBuf::from(&probe.intended_path);
+            let (intended, via) = intended_path(&probed, quality::final_ext(&q));
+            let (out, _) = claims.claim_unique_with(&intended, via.as_deref(), |c| c.exists());
+            let print_file = tmp.path().join(format!("{name}.path"));
+
+            let out_status = proc::command(&inv.runner.program)
+                .args(ytdlp::download_args(&inv.runner, &q, VIDEO, &out, &print_file))
+                .output().await.expect("yt-dlp runs");
+            let stderr = String::from_utf8_lossy(&out_status.stderr);
+            assert!(out_status.status.success(), "{name}: yt-dlp failed: {stderr}");
+
+            let landed = PathBuf::from(std::fs::read_to_string(&print_file).unwrap().trim());
+            let ext = landed.extension().unwrap().to_string_lossy().into_owned();
+            println!("{name}: probe said {}, claimed {}, landed {} ({} bytes)",
+                     probed.file_name().unwrap().to_string_lossy(),
+                     out.file_name().unwrap().to_string_lossy(),
+                     landed.file_name().unwrap().to_string_lossy(),
+                     std::fs::metadata(&landed).map(|m| m.len()).unwrap_or(0));
+            assert!(landed.exists(), "{name}: {landed:?} is missing");
+            assert_eq!(landed, out, "{name}: the file did not land where it was claimed");
+            match want_ext {
+                Some(e) => assert_eq!(ext, e, "{name}"),
+                None => assert_eq!(Some(ext.as_str()),
+                                   probed.extension().and_then(|e| e.to_str()),
+                                   "{name}: original audio keeps the probe's extension"),
+            }
+        }
+        let mut left: Vec<String> = std::fs::read_dir(tmp.path()).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".path"))
+            .collect();
+        left.sort();
+        println!("directory: {left:?}");
+    }
+
+    #[test]
+    fn the_intended_path_takes_the_extension_post_processing_gives_it() {
+        let p = Path::new("/out/Ch/Title [id].m4a");
+        assert_eq!(intended_path(p, Some("mp3")),
+                   (PathBuf::from("/out/Ch/Title [id].mp3"), Some("m4a".to_string())));
+        assert_eq!(intended_path(p, None), (p.to_path_buf(), None), "original audio keeps it");
+        let mkv = Path::new("/out/S01.E02 Pilot [id].mkv");
+        assert_eq!(intended_path(mkv, Some("mkv")), (mkv.to_path_buf(), None),
+                   "a merge the probe already named needs nothing");
+        assert_eq!(intended_path(Path::new("/out/1.5 [id].mp4"), Some("mkv")).0,
+                   PathBuf::from("/out/1.5 [id].mkv"), "only the last dot is the extension");
+    }
+
+    #[test]
+    fn a_conversion_claims_its_intermediate_name_too() {
+        let claims = PathClaims::default();
+        let (out, via) = claims.claim_unique_with(Path::new("/o/T.mp3"), Some("m4a"), |_| false);
+        assert_eq!(out, PathBuf::from("/o/T.mp3"));
+        assert_eq!(via, Some(PathBuf::from("/o/T.m4a")));
+        assert!(claims.is_claimed(Path::new("/o/T.m4a")));
+        // An original-audio download of a same-named video now cannot take
+        // the name the conversion is passing through.
+        assert_eq!(claims.claim_unique(Path::new("/o/T.m4a"), |_| false),
+                   PathBuf::from("/o/T (2).m4a"));
+    }
+
+    #[test]
+    fn an_intermediate_name_already_on_disk_moves_the_whole_pair() {
+        let claims = PathClaims::default();
+        let on_disk = |c: &Path| c == Path::new("/o/T.m4a");
+        let (out, via) = claims.claim_unique_with(Path::new("/o/T.mp3"), Some("m4a"), on_disk);
+        assert_eq!(out, PathBuf::from("/o/T (2).mp3"));
+        assert_eq!(via, Some(PathBuf::from("/o/T (2).m4a")));
     }
 
     #[test]
