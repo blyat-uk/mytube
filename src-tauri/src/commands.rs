@@ -6,7 +6,7 @@ use crate::db::Db;
 use crate::models::*;
 use crate::poll::{self, AppState};
 use crate::quality::Quality;
-use crate::{config, player, resolve, transfer, ytdlp};
+use crate::{app_update, config, player, resolve, transfer, ytdlp};
 
 /// Backfills run a few at a time: enough to hide latency, few enough
 /// to stay clear of YouTube rate limiting.
@@ -881,6 +881,24 @@ pub async fn tools_status(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>>
 pub async fn tools_update_now(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>> {
     let s = blocking(config::load).await.unwrap_or_default();
     state.tools.update_now(&s).await.map_err(e)
+}
+
+/// This build's version and any newer release already known, straight from
+/// `update-check.json` -- no network. The nav's version pill and Settings'
+/// About block draw from it at mount; `app://version-info` keeps them current.
+#[tauri::command]
+pub async fn app_version_info() -> R<app_update::VersionInfo> {
+    blocking(|| Ok(app_update::current_info(&config::load().unwrap_or_default()))).await
+}
+
+/// About's "Check now": asks GitHub whether or not a day has passed.
+#[tauri::command]
+pub async fn check_app_update_now(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<app_update::VersionInfo> {
+    let s = blocking(config::load).await?;
+    app_update::check_now(&app, &state.http, &s).await.map_err(e)
 }
 
 #[cfg(test)]

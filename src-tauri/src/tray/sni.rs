@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 
 use ksni::menu::StandardItem;
-use ksni::{Handle, Icon, MenuItem, Tray, TrayMethods};
+use ksni::{Handle, Icon, MenuItem, ToolTip, Tray, TrayMethods};
 use tauri::AppHandle;
 
 use super::{
@@ -79,6 +79,12 @@ impl Tray for MyTube {
 
     fn title(&self) -> String {
         "MyTube".into()
+    }
+
+    /// Diffed by ksni like the menu, so a release turning up re-sends it.
+    fn tool_tip(&self) -> ToolTip {
+        let (title, description) = super::tooltip(self.update.as_ref().map(|(v, _)| v.as_str()));
+        ToolTip { title, description, ..Default::default() }
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {

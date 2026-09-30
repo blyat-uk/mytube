@@ -21,7 +21,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Wry};
 
 use super::{
-    badge_slot, open_release_page, show_window, toggle_window, update_label, ICONS, TRAY_ID,
+    badge_slot, open_release_page, show_window, toggle_window, tooltip_line, update_label, ICONS,
+    TRAY_ID,
 };
 use crate::window;
 
@@ -103,7 +104,7 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
     // is already there), so returning means the icon is really in the tray.
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(Image::from_bytes(ICONS[0])?)
-        .tooltip("MyTube")
+        .tooltip(tooltip_line(update_slot().as_ref().map(|(v, _)| v.as_str())))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
@@ -187,6 +188,7 @@ pub(super) fn set_update(release: Option<(String, String)>) {
     let Some(app) = APP.get() else {
         return;
     };
+    let tip = tooltip_line(release.as_ref().map(|(v, _)| v.as_str()));
     {
         let mut slot = update_slot();
         if *slot == release {
@@ -200,6 +202,7 @@ pub(super) fn set_update(release: Option<(String, String)>) {
         let Some(tray) = handle.tray_by_id(TRAY_ID) else {
             return;
         };
+        let _ = tray.set_tooltip(Some(tip));
         match menu(&handle) {
             Ok(m) => {
                 let _ = tray.set_menu(Some(m));

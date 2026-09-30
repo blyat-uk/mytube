@@ -7,6 +7,7 @@ import PlayerField from "./PlayerField";
 import QualityForm from "./QualityForm";
 import { sanitizeQuality } from "../quality";
 import CookiesField from "./CookiesField";
+import AboutSection from "./AboutSection";
 import ToolsSection from "./ToolsSection";
 import { useTransferProgress } from "../events";
 import { useToast } from "./Toast";
@@ -522,6 +523,8 @@ export default function SettingsView() {
           </div>
         )}
       </div>
+
+      <AboutSection />
 
       {archive && (
         <TransferDialog

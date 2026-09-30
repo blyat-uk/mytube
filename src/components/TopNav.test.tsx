@@ -49,6 +49,8 @@ function props(over: Partial<Props> = {}): Props {
     polling: false,
     onRefresh: vi.fn(),
     onAdd: vi.fn(),
+    version: null,
+    onOpenRelease: vi.fn(),
     ...over,
   };
 }
@@ -467,5 +469,33 @@ describe("the action shortcuts", () => {
     renderNav();
     expect(button("Refresh subscriptions").title).toContain("Ctrl+R");
     expect(button("Add").title).toContain("Ctrl+N");
+  });
+});
+
+describe("the version pill", () => {
+  const V = { current: "2.1.0", update: null, checkedAt: null, checksEnabled: true };
+
+  it("says nothing until the version is known", () => {
+    renderNav();
+    expect(screen.getByText("MyTube")).toBeDefined();
+    expect(screen.queryByText("2.1.0")).toBeNull();
+  });
+
+  it("shows the running version as plain text, not a button", () => {
+    renderNav({ version: V });
+    expect(screen.getByText("2.1.0").tagName).toBe("SPAN");
+    expect(screen.queryByRole("button", { name: /Update available/ })).toBeNull();
+  });
+
+  it("offers a newer release and opens its page", () => {
+    const url = "https://github.com/blyat-uk/mytube/releases/tag/v2.2.0";
+    const p = renderNav({ version: { ...V, update: { version: "2.2.0", url } } });
+    fireEvent.click(screen.getByRole("button", { name: /Update available: MyTube 2\.2\.0/ }));
+    expect(p.onOpenRelease).toHaveBeenCalledWith(url);
+  });
+
+  it("stays beside the logo while a series is open", () => {
+    renderNav({ version: V, series: SERIES });
+    expect(screen.getByText("2.1.0")).toBeDefined();
   });
 });

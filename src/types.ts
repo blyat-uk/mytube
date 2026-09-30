@@ -176,6 +176,18 @@ export interface VideoFormats {
  *  MyTube was installed. */
 export interface AppUpdate { version: string; url: string }
 
+/** `app_version_info` / `check_app_update_now`, and `app://version-info`, which
+ *  the backend sends after every update check and whenever the setting flips.
+ *  camelCase, like every dialog payload. `update` is a release newer than this
+ *  build — the same test the tray item uses — and always null while checks are
+ *  off. `checkedAt` is Unix seconds. */
+export interface VersionInfo {
+  current: string;
+  update: AppUpdate | null;
+  checkedAt: number | null;
+  checksEnabled: boolean;
+}
+
 /** The `cookies_browser` value meaning "Firefox if there is one, else none". */
 export const COOKIES_AUTO = "auto";
 

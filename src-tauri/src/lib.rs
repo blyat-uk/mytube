@@ -190,6 +190,8 @@ pub fn run() {
             commands::detect_browsers,
             commands::tools_status,
             commands::tools_update_now,
+            commands::app_version_info,
+            commands::check_app_update_now,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -3,7 +3,7 @@ import {
   IconClose, IconContinue, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconSettings,
   IconSubscriptions, IconUnwatched,
 } from "./Icons";
-import type { Channel, SortOrder } from "../types";
+import type { Channel, SortOrder, VersionInfo } from "../types";
 
 export type Tab = "subscriptions" | "downloads" | "settings";
 
@@ -66,6 +66,10 @@ interface Props {
   polling: boolean;
   onRefresh: () => void;
   onAdd: () => void;
+  /** This build and any newer release; null until the first read lands. */
+  version: VersionInfo | null;
+  /** Opens a release page in the browser. */
+  onOpenRelease: (url: string) => void;
 }
 
 export default function TopNav(p: Props) {
@@ -167,7 +171,30 @@ export default function TopNav(p: Props) {
   return (
     <header className="topnav">
       <div className="topnav-row">
-        <span className="brand-mark" aria-hidden="true" />
+        {/* The logo carries the version: nothing else in the app said which
+            MyTube was running. A newer release turns the pill into the way to
+            it — a link out, since how to update depends on how it was installed. */}
+        <span className="brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <span className="brand-word">MyTube</span>
+          {p.version && (p.version.update ? (
+            <button
+              type="button"
+              className="brand-version is-update"
+              onClick={() => p.onOpenRelease(p.version!.update!.url)}
+              aria-label={`Update available: MyTube ${p.version.update.version}. Open the release page`}
+              title={`You have ${p.version.current}. Open the ${p.version.update.version} release page`}
+            >
+              <span aria-hidden="true">↑</span>
+              <span className="brand-version-word">Update</span>
+              {p.version.update.version}
+            </button>
+          ) : (
+            <span className="brand-version" title={`MyTube ${p.version.current}`}>
+              {p.version.current}
+            </span>
+          ))}
+        </span>
 
         {p.series ? (
           /* The series replaces the tab strip rather than adding a bar of its

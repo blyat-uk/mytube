@@ -3,7 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
-  PlayerOption, BrowserOption, ToolStatus, Quality, VideoFormats,
+  PlayerOption, BrowserOption, ToolStatus, Quality, VideoFormats, VersionInfo,
 } from "./types";
 
 export const api = {
@@ -81,6 +81,10 @@ export const api = {
   /** Forces the yt-dlp update check and retries any failed install. Rejects
    *  while a download holds yt-dlp, since nothing is swapped under a live job. */
   toolsUpdateNow: () => invoke<ToolStatus[]>("tools_update_now"),
+  /** This build's version and any newer release already known. No network. */
+  appVersionInfo: () => invoke<VersionInfo>("app_version_info"),
+  /** Asks GitHub now, whether or not a day has passed; rejects if it cannot. */
+  checkAppUpdateNow: () => invoke<VersionInfo>("check_app_update_now"),
   /** Hands a URL to the desktop's default browser. */
   openExternal: (url: string) => openUrl(url),
 };

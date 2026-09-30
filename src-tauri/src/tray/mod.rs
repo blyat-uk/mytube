@@ -136,6 +136,24 @@ fn update_label(version: &str) -> String {
     format!("Update available: v{version}\u{2026}")
 }
 
+/// The hover text, as `(title, body)`: which MyTube this is -- until now
+/// nothing in the app said -- and, while one is out, the newer release.
+/// StatusNotifierItem shows the two apart; Tauri's tray takes one string, and
+/// gets [`tooltip_line`].
+fn tooltip(update: Option<&str>) -> (String, String) {
+    let title = format!("MyTube {}", env!("CARGO_PKG_VERSION"));
+    let body = update.map(|v| format!("v{v} is available")).unwrap_or_default();
+    (title, body)
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn tooltip_line(update: Option<&str>) -> String {
+    match tooltip(update) {
+        (title, body) if body.is_empty() => title,
+        (title, body) => format!("{title} \u{2014} {body}"),
+    }
+}
+
 fn open_release_page(url: &str) {
     if let Err(err) = tauri_plugin_opener::open_url(url, None::<&str>) {
         eprintln!("mytube: could not open {url}: {err}");
@@ -180,6 +198,15 @@ mod tests {
         // while you are looking at it has been read by definition.
         assert_eq!(next_count(0, 3, true), 0);
         assert_eq!(next_count(3, 2, true), 0);
+    }
+
+    #[test]
+    fn the_tooltip_names_this_build_and_any_newer_one() {
+        let this = format!("MyTube {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(tooltip(None), (this.clone(), String::new()));
+        assert_eq!(tooltip(Some("9.0.0")), (this.clone(), "v9.0.0 is available".into()));
+        assert_eq!(tooltip_line(None), this);
+        assert_eq!(tooltip_line(Some("9.0.0")), format!("{this} \u{2014} v9.0.0 is available"));
     }
 
     #[test]

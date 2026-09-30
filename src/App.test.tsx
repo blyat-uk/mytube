@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
-import type { Channel, Settings, ToolStatus, Video, ViewState, VideoFilter } from "./types";
+import type {
+  Channel, Settings, ToolStatus, VersionInfo, Video, ViewState, VideoFilter,
+} from "./types";
 import { DEFAULT_QUALITY } from "./quality";
+
+const VERSION: VersionInfo = {
+  current: "2.1.0", update: null, checkedAt: 1_790_000_000, checksEnabled: true,
+};
 
 // Every listener the shell registers, by event name, so a test can deliver an
 // event exactly when it wants to.
@@ -31,6 +37,7 @@ const listVideos = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() => Prom
 const listVideoGroups = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() => Promise.resolve([]));
 const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([]));
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
+const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(VERSION));
 
 vi.mock("./api", () => ({
   api: {
@@ -41,6 +48,7 @@ vi.mock("./api", () => ({
     listVideoGroups: (filter: VideoFilter) => listVideoGroups(filter),
     toolsStatus: () => toolsStatus(),
     openExternal: (url: string) => openExternal(url),
+    appVersionInfo: () => appVersionInfo(),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
@@ -92,6 +100,7 @@ beforeEach(() => {
   listVideoGroups.mockImplementation(() => Promise.resolve([]));
   saveViewState.mockImplementation(() => Promise.resolve());
   toolsStatus.mockImplementation(() => Promise.resolve([]));
+  appVersionInfo.mockImplementation(() => Promise.resolve(VERSION));
   listeners.clear();
 });
 
@@ -418,5 +427,42 @@ describe("a newer MyTube release", () => {
     expect(openExternal).toHaveBeenCalledWith(RELEASE);
     // Acting on the toast is also done with it.
     await waitFor(() => expect(screen.queryByText("MyTube 0.1.2 is available.")).toBeNull());
+  });
+});
+
+describe("the version in the logo", () => {
+  const RELEASE = "https://github.com/blyat-uk/mytube/releases/tag/v2.2.0";
+
+  it("shows this build's version beside the name", async () => {
+    render(<App />);
+    expect(await screen.findByText("2.1.0")).toBeDefined();
+    expect(screen.getByText("MyTube")).toBeDefined();
+  });
+
+  it("turns into a link to the release page when a newer one is out", async () => {
+    render(<App />);
+    await screen.findByText("2.1.0");
+    await waitFor(() => expect(listeners.has("app://version-info")).toBe(true));
+
+    act(() => listeners.get("app://version-info")!({
+      payload: { ...VERSION, update: { version: "2.2.0", url: RELEASE } },
+    }));
+
+    fireEvent.click(await screen.findByRole("button", { name: /Update available: MyTube 2\.2\.0/ }));
+    expect(openExternal).toHaveBeenCalledWith(RELEASE);
+  });
+
+  it("keeps a check that lands before the first read over that older read", async () => {
+    let resolve!: (v: VersionInfo) => void;
+    appVersionInfo.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    render(<App />);
+    await waitFor(() => expect(listeners.has("app://version-info")).toBe(true));
+
+    act(() => listeners.get("app://version-info")!({
+      payload: { ...VERSION, update: { version: "2.2.0", url: RELEASE } },
+    }));
+    await act(async () => { resolve(VERSION); });
+
+    expect(screen.getByRole("button", { name: /Update available: MyTube 2\.2\.0/ })).toBeDefined();
   });
 });

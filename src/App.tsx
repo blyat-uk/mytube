@@ -9,6 +9,7 @@ import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
 import { useAppUpdate, usePollEvents, useToolsStatus, useTransferFinished } from "./events";
 import { toolsReadyMessage } from "./components/ToolsSection";
+import { useAppVersion } from "./appVersion";
 import type {
   Channel, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
 } from "./types";
@@ -197,14 +198,20 @@ function Shell() {
   // depends on how it was installed (deb, rpm, AppImage, NSIS, dmg), so the
   // action opens the release page. Missed while the window is hidden, the
   // tray menu's update item still says it.
+  const openRelease = useCallback((url: string) => {
+    api.openExternal(url).catch((err) => toast.error(errText(err)));
+  }, [toast]);
+
   useAppUpdate((u) => {
     toast.info(`MyTube ${u.version} is available.`, {
       label: "Download",
-      onClick: () => {
-        api.openExternal(u.url).catch((err) => toast.error(errText(err)));
-      },
+      onClick: () => openRelease(u.url),
     });
   });
+
+  // The toast is once per release; the version pill in the nav is the
+  // standing reminder, the in-window twin of the tray's menu item.
+  const [version] = useAppVersion();
 
   // A poll can also start on its own (startup and the interval timer), so the
   // spinner and the refetch are driven by events rather than by the button.
@@ -370,6 +377,8 @@ function Shell() {
         polling={polling}
         onRefresh={() => void refresh()}
         onAdd={() => setAddOpen(true)}
+        version={version}
+        onOpenRelease={openRelease}
       />
 
       <main className="content" ref={contentRef}>

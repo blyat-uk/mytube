@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppUpdate, DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, ToolProgress, ToolStatus,
-  TransferProgress,
+  TransferProgress, VersionInfo,
 } from "./types";
 
 /**
@@ -87,4 +87,10 @@ export function useToolsStatus(handler?: (list: ToolStatus[]) => void) {
  *  so the shell can toast it without keeping any record of its own. */
 export function useAppUpdate(handler?: (update: AppUpdate) => void) {
   useTauriEvent<AppUpdate>("app://update-available", handler);
+}
+
+/** The version state — not the news: sent after every check, so the nav's
+ *  version pill and Settings' About block follow it without polling. */
+export function useVersionInfo(handler?: (info: VersionInfo) => void) {
+  useTauriEvent<VersionInfo>("app://version-info", handler);
 }

@@ -96,6 +96,13 @@ vi.mock("../api", () => ({
     detectBrowsers: () => Promise.resolve(browsers),
     toolsStatus: () => Promise.resolve(tools),
     toolsUpdateNow: () => toolsUpdateNow(),
+    appVersionInfo: () => Promise.resolve({
+      current: "2.1.0", update: null, checkedAt: null, checksEnabled: true,
+    }),
+    checkAppUpdateNow: () => Promise.resolve({
+      current: "2.1.0", update: null, checkedAt: 1_790_000_000, checksEnabled: true,
+    }),
+    openExternal: () => Promise.resolve(),
   },
   errText: (e: unknown) => String(e),
 }));

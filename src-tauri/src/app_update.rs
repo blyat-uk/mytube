@@ -161,16 +161,66 @@ fn show_in_tray(book: &Bookkeeping, current: &str) {
     tray::set_update(newer_release(book, current).map(|r| (r.version.clone(), r.url.clone())));
 }
 
+/// What the nav's version pill and Settings' About block show. A dialog-style
+/// payload, so camelCase like the others; `Release` inside it is the same on
+/// both sides either way.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionInfo {
+    /// This build, `CARGO_PKG_VERSION`.
+    pub current: String,
+    /// A known release newer than this build -- the same test the tray item
+    /// uses, so the pill and the tray can never disagree. Always `None` while
+    /// checks are off: off means no update is shown anywhere.
+    pub update: Option<Release>,
+    /// When GitHub was last asked successfully, Unix seconds.
+    pub checked_at: Option<i64>,
+    pub checks_enabled: bool,
+}
+
+/// Sent after every check, successful or not, and whenever the setting flips,
+/// so the pill and the About block follow without polling. Unlike [`EVENT`]
+/// it is not once per release: it is the state, not the news.
+pub const INFO_EVENT: &str = "app://version-info";
+
+pub fn info_from(book: &Bookkeeping, current: &str, checks_enabled: bool) -> VersionInfo {
+    VersionInfo {
+        current: current.to_string(),
+        update: newer_release(book, current).filter(|_| checks_enabled).cloned(),
+        checked_at: book.checked_at,
+        checks_enabled,
+    }
+}
+
+/// The state as it stands on disk, with no network: what the frontend asks
+/// for when it mounts. Blocking (one small file read).
+pub fn current_info(s: &Settings) -> VersionInfo {
+    info_from(&load_from(&bookkeeping_path()), env!("CARGO_PKG_VERSION"), s.check_app_updates)
+}
+
 /// One round of the check, run hourly. Does no network at all unless a day has
 /// passed since the last successful check.
 pub async fn tick(app: &AppHandle, http: &reqwest::Client, s: &Settings) {
+    // A failed request is already a journal line, and the next tick retries.
+    let _ = check(app, http, s, false).await;
+}
+
+/// Settings' "Check now": asks GitHub whether or not a day has passed, and
+/// hands a failure back so the button can say it rather than log it.
+pub async fn check_now(app: &AppHandle, http: &reqwest::Client, s: &Settings) -> Result<VersionInfo> {
+    check(app, http, s, true).await
+}
+
+async fn check(app: &AppHandle, http: &reqwest::Client, s: &Settings, force: bool) -> Result<VersionInfo> {
+    let current = env!("CARGO_PKG_VERSION");
     if !s.check_app_updates {
         // Off means no request and no tray item -- including one a previous
         // check left behind.
         tray::set_update(None);
-        return;
+        let info = info_from(&Bookkeeping::default(), current, false);
+        let _ = app.emit(INFO_EVENT, &info);
+        return Ok(info);
     }
-    let current = env!("CARGO_PKG_VERSION");
     let path = bookkeeping_path();
     let mut book = load_from(&path);
     // Straight from the file, so the item survives a restart with no network;
@@ -178,7 +228,8 @@ pub async fn tick(app: &AppHandle, http: &reqwest::Client, s: &Settings) {
     show_in_tray(&book, current);
 
     let now = chrono::Utc::now().timestamp();
-    if due(now, book.checked_at) {
+    let mut failure = None;
+    if force || due(now, book.checked_at) {
         match fetch_latest(http).await {
             Ok(release) => {
                 book.latest = Some(release);
@@ -190,7 +241,10 @@ pub async fn tick(app: &AppHandle, http: &reqwest::Client, s: &Settings) {
             }
             // Offline, rate-limited, GitHub down: a journal line and nothing
             // else. `checked_at` stays put, so the next hourly tick tries again.
-            Err(err) => eprintln!("mytube: update check failed: {err:#}"),
+            Err(err) => {
+                eprintln!("mytube: update check failed: {err:#}");
+                failure = Some(err);
+            }
         }
     }
 
@@ -200,6 +254,14 @@ pub async fn tick(app: &AppHandle, http: &reqwest::Client, s: &Settings) {
         if let Err(err) = save_to(&path, &book) {
             eprintln!("mytube: could not record the update notice: {err:#}");
         }
+    }
+
+    // Emitted even after a failure: the file's last answer is still the truth.
+    let info = info_from(&book, current, true);
+    let _ = app.emit(INFO_EVENT, &info);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(info),
     }
 }
 
@@ -337,6 +399,37 @@ mod tests {
 
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(load_from(&path), Bookkeeping::default(), "corrupt file");
+    }
+
+    #[test]
+    fn info_offers_only_a_newer_release_and_only_while_checks_are_on() {
+        let book = Bookkeeping {
+            checked_at: Some(1_800_000_000),
+            latest: Some(release("0.1.2")),
+            notified_version: String::new(),
+        };
+        let on = info_from(&book, "0.1.1", true);
+        assert_eq!(on.current, "0.1.1");
+        assert_eq!(on.update, Some(release("0.1.2")));
+        assert_eq!(on.checked_at, Some(1_800_000_000));
+        assert!(on.checks_enabled);
+
+        assert_eq!(info_from(&book, "0.1.2", true).update, None, "already on it");
+        assert_eq!(info_from(&book, "0.2.0", true).update, None, "ahead of it");
+        let off = info_from(&book, "0.1.1", false);
+        assert_eq!(off.update, None, "off means no update shown anywhere");
+        assert!(!off.checks_enabled);
+    }
+
+    #[test]
+    fn info_crosses_the_ipc_boundary_in_camel_case() {
+        let json = serde_json::to_value(info_from(&Bookkeeping::default(), "2.1.0", true)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "current": "2.1.0", "update": null, "checkedAt": null, "checksEnabled": true
+            })
+        );
     }
 
     #[tokio::test]
