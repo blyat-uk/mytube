@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
-use crate::db::Db;
+use crate::db::{Db, ResolvedMeta};
 use crate::models::*;
 use crate::queue::Queue;
 use crate::tools::Tools;
@@ -130,16 +130,18 @@ async fn refresh_from_listing(db: &Db, tools: &Tools, channel_id: &str, backfill
         &entries.iter().map(|e| (e.id.clone(), e.title.clone())).collect::<Vec<_>>(),
     )?;
 
-    for e in &entries {
-        if !pending.contains(&e.id) {
-            continue;
-        }
-        let status = ytdlp::status_from(e.live_status.as_deref(), e.duration_secs);
-        db.update_video_meta(&e.id, e.duration_secs, e.view_count, status)?;
-        if let Some(ts) = e.published_at {
-            db.set_published_at_if_missing(&e.id, ts)?;
-        }
-    }
+    let resolved: Vec<ResolvedMeta> = entries
+        .iter()
+        .filter(|e| pending.contains(&e.id))
+        .map(|e| ResolvedMeta {
+            id: e.id.clone(),
+            duration_secs: e.duration_secs,
+            view_count: e.view_count,
+            status: ytdlp::status_from(e.live_status.as_deref(), e.duration_secs),
+            published_at: e.published_at,
+        })
+        .collect();
+    db.resolve_listed(&resolved)?;
     Ok(entries)
 }
 
@@ -204,10 +206,9 @@ fn ingestable(entries: &[FlatEntry], known: &HashSet<String>, member: bool, mode
 /// interleaves it into the feed instead of piling it at the bottom.
 fn insert_from_listing(db: &Db, channel_id: &str, entries: &[FlatEntry],
                        dates: &HashMap<String, i64>) -> Result<usize> {
-    let mut added = 0;
-    for e in entries {
+    let rows: Vec<NewVideo> = entries.iter().map(|e| {
         let when = dates.get(&e.id).copied().or(e.published_at);
-        let inserted = db.insert_video_if_new(&NewVideo {
+        NewVideo {
             id: e.id.clone(),
             channel_id: channel_id.to_string(),
             title: e.title.clone(),
@@ -220,12 +221,9 @@ fn insert_from_listing(db: &Db, channel_id: &str, entries: &[FlatEntry],
             duration_secs: e.duration_secs,
             view_count: e.view_count,
             status: ytdlp::status_from(e.live_status.as_deref(), e.duration_secs),
-        })?;
-        if inserted {
-            added += 1;
         }
-    }
-    Ok(added)
+    }).collect();
+    db.insert_videos_if_new(&rows)
 }
 
 /// Adds what a listing carries and RSS structurally cannot: a joined channel's
@@ -286,10 +284,11 @@ pub async fn repair_dates(state: &AppState) -> usize {
     if ids.is_empty() {
         return 0;
     }
-    let real = upload_date::fetch_many(&state.http, ids).await;
-    real.into_iter()
-        .filter(|(id, ts)| state.db.set_published_at(id, *ts).is_ok())
-        .count()
+    let real: Vec<(String, i64)> =
+        upload_date::fetch_many(&state.http, ids).await.into_iter().collect();
+    // One transaction for up to `DATE_REPAIR_LIMIT` rows, rather than a lock
+    // and a commit per row while the UI is trying to read.
+    state.db.set_published_at_many(&real).unwrap_or(0)
 }
 
 /// Writes a feed's entries as new rows, returning how many were actually new.
@@ -299,7 +298,8 @@ pub async fn repair_dates(state: &AppState) -> usize {
 fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<usize> {
     let ids: Vec<String> = feed.entries.iter().map(|e| e.video_id.clone()).collect();
     let existing = db.existing_video_ids(&ids)?;
-    let mut new_count = 0;
+    let mut dates: Vec<(String, i64)> = Vec::new();
+    let mut fresh: Vec<NewVideo> = Vec::new();
 
     for e in &feed.entries {
         if existing.contains(&e.video_id) {
@@ -308,7 +308,7 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<usize> {
             // outage: it lands on an approximate bucket and the feed replaces
             // it with the exact instant the moment RSS comes back.
             if e.published_at > 0 {
-                let _ = db.set_published_at(&e.video_id, e.published_at);
+                dates.push((e.video_id.clone(), e.published_at));
             }
             // Deliberately no retitle here: a feed entry's title is frozen at
             // publish time (see `Db::set_titles`), so writing it back would
@@ -316,7 +316,7 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<usize> {
             // the listing is unavailable.
             continue;
         }
-        let inserted = db.insert_video_if_new(&NewVideo {
+        fresh.push(NewVideo {
             id: e.video_id.clone(),
             channel_id: channel.id.clone(),
             title: e.title.clone(),
@@ -332,12 +332,11 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<usize> {
             duration_secs: None,
             view_count: e.view_count,
             status: VideoStatus::Pending,
-        })?;
-        if inserted {
-            new_count += 1;
-        }
+        });
     }
-    Ok(new_count)
+    // One lock and one commit for the whole feed. A date that fails to write is
+    // skipped, as it always was; only an insert failing fails the poll.
+    db.apply_feed(&dates, &fresh)
 }
 
 /// What one channel's poll produced.
@@ -629,30 +628,27 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
     let fresh_ids: Vec<String> = fresh.iter().map(|(_, e)| e.id.clone()).collect();
     let real = upload_date::fetch_many(&state.http, fresh_ids).await;
 
-    let mut added = 0;
-    for (rank, e) in &fresh {
-        let status = ytdlp::status_from(e.live_status.as_deref(), e.duration_secs);
-        let inserted = state.db.insert_video_if_new(&NewVideo {
-            id: e.id.clone(),
-            channel_id: channel_id.to_string(),
-            title: e.title.clone(),
-            description: None,
-            thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
-            // The real date when the watch page gave one; otherwise the
-            // approximate bucket, which at least interleaves the video into the
-            // feed instead of piling it up at the bottom.
-            published_at: real.get(&e.id).copied().or(e.published_at),
-            sort_at: real.get(&e.id).copied().or(e.published_at),
-            feed_rank: *rank as i64,
-            added_manually: false,
-            duration_secs: e.duration_secs,
-            view_count: e.view_count,
-            status,
-        })?;
-        if inserted {
-            added += 1;
-        }
-    }
+    // Built whole and written in one transaction: a deepen can be hundreds of
+    // rows, and a lock and a commit per row kept the UI's reads waiting behind
+    // every one of them.
+    let rows: Vec<NewVideo> = fresh.iter().map(|(rank, e)| NewVideo {
+        id: e.id.clone(),
+        channel_id: channel_id.to_string(),
+        title: e.title.clone(),
+        description: None,
+        thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
+        // The real date when the watch page gave one; otherwise the
+        // approximate bucket, which at least interleaves the video into the
+        // feed instead of piling it up at the bottom.
+        published_at: real.get(&e.id).copied().or(e.published_at),
+        sort_at: real.get(&e.id).copied().or(e.published_at),
+        feed_rank: *rank as i64,
+        added_manually: false,
+        duration_secs: e.duration_secs,
+        view_count: e.view_count,
+        status: ytdlp::status_from(e.live_status.as_deref(), e.duration_secs),
+    }).collect();
+    let added = state.db.insert_videos_if_new(&rows)?;
     cache_thumbs(
         state,
         fresh.iter().map(|(_, e)| (e.id.clone(), ytdlp::thumb_url_for(&e.id))),

@@ -141,6 +141,37 @@ pub fn normalize(title: &str) -> Normalized {
     Normalized { core: tidy(&s), had_marker }
 }
 
+/// How many titles [`normalize_memo`] remembers before starting over. Several
+/// times a real library (3,400 videos), so in practice it never empties.
+const MEMO_CAP: usize = 20_000;
+
+/// [`normalize`], remembered by title.
+///
+/// The grouped feed rebuilds every channel's [`Atoms`] on each page it serves,
+/// and running eight regexes over all 3,400 titles of a real library was about
+/// half of that walk's time -- for titles that almost never change between one
+/// page and the next. Keyed on the title alone because `normalize` is a pure
+/// function of it, so there is nothing to invalidate: a retitled video simply
+/// looks up a different key. Past [`MEMO_CAP`] the whole map is dropped rather
+/// than evicted piecemeal; a cold walk is only the cost every walk used to pay.
+fn normalize_memo(title: &str) -> Normalized {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Normalized>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(hit) = memo.lock().unwrap().get(title) {
+        return hit.clone();
+    }
+    // Outside the lock: two walks racing on a new title both compute it, which
+    // costs less than holding every other walk up behind the regexes.
+    let fresh = normalize(title);
+    let mut map = memo.lock().unwrap();
+    if map.len() >= MEMO_CAP {
+        map.clear();
+    }
+    map.insert(title.to_string(), fresh.clone());
+    fresh
+}
+
 /// A shared leading run must be at least this many words, and cover at least
 /// this share of the shorter title, before two differing titles are called
 /// siblings. Tuned to reject anthology entries that merely open with the same
@@ -149,27 +180,65 @@ const MIN_PREFIX_WORDS: usize = 2;
 const MIN_PREFIX_PERCENT: usize = 60;
 
 /// Whether two normalised titles look like parts of the same upload.
+///
+/// A convenience over [`Stem`] for one-off comparisons; [`Atoms`] locates each
+/// title's words once and compares the stems directly.
 pub fn is_sibling(a: &Normalized, b: &Normalized) -> bool {
-    if a.core.is_empty() || b.core.is_empty() {
-        // Titles that are nothing but a part number (`(1)`, `(2)`) still belong
-        // together, but an untitled video matches nothing.
-        return a.core.is_empty() && b.core.is_empty() && a.had_marker && b.had_marker;
+    Stem::new(a.clone()).matches(&Stem::new(b.clone()))
+}
+
+/// A [`Normalized`] title with its words located once.
+///
+/// Grouping compares every title on a channel against every other one it might
+/// join, and splitting both cores into fresh word vectors on each of those
+/// comparisons made allocation the bulk of the walk's cost. The words are byte
+/// ranges into `core` rather than owned strings, since `tidy` has already
+/// squeezed it to single spaces and a space is never part of a multi-byte char.
+struct Stem {
+    norm: Normalized,
+    words: Vec<std::ops::Range<usize>>,
+}
+
+impl Stem {
+    fn new(norm: Normalized) -> Self {
+        let mut words = Vec::new();
+        let mut start = 0;
+        for (i, b) in norm.core.bytes().enumerate() {
+            if b == b' ' {
+                words.push(start..i);
+                start = i + 1;
+            }
+        }
+        words.push(start..norm.core.len());
+        Self { norm, words }
     }
-    if a.core == b.core {
-        return true;
+
+    fn word(&self, i: usize) -> &str {
+        &self.norm.core[self.words[i].clone()]
     }
-    // Beyond an exact stem match, only a title that actually carries a part
-    // marker may match on a shared opening -- one side is enough, since part
-    // one is so often unnumbered. Without that guard, every anthology sharing a
-    // show name would read as one enormous series.
-    if !(a.had_marker || b.had_marker) {
-        return false;
+
+    /// The rule [`is_sibling`] names.
+    fn matches(&self, other: &Stem) -> bool {
+        let (a, b) = (&self.norm, &other.norm);
+        if a.core.is_empty() || b.core.is_empty() {
+            // Titles that are nothing but a part number (`(1)`, `(2)`) still belong
+            // together, but an untitled video matches nothing.
+            return a.core.is_empty() && b.core.is_empty() && a.had_marker && b.had_marker;
+        }
+        if a.core == b.core {
+            return true;
+        }
+        // Beyond an exact stem match, only a title that actually carries a part
+        // marker may match on a shared opening -- one side is enough, since part
+        // one is so often unnumbered. Without that guard, every anthology sharing a
+        // show name would read as one enormous series.
+        if !(a.had_marker || b.had_marker) {
+            return false;
+        }
+        let shorter = self.words.len().min(other.words.len());
+        let shared = (0..shorter).take_while(|&i| self.word(i) == other.word(i)).count();
+        shared >= MIN_PREFIX_WORDS && shared * 100 >= shorter * MIN_PREFIX_PERCENT
     }
-    let wa: Vec<&str> = a.core.split(' ').collect();
-    let wb: Vec<&str> = b.core.split(' ').collect();
-    let shared = wa.iter().zip(&wb).take_while(|(x, y)| x == y).count();
-    let shorter = wa.len().min(wb.len());
-    shared >= MIN_PREFIX_WORDS && shared * 100 >= shorter * MIN_PREFIX_PERCENT
 }
 
 /// A word reduced to what makes it comparable: its letters and digits,
@@ -283,7 +352,7 @@ pub struct Entry {
 /// what the matcher did before manual marking existed.
 pub struct Atoms {
     ids: Vec<String>,
-    stems: Vec<Normalized>,
+    stems: Vec<Stem>,
     /// Which atom each entry landed in.
     atom_of: Vec<usize>,
     /// Entry indices per atom, in the order the entries came in.
@@ -322,7 +391,7 @@ impl Atoms {
                 atom_of[i] = atoms.len();
                 atoms.push(vec![i]);
             }
-            stems.push(normalize(&e.title));
+            stems.push(Stem::new(normalize_memo(&e.title)));
             by_id.insert(e.id.clone(), i);
             ids.push(e.id);
         }
@@ -382,7 +451,7 @@ impl Atoms {
     fn atoms_match(&self, a: usize, b: usize) -> bool {
         self.atoms[a]
             .iter()
-            .any(|&i| self.atoms[b].iter().any(|&j| is_sibling(&self.stems[i], &self.stems[j])))
+            .any(|&i| self.atoms[b].iter().any(|&j| self.stems[i].matches(&self.stems[j])))
     }
 }
 

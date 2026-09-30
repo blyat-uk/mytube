@@ -209,11 +209,17 @@ fn like_pattern(term: &str) -> String {
 /// holds is ids, and the rows are already in hand. `watched` rides along for the
 /// same reason: "Continue watching" asks it of every part of a group, hidden and
 /// filtered-out parts included.
-fn channel_atoms(
+///
+/// Only the reading happens here. Building [`siblings::Atoms`] from the entries
+/// -- a regex pass over every title, then a match per candidate pair -- is left
+/// to the caller, which does it after the connection lock is released: that
+/// work is the bulk of a grouped fetch, and nothing else can touch the database
+/// while the lock is held.
+fn channel_rows(
     conn: &Connection,
     channel_id: &str,
-) -> Result<(siblings::Atoms, HashMap<String, PartFacts>)> {
-    let mut st = conn.prepare(
+) -> Result<(Vec<siblings::Entry>, HashMap<String, PartFacts>)> {
+    let mut st = conn.prepare_cached(
         "SELECT id, title, duration_secs, sibling_group, watched FROM videos
          WHERE channel_id=?1 AND status='ready'",
     )?;
@@ -236,7 +242,7 @@ fn channel_atoms(
         facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched });
         entries.push(siblings::Entry { id, title, group });
     }
-    Ok((siblings::Atoms::new(entries), facts))
+    Ok((entries, facts))
 }
 
 /// What the grouped walk needs to know about one part once its card is built,
@@ -247,41 +253,33 @@ struct PartFacts {
     watched: bool,
 }
 
-/// Ids of every ready video on the anchor's channel that belongs on the same
-/// card -- the anchor itself included, since a series view that omits the video
-/// you opened it from is disorienting.
-fn sibling_ids(conn: &rusqlite::Connection, anchor_id: &str) -> Result<Vec<String>> {
-    let channel_id: Option<String> = conn
-        .query_row("SELECT channel_id FROM videos WHERE id=?1", params![anchor_id], |r| r.get(0))
-        .optional()?;
-    let Some(channel_id) = channel_id else { return Ok(Vec::new()) };
-    let (atoms, _) = channel_atoms(conn, &channel_id)?;
-    Ok(atoms.group_led_by(anchor_id).into_iter().map(String::from).collect())
-}
-
 /// The feed query, ordered but unpaged: `list_videos` bolts `LIMIT`/`OFFSET`
 /// onto it, `list_video_groups` walks all of it. `select` decides how much of
 /// each row comes back -- the grouping walk needs ids alone, and reading
 /// twenty-two columns of a whole library only to drop them would be waste.
 ///
-/// `Ok(None)` means the filter selects nothing at all, which is not the same as
-/// a query that returns no rows: an anchor with no siblings has no `IN ()` that
+/// `series` is what [`Db::sibling_ids`] returned for `f.sibling_of`, worked out
+/// by the caller before it took the lock this query runs under: the matching is
+/// the expensive half, and the lock is not reentrant anyway. It is ignored when
+/// `sibling_of` is `None`.
+///
+/// `None` means the filter selects nothing at all, which is not the same as a
+/// query that returns no rows: an anchor with no siblings has no `IN ()` that
 /// SQLite would accept.
 fn feed_query(
-    conn: &Connection,
     f: &VideoFilter,
     select: &str,
-) -> Result<Option<(String, Vec<Box<dyn rusqlite::ToSql>>)>> {
+    series: Vec<String>,
+) -> Option<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     let mut sql = format!("{select} WHERE v.status='ready'");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-    if let Some(anchor) = &f.sibling_of {
+    if f.sibling_of.is_some() {
         // Showing a series means showing all of it, so none of the ordinary
         // filters apply here -- a part you have watched, hidden or not yet
         // downloaded is still a part.
-        let ids = sibling_ids(conn, anchor)?;
-        if ids.is_empty() { return Ok(None); }
-        let holes = ids
+        if series.is_empty() { return None; }
+        let holes = series
             .into_iter()
             .map(|id| { args.push(Box::new(id)); format!("?{}", args.len()) })
             .collect::<Vec<_>>()
@@ -303,7 +301,7 @@ fn feed_query(
         }
     }
     sql.push_str(order_by(f.sort));
-    Ok(Some((sql, args)))
+    Some((sql, args))
 }
 
 /// The one place the feed's orderings are written down. `list_video_groups`
@@ -352,6 +350,63 @@ fn hydrate(
     Ok(())
 }
 
+const INSERT_VIDEO: &str = "INSERT OR IGNORE INTO videos
+     (id,channel_id,title,description,thumb_url,published_at,sort_at,feed_rank,
+      added_manually,duration_secs,view_count,status,first_seen_at)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+
+const UPDATE_META: &str = "UPDATE videos SET
+       duration_secs=COALESCE(?2, duration_secs),
+       view_count=COALESCE(?3, view_count),
+       status=?4
+     WHERE id=?1";
+
+const SET_PUBLISHED: &str = "UPDATE videos SET published_at=?2,
+            sort_at = CASE WHEN added_manually=1 THEN sort_at ELSE ?2 END
+     WHERE id=?1";
+
+const SET_PUBLISHED_IF_MISSING: &str = "UPDATE videos SET published_at=?2,
+            sort_at = CASE WHEN added_manually=1 THEN sort_at
+                           ELSE COALESCE(sort_at, ?2) END
+     WHERE id=?1 AND published_at IS NULL";
+
+/// What a channel listing resolved for a row still awaiting it -- the input to
+/// [`Db::resolve_listed`].
+pub struct ResolvedMeta {
+    pub id: String,
+    pub duration_secs: Option<i64>,
+    pub view_count: Option<i64>,
+    pub status: VideoStatus,
+    /// The listing's date, written only where the row has none.
+    pub published_at: Option<i64>,
+}
+
+/// The body of [`Db::insert_video_if_new`] and its batch form: `INSERT OR
+/// IGNORE` each row, counting the ones that were new. Runs on whatever it is
+/// handed, so the batch form can hand it a transaction.
+fn insert_all(conn: &Connection, videos: &[NewVideo]) -> Result<usize> {
+    let mut st = conn.prepare_cached(INSERT_VIDEO)?;
+    let mut added = 0;
+    for v in videos {
+        let n = st.execute(params![v.id, v.channel_id, v.title, v.description, v.thumb_url,
+                                   v.published_at, v.sort_at, v.feed_rank,
+                                   v.added_manually as i64, v.duration_secs, v.view_count,
+                                   v.status.as_str(), now()])?;
+        if n > 0 { added += 1; }
+    }
+    Ok(added)
+}
+
+/// [`SET_PUBLISHED`] for each pair, skipping a row that fails rather than
+/// failing the lot; returns how many ran. For an ordinary statement error
+/// SQLite rolls back that statement alone, not the transaction around it; the
+/// kind that does take the transaction with it (a full disk, an I/O error)
+/// then fails the commit, which is reported.
+fn set_published_all(conn: &Connection, dates: &[(String, i64)]) -> Result<usize> {
+    let mut st = conn.prepare_cached(SET_PUBLISHED)?;
+    Ok(dates.iter().filter(|(id, ts)| st.execute(params![id, ts]).is_ok()).count())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
@@ -363,6 +418,15 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // NORMAL is the setting WAL was designed around: a commit no longer
+        // waits on an fsync of its own, only a checkpoint does. What it gives up
+        // is the last few commits on a power cut -- never the database itself --
+        // and every row here is one the next poll can write again.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // This process holds one connection, but the Python scripts in
+        // `scripts/` open the same file; a moment's wait for their lock beats
+        // failing a poll's write with SQLITE_BUSY on the spot.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -557,16 +621,25 @@ impl Db {
     /// Returns true when the row was newly inserted.
     pub fn insert_video_if_new(&self, v: &NewVideo) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let n = conn.execute(
-            "INSERT OR IGNORE INTO videos
-             (id,channel_id,title,description,thumb_url,published_at,sort_at,feed_rank,
-              added_manually,duration_secs,view_count,status,first_seen_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![v.id, v.channel_id, v.title, v.description, v.thumb_url,
-                    v.published_at, v.sort_at, v.feed_rank, v.added_manually as i64,
-                    v.duration_secs, v.view_count, v.status.as_str(), now()],
-        )?;
-        Ok(n > 0)
+        Ok(insert_all(&conn, std::slice::from_ref(v))? > 0)
+    }
+
+    /// [`Db::insert_video_if_new`] for a whole batch, returning how many rows
+    /// were actually new.
+    ///
+    /// One lock and one transaction for the lot, for the same reason as
+    /// [`Db::set_titles`]: a backfill writes hundreds of rows, and one implicit
+    /// transaction each was one commit each, with the connection locked and
+    /// released around every one -- so the UI's reads queued behind a poll's
+    /// writes one row at a time. `first_seen_at` is still stamped per row, so
+    /// it reads exactly as the one-at-a-time path would have left it.
+    pub fn insert_videos_if_new(&self, videos: &[NewVideo]) -> Result<usize> {
+        if videos.is_empty() { return Ok(0); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let added = insert_all(&tx, videos)?;
+        tx.commit()?;
+        Ok(added)
     }
 
     /// Fills in metadata the flat-playlist pass resolved. Never clears a real
@@ -574,13 +647,27 @@ impl Db {
     pub fn update_video_meta(&self, id: &str, duration: Option<i64>,
                              views: Option<i64>, status: VideoStatus) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE videos SET
-               duration_secs=COALESCE(?2, duration_secs),
-               view_count=COALESCE(?3, view_count),
-               status=?4
-             WHERE id=?1",
-            params![id, duration, views, status.as_str()])?;
+        conn.execute(UPDATE_META, params![id, duration, views, status.as_str()])?;
+        Ok(())
+    }
+
+    /// [`Db::update_video_meta`] and then, where the listing carried a date,
+    /// [`Db::set_published_at_if_missing`], for every row in one transaction.
+    pub fn resolve_listed(&self, rows: &[ResolvedMeta]) -> Result<()> {
+        if rows.is_empty() { return Ok(()); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut meta = tx.prepare(UPDATE_META)?;
+            let mut date = tx.prepare(SET_PUBLISHED_IF_MISSING)?;
+            for r in rows {
+                meta.execute(params![r.id, r.duration_secs, r.view_count, r.status.as_str()])?;
+                if let Some(ts) = r.published_at {
+                    date.execute(params![r.id, ts])?;
+                }
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -589,24 +676,44 @@ impl Db {
     /// added video must keep sorting by when the user added it.
     pub fn set_published_at(&self, id: &str, ts: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE videos SET published_at=?2,
-                    sort_at = CASE WHEN added_manually=1 THEN sort_at ELSE ?2 END
-             WHERE id=?1", params![id, ts])?;
+        conn.execute(SET_PUBLISHED, params![id, ts])?;
         Ok(())
+    }
+
+    /// [`Db::set_published_at`] for a batch, in one transaction. Returns how
+    /// many of the updates ran without error.
+    ///
+    /// A row that fails is skipped rather than failing the batch, which is what
+    /// both callers did with the single-row method: `repair_dates` counts the
+    /// successes, and a feed's date refresh ignored its errors outright.
+    pub fn set_published_at_many(&self, dates: &[(String, i64)]) -> Result<usize> {
+        if dates.is_empty() { return Ok(0); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let ok = set_published_all(&tx, dates)?;
+        tx.commit()?;
+        Ok(ok)
+    }
+
+    /// Everything one RSS feed writes, in one transaction: the exact instant
+    /// for each row already stored (`dates`, via [`Db::set_published_at`] and
+    /// its per-row error tolerance), then the new rows (via
+    /// [`Db::insert_videos_if_new`]). Returns how many rows were new.
+    pub fn apply_feed(&self, dates: &[(String, i64)], fresh: &[NewVideo]) -> Result<usize> {
+        if dates.is_empty() && fresh.is_empty() { return Ok(0); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        set_published_all(&tx, dates)?;
+        let added = insert_all(&tx, fresh)?;
+        tx.commit()?;
+        Ok(added)
     }
 
     /// Fills a date only where one is missing. An exact RSS timestamp must never
     /// be clobbered by the day-granular approximate date from a flat listing.
     pub fn set_published_at_if_missing(&self, id: &str, ts: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE videos SET published_at=?2,
-                    sort_at = CASE WHEN added_manually=1 THEN sort_at
-                                   ELSE COALESCE(sort_at, ?2) END
-             WHERE id=?1 AND published_at IS NULL",
-            params![id, ts],
-        )?;
+        conn.execute(SET_PUBLISHED_IF_MISSING, params![id, ts])?;
         Ok(())
     }
 
@@ -682,9 +789,35 @@ impl Db {
         Ok(st.query_row(params![id], map_video).optional()?)
     }
 
+    /// Ids of every ready video on the anchor's channel that belongs on the same
+    /// card -- the anchor itself included, since a series view that omits the
+    /// video you opened it from is disorienting.
+    ///
+    /// Takes the lock only to read the channel's rows and matches after letting
+    /// go of it, so it must never be called with the lock held -- it is not
+    /// reentrant.
+    fn sibling_ids(&self, anchor_id: &str) -> Result<Vec<String>> {
+        let entries = {
+            let conn = self.conn.lock().unwrap();
+            let channel_id: Option<String> = conn
+                .query_row("SELECT channel_id FROM videos WHERE id=?1", params![anchor_id],
+                           |r| r.get(0))
+                .optional()?;
+            let Some(channel_id) = channel_id else { return Ok(Vec::new()) };
+            channel_rows(&conn, &channel_id)?.0
+        };
+        let atoms = siblings::Atoms::new(entries);
+        Ok(atoms.group_led_by(anchor_id).into_iter().map(String::from).collect())
+    }
+
     pub fn list_videos(&self, f: &VideoFilter) -> Result<Vec<Video>> {
+        // Before the lock, not under it: see `sibling_ids`.
+        let series = match &f.sibling_of {
+            Some(anchor) => self.sibling_ids(anchor)?,
+            None => Vec::new(),
+        };
         let conn = self.conn.lock().unwrap();
-        let Some((mut sql, mut args)) = feed_query(&conn, f, SELECT_VIDEO)? else {
+        let Some((mut sql, mut args)) = feed_query(f, SELECT_VIDEO, series) else {
             return Ok(Vec::new());
         };
         args.push(Box::new(f.limit));
@@ -704,7 +837,7 @@ impl Db {
     /// routinely sit pages apart in date order, so the walk has to see the whole
     /// filtered set before it can hand back the first card. Each group is formed
     /// by matching its leader against every ready video on that leader's channel
-    /// -- the same match [`sibling_ids`] makes -- so a group's contents are by
+    /// -- the same match [`Db::sibling_ids`] makes -- so a group's contents are by
     /// construction exactly what "Find siblings" on that leader returns.
     ///
     /// The filters therefore choose which groups appear, not what is inside
@@ -712,30 +845,46 @@ impl Db {
     /// on screen until every one of them has been filtered out. `sibling_of` is
     /// meaningless here and is ignored -- the series view is a flat list on
     /// purpose.
+    ///
+    /// The lock is held only for the two rounds of queries -- the seeds and
+    /// each channel's rows, then the page's hydration -- and released for the
+    /// matching in between, which is where the time goes: a regex pass over
+    /// every title in the library and a comparison per candidate pair. Held
+    /// throughout, it stalled every other command and the poll's writes for the
+    /// whole walk. A write landing in that gap can leave one fetch grouping by
+    /// rows a moment stale, which the next refetch corrects; a row deleted in it
+    /// is simply absent from the hydrated page.
     pub fn list_video_groups(&self, f: &VideoFilter) -> Result<Vec<VideoGroup>> {
-        let conn = self.conn.lock().unwrap();
         let seed_filter = VideoFilter { sibling_of: None, ..f.clone() };
-        let Some((sql, args)) = feed_query(&conn, &seed_filter, SELECT_VIDEO_IDS)? else {
+        let Some((sql, args)) = feed_query(&seed_filter, SELECT_VIDEO_IDS, Vec::new()) else {
             return Ok(Vec::new());
         };
 
-        let mut st = conn.prepare(&sql)?;
-        let seeds: Vec<(String, String)> = st
-            .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        // Every ready video on each channel in play, bucketed once. Matching
+        // Every ready video on each channel in play, read once. Matching
         // against the unfiltered set is the whole point: the filterbar must not
         // be able to shorten a series, only to hide one.
+        let (seeds, rows_by_channel) = {
+            let conn = self.conn.lock().unwrap();
+            let mut st = conn.prepare(&sql)?;
+            let seeds: Vec<(String, String)> = st
+                .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut rows_by_channel = HashMap::new();
+            for (_, channel) in &seeds {
+                if rows_by_channel.contains_key(channel) { continue; }
+                rows_by_channel.insert(channel.clone(), channel_rows(&conn, channel)?);
+            }
+            (seeds, rows_by_channel)
+        };
+
+        // Bucketed with the lock released.
         let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
         let mut parts: HashMap<String, PartFacts> = HashMap::new();
-        for (_, channel) in &seeds {
-            if index.contains_key(channel) { continue; }
-            let (atoms, facts) = channel_atoms(&conn, channel)?;
+        for (channel, (entries, facts)) in rows_by_channel {
             parts.extend(facts);
-            index.insert(channel.clone(), atoms);
+            index.insert(channel, siblings::Atoms::new(entries));
         }
 
         // Top-down: the first part to survive the filters leads its group, and
@@ -806,6 +955,7 @@ impl Db {
 
         // Rows for the page, fetched in batches of whole groups: keeping a group
         // inside one ordered query is what makes its parts' order meaningful.
+        let conn = self.conn.lock().unwrap();
         let mut rows: HashMap<String, Video> = HashMap::new();
         let mut rank: HashMap<String, usize> = HashMap::new();
         let mut batch: Vec<&String> = Vec::new();
@@ -817,6 +967,9 @@ impl Db {
             batch.extend(members.iter());
         }
         hydrate(&conn, &batch, f.sort, &mut rows, &mut rank)?;
+        // Naming each group is another regex pass; nothing below reads the
+        // database.
+        drop(conn);
 
         let mut out = Vec::with_capacity(page.len());
         for members in &page {
@@ -2277,6 +2430,102 @@ mod tests {
         // Every poll of a channel yt-dlp could not list ends up here.
         let d = db();
         d.set_titles(&[]).unwrap();
+    }
+
+    #[test]
+    fn a_batch_insert_counts_only_the_rows_that_were_new() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("old", "UC1", Some(1))).unwrap();
+        let rows = [vid("old", "UC1", Some(2)), vid("a", "UC1", Some(3)), vid("b", "UC1", None)];
+        assert_eq!(d.insert_videos_if_new(&rows).unwrap(), 2);
+        assert_eq!(d.insert_videos_if_new(&rows).unwrap(), 0, "a second pass adds nothing");
+        assert_eq!(d.get_video("old").unwrap().unwrap().published_at, Some(1),
+                   "an existing row is left as it was");
+        assert!(d.get_video("a").unwrap().unwrap().first_seen_at > 0);
+        assert_eq!(d.insert_videos_if_new(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_feed_redates_what_it_knows_and_inserts_what_it_does_not_in_one_go() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("known", "UC1", Some(BUCKET))).unwrap();
+        let mut manual = vid("manual", "UC1", Some(10));
+        manual.sort_at = Some(10_000);
+        manual.added_manually = true;
+        d.insert_video_if_new(&manual).unwrap();
+
+        let dates = vec![("known".to_string(), 1234), ("manual".to_string(), 42),
+                         ("gone".to_string(), 7)];
+        let added = d.apply_feed(&dates, &[vid("new", "UC1", Some(99))]).unwrap();
+        assert_eq!(added, 1);
+
+        let known = d.get_video("known").unwrap().unwrap();
+        assert_eq!((known.published_at, known.sort_at), (Some(1234), Some(1234)));
+        let manual = d.get_video("manual").unwrap().unwrap();
+        assert_eq!((manual.published_at, manual.sort_at), (Some(42), Some(10_000)),
+                   "the added_manually exemption still holds");
+        assert!(d.get_video("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_batched_date_repair_counts_every_row_it_ran() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&vid("a", "UC1", Some(BUCKET))).unwrap();
+        let n = d.set_published_at_many(&[("a".into(), 5), ("absent".into(), 6)]).unwrap();
+        // An id no row carries still "ran", exactly as the per-row call did.
+        assert_eq!(n, 2);
+        assert_eq!(d.get_video("a").unwrap().unwrap().published_at, Some(5));
+        assert!(d.video_ids_needing_real_date(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolving_listed_rows_fills_meta_but_never_clobbers_a_date() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        let mut dated = vid("dated", "UC1", Some(777));
+        dated.status = VideoStatus::Pending;
+        dated.duration_secs = None;
+        d.insert_video_if_new(&dated).unwrap();
+        let mut undated = vid("undated", "UC1", None);
+        undated.status = VideoStatus::Pending;
+        d.insert_video_if_new(&undated).unwrap();
+
+        let meta = |id: &str| ResolvedMeta {
+            id: id.into(), duration_secs: Some(321), view_count: None,
+            status: VideoStatus::Ready, published_at: Some(BUCKET),
+        };
+        d.resolve_listed(&[meta("dated"), meta("undated")]).unwrap();
+
+        let a = d.get_video("dated").unwrap().unwrap();
+        assert_eq!((a.duration_secs, a.status, a.published_at),
+                   (Some(321), VideoStatus::Ready, Some(777)));
+        assert_eq!(a.view_count, Some(1), "a missing count never blanks the stored one");
+        let b = d.get_video("undated").unwrap().unwrap();
+        assert_eq!((b.published_at, b.sort_at), (Some(BUCKET), Some(BUCKET)));
+    }
+
+    #[test]
+    fn a_retitle_regroups_on_the_very_next_fetch() {
+        // Normalised titles are remembered between walks; the memo is keyed on
+        // the title itself, so a rename must read as a different title at once.
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "Retitle Regroup Saga Part 1"),
+            ("p2", "Retitle Regroup Saga Part 2"),
+        ]);
+        let f = VideoFilter::default();
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
+        assert_eq!(siblings_of(&d, "p1").len(), 2);
+
+        d.set_titles(&[("p1".into(), "Something Else Entirely".into())]).unwrap();
+        assert_eq!(grouped(&d, &f).len(), 2, "the rename splits the card");
+        assert_eq!(siblings_of(&d, "p1"), vec!["p1".to_string()]);
+
+        d.set_titles(&[("p1".into(), "Retitle Regroup Saga Part 1".into())]).unwrap();
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)], "and renaming back rejoins it");
     }
 
     #[test]
