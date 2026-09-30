@@ -417,16 +417,21 @@ impl Db {
     pub fn open_in_memory() -> Result<Self> { Self::init(Connection::open_in_memory()?) }
 
     fn init(conn: Connection) -> Result<Self> {
+        // This process holds one connection, but the Python scripts in
+        // `scripts/` open the same file; a moment's wait for their lock beats
+        // failing a poll's write with SQLITE_BUSY on the spot. First, so the
+        // journal-mode switch below -- the statement most likely to meet their
+        // lock -- waits too.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // NORMAL is the setting WAL was designed around: a commit no longer
         // waits on an fsync of its own, only a checkpoint does. What it gives up
-        // is the last few commits on a power cut -- never the database itself --
-        // and every row here is one the next poll can write again.
+        // is the last few commits on a power cut -- never the database itself.
+        // Most of those rows the next poll writes again; not all of them: a
+        // watched or hidden flag, a sibling mark, or a finished download's
+        // `done` (which `reset_stale_downloads` then turns to `none`, leaving
+        // the file on disk untracked) made in those last moments is lost.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // This process holds one connection, but the Python scripts in
-        // `scripts/` open the same file; a moment's wait for their lock beats
-        // failing a poll's write with SQLITE_BUSY on the spot.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })

@@ -168,10 +168,18 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
     slot.style.setProperty("--pop-y", `${offsetY}px`);
   }, [scrollRef, cardSize]);
 
-  /** Takes a row off the list now, and hands back how to put it back as it was. */
+  /** Takes a row off the list now, and hands back how to put it back as it was
+   *  -- where it was, too: the list is in download order, and a row that failed
+   *  to cancel or delete should not jump to the bottom of its section. */
   const takeOff = (v: Video) => {
+    const at = items.findIndex((x) => x.id === v.id);
     setItems((prev) => prev.filter((x) => x.id !== v.id));
-    return () => setItems((prev) => (prev.some((x) => x.id === v.id) ? prev : [...prev, v]));
+    return () => setItems((prev) => {
+      if (prev.some((x) => x.id === v.id)) return prev;
+      const next = [...prev];
+      next.splice(at < 0 ? next.length : Math.min(at, next.length), 0, v);
+      return next;
+    });
   };
   const put = (id: string, fields: Partial<Video>) =>
     setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...fields } : x)));

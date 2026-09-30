@@ -259,13 +259,19 @@ pub async fn add_channel(
         return Err("MyTube does not handle YouTube Shorts.".into());
     }
     let id = resolve::resolve(&state.http, &input).await.map_err(e)?;
-    if let Some(existing) = state.db.get_channel(&id).map_err(e)? {
+    // The settings are read in the same trip but only unwrapped past the early
+    // return, so an unreadable settings.json never fails a channel already here.
+    let (existing, settings) = {
+        let id = id.clone();
+        db_blocking(&state, move |db| Ok((db.get_channel(&id)?, config::load()))).await?
+    };
+    if let Some(existing) = existing {
         if existing.subscribed {
             return Ok(existing);
         }
     }
 
-    let settings = config::load().map_err(e)?;
+    let settings = settings.map_err(e)?;
     let channel = Channel {
         id: id.clone(),
         title: id.clone(),
@@ -278,7 +284,10 @@ pub async fn add_channel(
         last_polled_at: None,
         terminated: false, auto_download: false,
     };
-    state.db.upsert_channel(&channel).map_err(e)?;
+    {
+        let channel = channel.clone();
+        db_blocking(&state, move |db| db.upsert_channel(&channel)).await?;
+    }
 
     // Backfill history, then poll RSS so the recent window gets real dates.
     if let Err(err) = poll::backfill_channel(&state, &id, settings.backfill_count).await {
@@ -286,10 +295,8 @@ pub async fn add_channel(
     }
     poll::poll_channels(&state, &app, vec![channel]).await;
 
-    state
-        .db
-        .get_channel(&id)
-        .map_err(e)?
+    db_blocking(&state, move |db| db.get_channel(&id))
+        .await?
         .ok_or_else(|| "Channel disappeared after being added".to_string())
 }
 
@@ -437,7 +444,7 @@ pub async fn delete_video(video_id: String, state: State<'_, Arc<AppState>>) -> 
 
 #[tauri::command]
 pub async fn poll_all(state: State<'_, Arc<AppState>>, app: AppHandle) -> R<PollSummary> {
-    let channels = state.db.list_subscribed_channels().map_err(e)?;
+    let channels = db_blocking(&state, |db| db.list_subscribed_channels()).await?;
     Ok(poll::poll_channels(&state, &app, channels).await)
 }
 
@@ -447,11 +454,11 @@ pub async fn poll_channel(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> R<PollSummary> {
-    let c = state
-        .db
-        .get_channel(&channel_id)
-        .map_err(e)?
-        .ok_or_else(|| format!("No such channel: {channel_id}"))?;
+    let c = {
+        let id = channel_id.clone();
+        db_blocking(&state, move |db| db.get_channel(&id)).await?
+    }
+    .ok_or_else(|| format!("No such channel: {channel_id}"))?;
     Ok(poll::poll_channels(&state, &app, vec![c]).await)
 }
 
@@ -470,14 +477,20 @@ pub async fn set_channel_member(
     member: bool,
     state: State<'_, Arc<AppState>>,
 ) -> R<usize> {
-    if state.db.get_channel(&channel_id).map_err(e)?.is_none() {
-        return Err(format!("No such channel: {channel_id}"));
-    }
-    state.db.set_channel_member(&channel_id, member).map_err(e)?;
+    let depth = {
+        let id = channel_id.clone();
+        db_blocking(&state, move |db| {
+            if db.get_channel(&id)?.is_none() {
+                anyhow::bail!("No such channel: {id}");
+            }
+            db.set_channel_member(&id, member)?;
+            Ok(config::load().map(|s| s.backfill_count).unwrap_or(30))
+        })
+        .await?
+    };
     if !member {
         return Ok(0);
     }
-    let depth = config::load().map(|s| s.backfill_count).unwrap_or(30);
     poll::ingest_members_only(&state, &channel_id, depth).await.map_err(e)
 }
 
@@ -520,19 +533,20 @@ pub async fn set_channel_auto_download(
     backlog: Option<Backlog>,
     state: State<'_, Arc<AppState>>,
 ) -> R<usize> {
-    if state.db.get_channel(&channel_id).map_err(e)?.is_none() {
-        return Err(format!("No such channel: {channel_id}"));
-    }
-    state.db.set_channel_auto_download(&channel_id, enabled).map_err(e)?;
-    let Some(b) = backlog.filter(|_| enabled) else { return Ok(0) };
-    let ids = state
-        .db
-        .auto_download_backlog(&channel_id, b.include_watched, b.include_hidden)
-        .map_err(e)?;
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let s = config::load().map_err(e)?;
+    let queue = db_blocking(&state, move |db| {
+        if db.get_channel(&channel_id)?.is_none() {
+            anyhow::bail!("No such channel: {channel_id}");
+        }
+        db.set_channel_auto_download(&channel_id, enabled)?;
+        let Some(b) = backlog.filter(|_| enabled) else { return Ok(None) };
+        let ids = db.auto_download_backlog(&channel_id, b.include_watched, b.include_hidden)?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((ids, config::load()?)))
+    })
+    .await?;
+    let Some((ids, s)) = queue else { return Ok(0) };
     Ok(poll::queue_auto(&state, ids, &s.download_dir, &s.filename_template).await)
 }
 
@@ -590,15 +604,13 @@ pub async fn enqueue_download(
     quality: Option<Quality>,
     state: State<'_, Arc<AppState>>,
 ) -> R<()> {
-    let s = config::load().map_err(e)?;
+    let s = blocking(config::load).await?;
     if let Some(q) = quality {
         if state.queue.is_active(&video_id).await {
             return Ok(());
         }
-        state
-            .db
-            .set_download_quality(&video_id, Some(&q.sanitized()))
-            .map_err(e)?;
+        let id = video_id.clone();
+        db_blocking(&state, move |db| db.set_download_quality(&id, Some(&q.sanitized()))).await?;
     }
     state
         .queue
@@ -615,7 +627,7 @@ pub async fn probe_formats(
     video_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> R<ytdlp::VideoFormats> {
-    let s = config::load().map_err(e)?;
+    let s = blocking(config::load).await?;
     let inv = state.tools.ytdlp(&s).await.map_err(e)?;
     ytdlp::formats(&inv, &video_id, &s.quality).await.map_err(e)
 }
@@ -672,15 +684,7 @@ pub async fn delete_download(
         Ok(v.file_path)
     })
     .await?;
-    let _ = app.emit(
-        "download://state",
-        DownloadStateEvent {
-            video_id,
-            state: DownloadState::None,
-            file_path: None,
-            error: None,
-        },
-    );
+    crate::queue::emit_state(&app, &video_id, DownloadState::None, None, None);
     if let Some(p) = path {
         tauri::async_runtime::spawn_blocking(move || {
             // Already gone is the outcome wanted, not a failure worth a line.
@@ -794,7 +798,7 @@ pub async fn import_config(
     let emitter = app.clone();
 
     // Everything outside the database: settings, thumbnails, path re-rooting.
-    let prepared = tauri::async_runtime::spawn_blocking(move || {
+    let prepared = blocking(move || {
         transfer::prepare_import(&p, &channel_ids, apply_settings, &|done, total, current| {
             let _ = emitter.emit(
                 "transfer://progress",
@@ -807,9 +811,7 @@ pub async fn import_config(
             );
         })
     })
-    .await
-    .map_err(e)?
-    .map_err(e)?;
+    .await?;
 
     // And now the part that has to be atomic. One `Db` call, one transaction:
     // the connection Mutex is not reentrant, so a loop over several public
@@ -837,7 +839,7 @@ pub async fn import_config(
     // An imported settings block is a settings save, so the live queue has to
     // hear about a changed limit the same way `save_settings` tells it.
     if report.settings_applied {
-        if let Ok(s) = config::load() {
+        if let Ok(s) = blocking(config::load).await {
             state.queue.set_concurrency(s.max_concurrent_downloads).await;
         }
     }
@@ -870,14 +872,14 @@ pub async fn detect_browsers() -> Vec<BrowserOption> {
 
 #[tauri::command]
 pub async fn tools_status(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>> {
-    let s = config::load().unwrap_or_default();
+    let s = blocking(config::load).await.unwrap_or_default();
     Ok(state.tools.status(&s).await)
 }
 
 /// "Check for updates" / "Retry" in the Tools section.
 #[tauri::command]
 pub async fn tools_update_now(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>> {
-    let s = config::load().unwrap_or_default();
+    let s = blocking(config::load).await.unwrap_or_default();
     state.tools.update_now(&s).await.map_err(e)
 }
 

@@ -153,7 +153,9 @@ pub fn launch(player_command: &str, file_path: &str) -> Result<()> {
 
 /// [`launch`] without the existence check, for a caller that has just made
 /// it -- `open_in_player`, which must see a missing file itself to mark the
-/// row. A second stat of a file on a spun-down disk is not free.
+/// row. (The system-default path stats the file once more regardless:
+/// `tauri_plugin_opener::open_path` checks it before opening. By then the disk
+/// is awake, so that one is cheap.)
 pub fn start(player_command: &str, file_path: &str) -> Result<()> {
     if player_command.trim().is_empty() {
         return tauri_plugin_opener::open_path(file_path, None::<&str>)

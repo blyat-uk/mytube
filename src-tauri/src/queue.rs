@@ -469,8 +469,10 @@ trait Rows: Send + Sync + 'static {
     fn state(&self, video_id: &str) -> Option<DownloadState>;
 }
 
-fn emit_state(app: &AppHandle, video_id: &str, state: DownloadState, file_path: Option<String>,
-              error: Option<String>) {
+/// Tells every view a row's download state moved. Also used by
+/// `commands::delete_download`, the one write of the state outside the queue.
+pub(crate) fn emit_state(app: &AppHandle, video_id: &str, state: DownloadState,
+                         file_path: Option<String>, error: Option<String>) {
     let _ = app.emit(
         "download://state",
         DownloadStateEvent { video_id: video_id.to_string(), state, file_path, error },
@@ -643,7 +645,11 @@ impl<K: Kill> Registry<K> {
                     eprintln!("[mytube] {video_id}: gave up waiting for a cancelled download to clear up");
                 }
             }
-            reg.settle(&video_id, &mine, &*rows);
+            // A read and maybe a write of the row, under the book's lock: on a
+            // blocking thread, so a database held by an import parks that and
+            // not a runtime worker. `_alive` outlives it, so a download of the
+            // same video still waits for the settle.
+            let _ = tokio::task::spawn_blocking(move || reg.settle(&video_id, &mine, &*rows)).await;
         });
         written
     }
@@ -738,8 +744,15 @@ impl Queue {
 
     /// Returns as soon as the download is stopped and the row reads `None`;
     /// the part files are swept up behind it. See `Registry::cancel`.
+    ///
+    /// On a blocking thread, like `enqueue`: both write the row while holding
+    /// the registry's lock, and a cancel also waits on the job's lock, which a
+    /// job holds across its own row write -- any of which can wait on the
+    /// database behind an import. `Registry` spawns its tasks from there, which
+    /// works because the blocking pool runs inside the runtime.
     pub async fn cancel(&self, video_id: &str) -> Result<()> {
-        self.reg.cancel(video_id, &self.rows)
+        let (reg, rows, id) = (self.reg.clone(), self.rows.clone(), video_id.to_string());
+        blocking(move || reg.cancel(&id, &rows)).await?
     }
 
     pub async fn enqueue(&self, video_id: String, dir: String, template: String) -> Result<()> {
@@ -747,8 +760,9 @@ impl Queue {
         let claims = self.claims.clone();
         let tools = self.tools.clone();
         let vid = video_id.clone();
+        let (reg, rows) = (self.reg.clone(), self.rows.clone());
 
-        self.reg.enqueue(video_id, &self.rows, move |job, alive| async move {
+        blocking(move || reg.enqueue(video_id, &rows, move |job, alive| async move {
             let _permit = match sem.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
@@ -767,7 +781,8 @@ impl Queue {
                     emit_state(&app, &vid, DownloadState::Failed, None, Some(msg.clone()));
                 });
             }
-        })
+        }))
+        .await?
     }
 }
 
@@ -783,8 +798,9 @@ async fn run_one(
     alive: &Alive,
     claims: &Arc<PathClaims>,
 ) -> Result<()> {
-    // Every filesystem call from here on goes through `blocking`: see
-    // `sweep_blocking` for what a slow download directory does to a worker.
+    // Every touch of the download directory from here on goes through
+    // `blocking`: see `sweep_blocking` for what a slow one does to a worker.
+    // The print file in the temp dir and settings.json are left inline.
     let d = PathBuf::from(dir);
     blocking(move || std::fs::create_dir_all(d)).await??;
     let print_file = std::env::temp_dir().join(format!("mytube-{video_id}.path"));
@@ -879,6 +895,7 @@ async fn run_one(
 
     let app2 = app.clone();
     let vid2 = video_id.to_string();
+    let job = cancel.clone();
     let pump = tokio::spawn(async move {
         let emit = |percent, speed, eta| {
             let _ = app2.emit(
@@ -890,6 +907,14 @@ async fn run_one(
         let mut held = None;
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            // A cancel has already sent `None` and returned, while yt-dlp is
+            // still dying and its pipe still holds lines. A tick after that
+            // would put a stopped download back into the views' progress
+            // stores, so the rest is read -- the pipe must drain -- and dropped.
+            if job.is_cancelled() {
+                held = None;
+                continue;
+            }
             if let Some((percent, speed, eta)) = ytdlp::parse_progress_line(&line) {
                 if throttle.admit(Instant::now(), percent) {
                     held = None;
@@ -900,7 +925,7 @@ async fn run_one(
             }
         }
         // The last line held back, so the bar ends on what yt-dlp last said.
-        if let Some((percent, speed, eta)) = held {
+        if let Some((percent, speed, eta)) = held.filter(|_| !job.is_cancelled()) {
             emit(percent, speed, eta);
         }
     });

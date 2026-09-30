@@ -59,11 +59,15 @@ function fileOf(v: Video): Pick<Video, "download_state" | "download_error" | "fi
 }
 
 /**
- * Marking and unlinking both end in a refetch that regroups the feed. One key
- * for both, so the refetch cannot be raced by a second mark, and the grid that
- * is up stays up -- dimmed once it is slow -- until the new one lands.
+ * Marking and unlinking both end in a refetch that regroups the feed, and the
+ * grid that is up stays up -- dimmed once any of them is slow -- until the new
+ * one lands. Each runs under a key of its own behind this prefix: the same mark
+ * or unlink pressed twice goes out once, but a *different* one made while the
+ * first is out still goes out. One shared key used to drop it without a word,
+ * after the selection it came from had already been cleared. Racing refetches
+ * need no guard here -- `fetchPage`'s request counter lets only the newest land.
  */
-const SIBLINGS = "siblings";
+const SIBLINGS = "siblings:";
 
 /** What an open series holds, for the breadcrumb that names it. */
 export interface SeriesTally {
@@ -408,7 +412,7 @@ export default function SubscriptionsView(p: Props) {
 
   /** Records what the titles could not say: these are parts of one series. */
   const markSiblings = useCallback((ids: string[]) => {
-    void run(SIBLINGS, async () => {
+    void run(`${SIBLINGS}mark:${[...ids].sort().join(",")}`, async () => {
       // The answer can exceed what was sent -- marking across two hand-built
       // groups merges both -- so the toast reports what actually happened.
       const n = await api.markSiblings(ids);
@@ -418,7 +422,7 @@ export default function SubscriptionsView(p: Props) {
   }, [fetchPage, run, toast]);
 
   const unlinkSiblings = useCallback((video: Video) => {
-    void run(SIBLINGS, async () => {
+    void run(`${SIBLINGS}unlink:${video.id}`, async () => {
       await api.unlinkSiblings(video.id);
       toast.success(`Unlinked “${video.title}”.`);
       await fetchPage(0);
@@ -561,6 +565,8 @@ export default function SubscriptionsView(p: Props) {
   const filtered =
     channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
     inProgress;
+  /** Any mark or unlink slow enough to show; see `SIBLINGS`. */
+  const refreshing = useMemo(() => [...slow].some((k) => k.startsWith(SIBLINGS)), [slow]);
 
   return (
     <>
@@ -569,7 +575,7 @@ export default function SubscriptionsView(p: Props) {
       progress={progress}
       pending={pending}
       slow={slow}
-      refreshing={slow.has(SIBLINGS)}
+      refreshing={refreshing}
       loading={loading}
       hasMore={hasMore}
       cardSize={p.cardSize}

@@ -223,6 +223,29 @@ describe("card actions in flight", () => {
     );
     expect(cards()).toHaveLength(3);
   });
+
+  it("sends a second, different mark while the first is still out", async () => {
+    // The selection is cleared the moment a mark goes out, so a second mark
+    // swallowed behind the first would be lost without a trace.
+    videos = ["a", "b", "c"].map((id) =>
+      video({ id, title: `Video ${id}`, download_state: "none", file_path: null }));
+    renderView();
+    const [a, b, c] = await cardsReady(3);
+    markSiblings.mockImplementation(() => new Promise<number>(() => {}));
+
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(b, { ctrlKey: true });
+    fireEvent.contextMenu(a);
+    fireEvent.click(within(screen.getByRole("menu"), "Mark 2 videos as siblings"));
+
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(c, { ctrlKey: true });
+    fireEvent.contextMenu(a);
+    fireEvent.click(within(screen.getByRole("menu"), "Mark 2 videos as siblings"));
+
+    expect(markSiblings).toHaveBeenCalledTimes(2);
+    expect(markSiblings).toHaveBeenLastCalledWith(["a", "c"]);
+  });
 });
 
 describe("marking a downloaded video as watched", () => {
