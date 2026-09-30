@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore};
 
 use crate::db::Db;
 use crate::models::{DownloadProgress, DownloadState, DownloadStateEvent};
@@ -162,6 +164,73 @@ impl<K> Job<K> {
     fn reaped(&self) {
         self.inner.lock().unwrap().tree = None;
     }
+
+    /// Runs `f` -- a write of the row -- unless the job has been cancelled,
+    /// and holds the job's lock while it does. Returns `None`, having run
+    /// nothing, for a cancelled job.
+    ///
+    /// Holding the lock is the point. `Queue::cancel` marks the job cancelled
+    /// (which takes this lock) *before* it writes `None`, so a job's own write
+    /// either lands first and is overwritten, or sees the cancel and never
+    /// happens. Checking `is_cancelled` and then writing would leave a gap in
+    /// which a `Done` or `Failed` lands after the cancel's `None` -- a row
+    /// claiming a file the cancel is about to delete.
+    fn unless_cancelled<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let g = self.inner.lock().unwrap();
+        if g.cancelled {
+            return None;
+        }
+        let r = f();
+        drop(g);
+        Some(r)
+    }
+}
+
+/// What `Registry` needs of a tree handle: a way to kill it. The real one is
+/// [`proc::KillTree`]; the tests use a number and kill nothing.
+trait Kill: Send + Sync + 'static {
+    fn kill(&self);
+}
+
+impl Kill for proc::KillTree {
+    fn kill(&self) {
+        proc::KillTree::kill(self)
+    }
+}
+
+#[cfg(test)]
+impl Kill for i32 {
+    fn kill(&self) {}
+}
+
+/// Held by everything still working on a job's behalf -- its task, and the
+/// sweep a cancelled job's `CleanupGuard` hands to a blocking thread. When the
+/// last clone is dropped, the matching [`Gone`] resolves.
+///
+/// A `JoinHandle` cannot say this: the job's task can be over while the sweep
+/// it started on a blocking thread is still deleting files, and a download of
+/// the same video must not begin until that sweep has finished too.
+#[derive(Clone)]
+struct Alive(#[allow(dead_code)] Arc<watch::Sender<()>>);
+
+/// Resolves once every [`Alive`] of its pair has been dropped.
+#[derive(Clone)]
+struct Gone(watch::Receiver<()>);
+
+fn lifeline() -> (Alive, Gone) {
+    let (tx, rx) = watch::channel(());
+    (Alive(Arc::new(tx)), Gone(rx))
+}
+
+impl Gone {
+    async fn wait(mut self) {
+        // Nothing is ever sent, so this only returns once the sender is gone.
+        while self.0.changed().await.is_ok() {}
+    }
+
+    fn same(&self, other: &Gone) -> bool {
+        self.0.same_channel(&other.0)
+    }
 }
 
 /// Does `name` look like something yt-dlp wrote on the way to `out_path`?
@@ -229,21 +298,36 @@ const SWEEP_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(windows)]
 const SWEEP_ATTEMPTS: u32 = 10;
 
-/// `remove_leftovers`, then on Windows the files that would not go are tried
-/// again a few times. The waits are async, so this can run on a runtime
-/// worker; `retry_stuck_blocking` is the same loop for a caller that cannot
-/// await.
-async fn sweep_leftovers(out_path: &Path) {
+/// `remove_leftovers` for each path, then on Windows the files that would not
+/// go are tried again a few times. Blocking all the way -- a directory listing,
+/// unlinks, and on Windows sleeps between retries -- so it runs on a blocking
+/// thread, never a runtime worker: the download directory is as often as not a
+/// spun-down HDD or a network mount, and one `read_dir` there can take
+/// seconds, which on a worker stalls every other task scheduled on it.
+fn sweep_blocking(out_paths: &[PathBuf]) {
     #[allow(unused_mut, unused_variables)]
-    let mut stuck = remove_leftovers(out_path);
+    let mut stuck: Vec<PathBuf> = out_paths.iter().flat_map(|p| remove_leftovers(p)).collect();
     #[cfg(windows)]
     for _ in 0..SWEEP_ATTEMPTS {
         if stuck.is_empty() {
             break;
         }
-        tokio::time::sleep(SWEEP_RETRY).await;
+        std::thread::sleep(SWEEP_RETRY);
         stuck = remove_stuck(stuck);
     }
+}
+
+/// `sweep_blocking`, awaited from a blocking thread.
+async fn sweep_leftovers(out_paths: Vec<PathBuf>) {
+    let _ = tokio::task::spawn_blocking(move || sweep_blocking(&out_paths)).await;
+}
+
+/// Runs blocking filesystem work off the runtime's workers; see
+/// `sweep_blocking` for why that matters on this app's download directories.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow!("a filesystem task failed: {e}"))
 }
 
 /// Tries each path once more; returns the ones still there.
@@ -256,30 +340,6 @@ fn remove_stuck(paths: Vec<PathBuf>) -> Vec<PathBuf> {
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
         })
         .collect()
-}
-
-/// The retry loop for files `CleanupGuard` could not delete, on a blocking
-/// thread: it runs from a `Drop`, which cannot await, and sleeping there would
-/// stall a runtime worker.
-#[cfg(windows)]
-fn retry_stuck_blocking(stuck: Vec<PathBuf>) {
-    if stuck.is_empty() {
-        return;
-    }
-    let work = move || {
-        let mut stuck = stuck;
-        for _ in 0..SWEEP_ATTEMPTS {
-            if stuck.is_empty() {
-                break;
-            }
-            std::thread::sleep(SWEEP_RETRY);
-            stuck = remove_stuck(stuck);
-        }
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) => drop(h.spawn_blocking(work)),
-        Err(_) => work(),
-    }
 }
 
 /// Clears up after a cancelled download, however `run_one` leaves.
@@ -300,21 +360,45 @@ struct CleanupGuard {
     /// audio conversion passes through (`intended_path`), when there is one.
     out_paths: Vec<PathBuf>,
     print_file: PathBuf,
+    /// The job's claim on `out_paths`. Owned here so that a cancelled job
+    /// keeps its names reserved until the sweep below has finished with them:
+    /// released any earlier, another video of the same title could claim the
+    /// name and start writing a `.part` file the sweep then deletes.
+    claim: Option<ClaimGuard>,
+    /// Keeps the job counted as still clearing up while the sweep runs on a
+    /// blocking thread -- see `Alive`.
+    alive: Alive,
 }
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         // Removed on every exit path, not just cancellation: an aborted job
         // used to leave one of these in /tmp for the life of the machine.
+        // Removed here and now, not on the blocking thread below: a Retry of a
+        // *failed* download starts at once and waits for nothing, and a late
+        // removal could delete the file its own yt-dlp has just written.
         let _ = std::fs::remove_file(&self.print_file);
-        if self.job.is_cancelled() {
-            // Normally `run_one` has already swept, with the waits it needs on
-            // Windows, and this pass finds nothing; it is the backstop for the
-            // exits that skip that -- an abort, an error, a late cancel.
-            #[allow(unused_variables)]
-            let stuck: Vec<PathBuf> = self.out_paths.iter().flat_map(|p| remove_leftovers(p))
-                .collect();
-            #[cfg(windows)]
-            retry_stuck_blocking(stuck);
+        let claim = self.claim.take();
+        if !self.job.is_cancelled() {
+            drop(claim);
+            return;
+        }
+        // Normally `run_one` has already swept, with the waits it needs on
+        // Windows, and this pass finds nothing; it is the backstop for the
+        // exits that skip that -- an abort, an error, a late cancel. It lists
+        // the download directory, so it goes to a blocking thread too: this
+        // runs wherever the task was dropped, which is a runtime worker. A
+        // download of the same video waits for it through `alive` (see
+        // `Registry`), and the claim is only let go once it is done.
+        let out_paths = std::mem::take(&mut self.out_paths);
+        let alive = self.alive.clone();
+        let work = move || {
+            let _alive = alive;
+            sweep_blocking(&out_paths);
+            drop(claim);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => drop(h.spawn_blocking(work)),
+            Err(_) => work(),
         }
     }
 }
@@ -332,22 +416,292 @@ impl Drop for ClaimGuard {
     }
 }
 
-/// How long `cancel` gives a running download to kill yt-dlp, reap it and
-/// delete its part files. That is milliseconds of real work; the allowance is
-/// wide only so an unlink stalled on a busy disk is not cut short.
-const CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a cancelled download gets, in the background, to kill yt-dlp,
+/// reap it and delete its part files before its task is aborted. That is
+/// milliseconds of real work; the allowance is wide only so an unlink stalled
+/// on a busy disk is not cut short. `cancel` itself no longer waits for any of
+/// it -- see `Registry::cancel`.
+const CLEANUP_GRACE: Duration = Duration::from_secs(15);
 
 /// How long a cancelled download waits for every process in its tree to be
 /// gone before it deletes anything. Windows only; see `KillTree::wait_empty`.
-const TREE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const TREE_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// The most often one download's `download://progress` is emitted. yt-dlp
+/// runs with `--newline` and prints a line per progress tick -- dozens a second
+/// on a fast connection, each one an IPC message and a React re-render of the
+/// grid -- while a bar and a speed read the same at four updates a second.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// Thins one download's progress lines to one per `PROGRESS_EVERY`, without
+/// ever leaving the bar on a stale value: the first line always goes, so does
+/// 100%, and so does a percentage that went *down* -- yt-dlp fetches the video
+/// and audio streams one after the other and starts the second from 0%, and
+/// dropping that line would leave the bar at 100% for the whole second stream.
+/// What is held back when the output ends is flushed by the caller.
+#[derive(Default)]
+struct ProgressThrottle {
+    /// When the last line went out, and its percentage.
+    last: Option<(Instant, f64)>,
+}
+
+impl ProgressThrottle {
+    fn admit(&mut self, now: Instant, percent: f64) -> bool {
+        let go = match self.last {
+            None => true,
+            Some((at, was)) => {
+                percent >= 100.0 || percent < was || now.duration_since(at) >= PROGRESS_EVERY
+            }
+        };
+        if go {
+            self.last = Some((now, percent));
+        }
+        go
+    }
+}
+
+/// The two row writes the queue makes on its own account -- `Queued` and a
+/// cancel's `None` -- each followed by the `download://state` event that tells
+/// the UI, and a read of where the row stands. A trait so `Registry` can be
+/// tested without a Tauri runtime or a database.
+trait Rows: Send + Sync + 'static {
+    fn set(&self, video_id: &str, state: DownloadState) -> Result<()>;
+    fn state(&self, video_id: &str) -> Option<DownloadState>;
+}
+
+fn emit_state(app: &AppHandle, video_id: &str, state: DownloadState, file_path: Option<String>,
+              error: Option<String>) {
+    let _ = app.emit(
+        "download://state",
+        DownloadStateEvent { video_id: video_id.to_string(), state, file_path, error },
+    );
+}
+
+/// `Rows` for real: the database and the webview.
+struct Ledger {
+    db: Arc<Db>,
+    app: AppHandle,
+}
+
+impl Rows for Ledger {
+    fn set(&self, video_id: &str, state: DownloadState) -> Result<()> {
+        self.db.set_download_state(video_id, state, None, None)?;
+        emit_state(&self.app, video_id, state, None, None);
+        Ok(())
+    }
+    fn state(&self, video_id: &str) -> Option<DownloadState> {
+        self.db.get_video(video_id).ok().flatten().map(|v| v.download_state)
+    }
+}
+
+/// One queued or running download.
+struct Slot<K> {
+    job: Arc<Job<K>>,
+    abort: tokio::task::AbortHandle,
+    gone: Gone,
+}
+
+struct Book<K> {
+    /// Every download queued or running, by video id.
+    jobs: HashMap<String, Slot<K>>,
+    /// Cancelled downloads still clearing up, by video id: resolves once the
+    /// job is gone and its sweep is done. A new download of the same video
+    /// waits on it before it does anything at all -- the old sweep deletes by
+    /// the old job's names, and the new one would otherwise be writing to
+    /// those very names: the shared `mytube-{id}.path` print file, the same
+    /// claimed output path, the same `.part` files it resumes from.
+    cleaning: HashMap<String, Gone>,
+}
+
+/// Which downloads exist, and the rules for starting, finishing and
+/// cancelling one. Kept apart from `Queue` so it can be driven in tests with
+/// fake jobs, and generic over the kill handle for the same reason.
+///
+/// Everything is behind one *synchronous* lock, and nothing ever awaits while
+/// holding it -- the compiler enforces that for the spawned tasks, since a std
+/// guard is not `Send`. That is the fix for a deadlock `cancel` used to walk
+/// into: it held the tokio-locked `running` map (under edition 2021 the guard
+/// of an `if let` scrutinee lives for the whole `if let`/`else`) while waiting
+/// for the job, whose own last act was to lock `running` -- so every cancel of
+/// a running download hung for the full 15 s grace, and every enqueue, every
+/// `is_active` and every other finishing job hung behind it.
+struct Registry<K = proc::KillTree> {
+    book: std::sync::Mutex<Book<K>>,
+}
+
+impl<K: Kill> Registry<K> {
+    fn new() -> Arc<Self> {
+        Arc::new(Registry {
+            book: std::sync::Mutex::new(Book { jobs: HashMap::new(), cleaning: HashMap::new() }),
+        })
+    }
+
+    /// A panic under the lock cannot leave the maps half-written -- every
+    /// change is one insert or remove -- so a poisoned lock is still good.
+    fn book(&self) -> std::sync::MutexGuard<'_, Book<K>> {
+        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_active(&self, video_id: &str) -> bool {
+        self.book().jobs.contains_key(video_id)
+    }
+
+    /// Writes `Queued` and starts `body` as the download's task. A video
+    /// already queued or running is left alone.
+    ///
+    /// The row is written, the task spawned and the slot filed under the one
+    /// lock, so a cancel can never find the row queued but no slot to cancel,
+    /// and the task's `Downloading` can never be overwritten by a late
+    /// `Queued`. The task first waits out any cancelled download of the same
+    /// video that is still clearing up (`Book::cleaning`) -- before the
+    /// semaphore, before a single file is touched.
+    fn enqueue<R, F, Fut>(self: &Arc<Self>, video_id: String, rows: &Arc<R>, body: F) -> Result<()>
+    where
+        R: Rows,
+        F: FnOnce(Arc<Job<K>>, Alive) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut book = self.book();
+        if book.jobs.contains_key(&video_id) {
+            return Ok(()); // already in flight
+        }
+        rows.set(&video_id, DownloadState::Queued)?;
+
+        let job = Arc::new(Job::default());
+        let (alive, gone) = lifeline();
+        let pending = book.cleaning.get(&video_id).cloned();
+        let work = body(job.clone(), alive.clone());
+        let finish = Finish { reg: self.clone(), video_id: video_id.clone(), job: job.clone() };
+        let handle = tokio::spawn(async move {
+            // Declared first so it is dropped last: the job is not gone until
+            // everything else in here has been torn down.
+            let _alive = alive;
+            let _finish = finish;
+            if let Some(p) = pending {
+                p.wait().await;
+            }
+            work.await;
+        });
+        book.jobs.insert(video_id, Slot { job, abort: handle.abort_handle(), gone });
+        Ok(())
+    }
+
+    /// Stops a download and returns at once.
+    ///
+    /// Under the lock: the slot is taken out, the job marked cancelled, the
+    /// row set to `None` and the UI told, and the video filed as clearing up.
+    /// Then yt-dlp's tree is killed. What is left -- waiting for the job to
+    /// sweep its part files -- happens on a task of its own, so the button
+    /// answers immediately however slow the disk is. A download of the same
+    /// video started meanwhile waits for that sweep (see `enqueue`).
+    fn cancel<R: Rows>(self: &Arc<Self>, video_id: &str, rows: &Arc<R>) -> Result<()> {
+        let mut book = self.book();
+        let slot = book.jobs.remove(video_id);
+        // Stop the job first, and mark it cancelled in the same breath, so
+        // whatever it does next it knows to clear up rather than record a file
+        // the library is about to forget about. `Job::cancel` waits out a
+        // `Done` being written under `unless_cancelled`, which is what puts
+        // the `None` below after it.
+        let stop = slot.as_ref().map(|s| s.job.cancel());
+        let written = rows.set(video_id, DownloadState::None);
+        let (Some(slot), Some(stop)) = (slot, stop) else {
+            return written;
+        };
+        let (alive, mine) = lifeline();
+        let earlier = book.cleaning.insert(video_id.to_string(), mine.clone());
+        drop(book);
+
+        if let Some(tree) = &stop.tree {
+            tree.kill();
+        }
+        if !stop.spawned {
+            // Nothing has been spawned, so there is nothing on disk to wait
+            // for -- and a queued job is parked on the semaphore behind other
+            // downloads, which could be minutes.
+            slot.abort.abort();
+        }
+
+        let (reg, rows, video_id) = (self.clone(), rows.clone(), video_id.to_string());
+        tokio::spawn(async move {
+            let _alive = alive;
+            // This job may itself have been waiting on an earlier cancel of
+            // the same video; whoever waits on this one waits on that too.
+            if let Some(e) = earlier {
+                e.wait().await;
+            }
+            // Something may be on disk, so let the job sweep it up. Aborting
+            // it outright (which is what cancel once did) skipped that cleanup
+            // and, worse, left yt-dlp running: tokio does not kill a child when
+            // its task is dropped, so it ran on to a full download that nothing
+            // then recorded or deleted. The abort is now only for a job that
+            // has not finished within the grace; dropping it kills the tree
+            // (`TreeChild`) and runs `CleanupGuard`'s own sweep.
+            if tokio::time::timeout(CLEANUP_GRACE, slot.gone.clone().wait()).await.is_err() {
+                eprintln!("[mytube] {video_id}: a cancelled download outlived its grace; aborting it");
+                slot.abort.abort();
+                if tokio::time::timeout(CLEANUP_GRACE, slot.gone.wait()).await.is_err() {
+                    eprintln!("[mytube] {video_id}: gave up waiting for a cancelled download to clear up");
+                }
+            }
+            reg.settle(&video_id, &mine, &*rows);
+        });
+        written
+    }
+
+    /// A cancelled download has cleared up. Its record goes -- unless a later
+    /// cancel of the same video has replaced it -- and the row is put back to
+    /// `None` if it has somehow moved since the cancel wrote it: the backstop
+    /// for a job write the cancel's `None` did not come after. Left alone when
+    /// a new download of the video exists, because that one owns the row now
+    /// (its `Queued` is already written), and when the row already reads
+    /// `None`, since a second write would also clear a custom quality stored
+    /// for the next download in the meantime.
+    fn settle<R: Rows>(&self, video_id: &str, mine: &Gone, rows: &R) {
+        let mut book = self.book();
+        if book.cleaning.get(video_id).is_some_and(|g| g.same(mine)) {
+            book.cleaning.remove(video_id);
+        }
+        if book.jobs.contains_key(video_id) {
+            return;
+        }
+        if rows.state(video_id) != Some(DownloadState::None) {
+            let _ = rows.set(video_id, DownloadState::None);
+        }
+    }
+
+    /// The job's task is over: its slot goes, if it is still its own. After a
+    /// cancel it is not -- the slot was taken out then, and a new download of
+    /// the same video may be in it by now, which must not lose its entry to
+    /// the old job's exit.
+    fn finished(&self, video_id: &str, job: &Arc<Job<K>>) {
+        let mut book = self.book();
+        if book.jobs.get(video_id).is_some_and(|s| Arc::ptr_eq(&s.job, job)) {
+            book.jobs.remove(video_id);
+        }
+    }
+}
+
+/// Calls `Registry::finished` however the task ends -- a panic included, which
+/// would otherwise leave the video "active" for the life of the process, and
+/// every later Download of it a silent no-op.
+struct Finish<K: Kill> {
+    reg: Arc<Registry<K>>,
+    video_id: String,
+    job: Arc<Job<K>>,
+}
+impl<K: Kill> Drop for Finish<K> {
+    fn drop(&mut self) {
+        self.reg.finished(&self.video_id, &self.job);
+    }
+}
 
 pub struct Queue {
     db: Arc<Db>,
     app: AppHandle,
     sem: Arc<Semaphore>,
     permits: Arc<Mutex<usize>>,
-    running: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    cancels: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    reg: Arc<Registry>,
+    rows: Arc<Ledger>,
     claims: Arc<PathClaims>,
     tools: Arc<Tools>,
 }
@@ -355,13 +709,13 @@ pub struct Queue {
 impl Queue {
     pub fn new(db: Arc<Db>, app: AppHandle, concurrency: usize, tools: Arc<Tools>) -> Self {
         Self {
+            rows: Arc::new(Ledger { db: db.clone(), app: app.clone() }),
             db,
             app,
             tools,
             sem: Arc::new(Semaphore::new(concurrency.max(1))),
             permits: Arc::new(Mutex::new(concurrency.max(1))),
-            running: Arc::new(Mutex::new(HashMap::new())),
-            cancels: Arc::new(Mutex::new(HashMap::new())),
+            reg: Registry::new(),
             claims: Arc::new(PathClaims::default()),
         }
     }
@@ -379,112 +733,41 @@ impl Queue {
 
     /// Whether the video is queued or downloading right now.
     pub async fn is_active(&self, video_id: &str) -> bool {
-        self.running.lock().await.contains_key(video_id)
+        self.reg.is_active(video_id)
     }
 
+    /// Returns as soon as the download is stopped and the row reads `None`;
+    /// the part files are swept up behind it. See `Registry::cancel`.
     pub async fn cancel(&self, video_id: &str) -> Result<()> {
-        // Stop yt-dlp first, and mark the job cancelled in the same breath, so
-        // whatever the job does next it knows to clear up rather than record a
-        // file the library is about to forget about.
-        let job = self.cancels.lock().await.get(video_id).cloned();
-        let stop = job.map(|j| j.cancel());
-        if let Some(tree) = stop.as_ref().and_then(|s| s.tree.as_ref()) {
-            tree.kill();
-        }
-
-        if let Some(h) = self.running.lock().await.remove(video_id) {
-            if stop.is_some_and(|s| s.spawned) {
-                // Something may be on disk, so wait for the job to sweep it up
-                // -- a cancel that has returned should mean the download really
-                // is gone. Aborting instead (which is what this used to do)
-                // skipped that cleanup and, worse, left yt-dlp running: tokio
-                // does not kill a child when its task is dropped, so it ran on
-                // to a full download that nothing then recorded or deleted.
-                let abort = h.abort_handle();
-                if tokio::time::timeout(CLEANUP_GRACE, h).await.is_err() {
-                    abort.abort();
-                }
-            } else {
-                // Nothing has been spawned, so there is nothing on disk and
-                // nothing to wait for -- and a queued job is parked on the
-                // semaphore behind other downloads, which could be minutes.
-                h.abort();
-            }
-        }
-        self.cancels.lock().await.remove(video_id);
-        self.db
-            .set_download_state(video_id, DownloadState::None, None, None)?;
-        let _ = self.app.emit(
-            "download://state",
-            DownloadStateEvent {
-                video_id: video_id.to_string(),
-                state: DownloadState::None,
-                file_path: None,
-                error: None,
-            },
-        );
-        Ok(())
+        self.reg.cancel(video_id, &self.rows)
     }
 
     pub async fn enqueue(&self, video_id: String, dir: String, template: String) -> Result<()> {
-        if self.running.lock().await.contains_key(&video_id) {
-            return Ok(()); // already in flight
-        }
-        self.db
-            .set_download_state(&video_id, DownloadState::Queued, None, None)?;
-        let _ = self.app.emit(
-            "download://state",
-            DownloadStateEvent {
-                video_id: video_id.clone(),
-                state: DownloadState::Queued,
-                file_path: None,
-                error: None,
-            },
-        );
-
-        let cancel = Arc::new(Job::default());
-        self.cancels
-            .lock()
-            .await
-            .insert(video_id.clone(), cancel.clone());
-
         let (db, app, sem) = (self.db.clone(), self.app.clone(), self.sem.clone());
-        let running = self.running.clone();
-        let cancels = self.cancels.clone();
         let claims = self.claims.clone();
         let tools = self.tools.clone();
         let vid = video_id.clone();
 
-        let handle = tokio::spawn(async move {
+        self.reg.enqueue(video_id, &self.rows, move |job, alive| async move {
             let _permit = match sem.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            if cancel.is_cancelled() {
-                running.lock().await.remove(&vid);
-                cancels.lock().await.remove(&vid);
+            if job.is_cancelled() {
                 return;
             }
-            let result = run_one(&db, &app, &tools, &vid, &dir, &template, &cancel, &claims).await;
+            let result =
+                run_one(&db, &app, &tools, &vid, &dir, &template, &job, &alive, &claims).await;
             if let Err(e) = result {
                 let msg = tail(&e.to_string(), 2000);
-                let _ = db.set_download_state(&vid, DownloadState::Failed, None, Some(&msg));
-                let _ = app.emit(
-                    "download://state",
-                    DownloadStateEvent {
-                        video_id: vid.clone(),
-                        state: DownloadState::Failed,
-                        file_path: None,
-                        error: Some(msg),
-                    },
-                );
+                // A cancelled job's error is the cancel's doing, and the row
+                // is the cancel's to write.
+                job.unless_cancelled(|| {
+                    let _ = db.set_download_state(&vid, DownloadState::Failed, None, Some(&msg));
+                    emit_state(&app, &vid, DownloadState::Failed, None, Some(msg.clone()));
+                });
             }
-            running.lock().await.remove(&vid);
-            cancels.lock().await.remove(&vid);
-        });
-
-        self.running.lock().await.insert(video_id, handle);
-        Ok(())
+        })
     }
 }
 
@@ -497,22 +780,25 @@ async fn run_one(
     dir: &str,
     template: &str,
     cancel: &Arc<Job>,
+    alive: &Alive,
     claims: &Arc<PathClaims>,
 ) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
+    // Every filesystem call from here on goes through `blocking`: see
+    // `sweep_blocking` for what a slow download directory does to a worker.
+    let d = PathBuf::from(dir);
+    blocking(move || std::fs::create_dir_all(d)).await??;
     let print_file = std::env::temp_dir().join(format!("mytube-{video_id}.path"));
     let _ = std::fs::remove_file(&print_file);
 
-    db.set_download_state(video_id, DownloadState::Downloading, None, None)?;
-    let _ = app.emit(
-        "download://state",
-        DownloadStateEvent {
-            video_id: video_id.to_string(),
-            state: DownloadState::Downloading,
-            file_path: None,
-            error: None,
-        },
-    );
+    let begun = cancel.unless_cancelled(|| -> Result<()> {
+        db.set_download_state(video_id, DownloadState::Downloading, None, None)?;
+        emit_state(app, video_id, DownloadState::Downloading, None, None);
+        Ok(())
+    });
+    match begun {
+        None => return Ok(()),
+        Some(r) => r?,
+    }
 
     // One yt-dlp for both phases, resolved now rather than at enqueue so a job
     // that sat in the queue gets whatever is installed when it starts. Its
@@ -535,25 +821,37 @@ async fn run_one(
     }
     let (intended, via_ext) = intended_path(&probed, quality::final_ext(&quality));
 
-    // Phase 2: claim a free path, appending " (N)" if this name is taken.
-    let (out_path, via_path) =
-        claims.claim_unique_with(&intended, via_ext.as_deref(), |c| c.exists());
-    let out_paths: Vec<PathBuf> = std::iter::once(out_path.clone()).chain(via_path).collect();
-    let _guard = ClaimGuard {
-        claims: claims.clone(),
-        paths: out_paths.clone(),
+    // Phase 2: claim a free path, appending " (N)" if this name is taken. The
+    // disk checks run inside the claim's lock, as they always have -- that is
+    // what makes the check and the reservation one step -- but on a blocking
+    // thread. The guard is built there too: a cancel may abort this task while
+    // the claim is in flight, and the guard then drops with the blocking
+    // task's unwanted result instead of leaking the name for good.
+    let (out_path, out_paths, claim) = {
+        let claims = claims.clone();
+        blocking(move || {
+            let (out, via) = claims.claim_unique_with(&intended, via_ext.as_deref(),
+                                                      |c| c.exists());
+            let paths: Vec<PathBuf> = std::iter::once(out.clone()).chain(via).collect();
+            let claim = ClaimGuard { claims, paths: paths.clone() };
+            (out, paths, claim)
+        })
+        .await?
     };
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
 
     // The cleanup guard is declared before the child so that it drops *after*
-    // it: yt-dlp is dead before a cancelled job unlinks anything.
+    // it: yt-dlp is dead before a cancelled job unlinks anything. It owns the
+    // claim, so the names stay reserved until its sweep is done.
     let _cleanup = CleanupGuard {
         job: cancel.clone(),
         out_paths: out_paths.clone(),
         print_file: print_file.clone(),
+        claim: Some(claim),
+        alive: alive.clone(),
     };
+    if let Some(parent) = out_path.parent().map(Path::to_path_buf) {
+        blocking(move || std::fs::create_dir_all(parent)).await??;
+    }
 
     let mut cmd = proc::command(&inv.runner.program);
     cmd.args(ytdlp::download_args(&inv.runner, &quality, video_id, &out_path, &print_file))
@@ -582,19 +880,28 @@ async fn run_one(
     let app2 = app.clone();
     let vid2 = video_id.to_string();
     let pump = tokio::spawn(async move {
+        let emit = |percent, speed, eta| {
+            let _ = app2.emit(
+                "download://progress",
+                DownloadProgress { video_id: vid2.clone(), percent, speed, eta },
+            );
+        };
+        let mut throttle = ProgressThrottle::default();
+        let mut held = None;
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some((percent, speed, eta)) = ytdlp::parse_progress_line(&line) {
-                let _ = app2.emit(
-                    "download://progress",
-                    DownloadProgress {
-                        video_id: vid2.clone(),
-                        percent,
-                        speed,
-                        eta,
-                    },
-                );
+                if throttle.admit(Instant::now(), percent) {
+                    held = None;
+                    emit(percent, speed, eta);
+                } else {
+                    held = Some((percent, speed, eta));
+                }
             }
+        }
+        // The last line held back, so the bar ends on what yt-dlp last said.
+        if let Some((percent, speed, eta)) = held {
+            emit(percent, speed, eta);
         }
     });
 
@@ -614,21 +921,19 @@ async fn run_one(
     let stderr_text = err_collect.await.unwrap_or_default();
 
     // The part files are deleted here, before the task ends, because that is
-    // what `Queue::cancel` is waiting for; the row is left alone because
-    // `Queue::cancel` owns it. On Windows the leader being reaped does not mean
-    // the tree is: the kill has only been *started* for the real yt-dlp and
-    // its ffmpeg, and their open handles make a part file undeletable until
-    // they are gone -- so wait for the job to empty first (bounded, well
-    // inside `CLEANUP_GRACE`), then sweep with retries. `_cleanup` makes one
-    // more pass on the way out, which finds nothing. On unix both steps are
-    // what they always were: no wait, one pass.
+    // what a new download of the same video is waiting for (`Book::cleaning`);
+    // the row is left alone because `Registry::cancel` owns it. On Windows the
+    // leader being reaped does not mean the tree is: the kill has only been
+    // *started* for the real yt-dlp and its ffmpeg, and their open handles make
+    // a part file undeletable until they are gone -- so wait for the job to
+    // empty first (bounded, well inside `CLEANUP_GRACE`), then sweep with
+    // retries. `_cleanup` makes one more pass on the way out, which finds
+    // nothing. On unix both steps are what they always were: no wait, one pass.
     if cancel.is_cancelled() {
         if !tree.wait_empty(TREE_EXIT_GRACE).await {
             eprintln!("[mytube] {video_id}: yt-dlp's processes outlived the cancel's grace; sweeping anyway");
         }
-        for p in &out_paths {
-            sweep_leftovers(p).await;
-        }
+        sweep_leftovers(out_paths.clone()).await;
         return Ok(());
     }
 
@@ -654,29 +959,31 @@ async fn run_one(
     // `YoutubeDL._forceprint`, yt-dlp 2026.08.19) -- UTF-8 on every OS,
     // whatever `--encoding` says, and `\r\n` on Windows. So: read as UTF-8,
     // take the last line, trim the `\r`.
-    let path = std::fs::read_to_string(&print_file)
-        .map_err(|_| anyhow!("yt-dlp finished but reported no output file"))?
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let pf = print_file.clone();
+    let path = blocking(move || -> Result<String> {
+        let path = std::fs::read_to_string(&pf)
+            .map_err(|_| anyhow!("yt-dlp finished but reported no output file"))?
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if path.is_empty() || !Path::new(&path).exists() {
+            return Err(anyhow!("yt-dlp finished but the output file is missing"));
+        }
+        Ok(path)
+    })
+    .await??;
 
-    if path.is_empty() || !Path::new(&path).exists() {
-        return Err(anyhow!("yt-dlp finished but the output file is missing"));
-    }
-
-    db.set_download_state(video_id, DownloadState::Done, Some(&path), None)?;
-    let _ = app.emit(
-        "download://state",
-        DownloadStateEvent {
-            video_id: video_id.to_string(),
-            state: DownloadState::Done,
-            file_path: Some(path),
-            error: None,
-        },
-    );
-    Ok(())
+    // Under the job's lock: a cancel that got in first means the row is not
+    // ours to write, and `_cleanup` is about to delete the file; one that
+    // comes after finds `Done` written and overwrites it with `None`.
+    let recorded = cancel.unless_cancelled(|| -> Result<()> {
+        db.set_download_state(video_id, DownloadState::Done, Some(&path), None)?;
+        emit_state(app, video_id, DownloadState::Done, Some(path.clone()), None);
+        Ok(())
+    });
+    recorded.unwrap_or(Ok(()))
 }
 
 #[cfg(test)]
@@ -807,7 +1114,7 @@ mod tests {
         for n in ["V.mkv.part", "V.f137.mp4", "W.mkv"] {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
-        sweep_leftovers(&out).await;
+        sweep_leftovers(vec![out.clone()]).await;
         let left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -838,10 +1145,222 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(500));
             drop(held);
         });
-        sweep_leftovers(&out).await;
+        sweep_leftovers(vec![out.clone()]).await;
         release.join().unwrap();
         assert!(!part.exists(), "the retry should have deleted it once it was closed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Rows` in memory: each row's state, and every event in the order sent.
+    #[derive(Default)]
+    struct FakeRows {
+        rows: std::sync::Mutex<HashMap<String, DownloadState>>,
+        sent: std::sync::Mutex<Vec<DownloadState>>,
+    }
+    impl Rows for FakeRows {
+        fn set(&self, id: &str, state: DownloadState) -> Result<()> {
+            self.rows.lock().unwrap().insert(id.to_string(), state);
+            self.sent.lock().unwrap().push(state);
+            Ok(())
+        }
+        fn state(&self, id: &str) -> Option<DownloadState> {
+            self.rows.lock().unwrap().get(id).copied()
+        }
+    }
+
+    /// Waits, at most two seconds, for `f` to hold.
+    async fn eventually(f: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        f()
+    }
+
+    /// Waits for the cancelled download of `id` to finish clearing up.
+    async fn cleared(reg: &Registry<i32>, id: &str) {
+        let pending = reg.book().cleaning.get(id).cloned();
+        if let Some(g) = pending {
+            tokio::time::timeout(Duration::from_secs(5), g.wait()).await
+                .expect("the cancelled download should clear up well inside the grace");
+        }
+    }
+
+    /// A job body that plays a running download: yt-dlp "spawned" at once,
+    /// then, once cancelled, `sweep` spent deleting part files before `done`.
+    fn running_download(
+        ready: tokio::sync::oneshot::Sender<()>,
+        sweep: Duration,
+        done: impl FnOnce() + Send + 'static,
+    ) -> impl FnOnce(Arc<Job<i32>>, Alive) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        move |job, _alive| {
+            Box::pin(async move {
+                assert!(job.started(4242));
+                let _ = ready.send(());
+                while !job.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(sweep).await;
+                done();
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_running_download_returns_at_once_and_clears_up_behind() {
+        // The deadlock this replaces: cancel held the `running` map's lock
+        // while it waited for the job, and the job's last act was to take that
+        // lock -- so the cancel button hung for the full 15 s grace. Now it
+        // must not wait for the job at all, not even for a sweep that works.
+        let reg = Registry::<i32>::new();
+        let rows = Arc::new(FakeRows::default());
+        let swept = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let s = swept.clone();
+        reg.enqueue("v".into(), &rows,
+                    running_download(tx, Duration::from_millis(300),
+                                     move || s.store(true, std::sync::atomic::Ordering::SeqCst)))
+            .unwrap();
+        rx.await.unwrap();
+
+        let t = Instant::now();
+        reg.cancel("v", &rows).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(150),
+                "cancel took {:?}; it must not wait for the job", t.elapsed());
+        assert_eq!(rows.state("v"), Some(DownloadState::None), "the row reads None at once");
+        assert!(!reg.is_active("v"));
+        assert!(!swept.load(std::sync::atomic::Ordering::SeqCst), "the sweep is still going");
+
+        cleared(&reg, "v").await;
+        assert!(swept.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(reg.book().cleaning.is_empty(), "the record goes once the sweep is done");
+        assert_eq!(*rows.sent.lock().unwrap(), vec![DownloadState::Queued, DownloadState::None],
+                   "nothing moved the row after the cancel, so nothing is sent twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_restarted_after_a_cancel_waits_for_the_old_one_to_clear_up() {
+        // The old sweep deletes by the old job's names -- the same print file,
+        // the same claimed path, the same `.part` files -- so the new download
+        // must not start until it is over. And the old job's exit must not
+        // take the new job's entry with it.
+        let reg = Registry::<i32>::new();
+        let rows = Arc::new(FakeRows::default());
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let l = log.clone();
+        reg.enqueue("v".into(), &rows,
+                    running_download(tx, Duration::from_millis(200),
+                                     move || l.lock().unwrap().push("old swept")))
+            .unwrap();
+        rx.await.unwrap();
+        reg.cancel("v", &rows).unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let l = log.clone();
+        reg.enqueue("v".into(), &rows, move |_job, _alive| async move {
+            l.lock().unwrap().push("new started");
+            let _ = release_rx.await;
+        })
+        .unwrap();
+        assert!(reg.is_active("v"));
+
+        assert!(eventually(|| log.lock().unwrap().contains(&"new started")).await);
+        assert_eq!(*log.lock().unwrap(), vec!["old swept", "new started"]);
+        cleared(&reg, "v").await;
+        assert!(reg.is_active("v"), "the old job's exit removed the new job's entry");
+        assert_eq!(rows.state("v"), Some(DownloadState::Queued),
+                   "the old cancel's clean-up must not overwrite the new download's row");
+
+        release_tx.send(()).unwrap();
+        assert!(eventually(|| !reg.is_active("v")).await, "the new job's own exit clears it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_landing_after_the_cancel_is_put_back_to_none() {
+        // A `Done` that slips in after the cancel's `None`, while the file it
+        // names is being deleted, must not be where the row ends up.
+        let reg = Registry::<i32>::new();
+        let rows = Arc::new(FakeRows::default());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let r = rows.clone();
+        reg.enqueue("v".into(), &rows,
+                    running_download(tx, Duration::ZERO,
+                                     move || { let _ = r.set("v", DownloadState::Done); }))
+            .unwrap();
+        rx.await.unwrap();
+        reg.cancel("v", &rows).unwrap();
+        cleared(&reg, "v").await;
+        assert_eq!(rows.state("v"), Some(DownloadState::None));
+        assert_eq!(rows.sent.lock().unwrap().last(), Some(&DownloadState::None),
+                   "and the UI is told so");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_download_is_aborted_where_it_stands() {
+        // Parked on the semaphore behind other downloads, with nothing on
+        // disk: waiting for it to notice the cancel could take minutes.
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let reg = Registry::<i32>::new();
+        let rows = Arc::new(FakeRows::default());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = Dropped(dropped.clone());
+        reg.enqueue("v".into(), &rows, move |_job, _alive| async move {
+            let _d = d;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reg.cancel("v", &rows).unwrap();
+        cleared(&reg, "v").await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the task was aborted");
+        assert!(!reg.is_active("v"));
+        assert_eq!(rows.state("v"), Some(DownloadState::None));
+    }
+
+    #[tokio::test]
+    async fn enqueueing_a_download_already_in_flight_does_nothing() {
+        let reg = Registry::<i32>::new();
+        let rows = Arc::new(FakeRows::default());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        reg.enqueue("v".into(), &rows, move |_j, _a| async move { let _ = rx.await; }).unwrap();
+        reg.enqueue("v".into(), &rows, |_j, _a| async { panic!("a second job was started") })
+            .unwrap();
+        assert_eq!(*rows.sent.lock().unwrap(), vec![DownloadState::Queued]);
+        tx.send(()).unwrap();
+        assert!(eventually(|| !reg.is_active("v")).await);
+    }
+
+    #[test]
+    fn a_cancelled_job_does_not_write_its_row() {
+        // `Done` and `Failed` go through `unless_cancelled`, so a cancel that
+        // got in first leaves the row to the cancel.
+        let job = Job::<i32>::default();
+        assert_eq!(job.unless_cancelled(|| 1), Some(1));
+        job.cancel();
+        assert_eq!(job.unless_cancelled(|| panic!("wrote after a cancel")), None::<()>);
+    }
+
+    #[test]
+    fn progress_is_thinned_but_never_left_stale() {
+        let mut t = ProgressThrottle::default();
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert!(t.admit(at(0), 0.0), "the first line always goes");
+        assert!(!t.admit(at(50), 1.0));
+        assert!(!t.admit(at(200), 2.0));
+        assert!(t.admit(at(260), 3.0), "a quarter of a second on, the next one goes");
+        assert!(!t.admit(at(300), 4.0));
+        assert!(t.admit(at(310), 100.0), "100% always goes");
+        assert!(t.admit(at(320), 0.2), "so does the second stream starting from 0%");
+        assert!(!t.admit(at(330), 0.4));
     }
 
     #[test]
