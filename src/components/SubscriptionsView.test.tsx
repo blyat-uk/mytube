@@ -248,6 +248,43 @@ describe("card actions in flight", () => {
   });
 });
 
+/**
+ * A series shows every part whatever the filters say -- the backend's
+ * `sibling_of` replaces them all -- so acting on a part must not take it off
+ * the screen just because the feed behind the series would not show it.
+ */
+describe("acting on a part inside a series", () => {
+  const part = () => video({ id: "p2", title: "Part 2", download_state: "none", file_path: null });
+
+  it("keeps a part marked watched while Unwatched is on", async () => {
+    videos = [part()];
+    renderView({ hideWatched: true, siblingOf: video({ id: "p1" }) });
+    fireEvent.click(within(await openMenu(), "Mark as watched"));
+
+    await waitFor(() => expect(setWatched).toHaveBeenCalledWith("p2", true));
+    expect(screen.getByRole("article")).toBeTruthy();
+    expect(screen.getByRole("article").className).toContain("is-watched");
+  });
+
+  it("keeps a part hidden while Include hidden is off, shown as hidden", async () => {
+    videos = [part()];
+    renderView({ showHidden: false, siblingOf: video({ id: "p1" }) });
+    fireEvent.click(within(await openMenu(), "Hide from feed"));
+
+    await waitFor(() => expect(setVideoHidden).toHaveBeenCalledWith("p2", true));
+    expect(screen.getByRole("article")).toBeTruthy();
+  });
+
+  it("still drops a watched card from the ordinary feed while Unwatched is on", async () => {
+    videos = [part()];
+    renderView({ hideWatched: true });
+    fireEvent.click(within(await openMenu(), "Mark as watched"));
+
+    await waitFor(() => expect(setWatched).toHaveBeenCalledWith("p2", true));
+    await waitFor(() => expect(screen.queryByRole("article")).toBeNull());
+  });
+});
+
 describe("marking a downloaded video as watched", () => {
   it("marks it watched and then asks about the file", async () => {
     renderView();

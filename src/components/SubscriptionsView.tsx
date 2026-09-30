@@ -384,8 +384,9 @@ export default function SubscriptionsView(p: Props) {
     // card saying the opposite of the database.
     void run(`watched:${video.id}`, async () => {
       await api.setWatched(video.id, next);
-      // With "hide watched" on, a freshly watched card no longer belongs here.
-      if (next && hideWatched) drop(video.id);
+      // With "hide watched" on, a freshly watched card no longer belongs here --
+      // except in a series, which shows every part whatever the filters say.
+      if (next && hideWatched && !siblingOf) drop(video.id);
       // Watching something is usually the end of its life on disk — but that is
       // the user's call, and it is a separate step from marking it watched.
       // The dialog gets the video as it now is: its copy reads `watched`, and
@@ -399,7 +400,7 @@ export default function SubscriptionsView(p: Props) {
         return () => patch(video.id, { watched: video.watched, watched_at: video.watched_at });
       },
     });
-  }, [patch, drop, hideWatched, run]);
+  }, [patch, drop, hideWatched, siblingOf, run]);
 
   const unhideVideo = useCallback((video: Video) => {
     void run(video.id, () => api.setVideoHidden(video.id, false), {
@@ -468,7 +469,9 @@ export default function SubscriptionsView(p: Props) {
       toast.success(deleting ? `Deleted "${video.title}".` : `Hidden "${video.title}".`);
     }, {
       optimistic: () => {
-        if (deleting || !showHidden) {
+        // A series keeps a part it would otherwise lose to "Include hidden"
+        // being off: it shows every part, hidden ones included.
+        if (deleting || (!showHidden && !siblingOf)) {
           const undo = drop(video.id);
           return () => {
             undo();
@@ -479,7 +482,7 @@ export default function SubscriptionsView(p: Props) {
         return () => patch(video.id, { hidden: false, ...(fileGone ? {} : fileOf(video)) });
       },
     });
-  }, [drop, patch, run, showHidden, toast]);
+  }, [drop, patch, run, showHidden, siblingOf, toast]);
 
   const requestRemove = useCallback((video: Video) => {
     if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video });
