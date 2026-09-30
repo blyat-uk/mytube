@@ -44,7 +44,14 @@ pub fn run() {
         .setup(|app| {
             config::ensure_dirs()?;
             let settings = config::load().unwrap_or_default();
-            std::fs::create_dir_all(&settings.download_dir).ok();
+            // Off the main thread: the download directory is often on a disk
+            // that spins down, and waking it here held the first paint for
+            // seconds. Nothing waits on it -- `queue::run_one` creates the
+            // directory itself before every download.
+            let download_dir = settings.download_dir.clone();
+            std::thread::spawn(move || {
+                std::fs::create_dir_all(download_dir).ok();
+            });
 
             // The tray first: `window::track` asks whether one exists before it
             // turns a close into a hide. Only logged on failure — an app with

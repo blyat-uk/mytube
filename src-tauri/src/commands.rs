@@ -2,6 +2,7 @@ use std::sync::Arc;
 use futures::stream::StreamExt;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::db::Db;
 use crate::models::*;
 use crate::poll::{self, AppState};
 use crate::quality::Quality;
@@ -16,29 +17,72 @@ fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Runs blocking work -- SQL, the filesystem, settings.json, spawning or
+/// probing a binary -- on tokio's blocking pool.
+///
+/// Every command here is `async` for this reason. Tauri 2 runs a plain
+/// `#[tauri::command] pub fn` on the main thread, which on Linux is also the
+/// thread driving the webview, so any wait inside one froze the whole window:
+/// a download disk spinning up, or the `Db` Mutex held by a poll, an import or
+/// a grouping walk for as long as that takes. An `async fn` alone is not
+/// enough either -- blocking inline there parks a runtime worker, stalling
+/// every other future scheduled on it, progress events included.
+///
+/// The closure is `'static`, so it owns everything it touches: nothing
+/// borrowed survives into the await, which is what `generate_handler!`'s
+/// higher-ranked bounds insist on (see "Async gotchas" in CLAUDE.md). A panic
+/// inside comes back as an `Err`, not a torn-down command.
+async fn blocking<T, F>(f: F) -> R<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(e)?
+        .map_err(e)
+}
+
+/// [`blocking`] with the database in hand. Deliberately not an `async fn`:
+/// the `Arc` is cloned before the future is built, so the command's `State`
+/// borrow ends here rather than being captured and held across the await.
+fn db_blocking<T, F>(state: &AppState, f: F) -> impl std::future::Future<Output = R<T>> + Send + 'static
+where
+    T: Send + 'static,
+    F: FnOnce(&Db) -> anyhow::Result<T> + Send + 'static,
+{
+    let db = state.db.clone();
+    blocking(move || f(&db))
+}
+
 #[tauri::command]
-pub fn get_settings() -> R<config::Settings> {
-    config::load().map_err(e)
+pub async fn get_settings() -> R<config::Settings> {
+    blocking(config::load).await
 }
 
 #[tauri::command]
 pub async fn save_settings(
-    mut settings: config::Settings,
+    settings: config::Settings,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> R<()> {
-    // The Settings view sends a snapshot taken at mount, so if a filter
-    // changed while it was open, saving it verbatim would revert `view` to
-    // that stale copy. A failed re-read (e.g. no file yet) just means there
-    // is nothing on disk to defer to, so fall through and write as sent.
-    let disk = config::load().ok();
-    if let Some(disk) = &disk {
-        settings.keep_view_of(disk);
-        // The tool overrides have no UI, only hand edits, so the snapshot's
-        // copy can only ever be stale; see `keep_machine_overrides_of`.
-        settings.keep_machine_overrides_of(disk);
-    }
-    config::save(&settings).map_err(e)?;
+    let (settings, disk) = blocking(move || {
+        let mut settings = settings;
+        // The Settings view sends a snapshot taken at mount, so if a filter
+        // changed while it was open, saving it verbatim would revert `view` to
+        // that stale copy. A failed re-read (e.g. no file yet) just means there
+        // is nothing on disk to defer to, so fall through and write as sent.
+        let disk = config::load().ok();
+        if let Some(disk) = &disk {
+            settings.keep_view_of(disk);
+            // The tool overrides have no UI, only hand edits, so the snapshot's
+            // copy can only ever be stale; see `keep_machine_overrides_of`.
+            settings.keep_machine_overrides_of(disk);
+        }
+        config::save(&settings)?;
+        Ok((settings, disk))
+    })
+    .await?;
     // A new update channel or auto-update switched on should take effect now
     // rather than at the next hourly tools tick. The override paths cannot
     // differ from the file's any more; a hand edit to one is picked up by the
@@ -77,22 +121,25 @@ pub async fn save_settings(
 /// the same re-read-then-touch-one-block pattern `window::persist` uses to
 /// save geometry without disturbing the rest of the file.
 #[tauri::command]
-pub fn save_view_state(mut view: config::ViewState) -> R<()> {
+pub async fn save_view_state(mut view: config::ViewState) -> R<()> {
     // `Settings::from_json_str` only sanitises on the way back in, so without
     // this an unbounded search string (no `maxLength` on the search box)
     // would be written to settings.json in full every 400ms of typing.
     // Sanitising here also means the stored block is always byte-for-byte
     // what the next launch's `sanitize` call would produce anyway.
     view.sanitize();
-    let mut s = config::load().map_err(e)?;
-    s.view = view;
-    config::save(&s).map_err(e)
+    blocking(move || {
+        let mut s = config::load()?;
+        s.view = view;
+        config::save(&s)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn list_channels(state: State<'_, Arc<AppState>>) -> R<Vec<Channel>> {
+pub async fn list_channels(state: State<'_, Arc<AppState>>) -> R<Vec<Channel>> {
     // Only subscriptions: ad-hoc uploaders are not part of the user's channel list.
-    state.db.list_subscribed_channels().map_err(e)
+    db_blocking(&state, |db| db.list_subscribed_channels()).await
 }
 
 /// Tells the UI whether the Add box holds a channel, a video, or a rejected Short.
@@ -119,9 +166,12 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
             return Err("That is a channel link. Use Add channel to subscribe.".into())
         }
     };
-    let s = config::load().map_err(e)?;
+    let (s, known) = {
+        let id = video_id.clone();
+        db_blocking(&state, move |db| Ok((config::load()?, db.get_video(&id)?.is_some()))).await?
+    };
 
-    if state.db.get_video(&video_id).map_err(e)?.is_none() {
+    if !known {
         // The lease lives exactly as long as the probe; the download that
         // follows takes its own in the queue.
         let inv = state.tools.ytdlp(&s).await.map_err(e)?;
@@ -144,43 +194,41 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
 
         // subscribed = false: keeps the uploader's name on the card without
         // adding them to the subscription list or any poll cycle.
-        state
-            .db
-            .upsert_channel(&Channel {
-                id: channel_id.clone(),
-                title: if probe.channel_title.is_empty() {
-                    "Added manually".into()
-                } else {
-                    probe.channel_title.clone()
-                },
-                handle: None,
-                url: format!("https://www.youtube.com/channel/{channel_id}"),
-                thumb_path: None,
-                subscribed: false,
-                member: false,
-                added_at: chrono::Utc::now().timestamp(),
-                last_polled_at: None,
-                terminated: false, auto_download: false,
-            })
-            .map_err(e)?;
-
-        state
-            .db
-            .insert_video_if_new(&NewVideo {
-                id: video_id.clone(),
-                channel_id,
-                title: probe.title.clone(),
-                description: None,
-                thumb_url: Some(ytdlp::thumb_url_for(&video_id)),
-                published_at: probe.published_at, // true upload date, for display
-                sort_at: Some(chrono::Utc::now().timestamp()), // top of the grid
-                feed_rank: 0,
-                added_manually: true,
-                duration_secs: probe.duration_secs,
-                view_count: None,
-                status: VideoStatus::Ready,
-            })
-            .map_err(e)?;
+        let channel = Channel {
+            id: channel_id.clone(),
+            title: if probe.channel_title.is_empty() {
+                "Added manually".into()
+            } else {
+                probe.channel_title.clone()
+            },
+            handle: None,
+            url: format!("https://www.youtube.com/channel/{channel_id}"),
+            thumb_path: None,
+            subscribed: false,
+            member: false,
+            added_at: chrono::Utc::now().timestamp(),
+            last_polled_at: None,
+            terminated: false, auto_download: false,
+        };
+        let video = NewVideo {
+            id: video_id.clone(),
+            channel_id,
+            title: probe.title.clone(),
+            description: None,
+            thumb_url: Some(ytdlp::thumb_url_for(&video_id)),
+            published_at: probe.published_at, // true upload date, for display
+            sort_at: Some(chrono::Utc::now().timestamp()), // top of the grid
+            feed_rank: 0,
+            added_manually: true,
+            duration_secs: probe.duration_secs,
+            view_count: None,
+            status: VideoStatus::Ready,
+        };
+        db_blocking(&state, move |db| {
+            db.upsert_channel(&channel)?;
+            db.insert_video_if_new(&video)
+        })
+        .await?;
 
         poll::cache_thumb(
             &state.http,
@@ -196,10 +244,8 @@ pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Vide
         .enqueue(video_id.clone(), s.download_dir, s.filename_template)
         .await
         .map_err(e)?;
-    state
-        .db
-        .get_video(&video_id)
-        .map_err(e)?
+    db_blocking(&state, move |db| db.get_video(&video_id))
+        .await?
         .ok_or_else(|| "Video disappeared after being added".to_string())
 }
 
@@ -248,30 +294,34 @@ pub async fn add_channel(
 }
 
 #[tauri::command]
-pub fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    state.db.remove_channel(&channel_id).map_err(e)
+pub async fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    db_blocking(&state, move |db| db.remove_channel(&channel_id)).await
 }
 
 /// Parses the CSV without importing anything, so the UI can offer a checklist.
 #[tauri::command]
-pub fn preview_takeout_csv(path: String, state: State<'_, Arc<AppState>>) -> R<Vec<TakeoutRow>> {
-    let data = std::fs::read_to_string(&path).map_err(e)?;
-    let rows = resolve::parse_takeout_csv(&data).map_err(e)?;
-    let subscribed: std::collections::HashSet<String> = state
-        .db
-        .list_subscribed_channels()
-        .map_err(e)?
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
-    Ok(rows
-        .into_iter()
-        .map(|(channel_id, title)| TakeoutRow {
-            already_subscribed: subscribed.contains(&channel_id),
-            title: if title.is_empty() { channel_id.clone() } else { title },
-            channel_id,
-        })
-        .collect())
+pub async fn preview_takeout_csv(
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> R<Vec<TakeoutRow>> {
+    db_blocking(&state, move |db| {
+        let data = std::fs::read_to_string(&path)?;
+        let rows = resolve::parse_takeout_csv(&data)?;
+        let subscribed: std::collections::HashSet<String> = db
+            .list_subscribed_channels()?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        Ok(rows
+            .into_iter()
+            .map(|(channel_id, title)| TakeoutRow {
+                already_subscribed: subscribed.contains(&channel_id),
+                title: if title.is_empty() { channel_id.clone() } else { title },
+                channel_id,
+            })
+            .collect())
+    })
+    .await
 }
 
 /// Imports only the channels the user ticked. Backfills run a few at a time and
@@ -283,40 +333,46 @@ pub async fn import_takeout_csv(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> R<ImportResult> {
-    let data = std::fs::read_to_string(&path).map_err(e)?;
-    let all = resolve::parse_takeout_csv(&data).map_err(e)?;
-    let wanted: std::collections::HashSet<String> = channel_ids.into_iter().collect();
-    let rows: Vec<(String, String)> =
-        all.into_iter().filter(|(id, _)| wanted.contains(id)).collect();
+    // The file read and one upsert per ticked row, off the runtime: a Takeout
+    // export can list hundreds of channels, each its own write.
+    let (settings, total, mut result, to_backfill) = db_blocking(&state, move |db| {
+        let data = std::fs::read_to_string(&path)?;
+        let all = resolve::parse_takeout_csv(&data)?;
+        let wanted: std::collections::HashSet<String> = channel_ids.into_iter().collect();
+        let rows: Vec<(String, String)> =
+            all.into_iter().filter(|(id, _)| wanted.contains(id)).collect();
 
-    let settings = config::load().map_err(e)?;
-    let total = rows.len();
-    let mut result = ImportResult::default();
-    let mut to_backfill: Vec<(String, String)> = Vec::new();
+        let settings = config::load()?;
+        let total = rows.len();
+        let mut result = ImportResult::default();
+        let mut to_backfill: Vec<(String, String)> = Vec::new();
 
-    for (id, title) in rows {
-        if state.db.get_channel(&id).map_err(e)?.map(|c| c.subscribed).unwrap_or(false) {
-            result.skipped += 1;
-            continue;
+        for (id, title) in rows {
+            if db.get_channel(&id)?.map(|c| c.subscribed).unwrap_or(false) {
+                result.skipped += 1;
+                continue;
+            }
+            let channel = Channel {
+                id: id.clone(),
+                title: if title.is_empty() { id.clone() } else { title.clone() },
+                handle: None,
+                url: format!("https://www.youtube.com/channel/{id}"),
+                thumb_path: None,
+                subscribed: true,
+                member: false,
+                added_at: chrono::Utc::now().timestamp(),
+                last_polled_at: None,
+                terminated: false, auto_download: false,
+            };
+            if let Err(err) = db.upsert_channel(&channel) {
+                result.failed.push(format!("{title}: {err}"));
+                continue;
+            }
+            to_backfill.push((id, channel.title));
         }
-        let channel = Channel {
-            id: id.clone(),
-            title: if title.is_empty() { id.clone() } else { title.clone() },
-            handle: None,
-            url: format!("https://www.youtube.com/channel/{id}"),
-            thumb_path: None,
-            subscribed: true,
-            member: false,
-            added_at: chrono::Utc::now().timestamp(),
-            last_polled_at: None,
-            terminated: false, auto_download: false,
-        };
-        if let Err(err) = state.db.upsert_channel(&channel) {
-            result.failed.push(format!("{title}: {err}"));
-            continue;
-        }
-        to_backfill.push((id, channel.title));
-    }
+        Ok((settings, total, result, to_backfill))
+    })
+    .await?;
 
     let done = std::sync::atomic::AtomicUsize::new(0);
     let failures: tokio::sync::Mutex<Vec<String>> = tokio::sync::Mutex::new(Vec::new());
@@ -347,35 +403,36 @@ pub async fn import_takeout_csv(
     result.added = to_backfill.len() - failed.len();
     result.failed.extend(failed);
 
-    let channels = state.db.list_subscribed_channels().map_err(e)?;
+    let channels = db_blocking(&state, |db| db.list_subscribed_channels()).await?;
     poll::poll_channels(&state, &app, channels).await;
     Ok(result)
 }
 
 /// Hides a video so polling never surfaces it again.
 #[tauri::command]
-pub fn set_video_hidden(
+pub async fn set_video_hidden(
     video_id: String,
     hidden: bool,
     state: State<'_, Arc<AppState>>,
 ) -> R<()> {
-    state.db.set_hidden(&video_id, hidden).map_err(e)
+    db_blocking(&state, move |db| db.set_hidden(&video_id, hidden)).await
 }
 
 /// Removes a manually added video outright. Refuses subscription videos, which
 /// would simply reappear on the next poll — those must be hidden instead.
 #[tauri::command]
-pub fn delete_video(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    let v = state
-        .db
-        .get_video(&video_id)
-        .map_err(e)?
-        .ok_or_else(|| "Unknown video".to_string())?;
-    if !v.added_manually {
-        return Err("Only manually added videos can be deleted. Hide this one instead.".into());
-    }
-    state.db.delete_video(&video_id).map_err(e)?;
-    state.db.prune_orphan_channel(&v.channel_id).map_err(e)
+pub async fn delete_video(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    db_blocking(&state, move |db| {
+        let v = db
+            .get_video(&video_id)?
+            .ok_or_else(|| anyhow::anyhow!("Unknown video"))?;
+        if !v.added_manually {
+            anyhow::bail!("Only manually added videos can be deleted. Hide this one instead.");
+        }
+        db.delete_video(&video_id)?;
+        db.prune_orphan_channel(&v.channel_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -436,17 +493,17 @@ pub struct Backlog {
 /// How many videos a switch-on with this backlog would queue. Read-only: it is
 /// the live count the prompt shows while the ticks move.
 #[tauri::command]
-pub fn auto_download_backlog_count(
+pub async fn auto_download_backlog_count(
     channel_id: String,
     include_watched: bool,
     include_hidden: bool,
     state: State<'_, Arc<AppState>>,
 ) -> R<usize> {
-    state
-        .db
-        .auto_download_backlog(&channel_id, include_watched, include_hidden)
-        .map(|ids| ids.len())
-        .map_err(e)
+    db_blocking(&state, move |db| {
+        db.auto_download_backlog(&channel_id, include_watched, include_hidden)
+            .map(|ids| ids.len())
+    })
+    .await
 }
 
 /// Switches auto-download on or off for one channel, and returns how many
@@ -480,18 +537,18 @@ pub async fn set_channel_auto_download(
 }
 
 #[tauri::command]
-pub fn list_videos(filter: VideoFilter, state: State<'_, Arc<AppState>>) -> R<Vec<Video>> {
-    state.db.list_videos(&filter).map_err(e)
+pub async fn list_videos(filter: VideoFilter, state: State<'_, Arc<AppState>>) -> R<Vec<Video>> {
+    db_blocking(&state, move |db| db.list_videos(&filter)).await
 }
 
 /// The same feed, with each channel's multi-part uploads behind one card.
 /// `filter.limit` and `filter.offset` count groups here, not videos.
 #[tauri::command]
-pub fn list_video_groups(
+pub async fn list_video_groups(
     filter: VideoFilter,
     state: State<'_, Arc<AppState>>,
 ) -> R<Vec<VideoGroup>> {
-    state.db.list_video_groups(&filter).map_err(e)
+    db_blocking(&state, move |db| db.list_video_groups(&filter)).await
 }
 
 /// Marks videos siblings by hand, for a series whose titles no matcher could
@@ -499,24 +556,24 @@ pub fn list_video_groups(
 /// size, which can exceed what was sent: marking across two hand-built groups
 /// merges both. Refused across channels.
 #[tauri::command]
-pub fn mark_siblings(video_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> R<usize> {
-    state.db.mark_siblings(&video_ids).map_err(e)
+pub async fn mark_siblings(video_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> R<usize> {
+    db_blocking(&state, move |db| db.mark_siblings(&video_ids)).await
 }
 
 /// Takes one video back out of its hand-built group, dissolving the group when
 /// that leaves it with a single member.
 #[tauri::command]
-pub fn unlink_siblings(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    state.db.unlink_siblings(&video_id).map_err(e)
+pub async fn unlink_siblings(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    db_blocking(&state, move |db| db.unlink_siblings(&video_id)).await
 }
 
 #[tauri::command]
-pub fn set_watched(
+pub async fn set_watched(
     video_id: String,
     watched: bool,
     state: State<'_, Arc<AppState>>,
 ) -> R<()> {
-    state.db.set_watched(&video_id, watched).map_err(e)
+    db_blocking(&state, move |db| db.set_watched(&video_id, watched)).await
 }
 
 /// `quality` is "Download (custom)…": `Some` stores it on the row first, so
@@ -569,34 +626,73 @@ pub async fn cancel_download(video_id: String, state: State<'_, Arc<AppState>>) 
 }
 
 #[tauri::command]
-pub fn open_in_player(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    let v = state
-        .db
-        .get_video(&video_id)
-        .map_err(e)?
-        .ok_or_else(|| "Unknown video".to_string())?;
-    let path = v
-        .file_path
-        .ok_or_else(|| "This video has not been downloaded".to_string())?;
-    if !std::path::Path::new(&path).exists() {
-        state.db.clear_file_path(&video_id).map_err(e)?;
-        return Err(format!("File is gone: {path}. Marked as not downloaded."));
-    }
-    let s = config::load().map_err(e)?;
-    player::launch(&s.player_command, &path).map_err(e)
+pub async fn open_in_player(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    // All of it off the main thread: the existence check is the first touch of
+    // the download disk, and a sleeping one takes seconds to answer.
+    db_blocking(&state, move |db| {
+        let v = db
+            .get_video(&video_id)?
+            .ok_or_else(|| anyhow::anyhow!("Unknown video"))?;
+        let path = v
+            .file_path
+            .ok_or_else(|| anyhow::anyhow!("This video has not been downloaded"))?;
+        // The one existence check on this path, here rather than in
+        // `player::launch`, because only the caller can mark the row.
+        if !std::path::Path::new(&path).exists() {
+            db.clear_file_path(&video_id)?;
+            anyhow::bail!("File is gone: {path}. Marked as not downloaded.");
+        }
+        let s = config::load()?;
+        player::start(&s.player_command, &path)
+    })
+    .await
 }
 
+/// Forgets a download at once and unlinks the file afterwards.
+///
+/// The row is cleared and `download://state` sent before the file is touched,
+/// so every view -- not only the one that asked -- drops the card's
+/// downloaded look immediately. The unlink follows on the blocking pool: on a
+/// spun-down disk it can take seconds, and nothing the user sees depends on
+/// it. A failure there is only logged; the row is already `none` either way,
+/// the same outcome the old unlink-then-clear order reached when the unlink
+/// failed.
 #[tauri::command]
-pub fn delete_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    let v = state
-        .db
-        .get_video(&video_id)
-        .map_err(e)?
-        .ok_or_else(|| "Unknown video".to_string())?;
-    if let Some(p) = v.file_path {
-        let _ = std::fs::remove_file(p);
+pub async fn delete_download(
+    video_id: String,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> R<()> {
+    let id = video_id.clone();
+    let path = db_blocking(&state, move |db| {
+        let v = db
+            .get_video(&id)?
+            .ok_or_else(|| anyhow::anyhow!("Unknown video"))?;
+        db.clear_file_path(&id)?;
+        Ok(v.file_path)
+    })
+    .await?;
+    let _ = app.emit(
+        "download://state",
+        DownloadStateEvent {
+            video_id,
+            state: DownloadState::None,
+            file_path: None,
+            error: None,
+        },
+    );
+    if let Some(p) = path {
+        tauri::async_runtime::spawn_blocking(move || {
+            // Already gone is the outcome wanted, not a failure worth a line.
+            match std::fs::remove_file(&p) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    eprintln!("mytube: could not delete {p}: {err}")
+                }
+                _ => {}
+            }
+        });
     }
-    state.db.clear_file_path(&video_id).map_err(e)
+    Ok(())
 }
 
 // ---- config transfer ----
@@ -604,12 +700,16 @@ pub fn delete_download(video_id: String, state: State<'_, Arc<AppState>>) -> R<(
 /// What an export would weigh, so the "Include thumbnails" tick can offer a
 /// real number instead of a guess.
 #[tauri::command]
-pub fn transfer_estimate(state: State<'_, Arc<AppState>>) -> R<TransferEstimate> {
-    let channels = state.db.export_channels().map_err(e)?;
-    let videos = state.db.export_videos().map_err(e)?;
-    // `transfer` owns the sizing because it owns what actually goes in the zip:
-    // a thumbnail is counted only if the file is really there to be copied.
-    Ok(transfer::estimate(&channels, &videos))
+pub async fn transfer_estimate(state: State<'_, Arc<AppState>>) -> R<TransferEstimate> {
+    db_blocking(&state, |db| {
+        let channels = db.export_channels()?;
+        let videos = db.export_videos()?;
+        // `transfer` owns the sizing because it owns what actually goes in the
+        // zip: a thumbnail is counted only if the file is really there to be
+        // copied -- one stat per thumbnail, which is why this is off the runtime.
+        Ok(transfer::estimate(&channels, &videos))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -619,15 +719,16 @@ pub async fn export_config(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> R<()> {
-    let channels = state.db.export_channels().map_err(e)?;
-    let videos = state.db.export_videos().map_err(e)?;
-    let settings = config::load().map_err(e)?;
     let dest = std::path::PathBuf::from(path);
 
     // Zipping thousands of thumbnails is blocking work. On the async runtime's
     // own threads it would stall every other command behind it -- including the
-    // progress events this very call is emitting.
-    tauri::async_runtime::spawn_blocking(move || {
+    // progress events this very call is emitting. The reads that feed it go
+    // with it: every row in the library, under the shared connection lock.
+    db_blocking(&state, move |db| {
+        let channels = db.export_channels()?;
+        let videos = db.export_videos()?;
+        let settings = config::load()?;
         transfer::write_archive(
             &dest,
             &channels,
@@ -648,8 +749,6 @@ pub async fn export_config(
         )
     })
     .await
-    .map_err(e)?
-    .map_err(e)
 }
 
 /// Parses the archive's manifest without writing anything, so the dialog can
@@ -659,30 +758,27 @@ pub async fn read_archive(
     path: String,
     state: State<'_, Arc<AppState>>,
 ) -> R<ArchiveSummary> {
-    // Every channel, not just the subscribed ones: an ad-hoc uploader already
-    // here is "already here", and saying otherwise would offer to re-add it.
-    let known: std::collections::HashSet<String> = state
-        .db
-        .export_channels()
-        .map_err(e)?
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
     let p = std::path::PathBuf::from(path);
-    let mut summary = tauri::async_runtime::spawn_blocking(move || transfer::read_summary(&p, &known))
-        .await
-        .map_err(e)?
-        .map_err(e)?;
+    db_blocking(&state, move |db| {
+        // Every channel, not just the subscribed ones: an ad-hoc uploader
+        // already here is "already here", and saying otherwise would offer to
+        // re-add it.
+        let known: std::collections::HashSet<String> =
+            db.export_channels()?.into_iter().map(|c| c.id).collect();
+        let mut summary = transfer::read_summary(&p, &known)?;
 
-    // What a Replace would remove, measured here because only the database can
-    // answer it. Against the archive's whole roster, never the ticked subset:
-    // unticking a row means "skip it", so the number the dialog shows must not
-    // move as the user works down the checklist.
-    let roster: Vec<String> = summary.channels.iter().map(|c| c.channel_id.clone()).collect();
-    let (local_only_channels, local_only_videos) = state.db.absent_from(&roster).map_err(e)?;
-    summary.local_only_channels = local_only_channels;
-    summary.local_only_videos = local_only_videos;
-    Ok(summary)
+        // What a Replace would remove, measured here because only the database
+        // can answer it. Against the archive's whole roster, never the ticked
+        // subset: unticking a row means "skip it", so the number the dialog
+        // shows must not move as the user works down the checklist.
+        let roster: Vec<String> =
+            summary.channels.iter().map(|c| c.channel_id.clone()).collect();
+        let (local_only_channels, local_only_videos) = db.absent_from(&roster)?;
+        summary.local_only_channels = local_only_channels;
+        summary.local_only_videos = local_only_videos;
+        Ok(summary)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -718,16 +814,18 @@ pub async fn import_config(
     // And now the part that has to be atomic. One `Db` call, one transaction:
     // the connection Mutex is not reentrant, so a loop over several public
     // methods was never available, and a failure here must leave the library
-    // exactly as it was.
-    let mut report = state
-        .db
-        .apply_import(
+    // exactly as it was. Off the runtime: thousands of rows in one transaction
+    // is the longest the connection lock is ever held.
+    let (mut report, prepared) = db_blocking(&state, move |db| {
+        let report = db.apply_import(
             &prepared.channels,
             &prepared.videos,
             mode,
             &prepared.archive_channel_ids,
-        )
-        .map_err(e)?;
+        )?;
+        Ok((report, prepared))
+    })
+    .await?;
 
     // `db` knows the row counts; `transfer` knows everything that happened
     // outside SQL. Neither can fill the other's half.
@@ -754,14 +852,20 @@ pub async fn import_config(
 
 /// Players installed on this machine, "System default" first.
 #[tauri::command]
-pub fn detect_players() -> Vec<PlayerOption> {
-    crate::detect::detect_players()
+pub async fn detect_players() -> Vec<PlayerOption> {
+    // Probing means stat-ing and walking PATH. A failed join is an empty list,
+    // which the view already shows as "System default" alone.
+    tauri::async_runtime::spawn_blocking(crate::detect::detect_players)
+        .await
+        .unwrap_or_default()
 }
 
 /// Browsers yt-dlp could read cookies from, as found on this machine.
 #[tauri::command]
-pub fn detect_browsers() -> Vec<BrowserOption> {
-    crate::detect::detect_browsers()
+pub async fn detect_browsers() -> Vec<BrowserOption> {
+    tauri::async_runtime::spawn_blocking(crate::detect::detect_browsers)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -775,4 +879,34 @@ pub async fn tools_status(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>>
 pub async fn tools_update_now(state: State<'_, Arc<AppState>>) -> R<Vec<ToolStatus>> {
     let s = config::load().unwrap_or_default();
     state.tools.update_now(&s).await.map_err(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocking_runs_the_work_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let ran_on =
+            tauri::async_runtime::block_on(blocking(|| Ok(std::thread::current().id()))).unwrap();
+        assert_ne!(ran_on, caller);
+    }
+
+    #[test]
+    fn blocking_hands_back_the_value_and_the_error_as_text() {
+        assert_eq!(tauri::async_runtime::block_on(blocking(|| Ok(42))), Ok(42));
+        let err = tauri::async_runtime::block_on(blocking(|| -> anyhow::Result<()> {
+            anyhow::bail!("Unknown video")
+        }));
+        assert_eq!(err, Err("Unknown video".to_string()));
+    }
+
+    #[test]
+    fn a_panic_in_blocking_work_is_an_error_not_a_crash() {
+        let r = tauri::async_runtime::block_on(blocking(|| -> anyhow::Result<()> {
+            panic!("boom")
+        }));
+        assert!(r.is_err());
+    }
 }

@@ -148,6 +148,13 @@ pub fn launch(player_command: &str, file_path: &str) -> Result<()> {
     if !Path::new(file_path).exists() {
         return Err(anyhow!("File no longer exists: {file_path}"));
     }
+    start(player_command, file_path)
+}
+
+/// [`launch`] without the existence check, for a caller that has just made
+/// it -- `open_in_player`, which must see a missing file itself to mark the
+/// row. A second stat of a file on a spun-down disk is not free.
+pub fn start(player_command: &str, file_path: &str) -> Result<()> {
     if player_command.trim().is_empty() {
         return tauri_plugin_opener::open_path(file_path, None::<&str>)
             .map_err(|e| anyhow!("Could not open the file with the system default app: {e}"));
