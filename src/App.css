@@ -41,6 +41,11 @@
   --resume-text: #ecd6a6;
   --resume-text-dim: #bba77c;
 
+  /* The top row's fold: long enough to follow, short enough not to lag a drag. */
+  --fold-time: 260ms;
+  --fold-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --fold-stagger: 90ms;
+
   --radius: 12px;
   --radius-sm: 8px;
   --shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
@@ -109,6 +114,10 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   height: 100%;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+  /* An implicit column is `auto`, which grows to the widest thing in it: the
+     top row, whose controls do not shrink, then pushed the page past the window
+     instead of being told how much room it had. */
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .content {
@@ -183,10 +192,9 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
   flex: none;
 }
-.brand-word { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+.brand-word { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; margin-left: 7px; }
 .brand-version {
   appearance: none;
   display: inline-flex;
@@ -198,6 +206,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 0 7px;
+  margin-left: 7px;
   white-space: nowrap;
 }
 .brand-version.is-update {
@@ -227,17 +236,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   font-weight: 500;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
   padding: 5px 2px;
   margin: 0 7px;
   cursor: pointer;
-  transition: color 120ms ease, border-color 120ms ease;
+  transition: color 120ms ease, border-color 120ms ease, margin var(--fold-time) var(--fold-ease);
   white-space: nowrap;
 }
 .tab:hover { color: var(--text); }
 .tab.is-active { color: var(--text); border-bottom-color: var(--brand); }
-/* The glyph only appears once the window is too narrow for the word. */
-.tab-glyph { display: none; align-items: center; }
 .tab .icon { width: 17px; height: 17px; }
 
 /* --- the open series' breadcrumb ----------------------------------------- */
@@ -335,7 +341,6 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .btn-add {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
   flex: none;
   font-size: 13px;
   padding: 5px 13px;
@@ -483,7 +488,6 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   font-weight: 500;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
   padding: 5px 11px;
   cursor: pointer;
   white-space: nowrap;
@@ -493,7 +497,6 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .seg-btn:hover:not(:disabled) { background: var(--card); color: var(--text); }
 .seg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .seg-btn.is-on { background: var(--accent-soft); color: #9ed3ff; }
-.seg-glyph { display: none; align-items: center; }
 
 .chip {
   appearance: none;
@@ -519,6 +522,148 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   background: var(--accent-soft);
   border-color: rgba(62, 166, 255, 0.5);
   color: #9ed3ff;
+}
+
+/* --- the folding filter row ---------------------------------------------- */
+
+/* Every word or glyph that comes and goes as the window narrows stays in the
+   layout at zero width rather than going `display: none`: dragging the window
+   edge then shows each control turning into the next instead of jumping, and
+   toolbarFit.ts can still read how wide it would be (`scrollWidth`). Gaps
+   between a glyph and its word are margins on the word for the same reason --
+   a flex gap would outlive the word it spaced. */
+.tab-glyph, .tab-label, .seg-glyph, .seg-label, .brand-word, .btn-add-label {
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: max-width var(--fold-time) var(--fold-ease), opacity 200ms ease,
+    margin var(--fold-time) var(--fold-ease);
+}
+.tab-label, .seg-label, .brand-word, .btn-add-label { max-width: 12em; }
+.btn-add-label { margin-left: 6px; }
+.tab-glyph, .seg-glyph { max-width: 0; opacity: 0; }
+.fit-glyphs .seg-label, .fit-folded .seg-label { max-width: 0; opacity: 0; }
+.fit-glyphs .seg-glyph, .fit-folded .seg-glyph { max-width: 20px; opacity: 1; }
+/* Whatever arrives waits for whatever leaves: grown at the same time, a glyph
+   would widen the row for a moment before the word beside it had given any
+   room back. The delay belongs to the state being entered, so each rule below
+   is the arriving half. */
+.tab-label, .seg-label, .brand-word, .btn-add-label,
+.fit-glyphs .seg-glyph, .fit-folded .seg-glyph { transition-delay: var(--fold-stagger); }
+.fit-glyphs .seg-label, .fit-folded .seg-label { transition-delay: 0s; }
+
+/* The two clusters: the full controls and their folded stand-in. Both are
+   always in the row, one of them at zero width; toolbarFit.ts slides the width
+   between them and the hidden one fades. The vertical padding keeps a focus
+   ring from being clipped by the overflow that the slide needs. */
+.tools {
+  display: flex;
+  flex: none;
+  overflow: hidden;
+  padding-block: 3px;
+  margin-block: -3px;
+  transition: width var(--fold-time) var(--fold-ease), opacity 200ms ease;
+}
+.tools[aria-hidden="true"] { opacity: 0; }
+/* During a drag the window can outrun the fold by a frame or two; the full
+   controls give way (clipped) rather than pushing Refresh and Add off the edge. */
+.tools-full { flex: 0 1 auto; min-width: 0; }
+.tools-inner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  width: max-content;
+}
+/* A fixed width in the full row: the row folds before search would be squeezed
+   to a stub, rather than shrinking it to make room. */
+.tools-full .search { flex: none; width: 240px; min-width: 0; }
+
+.search-compact {
+  flex: none;
+  width: 240px;
+  animation: search-open var(--fold-time) var(--fold-ease);
+}
+@keyframes search-open { from { width: 32px; opacity: 0.4; } }
+
+.filters-btn { padding: 5px 11px; }
+.filters-btn.is-open { border-color: var(--accent); color: var(--text); }
+.filters-btn .count {
+  font: 600 11px/1 var(--font);
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 2px 6px;
+}
+.topnav-row .icon-caret { width: 11px; height: 11px; opacity: 0.7; }
+
+/* The panel the folded row opens. It hangs from the header, not the button:
+   the button's cluster clips while it slides. */
+.topnav-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 30;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 6px;
+  animation: pop-in 160ms var(--fold-ease);
+  transform-origin: top right;
+}
+@keyframes pop-in { from { opacity: 0; transform: translateY(-4px) scale(0.98); } }
+.filters-pop {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(210px, 1fr));
+  gap: 6px;
+}
+.pop-head {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+  padding: 8px 10px 4px;
+}
+.pop-item, .pop-radio {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  color: var(--muted);
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: background 120ms ease, color 120ms ease;
+}
+.pop-item:hover:not(:disabled), .pop-radio:hover:not(:disabled) { background: var(--card); color: var(--text); }
+.pop-item:disabled { opacity: 0.4; cursor: not-allowed; }
+.pop-item.is-on, .pop-radio.is-on { color: var(--text); }
+.pop-label { flex: 1; }
+.pop-glyph, .pop-check { display: inline-flex; }
+.pop-item .icon { width: 15px; height: 15px; }
+.pop-item.is-on .pop-glyph, .pop-check { color: var(--accent); }
+.pop-dot {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--faint);
+  transition: border 120ms ease;
+}
+.pop-radio.is-on .pop-dot { border: 4px solid var(--accent); }
+.pop-sep { height: 1px; background: var(--line); margin: 6px 4px; }
+.select.pop-select {
+  width: calc(100% - 16px);
+  margin: 2px 8px 8px;
+  font-size: 13px;
+  padding: 5px 26px 5px 10px;
 }
 
 /* --- video grid ---------------------------------------------------------- */
@@ -1742,24 +1887,18 @@ label.field-label { display: block; }
 
 /* --- narrow windows ------------------------------------------------------ */
 
-/* The top row never wraps. It gives up words instead, in the order they can
-   most afford to go: the filters keep their glyphs, the sort picker keeps its
-   words to the end -- "Newest first" is the one control nobody could guess
-   from an icon. */
+/* The top row never wraps. The filter controls step down by measurement
+   (toolbarFit.ts: words, then glyphs, then folded behind one button); what is
+   left -- the tabs, Add and the wordmark -- gives up its words here, once the
+   folded row is all there is beside them. */
 
-@media (max-width: 1180px) {
-  .seg-label { display: none; }
-  .seg-glyph { display: inline-flex; }
-  .seg-btn { padding: 5px 10px; }
+@media (max-width: 1000px) {
+  .tab-label, .btn-add-label { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
+  .tab-glyph { max-width: 20px; opacity: 1; transition-delay: var(--fold-stagger); }
+  .tab { margin: 0 4px; }
 }
 
 @media (max-width: 980px) {
-  .chip-label, .btn-add-label { display: none; }
-  .chip-glyph { display: inline-flex; }
-  .chip { padding: 5px 10px; }
-  /* A native select cannot wear an icon, so it truncates instead and hands the
-     full channel name to its tooltip. */
-  .channel-select { max-width: 96px; }
   .crumb-name { max-width: 22ch; }
   .content { padding: 16px 16px 56px; }
   .dl-row { grid-template-columns: 96px minmax(0, 1fr); }
@@ -1769,11 +1908,8 @@ label.field-label { display: block; }
 
 @media (max-width: 860px) {
   /* The mark already says which app; the number is what the pill is for. */
-  .brand-word, .brand-version-word { display: none; }
-  .tab-label { display: none; }
-  .tab-glyph { display: inline-flex; }
-  .tab { margin: 0 4px; }
-  .channel-select { max-width: 74px; }
+  .brand-word { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
+  .brand-version-word { display: none; }
   .crumb-meta { display: none; }
   .crumb-name { max-width: 16ch; }
   .topnav-row { padding: 8px 12px; }

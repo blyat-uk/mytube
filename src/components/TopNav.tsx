@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconClose, IconContinue, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconSettings,
-  IconSubscriptions, IconUnwatched,
+  IconCaret, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly, IconHidden, IconSearch,
+  IconSeries, IconSettings, IconSubscriptions, IconUnwatched,
 } from "./Icons";
+import FiltersPanel, { activeFilterCount, SORTS } from "./FiltersPanel";
+import { useToolbarFit } from "../toolbarFit";
 import type { Channel, SortOrder, VersionInfo } from "../types";
 
 export type Tab = "subscriptions" | "downloads" | "settings";
@@ -87,6 +89,36 @@ export default function TopNav(p: Props) {
   }, [text, p.onSearch]);
 
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const compactSearchRef = useRef<HTMLInputElement | null>(null);
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const fullRef = useRef<HTMLDivElement | null>(null);
+  const compactRef = useRef<HTMLDivElement | null>(null);
+  const filtersBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  const showFilters = p.tab === "subscriptions";
+  const fit = useToolbarFit(
+    { row: rowRef, full: fullRef, compact: compactRef },
+    showFilters,
+    p.series ? "crumb" : "tabs",
+  );
+  const folded = fit === "folded";
+  const foldedRef = useRef(folded);
+  foldedRef.current = folded;
+
+  const [panelOpen, setPanelOpen] = useState(false);
+  // The panel belongs to the folded row; unfolding puts its controls back in
+  // the row, so it closes rather than waiting to reappear on the next fold.
+  useEffect(() => {
+    if (!folded) setPanelOpen(false);
+  }, [folded]);
+  const closePanel = useCallback((refocus: boolean) => {
+    setPanelOpen(false);
+    if (refocus) filtersBtnRef.current?.focus();
+  }, []);
+
+  /** The folded row's search box is out: asked for, or holding a query. */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const compactSearch = searchOpen || text !== "";
   // A shortcut can arrive on a tab that has neither the search box nor the
   // filter row, so the handler — which is bound once — reads what it needs
   // through a ref rather than capturing a stale set of props.
@@ -131,6 +163,14 @@ export default function TopNav(p: Props) {
         return;
       }
 
+      // Folded, the box is behind the magnifier: open it, and focus it once
+      // it has rendered.
+      if (tab === "subscriptions" && foldedRef.current) {
+        if (live.current.series) return;
+        setSearchOpen(true);
+        setFocusWanted(true);
+        return;
+      }
       const el = searchRef.current;
       if (el) {
         if (el.disabled) return;
@@ -152,25 +192,30 @@ export default function TopNav(p: Props) {
   useEffect(() => {
     if (!focusWanted) return;
     setFocusWanted(false);
-    const el = searchRef.current;
+    const el = (foldedRef.current ? compactSearchRef : searchRef).current;
     if (!el || el.disabled) return;
     el.focus();
     el.select();
   }, [focusWanted, p.tab]);
 
-  const showFilters = p.tab === "subscriptions";
   // A series shows every part regardless of these, so rather than let them look
   // live and do nothing, they are switched off and say why.
   const off = p.series !== null;
   const offHint = off ? "Not applied while a series is open" : undefined;
+
+  const openSearch = () => {
+    setSearchOpen(true);
+    setFocusWanted(true);
+  };
+  const filterCount = activeFilterCount(p);
 
   const channelTitle = p.channelId
     ? p.channels.find((c) => c.id === p.channelId)?.title ?? "All channels"
     : "All channels";
 
   return (
-    <header className="topnav">
-      <div className="topnav-row">
+    <header className={`topnav fit-${fit}`}>
+      <div className="topnav-row" ref={rowRef}>
         {/* The logo carries the version: nothing else in the app said which
             MyTube was running. A newer release turns the pill into the way to
             it — a link out, since how to update depends on how it was installed. */}
@@ -245,136 +290,196 @@ export default function TopNav(p: Props) {
 
         {showFilters && (
           <>
-            {/* What is in the list ------------------------------------------ */}
-            <div className="seg" role="group" aria-label="Filters">
-              <button
-                type="button"
-                className={`seg-btn${p.hideWatched ? " is-on" : ""}`}
-                aria-pressed={p.hideWatched}
-                aria-label="Unwatched"
-                disabled={off}
-                title={offHint ?? "Show only videos you have not watched"}
-                onClick={() => p.onHideWatched(!p.hideWatched)}
-              >
-                <span className="seg-glyph" aria-hidden="true"><IconUnwatched /></span>
-                <span className="seg-label">Unwatched</span>
-              </button>
-              <button
-                type="button"
-                className={`seg-btn${p.downloadedOnly ? " is-on" : ""}`}
-                aria-pressed={p.downloadedOnly}
-                aria-label="Downloaded"
-                disabled={off}
-                title={offHint ?? "Show only videos you have downloaded"}
-                onClick={() => p.onDownloadedOnly(!p.downloadedOnly)}
-              >
-                <span className="seg-glyph" aria-hidden="true"><IconDownload /></span>
-                <span className="seg-label">Downloaded</span>
-              </button>
-              <button
-                type="button"
-                className={`seg-btn${p.showHidden ? " is-on" : ""}`}
-                aria-pressed={p.showHidden}
-                aria-label="Include hidden"
-                disabled={off}
-                title={offHint ?? "Also show videos you have hidden, so you can un-hide them"}
-                onClick={() => p.onShowHidden(!p.showHidden)}
-              >
-                <span className="seg-glyph" aria-hidden="true"><IconHidden /></span>
-                <span className="seg-label">Include hidden</span>
-              </button>
-              {/* Filters over cards that only exist grouped, so they are offered
-                  only then -- ungrouped, every card is a lone video. */}
-              {p.grouped && (
-                <>
+            {/* The full controls. Folded, they stay in the layout at zero width
+                -- that is what lets the fold animate, and what lets the row
+                measure what they would need to come back -- but inert. */}
+            <div className="tools tools-full" ref={fullRef} inert={folded} aria-hidden={folded || undefined}>
+              <div className="tools-inner">
+                <div className="search">
+                  <span className="search-glyph" aria-hidden="true">⌕</span>
+                  <input
+                    ref={searchRef}
+                    className="search-input"
+                    type="search"
+                    value={text}
+                    placeholder="Search titles and channels"
+                    aria-label="Search videos"
+                    disabled={off}
+                    title={offHint ?? "Ctrl+F to focus"}
+                    onChange={(e) => setText(e.currentTarget.value)}
+                  />
+                </div>
+
+                <div className="seg" role="group" aria-label="Filters">
+                  <button
+                    type="button"
+                    className={`seg-btn${p.hideWatched ? " is-on" : ""}`}
+                    aria-pressed={p.hideWatched}
+                    aria-label="Unwatched"
+                    disabled={off}
+                    title={offHint ?? "Show only videos you have not watched"}
+                    onClick={() => p.onHideWatched(!p.hideWatched)}
+                  >
+                    <span className="seg-glyph" aria-hidden="true"><IconUnwatched /></span>
+                    <span className="seg-label">Unwatched</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`seg-btn${p.downloadedOnly ? " is-on" : ""}`}
+                    aria-pressed={p.downloadedOnly}
+                    aria-label="Downloaded"
+                    disabled={off}
+                    title={offHint ?? "Show only videos you have downloaded"}
+                    onClick={() => p.onDownloadedOnly(!p.downloadedOnly)}
+                  >
+                    <span className="seg-glyph" aria-hidden="true"><IconDownload /></span>
+                    <span className="seg-label">Downloaded</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`seg-btn${p.showHidden ? " is-on" : ""}`}
+                    aria-pressed={p.showHidden}
+                    aria-label="Include hidden"
+                    disabled={off}
+                    title={offHint ?? "Also show videos you have hidden, so you can un-hide them"}
+                    onClick={() => p.onShowHidden(!p.showHidden)}
+                  >
+                    <span className="seg-glyph" aria-hidden="true"><IconHidden /></span>
+                    <span className="seg-label">Include hidden</span>
+                  </button>
+                  {/* Filters over cards that only exist grouped, so they are offered
+                      only then -- ungrouped, every card is a lone video. */}
+                  {p.grouped && (
+                    <>
+                    <button
+                      type="button"
+                      className={`seg-btn${p.groupsOnly ? " is-on" : ""}`}
+                      aria-pressed={p.groupsOnly}
+                      aria-label="Only groups"
+                      disabled={off}
+                      title={offHint ?? "Show only multi-part series, not lone videos"}
+                      onClick={() => p.onGroupsOnly(!p.groupsOnly)}
+                    >
+                      <span className="seg-glyph" aria-hidden="true"><IconGroupsOnly /></span>
+                      <span className="seg-label">Only groups</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`seg-btn${p.inProgress ? " is-on" : ""}`}
+                      aria-pressed={p.inProgress}
+                      aria-label="Continue watching"
+                      disabled={off}
+                      title={offHint ?? "Show only series you have started and not finished"}
+                      onClick={() => p.onInProgress(!p.inProgress)}
+                    >
+                      <span className="seg-glyph" aria-hidden="true"><IconContinue /></span>
+                      <span className="seg-label">Continue watching</span>
+                    </button>
+                    </>
+                  )}
+                </div>
+
+                {/* ...and how it is shown -------------------------------------- */}
+                <div className="topnav-rule" aria-hidden="true" />
+
                 <button
                   type="button"
-                  className={`seg-btn${p.groupsOnly ? " is-on" : ""}`}
-                  aria-pressed={p.groupsOnly}
-                  aria-label="Only groups"
+                  className={`chip${p.grouped ? " is-on" : ""}`}
+                  aria-pressed={p.grouped}
+                  aria-label="Grouped"
                   disabled={off}
-                  title={offHint ?? "Show only multi-part series, not lone videos"}
-                  onClick={() => p.onGroupsOnly(!p.groupsOnly)}
+                  title={offHint ?? "Collapse each channel's multi-part uploads into one card"}
+                  onClick={() => p.onGrouped(!p.grouped)}
                 >
-                  <span className="seg-glyph" aria-hidden="true"><IconGroupsOnly /></span>
-                  <span className="seg-label">Only groups</span>
+                  <span className="chip-glyph" aria-hidden="true"><IconSeries /></span>
+                  <span className="chip-label">Grouped</span>
                 </button>
+
+                <select
+                  className="select sort-select"
+                  value={p.sort}
+                  aria-label="Sort order"
+                  onChange={(e) => p.onSort(e.currentTarget.value as SortOrder)}
+                >
+                  {/* Only groups have a part count to rank by; ungrouped this
+                      option would silently be "newest". */}
+                  {SORTS.filter((o) => o.value !== "parts" || p.grouped).map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+                <select
+                  className="select channel-select"
+                  value={p.channelId ?? ""}
+                  aria-label="Filter by channel"
+                  disabled={off}
+                  // A long name is cut short in the box, so the full name lives here.
+                  title={offHint ?? channelTitle}
+                  onChange={(e) => p.onChannelId(e.currentTarget.value || null)}
+                >
+                  <option value="">All channels</option>
+                  {p.channels.map((c) => (
+                    <option key={c.id} value={c.id}>{c.title}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* ...and the same, folded: search behind a magnifier, everything
+                else behind one button that says how many filters are on. */}
+            <div className="tools tools-compact" ref={compactRef} inert={!folded} aria-hidden={!folded || undefined}>
+              <div className="tools-inner">
+                {folded && compactSearch ? (
+                  <div className="search search-compact">
+                    <span className="search-glyph" aria-hidden="true">⌕</span>
+                    <input
+                      ref={compactSearchRef}
+                      className="search-input"
+                      type="search"
+                      value={text}
+                      placeholder="Search titles and channels"
+                      aria-label="Search videos"
+                      disabled={off}
+                      title={offHint ?? "Ctrl+F to focus"}
+                      onChange={(e) => setText(e.currentTarget.value)}
+                      // Holding a query, the box stays open so the search
+                      // that is narrowing the grid is never out of sight.
+                      onBlur={() => setSearchOpen(false)}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Escape") return;
+                        // Leaving the box, not the series behind it.
+                        e.stopPropagation();
+                        e.currentTarget.blur();
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="icon-btn search-toggle"
+                    disabled={off}
+                    title={offHint ?? "Search (Ctrl+F)"}
+                    onClick={openSearch}
+                  >
+                    <IconSearch />
+                    <span className="sr-only">Open search</span>
+                  </button>
+                )}
                 <button
                   type="button"
-                  className={`seg-btn${p.inProgress ? " is-on" : ""}`}
-                  aria-pressed={p.inProgress}
-                  aria-label="Continue watching"
-                  disabled={off}
-                  title={offHint ?? "Show only series you have started and not finished"}
-                  onClick={() => p.onInProgress(!p.inProgress)}
+                  ref={filtersBtnRef}
+                  className={`chip filters-btn${panelOpen ? " is-open" : ""}`}
+                  aria-haspopup="dialog"
+                  aria-expanded={panelOpen}
+                  aria-label={filterCount > 0 ? `Filters, ${filterCount} applied` : "Filters"}
+                  onClick={() => setPanelOpen((o) => !o)}
                 >
-                  <span className="seg-glyph" aria-hidden="true"><IconContinue /></span>
-                  <span className="seg-label">Continue watching</span>
+                  <IconFilters />
+                  <span>Filters</span>
+                  {filterCount > 0 && <span className="count">{filterCount}</span>}
+                  <IconCaret />
                 </button>
-                </>
-              )}
+              </div>
             </div>
-
-            <div className="search">
-              <span className="search-glyph" aria-hidden="true">⌕</span>
-              <input
-                ref={searchRef}
-                className="search-input"
-                type="search"
-                value={text}
-                placeholder="Search titles and channels"
-                aria-label="Search videos"
-                disabled={off}
-                title={offHint ?? "Ctrl+F to focus"}
-                onChange={(e) => setText(e.currentTarget.value)}
-              />
-            </div>
-
-            <select
-              className="select channel-select"
-              value={p.channelId ?? ""}
-              aria-label="Filter by channel"
-              disabled={off}
-              // The box narrows with the window, so the full name lives here.
-              title={offHint ?? channelTitle}
-              onChange={(e) => p.onChannelId(e.currentTarget.value || null)}
-            >
-              <option value="">All channels</option>
-              {p.channels.map((c) => (
-                <option key={c.id} value={c.id}>{c.title}</option>
-              ))}
-            </select>
-
-            {/* ...and how it is shown -------------------------------------- */}
-            <div className="topnav-rule" aria-hidden="true" />
-
-            <button
-              type="button"
-              className={`chip${p.grouped ? " is-on" : ""}`}
-              aria-pressed={p.grouped}
-              aria-label="Grouped"
-              disabled={off}
-              title={offHint ?? "Collapse each channel's multi-part uploads into one card"}
-              onClick={() => p.onGrouped(!p.grouped)}
-            >
-              <span className="chip-glyph" aria-hidden="true"><IconSeries /></span>
-              <span className="chip-label">Grouped</span>
-            </button>
-
-            <select
-              className="select sort-select"
-              value={p.sort}
-              aria-label="Sort order"
-              onChange={(e) => p.onSort(e.currentTarget.value as SortOrder)}
-            >
-              <option value="newest">Newest first</option>
-              <option value="oldest">Oldest first</option>
-              <option value="channel">By channel</option>
-              <option value="length">Longest first</option>
-              {/* Only groups have a part count to rank by; ungrouped this
-                  option would silently be "newest". */}
-              {p.grouped && <option value="parts">Most parts first</option>}
-            </select>
           </>
         )}
 
@@ -399,6 +504,32 @@ export default function TopNav(p: Props) {
           <span className="btn-add-label">Add</span>
         </button>
       </div>
+
+      {showFilters && folded && panelOpen && (
+        <FiltersPanel
+          anchor={filtersBtnRef}
+          onClose={closePanel}
+          off={off}
+          offHint={offHint}
+          channels={p.channels}
+          channelId={p.channelId}
+          onChannelId={p.onChannelId}
+          hideWatched={p.hideWatched}
+          onHideWatched={p.onHideWatched}
+          downloadedOnly={p.downloadedOnly}
+          onDownloadedOnly={p.onDownloadedOnly}
+          showHidden={p.showHidden}
+          onShowHidden={p.onShowHidden}
+          grouped={p.grouped}
+          onGrouped={p.onGrouped}
+          groupsOnly={p.groupsOnly}
+          onGroupsOnly={p.onGroupsOnly}
+          inProgress={p.inProgress}
+          onInProgress={p.onInProgress}
+          sort={p.sort}
+          onSort={p.onSort}
+        />
+      )}
     </header>
   );
 }

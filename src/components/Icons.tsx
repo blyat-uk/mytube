@@ -16,6 +16,9 @@ import { ClockCounterClockwise } from "@phosphor-icons/react/dist/icons/ClockCou
 import { Circle } from "@phosphor-icons/react/dist/icons/Circle";
 import { DownloadSimple } from "@phosphor-icons/react/dist/icons/DownloadSimple";
 import { EyeSlash } from "@phosphor-icons/react/dist/icons/EyeSlash";
+import { Funnel } from "@phosphor-icons/react/dist/icons/Funnel";
+import { CaretDown } from "@phosphor-icons/react/dist/icons/CaretDown";
+import { MagnifyingGlass } from "@phosphor-icons/react/dist/icons/MagnifyingGlass";
 import { GearSix } from "@phosphor-icons/react/dist/icons/GearSix";
 import { Play } from "@phosphor-icons/react/dist/icons/Play";
 import { SquaresFour } from "@phosphor-icons/react/dist/icons/SquaresFour";
@@ -71,3 +74,7 @@ export const IconHidden = () => <EyeSlash className="icon" weight="bold" />;
 /** Same glyph as IconCancel, named for dismissing rather than stopping. */
 export const IconCheck = () => <Check className="icon" weight="bold" />;
 export const IconClose = () => <X className="icon" weight="bold" />;
+/** The folded filter row's button, and what it opens. */
+export const IconFilters = () => <Funnel className="icon" weight="bold" />;
+export const IconSearch = () => <MagnifyingGlass className="icon" weight="bold" />;
+export const IconCaret = () => <CaretDown className="icon icon-caret" weight="bold" />;
