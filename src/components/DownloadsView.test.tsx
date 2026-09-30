@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, within, act } from "@testing-library/react";
 import type { Video } from "../types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
@@ -7,12 +7,18 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}
 const listVideos = vi.fn(() => Promise.resolve(videos));
 const setWatched = vi.fn((_id: string, _watched: boolean) => Promise.resolve());
 const deleteDownload = vi.fn((_id: string) => Promise.resolve());
+const cancelDownload = vi.fn((_id: string) => Promise.resolve());
+const enqueueDownload = vi.fn((_id: string) => Promise.resolve());
+const openInPlayer = vi.fn((_id: string) => Promise.resolve());
 
 vi.mock("../api", () => ({
   api: {
     listVideos: (...a: unknown[]) => listVideos(...(a as [])),
     setWatched: (id: string, watched: boolean) => setWatched(id, watched),
     deleteDownload: (id: string) => deleteDownload(id),
+    cancelDownload: (id: string) => cancelDownload(id),
+    enqueueDownload: (id: string) => enqueueDownload(id),
+    openInPlayer: (id: string) => openInPlayer(id),
   },
   thumbSrc: (v: { thumb_path: string | null }) => v.thumb_path ?? "",
   errText: (e: unknown) => String(e),
@@ -48,6 +54,9 @@ beforeEach(() => {
   listVideos.mockImplementation(() => Promise.resolve(videos));
   setWatched.mockImplementation(() => Promise.resolve());
   deleteDownload.mockImplementation(() => Promise.resolve());
+  cancelDownload.mockImplementation(() => Promise.resolve());
+  enqueueDownload.mockImplementation(() => Promise.resolve());
+  openInPlayer.mockImplementation(() => Promise.resolve());
 });
 afterEach(cleanup);
 
@@ -182,6 +191,77 @@ describe("Downloads row actions", () => {
     expect(await screen.findByText("database is locked")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Mark as watched" })).toBeTruthy();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+/**
+ * Every row action goes out once, however hard it is clicked, and shows its
+ * result before the backend answers -- putting the row back if it refuses.
+ */
+describe("Downloads row actions in flight", () => {
+  it("takes a cancelled download off the list at once", async () => {
+    let finish = () => {};
+    cancelDownload.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    videos = [video({ id: "a", title: "Running", download_state: "downloading" })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel download" }));
+    await waitFor(() => expect(screen.queryByText("Running")).toBeNull());
+    expect(cancelDownload).toHaveBeenCalledTimes(1);
+    await act(async () => { finish(); });
+  });
+
+  it("puts a cancelled row back, and says why, when the cancel fails", async () => {
+    cancelDownload.mockImplementation(() => Promise.reject("no such job"));
+    videos = [video({ id: "a", title: "Running", download_state: "downloading" })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel download" }));
+    expect(await screen.findByText("no such job")).toBeTruthy();
+    expect(titlesUnder("Active")).toEqual(["Running"]);
+  });
+
+  it("puts a retried row back under Failed when the queue refuses it", async () => {
+    enqueueDownload.mockImplementation(() => Promise.reject("queue is closed"));
+    videos = [video({
+      id: "a", title: "Broken", download_state: "failed", file_path: null, download_error: "HTTP 403",
+    })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Retry download" }));
+    expect(await screen.findByText("queue is closed")).toBeTruthy();
+    expect(titlesUnder("Failed")).toEqual(["Broken"]);
+    expect(screen.getByText("HTTP 403")).toBeTruthy();
+  });
+
+  it("opens one player for a double-click, and none while the first is starting", async () => {
+    let finish = () => {};
+    openInPlayer.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+    renderView();
+
+    const play = await screen.findByRole<HTMLButtonElement>("button", { name: "Play" });
+    fireEvent.click(play, { detail: 1 });
+    fireEvent.click(play, { detail: 2 });
+    expect(openInPlayer).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(play.getAttribute("aria-busy")).toBe("true"));
+    expect(play.disabled).toBe(true);
+    // The row's other file action waits too: deleting a file mid-launch is a race.
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Delete file" }).disabled).toBe(true);
+
+    await act(async () => { finish(); });
+    await waitFor(() => expect(play.disabled).toBe(false));
+  });
+
+  it("deletes a file once, however often the button is pressed", async () => {
+    videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+    renderView();
+
+    const del = await screen.findByRole("button", { name: "Delete file" });
+    fireEvent.click(del);
+    fireEvent.click(del);
+    await waitFor(() => expect(screen.queryByText("Finished")).toBeNull());
+    expect(deleteDownload).toHaveBeenCalledTimes(1);
   });
 });
 

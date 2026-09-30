@@ -160,6 +160,24 @@ describe("channel row actions", () => {
     await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC2"));
   });
 
+  it("removes once, however often the confirmation is pressed", async () => {
+    let finish = () => {};
+    removeChannel.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    renderDialog();
+    fireEvent.click(rowButton("Remove Daily Comics"));
+    const yes = rowButton("Remove Daily Comics and delete its videos");
+    fireEvent.click(yes);
+    fireEvent.click(yes);
+    expect(removeChannel).toHaveBeenCalledTimes(1);
+    expect(yes.disabled).toBe(true);
+    expect(yes.getAttribute("aria-busy")).toBe("true");
+    // Too late to keep it once the removal is out.
+    expect(rowButton("Keep Daily Comics").disabled).toBe(true);
+
+    await act(async () => { finish(); });
+    await waitFor(() => expect(screen.queryByText("Remove and delete its videos?")).toBeNull());
+  });
+
   it("backs out of the confirmation without removing anything", () => {
     renderDialog();
     fireEvent.click(rowButton("Remove Daily Comics"));

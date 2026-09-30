@@ -10,7 +10,9 @@ import { api, errText } from "../api";
 import { useDownloadEvents } from "../events";
 import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction } from "../format";
 import { useSiblingMarking } from "../marking";
-import type { DownloadProgress, SortOrder, Video, VideoGroup } from "../types";
+import { usePending } from "../pending";
+import { createProgressStore } from "../progress";
+import type { SortOrder, Video, VideoGroup } from "../types";
 
 const PAGE = 100;
 
@@ -47,6 +49,21 @@ function remember(places: Map<string, Place>, key: string, place: Place) {
 function pagesFor(cards: number): number {
   return Math.max(PAGE, Math.ceil(cards / PAGE) * PAGE);
 }
+
+/** A row whose download has been cleared, as the backend writes it. */
+const NO_FILE = { download_state: "none", download_error: null, file_path: null } as const;
+
+/** The fields `NO_FILE` overwrites, as they were, for putting them back. */
+function fileOf(v: Video): Pick<Video, "download_state" | "download_error" | "file_path"> {
+  return { download_state: v.download_state, download_error: v.download_error, file_path: v.file_path };
+}
+
+/**
+ * Marking and unlinking both end in a refetch that regroups the feed. One key
+ * for both, so the refetch cannot be raced by a second mark, and the grid that
+ * is up stays up -- dimmed once it is slow -- until the new one lands.
+ */
+const SIBLINGS = "siblings";
 
 /** What an open series holds, for the breadcrumb that names it. */
 export interface SeriesTally {
@@ -91,7 +108,9 @@ export default function SubscriptionsView(p: Props) {
   // One entry per card. Ungrouped, every group holds a single video — carrying
   // one shape through the view keeps the two modes off every code path below.
   const [groups, setGroups] = useState<VideoGroup[]>([]);
-  const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
+  // Read by each card for itself: a tick never renders this view.
+  const [progress] = useState(createProgressStore);
+  const { pending, slow, run } = usePending();
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(false);
   const offset = useRef(0);
@@ -221,9 +240,23 @@ export default function SubscriptionsView(p: Props) {
     onSeriesTally({ parts: videos.length, ...seriesRuntime(videos) });
   }, [siblingOf, groups, loading, onSeriesTally]);
 
-  /** Rewrites every video in place, wherever in the grouping it sits. */
+  /**
+   * Rewrites every video in place, wherever in the grouping it sits. A group
+   * none of whose parts changed is handed back as the same object, and so is
+   * the whole list when nothing did: the cards are memoised, and a fresh group
+   * per event would re-render every series in the grid for one video's state.
+   */
   const mapVideos = useCallback((fn: (v: Video) => Video) => {
-    setGroups((prev) => prev.map((g) => ({ ...g, videos: g.videos.map(fn) })));
+    setGroups((prev) => {
+      let changed = false;
+      const next = prev.map((g) => {
+        const videos = g.videos.map(fn);
+        if (videos.every((v, i) => v === g.videos[i])) return g;
+        changed = true;
+        return { ...g, videos };
+      });
+      return changed ? next : prev;
+    });
   }, []);
 
   const patch = useCallback((videoId: string, fields: Partial<Video>) => {
@@ -232,7 +265,7 @@ export default function SubscriptionsView(p: Props) {
 
   // Live updates land straight on the cards; no refetch, no scroll jump.
   useDownloadEvents({
-    onProgress: (pr) => setProgress((prev) => ({ ...prev, [pr.videoId]: pr })),
+    onProgress: progress.set,
     onState: (s) => {
       mapVideos((v) => (
         v.id === s.videoId
@@ -244,67 +277,108 @@ export default function SubscriptionsView(p: Props) {
             }
           : v
       ));
-      if (s.state !== "downloading") {
-        setProgress((prev) => {
-          if (!(s.videoId in prev)) return prev;
-          const next = { ...prev };
-          delete next[s.videoId];
-          return next;
-        });
-      }
+      if (s.state !== "downloading") progress.clear(s.videoId);
     },
   });
 
-  const onAction = useCallback(async (action: CardAction, video: Video) => {
+  /** The grid as last rendered, for the undo `drop` hands back. */
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
+
+  /**
+   * Every card action goes through `run`, keyed on the video, so a second press
+   * while the first is out does nothing: the card is disabled until it lands.
+   * Each change is shown before the call and put back if it fails.
+   */
+  const onAction = useCallback((action: CardAction, video: Video) => {
     const before = { download_state: video.download_state, download_error: video.download_error };
-    try {
-      switch (action) {
-        case "download":
-        case "retry":
-          patch(video.id, { download_state: "queued", download_error: null });
-          await api.enqueueDownload(video.id);
-          break;
-        case "cancel":
-          await api.cancelDownload(video.id);
-          break;
-        case "play":
-          await api.openInPlayer(video.id);
-          break;
-        case "open":
-          await api.openExternal(videoUrl(video));
-          break;
-      }
-    } catch (err) {
-      patch(video.id, before);
-      toast.error(errText(err));
+    const restore = () => patch(video.id, before);
+    switch (action) {
+      case "download":
+      case "retry":
+        void run(video.id, () => api.enqueueDownload(video.id), {
+          optimistic: () => {
+            patch(video.id, { download_state: "queued", download_error: null });
+            return restore;
+          },
+        });
+        break;
+      case "cancel":
+        // The card goes back to Download at once: the backend clears the row
+        // before it has finished killing yt-dlp and sweeping its files, and the
+        // `none` it sends then only confirms this.
+        void run(video.id, () => api.cancelDownload(video.id), {
+          optimistic: () => {
+            patch(video.id, { download_state: "none", download_error: null });
+            progress.clear(video.id);
+            return restore;
+          },
+        });
+        break;
+      case "play":
+        // Nothing to show optimistically, but a double press would otherwise
+        // open the file in two players.
+        void run(video.id, () => api.openInPlayer(video.id));
+        break;
+      case "open":
+        // A key of its own, so a browser slow to come up never locks the
+        // card's download button.
+        void run(`open:${video.id}`, () => api.openExternal(videoUrl(video)));
+        break;
     }
-  }, [patch, toast]);
+  }, [patch, progress, run]);
 
   /** Mirrors what the backend writes when it clears a download. */
-  const deleteFile = useCallback(async (video: Video) => {
-    try {
-      await api.deleteDownload(video.id);
-      patch(video.id, { download_state: "none", download_error: null, file_path: null });
-    } catch (err) {
-      toast.error(errText(err));
-    }
-  }, [patch, toast]);
+  const deleteFile = useCallback((video: Video) => {
+    void run(video.id, () => api.deleteDownload(video.id), {
+      optimistic: () => {
+        patch(video.id, NO_FILE);
+        return () => patch(video.id, fileOf(video));
+      },
+    });
+  }, [patch, run]);
 
-  /** Removes a video from view without waiting for a refetch, taking its card
-   *  with it once nothing is left in the group. */
-  const drop = useCallback((id: string) => {
+  /**
+   * Removes a video from view without waiting for a refetch, taking its card
+   * with it once nothing is left in the group. Returns how to put it back where
+   * it was, for a call that fails after the card has already gone.
+   */
+  const drop = useCallback((id: string): (() => void) => {
+    const at = groupsRef.current.findIndex((g) => g.videos.some((v) => v.id === id));
+    if (at < 0) return () => {};
+    const group = groupsRef.current[at];
+    const index = group.videos.findIndex((v) => v.id === id);
+    const video = group.videos[index];
     setGroups((prev) => prev
       .map((g) => (g.videos.some((v) => v.id === id)
         ? { ...g, videos: g.videos.filter((v) => v.id !== id) }
         : g))
       .filter((g) => g.videos.length > 0));
+    return () => setGroups((prev) => {
+      if (prev.some((g) => g.videos.some((v) => v.id === id))) return prev;
+      // Back into its own group if any of that group is still here, at the
+      // place it held; otherwise as a card of its own where the group stood.
+      const siblings = new Set(group.videos.map((v) => v.id));
+      const home = prev.findIndex((g) => g.videos.some((v) => siblings.has(v.id)));
+      const next = [...prev];
+      if (home >= 0) {
+        const videos = [...next[home].videos];
+        videos.splice(Math.min(index, videos.length), 0, video);
+        next[home] = { ...next[home], videos };
+      } else {
+        next.splice(Math.min(at, next.length), 0, { ...group, videos: [video] });
+      }
+      return next;
+    });
   }, []);
 
-  const onToggleWatched = useCallback(async (video: Video) => {
+  const onToggleWatched = useCallback((video: Video) => {
     const next = !video.watched;
     const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
-    patch(video.id, watched);
-    try {
+    // Its own key: marking watched does not lock the card's download button,
+    // but two toggles out at once could land in either order and leave the
+    // card saying the opposite of the database.
+    void run(`watched:${video.id}`, async () => {
       await api.setWatched(video.id, next);
       // With "hide watched" on, a freshly watched card no longer belongs here.
       if (next && hideWatched) drop(video.id);
@@ -315,54 +389,41 @@ export default function SubscriptionsView(p: Props) {
       if (next && hasDownloadedFile(video)) {
         setConfirm({ kind: "file", video: { ...video, ...watched } });
       }
-    } catch (err) {
-      patch(video.id, { watched: video.watched, watched_at: video.watched_at });
-      toast.error(errText(err));
-    }
-  }, [patch, drop, hideWatched, toast]);
+    }, {
+      optimistic: () => {
+        patch(video.id, watched);
+        return () => patch(video.id, { watched: video.watched, watched_at: video.watched_at });
+      },
+    });
+  }, [patch, drop, hideWatched, run]);
 
-  const hideVideo = useCallback(async (video: Video) => {
-    try {
-      await api.setVideoHidden(video.id, true);
-      if (!showHidden) drop(video.id);
-      else patch(video.id, { hidden: true });
-      toast.success(`Hidden "${video.title}".`);
-    } catch (err) {
-      toast.error(errText(err));
-    }
-  }, [drop, patch, showHidden, toast]);
-
-  const unhideVideo = useCallback(async (video: Video) => {
-    try {
-      await api.setVideoHidden(video.id, false);
-      patch(video.id, { hidden: false });
-    } catch (err) {
-      toast.error(errText(err));
-    }
-  }, [patch, toast]);
+  const unhideVideo = useCallback((video: Video) => {
+    void run(video.id, () => api.setVideoHidden(video.id, false), {
+      optimistic: () => {
+        patch(video.id, { hidden: false });
+        return () => patch(video.id, { hidden: true });
+      },
+    });
+  }, [patch, run]);
 
   /** Records what the titles could not say: these are parts of one series. */
-  const markSiblings = useCallback(async (ids: string[]) => {
-    try {
+  const markSiblings = useCallback((ids: string[]) => {
+    void run(SIBLINGS, async () => {
       // The answer can exceed what was sent -- marking across two hand-built
       // groups merges both -- so the toast reports what actually happened.
       const n = await api.markSiblings(ids);
       toast.success(`Marked ${n} videos as siblings.`);
-      void fetchPage(0);
-    } catch (err) {
-      toast.error(errText(err));
-    }
-  }, [fetchPage, toast]);
+      await fetchPage(0);
+    });
+  }, [fetchPage, run, toast]);
 
-  const unlinkSiblings = useCallback(async (video: Video) => {
-    try {
+  const unlinkSiblings = useCallback((video: Video) => {
+    void run(SIBLINGS, async () => {
       await api.unlinkSiblings(video.id);
       toast.success(`Unlinked “${video.title}”.`);
-      void fetchPage(0);
-    } catch (err) {
-      toast.error(errText(err));
-    }
-  }, [fetchPage, toast]);
+      await fetchPage(0);
+    });
+  }, [fetchPage, run, toast]);
 
   // A dropped card waits here for its confirmation; see `confirmDrop`.
   const [dropped, setDropped] = useState<Video[] | null>(null);
@@ -383,33 +444,42 @@ export default function SubscriptionsView(p: Props) {
   // across one.
   useEffect(() => { marking.clear(); }, [fetchPage, reloadToken, marking.clear]);
 
-  const deleteVideo = useCallback(async (video: Video) => {
-    try {
-      await api.deleteVideo(video.id);
-      drop(video.id);
-      toast.success(`Deleted "${video.title}".`);
-    } catch (err) {
-      toast.error(errText(err));
-    }
-  }, [drop, toast]);
-
-  /** Hiding or deleting a downloaded video asks before touching the file. */
-  const removeVideo = useCallback(async (video: Video, alsoDeleteFile: boolean) => {
-    if (alsoDeleteFile) {
-      try {
+  /**
+   * Hides a subscription video, or deletes one added by hand -- and its file
+   * first, when asked. The card leaves at once (or turns hidden, with hidden
+   * videos on show) and comes back as it was if anything fails.
+   */
+  const removeVideo = useCallback((video: Video, alsoDeleteFile: boolean) => {
+    const deleting = video.added_manually;
+    // Set once the file is gone, which no undo can bring back: a hide that
+    // fails after it restores the card, but not as downloaded.
+    let fileGone = false;
+    void run(video.id, async () => {
+      if (alsoDeleteFile) {
         await api.deleteDownload(video.id);
-      } catch (err) {
-        toast.error(errText(err));
-        return;
+        fileGone = true;
       }
-    }
-    if (video.added_manually) await deleteVideo(video);
-    else await hideVideo(video);
-  }, [deleteVideo, hideVideo, toast]);
+      if (deleting) await api.deleteVideo(video.id);
+      else await api.setVideoHidden(video.id, true);
+      toast.success(deleting ? `Deleted "${video.title}".` : `Hidden "${video.title}".`);
+    }, {
+      optimistic: () => {
+        if (deleting || !showHidden) {
+          const undo = drop(video.id);
+          return () => {
+            undo();
+            if (fileGone) patch(video.id, NO_FILE);
+          };
+        }
+        patch(video.id, { hidden: true, ...(alsoDeleteFile ? NO_FILE : {}) });
+        return () => patch(video.id, { hidden: false, ...(fileGone ? {} : fileOf(video)) });
+      },
+    });
+  }, [drop, patch, run, showHidden, toast]);
 
   const requestRemove = useCallback((video: Video) => {
     if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video });
-    else void removeVideo(video, false);
+    else removeVideo(video, false);
   }, [removeVideo]);
 
   const menuItems = useCallback((video: Video): MenuItem[] => {
@@ -479,6 +549,15 @@ export default function SubscriptionsView(p: Props) {
     setMenu({ video, x, y });
   }, [menuItems]);
 
+  // `openMenu` changes with every change to the grid, since the menu reads the
+  // groups; handed to the cards as is, it would re-render all of them each time
+  // and undo their memo. They get this instead, which never changes.
+  const openMenuRef = useRef(openMenu);
+  openMenuRef.current = openMenu;
+  const onContextMenu = useCallback((video: Video, x: number, y: number) => {
+    openMenuRef.current(video, x, y);
+  }, []);
+
   const filtered =
     channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
     inProgress;
@@ -488,13 +567,16 @@ export default function SubscriptionsView(p: Props) {
     <VideoGrid
       groups={groups}
       progress={progress}
+      pending={pending}
+      slow={slow}
+      refreshing={slow.has(SIBLINGS)}
       loading={loading}
       hasMore={hasMore}
       cardSize={p.cardSize}
       onCardSize={p.onCardSize}
       onLoadMore={() => fetchPage(offset.current)}
       onAction={onAction}
-      onContextMenu={openMenu}
+      onContextMenu={onContextMenu}
       onOpenSeries={p.onFindSiblings}
       marking={marking}
       empty={

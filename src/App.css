@@ -341,7 +341,8 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .icon-btn.is-on:hover:not(:disabled) { background: rgba(62, 166, 255, 0.24); }
 .icon-btn.is-danger { color: #ffc9ca; border-color: rgba(255, 90, 95, 0.4); background: var(--danger-soft); }
 .icon-btn.is-danger:hover:not(:disabled) { background: rgba(255, 90, 95, 0.24); border-color: var(--danger); }
-.icon-btn.is-spinning > span[aria-hidden] {
+.icon-btn.is-spinning > span[aria-hidden],
+.card-btn.is-spinning > .card-glyph {
   display: inline-block;
   animation: spin 900ms linear infinite;
 }
@@ -818,6 +819,24 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   color: #101010;
 }
 .card-btn.is-primary:hover { background: #fff; }
+/* A call is out for this card. The buttons are disabled for exactly as long,
+   and the spinner only appears once it is slow (`usePending`), so a quick
+   answer shows nothing at all -- no grey flash, no hover to take back. */
+.card-glyph { display: grid; place-items: center; }
+.card-btn:disabled,
+.queued-badge:disabled { cursor: progress; }
+.card-btn:disabled:hover { transform: none; }
+.card-btn.is-primary:disabled:hover { background: rgba(255, 255, 255, 0.94); }
+.card.is-pending { cursor: progress; }
+
+/* The grid on screen while its replacement is fetched: a sibling mark or unlink
+   regroups the feed, and blanking it in between would lose your place for the
+   sake of a refetch that mostly returns the same cards. Dimmed only once slow. */
+.video-grid.is-refreshing {
+  opacity: 0.55;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
 
 .icon {
   width: calc(var(--act, 48px) * 0.42);

@@ -28,6 +28,8 @@ const markSiblings = vi.fn(() => Promise.resolve(2));
 const unlinkSiblings = vi.fn(() => Promise.resolve());
 const enqueueDownload = vi.fn((_id: string, _q?: unknown) => Promise.resolve());
 const probeFormats = vi.fn((_id: string) => Promise.resolve(rickroll()));
+const cancelDownload = vi.fn((_id: string) => Promise.resolve());
+const setVideoHidden = vi.fn((_id: string, _hidden: boolean) => Promise.resolve());
 // Typed with the filter so a test can page through a library with it.
 const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn<(f: VideoFilter) => Promise<VideoGroup[]>>(() => Promise.resolve(groups));
@@ -42,6 +44,8 @@ vi.mock("../api", () => ({
     unlinkSiblings: (...a: unknown[]) => unlinkSiblings(...(a as [])),
     enqueueDownload: (id: string, q?: unknown) => enqueueDownload(id, q),
     probeFormats: (id: string) => probeFormats(id),
+    cancelDownload: (id: string) => cancelDownload(id),
+    setVideoHidden: (id: string, hidden: boolean) => setVideoHidden(id, hidden),
     getSettings: () => Promise.resolve({ quality: DEFAULT_QUALITY }),
   },
   thumbSrc: () => "",
@@ -114,8 +118,112 @@ beforeEach(() => {
   listVideos.mockImplementation(() => Promise.resolve(videos));
   listVideoGroups.mockImplementation(() => Promise.resolve(groups));
   probeFormats.mockImplementation(() => Promise.resolve(rickroll()));
+  cancelDownload.mockImplementation(() => Promise.resolve());
+  setVideoHidden.mockImplementation(() => Promise.resolve());
+  enqueueDownload.mockImplementation(() => Promise.resolve());
+  markSiblings.mockImplementation(() => Promise.resolve(2));
 });
 afterEach(cleanup);
+
+/**
+ * A card's action flips with its state, so a click that lands twice -- a
+ * double-click, or an impatient second press while the first is out -- used to
+ * download and then cancel. Every action now goes out once and shows its
+ * result before the backend answers.
+ */
+describe("card actions in flight", () => {
+  it("downloads once for a double-click, and never cancels", async () => {
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView();
+    const card = await screen.findByRole("article");
+
+    fireEvent.click(card, { detail: 1 });
+    fireEvent.click(card, { detail: 2 });
+
+    await waitFor(() => expect(enqueueDownload).toHaveBeenCalledTimes(1));
+    expect(cancelDownload).not.toHaveBeenCalled();
+    expect(await screen.findByRole("button", { name: /Queued/ })).toBeTruthy();
+  });
+
+  it("ignores a second press while the first download is still going out", async () => {
+    let finish = () => {};
+    enqueueDownload.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView();
+    const card = await screen.findByRole("article");
+
+    fireEvent.click(card);
+    // Shown as queued at once, but held: pressing the badge now would cancel
+    // a download the backend has not even accepted yet.
+    const badge = await screen.findByRole<HTMLButtonElement>("button", { name: /Queued/ });
+    expect(badge.disabled).toBe(true);
+    expect(card.getAttribute("aria-busy")).toBe("true");
+    fireEvent.click(card);
+    fireEvent.click(badge);
+    expect(enqueueDownload).toHaveBeenCalledTimes(1);
+    expect(cancelDownload).not.toHaveBeenCalled();
+
+    await act(async () => { finish(); });
+    await waitFor(() => expect(badge.disabled).toBe(false));
+  });
+
+  it("drops the ring at once on cancel", async () => {
+    let finish = () => {};
+    cancelDownload.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    videos = [video({ download_state: "downloading", file_path: null })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Cancel download/ }));
+    const download = await screen.findByRole<HTMLButtonElement>("button", { name: "Download" });
+    // Back to Download before the backend has answered -- and not pressable
+    // until it has, or a quick second click would queue what was just stopped.
+    expect(download.disabled).toBe(true);
+    expect(cancelDownload).toHaveBeenCalledTimes(1);
+
+    await act(async () => { finish(); });
+    await waitFor(() => expect(download.disabled).toBe(false));
+  });
+
+  it("puts the download back when the cancel fails", async () => {
+    cancelDownload.mockImplementation(() => Promise.reject("no such job"));
+    videos = [video({ download_state: "downloading", file_path: null })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Cancel download/ }));
+    expect(await screen.findByText("no such job")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Cancel download/ })).toBeTruthy();
+    expect(document.querySelector(".card")?.getAttribute("data-state")).toBe("downloading");
+  });
+
+  it("hides a card at once, and brings it back if the hide fails", async () => {
+    setVideoHidden.mockImplementation(() => Promise.reject("database is locked"));
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView();
+
+    fireEvent.click(within(await openMenu(), "Hide from feed"));
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(screen.getByRole("article")).toBeTruthy();
+    expect(setVideoHidden).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the grid up, dimmed, while a sibling mark regroups it", async () => {
+    threeCards();
+    renderView();
+    const [a, b] = await cardsReady(3);
+    // The refetch that follows the mark hangs, as a slow one would.
+    listVideos.mockImplementation(() => new Promise<Video[]>(() => {}));
+
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(b, { ctrlKey: true });
+    fireEvent.contextMenu(a);
+    fireEvent.click(within(screen.getByRole("menu"), "Mark 2 videos as siblings"));
+
+    await waitFor(() =>
+      expect(document.querySelector(".video-grid")?.className).toContain("is-refreshing"),
+    );
+    expect(cards()).toHaveLength(3);
+  });
+});
 
 describe("marking a downloaded video as watched", () => {
   it("marks it watched and then asks about the file", async () => {

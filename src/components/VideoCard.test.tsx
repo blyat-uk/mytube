@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
 import VideoCard from "./VideoCard";
+import { createProgressStore } from "../progress";
 import type { DownloadState, Video } from "../types";
 
 afterEach(cleanup);
@@ -55,6 +56,58 @@ describe("VideoCard hover actions", () => {
     const { onAction } = renderCard({ download_state: "queued" });
     fireEvent.click(screen.getByRole("button", { name: /Queued/ }));
     expect(onAction.mock.calls[0][0]).toBe("cancel");
+  });
+});
+
+describe("VideoCard with a call in flight", () => {
+  it("refuses clicks on the card and its primary button while pending", () => {
+    const onAction = vi.fn();
+    render(
+      <VideoCard video={video()} pending onAction={onAction} onContextMenu={vi.fn()} />,
+    );
+    const button = screen.getByRole<HTMLButtonElement>("button", { name: /^Download$/ });
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    fireEvent.click(screen.getByRole("article"));
+    expect(onAction).not.toHaveBeenCalled();
+    // Leaving for YouTube is never held up by a download call.
+    fireEvent.click(screen.getByRole("button", { name: /Open on YouTube/ }));
+    expect(onAction).toHaveBeenCalledWith("open", expect.anything());
+  });
+
+  it("spins only once the call is slow, keeping the name for screen readers", () => {
+    const { rerender } = render(
+      <VideoCard video={video()} pending onAction={vi.fn()} onContextMenu={vi.fn()} />,
+    );
+    const button = () => screen.getByRole("button", { name: /^Download$/ });
+    expect(button().className).not.toContain("is-spinning");
+    rerender(<VideoCard video={video()} pending slow onAction={vi.fn()} onContextMenu={vi.fn()} />);
+    expect(button().className).toContain("is-spinning");
+  });
+
+  it("drops the second click of a double-click", () => {
+    const { onAction } = renderCard();
+    const card = screen.getByRole("article");
+    fireEvent.click(card, { detail: 1 });
+    fireEvent.click(card, { detail: 2 });
+    expect(onAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads its progress from the store, by its own id", () => {
+    const store = createProgressStore();
+    render(
+      <VideoCard
+        video={video({ download_state: "downloading" })}
+        progress={store}
+        onAction={vi.fn()}
+        onContextMenu={vi.fn()}
+      />,
+    );
+    act(() => store.set({ videoId: "someone-else", percent: 90, speed: "", eta: "" }));
+    expect(screen.getByText("0%")).toBeTruthy();
+    act(() => store.set({ videoId: "J1WoNuemKOg", percent: 42, speed: "3MiB/s", eta: "00:10" }));
+    expect(screen.getByText("42%")).toBeTruthy();
+    expect(screen.getByText(/3MiB\/s/)).toBeTruthy();
   });
 });
 

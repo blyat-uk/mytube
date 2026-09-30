@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { thumbSrc } from "../api";
 import { formatDate, formatRelative, seriesRuntime } from "../format";
 import { IconSeries } from "./Icons";
@@ -25,8 +25,11 @@ interface Props {
  * Deliberately no download or play button. The card is one click target that
  * opens the series, and the parts are acted on inside it — a button here would
  * silently act on one part out of seven.
+ *
+ * Memoised like VideoCard: the view keeps a group's object as it was unless one
+ * of its parts changed, so a state event elsewhere in the grid passes it by.
  */
-export default function SeriesCard({ group, onOpen, onContextMenu, mark }: Props) {
+export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: Props) {
   const leader = group.videos[0];
   const parts = group.videos.length;
   const watched = group.videos.filter((v) => v.watched).length;
@@ -151,4 +154,4 @@ export default function SeriesCard({ group, onOpen, onContextMenu, mark }: Props
       </div>
     </article>
   );
-}
+});

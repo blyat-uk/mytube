@@ -3,13 +3,22 @@ import VideoCard from "./VideoCard";
 import SeriesCard from "./SeriesCard";
 import { nextCardSize, type CardAction } from "../format";
 import type { Marking } from "../marking";
-import type { DownloadProgress, Video, VideoGroup } from "../types";
+import type { ProgressStore } from "../progress";
+import type { Video, VideoGroup } from "../types";
 
 interface Props {
   /** One entry per card. Ungrouped views wrap each video in a group of one, so
    *  the grid has a single shape to lay out either way. */
   groups: VideoGroup[];
-  progress: Record<string, DownloadProgress>;
+  /** Read by each card for its own video, so a tick skips the grid entirely. */
+  progress?: ProgressStore;
+  /** Video ids with a call in flight, and those of them slow enough to show.
+   *  Handed to each card as a boolean so the memo holds for the rest. */
+  pending?: ReadonlySet<string>;
+  slow?: ReadonlySet<string>;
+  /** The grid on screen is about to be replaced. It stays up, dimmed, rather
+   *  than blanking: the replacement is usually the same cards regrouped. */
+  refreshing?: boolean;
   loading: boolean;
   hasMore: boolean;
   cardSize: number;
@@ -31,7 +40,7 @@ const MAX_ANIMATED = 60;
 const NEAR_VIEWPORT = 400;
 
 export default function VideoGrid({
-  groups, progress, loading, hasMore, cardSize, onCardSize,
+  groups, progress, pending, slow, refreshing = false, loading, hasMore, cardSize, onCardSize,
   onLoadMore, onAction, onContextMenu, onOpenSeries, marking, empty,
 }: Props) {
   const sentinel = useRef<HTMLDivElement | null>(null);
@@ -172,9 +181,13 @@ export default function VideoGrid({
     <>
       <div
         ref={gridRef}
-        className="video-grid"
+        className={`video-grid${refreshing ? " is-refreshing" : ""}`}
         style={{ ["--card-w" as string]: `${cardSize}px` }}
+        aria-busy={refreshing || undefined}
       >
+        {/* Every prop below is either a primitive or holds its identity across
+            renders (`forGroup` caches per card), which is what lets the
+            memoised cards skip a render that did not touch them. */}
         {groups.map((g) =>
           g.videos.length > 1 ? (
             <SeriesCard
@@ -188,7 +201,9 @@ export default function VideoGrid({
             <VideoCard
               key={g.videos[0].id}
               video={g.videos[0]}
-              progress={progress[g.videos[0].id]}
+              progress={progress}
+              pending={pending?.has(g.videos[0].id) ?? false}
+              slow={slow?.has(g.videos[0].id) ?? false}
               onAction={onAction}
               onContextMenu={onCtx}
               mark={marking?.forGroup(g)}

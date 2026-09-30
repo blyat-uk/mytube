@@ -6,6 +6,7 @@ import {
 } from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
+import { singleClick, usePending } from "../pending";
 import type { AddKind, Channel, TakeoutRow } from "../types";
 
 interface Props {
@@ -38,11 +39,11 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
   const [importing, setImporting] = useState(false);
   const [takeout, setTakeout] = useState<{ path: string; rows: TakeoutRow[] } | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
-  // By channel, not one at a time: joining reads a whole listing, and a slow
-  // one must not lock the rest of the list.
-  const [joining, setJoining] = useState<string[]>([]);
-  // The same, for auto-download: turning it on can queue a whole backlog.
-  const [switching, setSwitching] = useState<string[]>([]);
+  // Keyed by action and channel, not one flag for the list: joining reads a
+  // whole listing, turning auto-download on can queue a whole backlog, and a
+  // slow one must not lock the rest of the list.
+  const { pending, slow, run } = usePending();
+  const act = (key: string) => ({ busy: pending.has(key), spinning: slow.has(key) });
   /** The channel whose "turn auto-download on" prompt is open, if any. */
   const [autoPrompt, setAutoPrompt] = useState<Channel | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -173,10 +174,8 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
    * has existed. Leaving collects nothing further and removes nothing already
    * collected.
    */
-  async function setMember(c: Channel) {
-    if (joining.includes(c.id)) return;
-    setJoining((ids) => [...ids, c.id]);
-    try {
+  function setMember(c: Channel) {
+    void run(`member:${c.id}`, async () => {
       const found = await api.setChannelMember(c.id, !c.member);
       onChanged();
       if (c.member) {
@@ -186,29 +185,23 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
       } else {
         toast.success(`${found} members-only video${found === 1 ? "" : "s"} added.`);
       }
-    } catch (err) {
-      toast.error(errText(err));
-    } finally {
-      setJoining((ids) => ids.filter((id) => id !== c.id));
-    }
+    });
   }
 
   /** Off is immediate and takes nothing back; on goes through the prompt. */
   function toggleAutoDownload(c: Channel) {
-    if (switching.includes(c.id)) return;
+    if (pending.has(`auto:${c.id}`)) return;
     if (c.auto_download) {
-      void setAutoDownload(c, false, null);
+      setAutoDownload(c, false, null);
     } else {
       setConfirmRemove(null);
       setAutoPrompt(c);
     }
   }
 
-  async function setAutoDownload(c: Channel, enabled: boolean, backlog: Backlog | null) {
-    if (switching.includes(c.id)) return;
-    setSwitching((ids) => [...ids, c.id]);
+  function setAutoDownload(c: Channel, enabled: boolean, backlog: Backlog | null) {
     setAutoPrompt(null);
-    try {
+    void run(`auto:${c.id}`, async () => {
       const queued = await api.setChannelAutoDownload(c.id, enabled, backlog);
       onChanged();
       if (!enabled) {
@@ -219,30 +212,23 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
           (queued > 0 ? ` ${queued} video${queued === 1 ? "" : "s"} queued.` : ""),
         );
       }
-    } catch (err) {
-      toast.error(errText(err));
-    } finally {
-      setSwitching((ids) => ids.filter((id) => id !== c.id));
-    }
+    });
   }
 
-  async function openChannel(c: Channel) {
-    try {
-      await api.openExternal(c.url);
-    } catch (err) {
-      toast.error(errText(err));
-    }
+  function openChannel(c: Channel) {
+    // Keyed so a double press opens one browser tab, not two.
+    void run(`open:${c.id}`, () => api.openExternal(c.url));
   }
 
-  async function removeChannel(c: Channel) {
-    try {
+  /** Removal deletes every video the channel has, so it must not run twice --
+   *  the confirm's glyph stays pressed and disabled until the answer is in. */
+  function removeChannel(c: Channel) {
+    void run(`remove:${c.id}`, async () => {
       await api.removeChannel(c.id);
       toast.success(`Removed ${c.title} and its videos.`);
       setConfirmRemove(null);
       onChanged();
-    } catch (err) {
-      toast.error(errText(err));
-    }
+    });
   }
 
   return (
@@ -338,11 +324,17 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                     <ChannelAction
                       label={`Remove ${c.title} and delete its videos`}
                       tone="is-danger"
-                      onClick={() => void removeChannel(c)}
+                      {...act(`remove:${c.id}`)}
+                      onClick={() => removeChannel(c)}
                     >
                       <IconDelete />
                     </ChannelAction>
-                    <ChannelAction label={`Keep ${c.title}`} onClick={() => setConfirmRemove(null)}>
+                    <ChannelAction
+                      label={`Keep ${c.title}`}
+                      // Too late to keep it once the removal is out.
+                      busy={pending.has(`remove:${c.id}`)}
+                      onClick={() => setConfirmRemove(null)}
+                    >
                       <IconClose />
                     </ChannelAction>
                   </span>
@@ -350,7 +342,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                   <span className="channel-actions">
                     <ChannelAction
                       label={`Open ${c.title} on YouTube`}
-                      onClick={() => void openChannel(c)}
+                      onClick={() => openChannel(c)}
                     >
                       <IconExternal />
                     </ChannelAction>
@@ -360,7 +352,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                       label={`Members — ${c.title}`}
                       tone={c.member ? "is-on" : undefined}
                       pressed={c.member}
-                      busy={joining.includes(c.id)}
+                      {...act(`member:${c.id}`)}
                       // A terminated account has no uploads left to collect,
                       // members-only or otherwise. Hidden rather than dropped:
                       // the circle keeps its slot so the glyphs still line up
@@ -371,7 +363,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                           ? `You are a member of ${c.title}. Its members-only uploads are collected with the rest.`
                           : `Joined ${c.title}? Collect its members-only uploads too — the RSS feed never carries them.`
                       }
-                      onClick={() => void setMember(c)}
+                      onClick={() => setMember(c)}
                     >
                       <IconMember joined={c.member} />
                     </ChannelAction>
@@ -379,7 +371,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                       label={`Auto-download — ${c.title}`}
                       tone={c.auto_download ? "is-on" : undefined}
                       pressed={c.auto_download}
-                      busy={switching.includes(c.id)}
+                      {...act(`auto:${c.id}`)}
                       // Nothing new will ever arrive from a terminated account.
                       hidden={c.terminated}
                       title={
@@ -402,7 +394,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
                 {autoPrompt?.id === c.id && (
                   <AutoDownloadPrompt
                     channel={c}
-                    onConfirm={(backlog) => void setAutoDownload(c, true, backlog)}
+                    onConfirm={(backlog) => setAutoDownload(c, true, backlog)}
                     onCancel={() => setAutoPrompt(null)}
                   />
                 )}
@@ -621,15 +613,21 @@ function ToggleChip({ label, checked, onChange, children }: {
  * a list of them reads as one column of identical buttons otherwise.
  *
  * DownloadsView has a `RowAction` of its own; this one additionally carries the
- * pressed and busy states the membership and auto-download toggles need.
+ * pressed state the membership and auto-download toggles need.
+ *
+ * `busy` disables it the moment its call goes out; `spinning` swaps the glyph
+ * for IconBusy only once the call is slow enough to notice (`usePending`). The
+ * second click of a double-click is dropped, since on a toggle it would join
+ * and then leave.
  */
-function ChannelAction({ label, title, tone, pressed, busy, hidden, onClick, children }: {
+function ChannelAction({ label, title, tone, pressed, busy, spinning, hidden, onClick, children }: {
   label: string;
   /** The long explanation, when the tooltip has more to say than the name. */
   title?: string;
   tone?: "is-on" | "is-danger";
   pressed?: boolean;
   busy?: boolean;
+  spinning?: boolean;
   /** Keeps the slot but shows nothing and takes no focus or clicks. */
   hidden?: boolean;
   onClick: () => void;
@@ -638,17 +636,17 @@ function ChannelAction({ label, title, tone, pressed, busy, hidden, onClick, chi
   return (
     <button
       type="button"
-      className={`icon-btn${tone ? ` ${tone}` : ""}${busy ? " is-spinning" : ""}${hidden ? " is-placeholder" : ""}`}
+      className={`icon-btn${tone ? ` ${tone}` : ""}${spinning ? " is-spinning" : ""}${hidden ? " is-placeholder" : ""}`}
       title={title ?? label}
       aria-pressed={pressed}
-      aria-busy={busy}
+      aria-busy={busy || undefined}
       disabled={busy || hidden}
       aria-hidden={hidden || undefined}
       tabIndex={hidden ? -1 : undefined}
-      onClick={onClick}
+      onClick={singleClick(onClick)}
     >
       {/* `.is-spinning` turns this span, so the glyph has to sit inside one. */}
-      <span aria-hidden="true">{busy ? <IconBusy /> : children}</span>
+      <span aria-hidden="true">{spinning ? <IconBusy /> : children}</span>
       <span className="sr-only">{label}</span>
     </button>
   );

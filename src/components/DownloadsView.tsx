@@ -2,12 +2,14 @@ import {
   useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject,
 } from "react";
 import ConfirmDialog from "./ConfirmDialog";
-import { IconCancel, IconDelete, IconPlay, IconRetry, IconWatched } from "./Icons";
+import { IconBusy, IconCancel, IconDelete, IconPlay, IconRetry, IconWatched } from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText, thumbSrc } from "../api";
 import { useDownloadEvents } from "../events";
 import { formatDuration, formatRelative, hasDownloadedFile, popoutPlacement } from "../format";
-import type { DownloadProgress, DownloadState, Video } from "../types";
+import { singleClick, usePending } from "../pending";
+import { createProgressStore, useProgress, type ProgressStore } from "../progress";
+import type { DownloadState, Video } from "../types";
 
 /** Downloads are rare relative to the library, so one wide sweep is enough. */
 const SWEEP = 500;
@@ -49,7 +51,9 @@ interface Props {
 export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Props) {
   const toast = useToast();
   const [items, setItems] = useState<Video[]>([]);
-  const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
+  // Each active row reads its own entry, so a tick renders one row, not the tab.
+  const [progress] = useState(createProgressStore);
+  const { pending, slow, run } = usePending();
   const [loading, setLoading] = useState(true);
   /** A video just marked watched, whose file may now be done with. */
   const [confirmFile, setConfirmFile] = useState<Video | null>(null);
@@ -106,7 +110,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
   useEffect(() => { knownIds.current = new Set(items.map((v) => v.id)); }, [items]);
 
   useDownloadEvents({
-    onProgress: (p) => setProgress((prev) => ({ ...prev, [p.videoId]: p })),
+    onProgress: progress.set,
     onState: (s) => {
       const known = knownIds.current.has(s.videoId);
       if (known) {
@@ -121,18 +125,14 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
               }
             : v))
           .filter((v) => v.download_state !== "none"));
-      } else {
+      } else if (s.state !== "none") {
         // A video queued from the Subscriptions tab is not in this list yet.
+        // A `none` is never listed here, so an unknown one needs no reload --
+        // and it is usually the echo of a cancel or a delete this tab already
+        // took off the list itself.
         scheduleReload();
       }
-      if (s.state !== "downloading") {
-        setProgress((prev) => {
-          if (!(s.videoId in prev)) return prev;
-          const next = { ...prev };
-          delete next[s.videoId];
-          return next;
-        });
-      }
+      if (s.state !== "downloading") progress.clear(s.videoId);
     },
   });
 
@@ -168,39 +168,57 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
     slot.style.setProperty("--pop-y", `${offsetY}px`);
   }, [scrollRef, cardSize]);
 
-  const guard = useCallback(async (fn: () => Promise<void>) => {
-    try { await fn(); } catch (err) { toast.error(errText(err)); }
-  }, [toast]);
-
-  const cancel = (v: Video) => guard(async () => { await api.cancelDownload(v.id); });
-  const play = (v: Video) => guard(async () => { await api.openInPlayer(v.id); });
-  const retry = (v: Video) => guard(async () => {
-    setItems((prev) => prev.map((x) => (
-      x.id === v.id ? { ...x, download_state: "queued", download_error: null } : x
-    )));
-    await api.enqueueDownload(v.id);
-  });
-  const remove = (v: Video) => guard(async () => {
-    await api.deleteDownload(v.id);
+  /** Takes a row off the list now, and hands back how to put it back as it was. */
+  const takeOff = (v: Video) => {
     setItems((prev) => prev.filter((x) => x.id !== v.id));
-    toast.success(`Deleted the file for “${v.title}”.`);
+    return () => setItems((prev) => (prev.some((x) => x.id === v.id) ? prev : [...prev, v]));
+  };
+  const put = (id: string, fields: Partial<Video>) =>
+    setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...fields } : x)));
+
+  // Every row action runs under the video's id, so a second press while the
+  // first is out does nothing, and its buttons say so. Each change is shown
+  // before the call and put back if the call fails.
+  const cancel = (v: Video) => run(v.id, () => api.cancelDownload(v.id), {
+    // Off the list at once: the backend clears the row before it has finished
+    // killing yt-dlp and sweeping the part files, so there is nothing to wait
+    // for, and its `none` event lands on a row that is already gone.
+    optimistic: () => {
+      progress.clear(v.id);
+      return takeOff(v);
+    },
   });
+  // Nothing to show optimistically, but a double press would otherwise open
+  // the file in two players.
+  const play = (v: Video) => run(v.id, () => api.openInPlayer(v.id));
+  const retry = (v: Video) => run(v.id, () => api.enqueueDownload(v.id), {
+    optimistic: () => {
+      put(v.id, { download_state: "queued", download_error: null });
+      return () => put(v.id, { download_state: v.download_state, download_error: v.download_error });
+    },
+  });
+  const remove = (v: Video) => run(v.id, async () => {
+    await api.deleteDownload(v.id);
+    toast.success(`Deleted the file for “${v.title}”.`);
+  }, { optimistic: () => takeOff(v) });
   /** The Subscriptions menu's rule: watching a video asks about its file, and
-   *  un-watching one asks nothing. */
-  const toggleWatched = async (v: Video) => {
+   *  un-watching one asks nothing. Its own key, so it never locks the row's
+   *  other buttons, but two toggles cannot be out at once and land out of order. */
+  const toggleWatched = (v: Video) => {
     const next = !v.watched;
     const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
-    const put = (fields: Pick<Video, "watched" | "watched_at">) =>
-      setItems((prev) => prev.map((x) => (x.id === v.id ? { ...x, ...fields } : x)));
-    put(watched);
-    try {
+    return run(`watched:${v.id}`, async () => {
       await api.setWatched(v.id, next);
       if (next && hasDownloadedFile(v)) setConfirmFile({ ...v, ...watched });
-    } catch (err) {
-      put({ watched: v.watched, watched_at: v.watched_at });
-      toast.error(errText(err));
-    }
+    }, {
+      optimistic: () => {
+        put(v.id, watched);
+        return () => put(v.id, { watched: v.watched, watched_at: v.watched_at });
+      },
+    });
   };
+  /** What a row's action buttons need to know about a call in flight. */
+  const state = (key: string) => ({ busy: pending.has(key), spinning: slow.has(key) });
 
   if (loading && items.length === 0) {
     return (
@@ -226,22 +244,10 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
       <Section title="Active" count={active.length}>
         {active.map((v) => (
           <Row key={v.id} video={v} onPopout={placePopout}>
-            <div className="row-progress">
-              <div className="bar">
-                <div
-                  className={`bar-fill${v.download_state === "queued" ? " is-idle" : ""}`}
-                  style={{ width: `${v.download_state === "queued" ? 100 : progress[v.id]?.percent ?? 0}%` }}
-                />
-              </div>
-              <span className="row-progress-text">
-                {v.download_state === "queued"
-                  ? "Queued"
-                  : `${(progress[v.id]?.percent ?? 0).toFixed(1)}%${
-                      progress[v.id]?.speed ? ` · ${progress[v.id]!.speed}` : ""
-                    }${progress[v.id]?.eta ? ` · ETA ${progress[v.id]!.eta}` : ""}`}
-              </span>
-            </div>
-            <RowAction label="Cancel download" onClick={() => cancel(v)}><IconCancel /></RowAction>
+            <RowProgress store={progress} video={v} />
+            <RowAction label="Cancel download" {...state(v.id)} onClick={() => void cancel(v)}>
+              <IconCancel />
+            </RowAction>
           </Row>
         ))}
       </Section>
@@ -249,15 +255,20 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
       <Section title="Completed" count={completed.length}>
         {completed.map((v) => (
           <Row key={v.id} video={v} onPopout={placePopout}>
-            <RowAction label="Play" tone="is-primary" onClick={() => play(v)}><IconPlay /></RowAction>
+            <RowAction label="Play" tone="is-primary" {...state(v.id)} onClick={() => void play(v)}>
+              <IconPlay />
+            </RowAction>
             <RowAction
               label={v.watched ? "Mark as unwatched" : "Mark as watched"}
               tone={v.watched ? "is-on" : undefined}
+              {...state(`watched:${v.id}`)}
               onClick={() => void toggleWatched(v)}
             >
               <IconWatched done={v.watched} />
             </RowAction>
-            <RowAction label="Delete file" tone="is-danger" onClick={() => remove(v)}><IconDelete /></RowAction>
+            <RowAction label="Delete file" tone="is-danger" {...state(v.id)} onClick={() => void remove(v)}>
+              <IconDelete />
+            </RowAction>
           </Row>
         ))}
       </Section>
@@ -268,7 +279,9 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
             <span className="row-error" title={v.download_error ?? ""}>
               {v.download_error ?? "Download failed"}
             </span>
-            <RowAction label="Retry download" onClick={() => retry(v)}><IconRetry /></RowAction>
+            <RowAction label="Retry download" {...state(v.id)} onClick={() => void retry(v)}>
+              <IconRetry />
+            </RowAction>
           </Row>
         ))}
       </Section>
@@ -290,22 +303,59 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
   );
 }
 
-/** A row's actions are glyphs, so the tooltip and the screen-reader name carry
- *  the words the buttons used to. */
-function RowAction({ label, tone, onClick, children }: {
+/**
+ * An active row's bar and figures, read from the progress store by id: a tick
+ * renders this and nothing else, where it used to render the whole tab.
+ */
+function RowProgress({ store, video }: { store: ProgressStore; video: Video }) {
+  const p = useProgress(store, video.id);
+  const queued = video.download_state === "queued";
+  const percent = p?.percent ?? 0;
+  return (
+    <div className="row-progress">
+      <div className="bar">
+        <div
+          className={`bar-fill${queued ? " is-idle" : ""}`}
+          style={{ width: `${queued ? 100 : percent}%` }}
+        />
+      </div>
+      <span className="row-progress-text">
+        {queued
+          ? "Queued"
+          : `${percent.toFixed(1)}%${p?.speed ? ` · ${p.speed}` : ""}${p?.eta ? ` · ETA ${p.eta}` : ""}`}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * A row's actions are glyphs, so the tooltip and the screen-reader name carry
+ * the words the buttons used to.
+ *
+ * `busy` disables the button the moment its call goes out; `spinning` swaps the
+ * glyph for IconBusy only once the call is slow enough to notice. The second
+ * click of a double-click is dropped: a double-clicked Play would otherwise
+ * start two players the moment the first call answered.
+ */
+function RowAction({ label, tone, busy, spinning, onClick, children }: {
   label: string;
   tone?: "is-primary" | "is-on" | "is-danger";
+  busy?: boolean;
+  spinning?: boolean;
   onClick: () => void;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
-      className={`icon-btn${tone ? ` ${tone}` : ""}`}
+      className={`icon-btn${tone ? ` ${tone}` : ""}${spinning ? " is-spinning" : ""}`}
       title={label}
-      onClick={onClick}
+      disabled={busy}
+      aria-busy={busy || undefined}
+      onClick={singleClick(onClick)}
     >
-      {children}
+      {/* `.is-spinning` turns this span, so the glyph has to sit inside one. */}
+      <span aria-hidden="true">{spinning ? <IconBusy /> : children}</span>
       <span className="sr-only">{label}</span>
     </button>
   );
