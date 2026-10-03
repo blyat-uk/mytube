@@ -53,7 +53,7 @@ mytube import mytube-export-2026-10-02.zip # or Settings → Backup & transfer �
 
 `mytube import` shows what the archive holds and then asks: Merge or Replace, which channels, whether to apply its settings, and finally to confirm. Esc at any question cancels before anything is written. Every question has a flag (`mytube export --help`, `mytube import --help`). With no terminal attached, such as a cron job or `ssh home mytube export` without `-t`, nothing is asked: thumbnails are included, every channel is merged and the settings are applied. `--replace` then needs `--yes` as well.
 
-The command is `mytube` with the `.deb` and `.rpm`, the AppImage file itself (`./mytube-v3.0.0-linux-x86_64.AppImage export`), and `/Applications/mytube.app/Contents/MacOS/mytube` on macOS. On Windows, use Settings → Backup & transfer.
+The command is `mytube` with the `.deb` and `.rpm`, the AppImage file itself (`./mytube-v3.1.0-linux-x86_64.AppImage export`), and `/Applications/mytube.app/Contents/MacOS/mytube` on macOS. On Windows, use Settings → Backup & transfer.
 
 If MyTube is running on the machine you import into, its window shows the import after its next poll.
 
