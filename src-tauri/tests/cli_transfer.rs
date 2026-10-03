@@ -99,7 +99,19 @@ fn home_library(home: &Path) {
 
     let mut settings = config::Settings::default();
     settings.backfill_count = 77;
+    // A download folder that exists, so an import applies the settings whole.
+    // The default is the real ~/Videos/mytube: there on a developer's machine,
+    // absent on a fresh CI runner, where the import then keeps the local folder
+    // instead and says so.
+    settings.download_dir = downloads(home).to_string_lossy().into_owned();
+    std::fs::create_dir_all(downloads(home)).unwrap();
     config::save_to(&home.join("settings.json"), &settings).unwrap();
+}
+
+/// The download folder `home_library` sets: beside both "machines", since they
+/// share this filesystem.
+fn downloads(home: &Path) -> std::path::PathBuf {
+    home.parent().unwrap().join("videos")
 }
 
 #[test]
@@ -134,7 +146,9 @@ fn a_library_goes_from_home_to_the_laptop_with_nobody_at_a_terminal() {
     let v1 = db.get_video("v1").unwrap().expect("crossed");
     assert!(v1.watched, "watched state crossed");
     assert!(laptop.join("thumbs").join("v1.jpg").is_file(), "and its thumbnail");
-    assert_eq!(config::load_from(&laptop.join("settings.json")).unwrap().backfill_count, 77);
+    let applied = config::load_from(&laptop.join("settings.json")).unwrap();
+    assert_eq!(applied.backfill_count, 77);
+    assert_eq!(Path::new(&applied.download_dir), downloads(&home));
 }
 
 #[test]
