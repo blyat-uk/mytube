@@ -417,7 +417,11 @@ pub fn write_archive(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let file = std::fs::File::create(dest)
+    // Declared before the writer so it drops after it: a `ZipWriter` dropped
+    // mid-unwind still finishes the file it was writing, and only then may the
+    // guard delete it.
+    let mut partial = Partial(Some(partial_path(dest)));
+    let file = std::fs::File::create(partial.path())
         .with_context(|| format!("cannot write {}", dest.display()))?;
     let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
 
@@ -448,9 +452,50 @@ pub fn write_archive(
     // `finish` hands the BufWriter back rather than dropping it, because a
     // BufWriter dropped on its own swallows the error from its last flush --
     // and that flush is the tail of the archive.
-    let mut out = zip.finish()?;
-    out.flush().context("flushing the archive")?;
+    let out = zip.finish()?;
+    let file = out.into_inner().map_err(|e| e.into_error()).context("flushing the archive")?;
+    // On disk before the rename, or a crash just after it could leave a
+    // complete-looking name over an empty file.
+    file.sync_all().context("flushing the archive")?;
+    // Closed before the rename, which Windows refuses on a file still open.
+    drop(file);
+    std::fs::rename(partial.path(), dest)
+        .with_context(|| format!("cannot write {}", dest.display()))?;
+    partial.0 = None;
     Ok(())
+}
+
+/// The archive is written beside its destination under this suffix and renamed
+/// over it only once complete. Re-exporting over the same file is what keeping
+/// two machines in step looks like, and an export cut off part way -- an SSH
+/// session dropping, a full disk -- must leave the previous archive whole
+/// rather than a truncated one where it stood.
+const PARTIAL_SUFFIX: &str = ".partial";
+
+fn partial_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(PARTIAL_SUFFIX);
+    dest.with_file_name(name)
+}
+
+/// Deletes the partial file on any way out of `write_archive` that did not
+/// rename it into place: an error, or a panic unwinding through it. A process
+/// killed outright leaves it behind, under a name that says what it is and that
+/// the next export to the same place overwrites.
+struct Partial(Option<PathBuf>);
+
+impl Partial {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("only read before the rename")
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 fn hostname() -> String {
@@ -581,13 +626,13 @@ pub struct Prepared {
 /// can point an import at a temp directory. `config_dir()` is built from
 /// `$XDG_CONFIG_HOME`, which is process-wide state; a struct is not, so these
 /// tests run in parallel with each other and with everything else in the crate.
-struct Dirs {
-    thumbs: PathBuf,
-    settings: PathBuf,
+pub(crate) struct Dirs {
+    pub(crate) thumbs: PathBuf,
+    pub(crate) settings: PathBuf,
 }
 
 impl Dirs {
-    fn live() -> Self {
+    pub(crate) fn live() -> Self {
         Self { thumbs: config::thumbs_dir(), settings: config::settings_path() }
     }
 }
@@ -611,7 +656,7 @@ pub fn prepare_import(
 /// changes are the part that has to be all-or-nothing, and those are still
 /// entirely in the caller's transaction, which is exactly why this function
 /// hands back `Vec`s instead of writing them itself.
-fn prepare_import_in(
+pub(crate) fn prepare_import_in(
     path: &Path,
     picked: &[String],
     apply_settings: bool,
@@ -1567,6 +1612,31 @@ mod tests {
         assert_eq!(est.video_count, 3);
         assert_eq!(est.thumb_count, 1);
         assert_eq!(est.thumb_bytes, 10);
+    }
+
+    #[test]
+    fn an_export_cut_off_part_way_leaves_the_previous_archive_whole() {
+        // Re-exporting over the same file is the whole of a nightly sync, and a
+        // dropped SSH session kills the export wherever it stands. The panic
+        // below stands in for that, after the manifest is already written.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mytube-export.zip");
+        let settings = settings_with_download_dir(tmp.path());
+        write_archive(&dest, &[channel("UC1", "One")], &[video("v1", "UC1")], &settings, false, &noop)
+            .unwrap();
+        let before = std::fs::read(&dest).unwrap();
+
+        let cut = std::panic::catch_unwind(|| {
+            write_archive(&dest, &[channel("UC2", "Two")], &[], &settings, false, &|done, _, _| {
+                if done > 0 {
+                    panic!("connection lost");
+                }
+            })
+        });
+        assert!(cut.is_err());
+        assert!(std::fs::read(&dest).unwrap() == before, "yesterday's archive is intact");
+        let names: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("mytube-export.zip")], "and nothing is left beside it");
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod db;
 pub mod detect;
+pub mod library_transfer;
 pub mod models;
 pub mod player;
 pub mod poll;

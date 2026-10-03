@@ -6,7 +6,7 @@ use crate::db::Db;
 use crate::models::*;
 use crate::poll::{self, AppState};
 use crate::quality::Quality;
-use crate::{app_update, config, player, resolve, transfer, ytdlp};
+use crate::{app_update, config, library_transfer, player, resolve, ytdlp};
 
 /// Backfills run a few at a time: enough to hide latency, few enough
 /// to stay clear of YouTube rate limiting.
@@ -700,20 +700,27 @@ pub async fn delete_download(
 }
 
 // ---- config transfer ----
+//
+// The wiring itself lives in `library_transfer`, shared with the terminal's
+// `mytube export` / `mytube import`. What stays here is Tauri's half: running
+// it off the runtime, the progress events, and telling the live app.
 
 /// What an export would weigh, so the "Include thumbnails" tick can offer a
 /// real number instead of a guess.
 #[tauri::command]
 pub async fn transfer_estimate(state: State<'_, Arc<AppState>>) -> R<TransferEstimate> {
-    db_blocking(&state, |db| {
-        let channels = db.export_channels()?;
-        let videos = db.export_videos()?;
-        // `transfer` owns the sizing because it owns what actually goes in the
-        // zip: a thumbnail is counted only if the file is really there to be
-        // copied -- one stat per thumbnail, which is why this is off the runtime.
-        Ok(transfer::estimate(&channels, &videos))
-    })
-    .await
+    // One stat per thumbnail, which is why this is off the runtime.
+    db_blocking(&state, library_transfer::estimate).await
+}
+
+/// `transfer://progress` for one phase, as the dialogs listen for it.
+fn progress_emitter(app: AppHandle, phase: TransferPhase) -> impl Fn(usize, usize, &str) {
+    move |done, total, current| {
+        let _ = app.emit(
+            "transfer://progress",
+            TransferProgress { phase, done, total, current: current.to_string() },
+        );
+    }
 }
 
 #[tauri::command]
@@ -724,33 +731,15 @@ pub async fn export_config(
     app: AppHandle,
 ) -> R<()> {
     let dest = std::path::PathBuf::from(path);
+    let progress = progress_emitter(app, TransferPhase::Export);
 
     // Zipping thousands of thumbnails is blocking work. On the async runtime's
     // own threads it would stall every other command behind it -- including the
     // progress events this very call is emitting. The reads that feed it go
     // with it: every row in the library, under the shared connection lock.
     db_blocking(&state, move |db| {
-        let channels = db.export_channels()?;
-        let videos = db.export_videos()?;
         let settings = config::load()?;
-        transfer::write_archive(
-            &dest,
-            &channels,
-            &videos,
-            &settings,
-            include_thumbs,
-            &|done, total, current| {
-                let _ = app.emit(
-                    "transfer://progress",
-                    TransferProgress {
-                        phase: TransferPhase::Export,
-                        done,
-                        total,
-                        current: current.to_string(),
-                    },
-                );
-            },
-        )
+        library_transfer::export(db, &settings, &dest, include_thumbs, &progress)
     })
     .await
 }
@@ -763,26 +752,7 @@ pub async fn read_archive(
     state: State<'_, Arc<AppState>>,
 ) -> R<ArchiveSummary> {
     let p = std::path::PathBuf::from(path);
-    db_blocking(&state, move |db| {
-        // Every channel, not just the subscribed ones: an ad-hoc uploader
-        // already here is "already here", and saying otherwise would offer to
-        // re-add it.
-        let known: std::collections::HashSet<String> =
-            db.export_channels()?.into_iter().map(|c| c.id).collect();
-        let mut summary = transfer::read_summary(&p, &known)?;
-
-        // What a Replace would remove, measured here because only the database
-        // can answer it. Against the archive's whole roster, never the ticked
-        // subset: unticking a row means "skip it", so the number the dialog
-        // shows must not move as the user works down the checklist.
-        let roster: Vec<String> =
-            summary.channels.iter().map(|c| c.channel_id.clone()).collect();
-        let (local_only_channels, local_only_videos) = db.absent_from(&roster)?;
-        summary.local_only_channels = local_only_channels;
-        summary.local_only_videos = local_only_videos;
-        Ok(summary)
-    })
-    .await
+    db_blocking(&state, move |db| library_transfer::inspect(db, &p)).await
 }
 
 #[tauri::command]
@@ -795,46 +765,16 @@ pub async fn import_config(
     app: AppHandle,
 ) -> R<ImportReport> {
     let p = std::path::PathBuf::from(path);
-    let emitter = app.clone();
+    let progress = progress_emitter(app.clone(), TransferPhase::Import);
 
-    // Everything outside the database: settings, thumbnails, path re-rooting.
-    let prepared = blocking(move || {
-        transfer::prepare_import(&p, &channel_ids, apply_settings, &|done, total, current| {
-            let _ = emitter.emit(
-                "transfer://progress",
-                TransferProgress {
-                    phase: TransferPhase::Import,
-                    done,
-                    total,
-                    current: current.to_string(),
-                },
-            );
-        })
+    // Off the runtime: extracting thumbnails is disk work, and thousands of
+    // rows in one transaction is the longest the connection lock is ever held.
+    // `prepare_import` takes no lock, so running it in the same closure holds
+    // nothing a poll is waiting for.
+    let report = db_blocking(&state, move |db| {
+        library_transfer::import(db, &p, &channel_ids, mode, apply_settings, &progress)
     })
     .await?;
-
-    // And now the part that has to be atomic. One `Db` call, one transaction:
-    // the connection Mutex is not reentrant, so a loop over several public
-    // methods was never available, and a failure here must leave the library
-    // exactly as it was. Off the runtime: thousands of rows in one transaction
-    // is the longest the connection lock is ever held.
-    let (mut report, prepared) = db_blocking(&state, move |db| {
-        let report = db.apply_import(
-            &prepared.channels,
-            &prepared.videos,
-            mode,
-            &prepared.archive_channel_ids,
-        )?;
-        Ok((report, prepared))
-    })
-    .await?;
-
-    // `db` knows the row counts; `transfer` knows everything that happened
-    // outside SQL. Neither can fill the other's half.
-    report.downloads_relinked = prepared.report.downloads_relinked;
-    report.thumbs_written = prepared.report.thumbs_written;
-    report.settings_applied = prepared.report.settings_applied;
-    report.download_dir_kept = prepared.report.download_dir_kept;
 
     // An imported settings block is a settings save, so the live queue has to
     // hear about a changed limit the same way `save_settings` tells it.

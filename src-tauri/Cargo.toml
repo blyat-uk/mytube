@@ -54,6 +54,10 @@ tar = "0.4"
 lzma-rust2 = "0.21"
 # PATH lookup that knows about PATHEXT on Windows.
 which = "8"
+# The questions `mytube export` / `mytube import` ask in a terminal. Without
+# `fuzzy`, the channel checklist filters by plain substring -- what the import
+# dialog's own filter box does -- and pulls in no matcher crate.
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 
 # The tray. Linux speaks StatusNotifierItem itself (see tray/sni.rs for why
 # Tauri's libayatana-backed tray cannot report a left click); macOS and Windows

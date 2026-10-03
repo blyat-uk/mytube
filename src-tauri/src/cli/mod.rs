@@ -1,11 +1,18 @@
-//! Command-line flags handled before any window exists: `--version` and
-//! `--self-test <dir>`, which CI runs against every release build.
+//! Command-line actions handled before any window exists: `--version`,
+//! `--help`, `--self-test <dir>`, which CI runs against every release build,
+//! and `export` / `import`, Settings → Backup & transfer for a terminal (see
+//! `library`).
 //!
-//! Both run before Tauri, GTK or the single-instance plugin are touched, so
-//! they work on a headless runner and alongside an already-running MyTube. Any
-//! argument list this module does not recognise starts the app normally —
-//! a stray argument (a file manager passing a path, macOS's old `-psn_…`) must
-//! never turn a launch into an error.
+//! All of them run before Tauri, GTK or the single-instance plugin are
+//! touched, so they work on a headless runner, over SSH with no display, and
+//! alongside an already-running MyTube. Any argument list this module does not
+//! recognise starts the app normally — a stray argument (a file manager passing
+//! a path, macOS's old `-psn_…`) must never turn a launch into an error. Once
+//! the first word *is* recognised, though, a mistake after it is a usage error:
+//! `mytube import` asked for the terminal, and a window is no answer to a typo.
+
+mod library;
+mod terminal;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,11 +21,40 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Version,
+    /// `--help`, or a subcommand's: the text to print.
+    Help(&'static str),
     SelfTest(PathBuf),
-    /// `--self-test` with no directory: a usage error, not an app launch —
-    /// CI asked for a test and must not get a window instead.
+    Export(library::ExportArgs),
+    Import(library::ImportArgs),
+    /// Arguments a CLI action cannot run with: a usage error, not an app launch
+    /// — CI asked for a test, or someone typed `mytube import`, and neither
+    /// must get a window instead.
     Usage(String),
 }
+
+const USAGE: &str = concat!(
+    "MyTube ",
+    env!("CARGO_PKG_VERSION"),
+    " — a desktop YouTube subscription feed and downloader
+
+Usage:
+  mytube                    Start the app, or show the window of the one running
+  mytube export [PATH]      Write the library to an archive
+  mytube import FILE        Read an archive into the library
+  mytube --version          Print the version
+  mytube --self-test DIR    Download yt-dlp, ffmpeg and deno into DIR/bin and check them
+
+export and import are Settings → Backup & transfer for a terminal, such as an
+SSH session to the machine MyTube runs on (Linux and macOS). See
+`mytube export --help` and `mytube import --help`."
+);
+
+/// Windows' release build is a GUI-subsystem program, which cmd and PowerShell
+/// do not wait for: a question would be answered by whatever the shell read
+/// next. Checked at run time rather than compiled out, so the parsing and the
+/// questions stay one code path on every OS.
+const NOT_ON_WINDOWS: &str = "mytube export and mytube import are not available on Windows. \
+Use Settings → Backup & transfer in the app instead.";
 
 const SELF_TEST_FILE: &str = "self-test.txt";
 
@@ -33,9 +69,19 @@ pub fn run(args: &[String]) -> Option<i32> {
             say(&format!("mytube {}", env!("CARGO_PKG_VERSION")));
             0
         }
+        Action::Help(text) => {
+            say(text);
+            0
+        }
         Action::SelfTest(dir) => self_test(&dir),
+        Action::Export(_) | Action::Import(_) if cfg!(windows) => {
+            warn(NOT_ON_WINDOWS);
+            2
+        }
+        Action::Export(args) => library::export(args),
+        Action::Import(args) => library::import(args),
         Action::Usage(msg) => {
-            say(&msg);
+            warn(&msg);
             2
         }
     })
@@ -44,6 +90,9 @@ pub fn run(args: &[String]) -> Option<i32> {
 fn parse(args: &[String]) -> Option<Action> {
     match args {
         [flag] if flag == "--version" || flag == "-V" => Some(Action::Version),
+        [flag] if flag == "--help" || flag == "-h" => Some(Action::Help(USAGE)),
+        [cmd, rest @ ..] if cmd == "export" => Some(library::parse_export(rest)),
+        [cmd, rest @ ..] if cmd == "import" => Some(library::parse_import(rest)),
         [flag, dir] if flag == "--self-test" && !dir.is_empty() => {
             Some(Action::SelfTest(PathBuf::from(dir)))
         }
@@ -120,6 +169,14 @@ fn say(line: &str) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// [`say`] on stderr: a question, a warning or an error, which a script that
+/// keeps stdout must not find mixed into the report.
+fn warn(line: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{line}");
+    let _ = err.flush();
 }
 
 /// The release build on Windows is `windows_subsystem = "windows"`, so a
@@ -199,13 +256,42 @@ mod tests {
     }
 
     #[test]
+    fn help_is_printed_rather_than_opening_a_window() {
+        // Over SSH a window is a GTK error, which is no answer to "--help".
+        assert_eq!(parse(&args(&["--help"])), Some(Action::Help(USAGE)));
+        assert_eq!(parse(&args(&["-h"])), Some(Action::Help(USAGE)));
+        assert_eq!(run(&args(&["--help"])), Some(0));
+        for line in ["mytube export", "mytube import", "mytube --version", "mytube --self-test"] {
+            assert!(USAGE.contains(line), "usage mentions {line}");
+        }
+    }
+
+    #[test]
+    fn export_and_import_are_cli_actions_whatever_follows_them() {
+        assert!(matches!(parse(&args(&["export"])), Some(Action::Export(_))));
+        assert!(matches!(parse(&args(&["import", "a.zip"])), Some(Action::Import(_))));
+        // A mistake after the subcommand is a usage error, never a window.
+        assert!(matches!(parse(&args(&["import"])), Some(Action::Usage(_))));
+        assert_eq!(run(&args(&["import"])), Some(2));
+        assert_eq!(run(&args(&["export", "--help"])), Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn export_and_import_are_refused_on_windows() {
+        assert_eq!(run(&args(&["export"])), Some(2));
+        assert_eq!(run(&args(&["import", "a.zip"])), Some(2));
+    }
+
+    #[test]
     fn anything_unrecognised_starts_the_app_normally() {
         for other in [
             &["/home/me/Videos/clip.mkv"][..],
             &["-psn_0_12345"],
             &["--version", "extra"],
             &["--versions"],
-            &["--help"],
+            &["--help", "extra"],
+            &["exports"],
         ] {
             assert_eq!(parse(&args(other)), None, "{other:?}");
         }

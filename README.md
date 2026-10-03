@@ -40,6 +40,22 @@ Downloads go out with the YouTube cookies of a browser you are signed in to (Set
 - **macOS:** the app is not notarized. After copying it to Applications, open it with right-click → Open, or allow it under System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/mytube.app`.
 - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. If the AppImage does not start, install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with `--appimage-extract-and-run`. The tray icon needs a StatusNotifierItem host (built into KDE; GNOME needs the AppIndicator extension).
 
+## Moving your library from a terminal
+
+Settings → Backup & transfer also works with no window at all, for a machine you can only reach over SSH (Linux and macOS). To carry the library at home to a laptop:
+
+```sh
+ssh -t home mytube export                  # writes ~/mytube-export-YYYY-MM-DD.zip on home
+scp 'home:mytube-export-*.zip' .
+mytube import mytube-export-2026-10-02.zip # or Settings → Backup & transfer → Import…
+```
+
+`mytube import` shows what the archive holds and then asks: Merge or Replace, which channels, whether to apply its settings, and finally to confirm. Esc at any question cancels before anything is written. Every question has a flag (`mytube export --help`, `mytube import --help`). With no terminal attached, such as a cron job or `ssh home mytube export` without `-t`, nothing is asked: thumbnails are included, every channel is merged and the settings are applied. `--replace` then needs `--yes` as well.
+
+The command is `mytube` with the `.deb` and `.rpm`, the AppImage file itself (`./mytube-v3.0.0-linux-x86_64.AppImage export`), and `/Applications/mytube.app/Contents/MacOS/mytube` on macOS. On Windows, use Settings → Backup & transfer.
+
+If MyTube is running on the machine you import into, its window shows the import after its next poll.
+
 ## Uninstalling
 
 Uninstalling removes the app but not your data or the tools it downloaded. Delete these folders as well to remove everything:
