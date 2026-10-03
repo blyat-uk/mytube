@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
 import type {
-  BrowserOption, PlayerOption, Settings, ToolStatus, TransferEstimate,
+  BrowserOption, BrowserScan, CookiesFileInfo, PlayerOption, Settings, ToolStatus,
+  TransferEstimate,
 } from "../types";
 import { DEFAULT_QUALITY } from "../quality";
 
@@ -48,11 +49,18 @@ const PLAYERS: PlayerOption[] = [
   { id: "vlc", label: "VLC", command: "vlc" },
 ];
 
-const CHROME_NOTE = "Chrome's cookies can't be read on Windows. Use Firefox or a cookies.txt.";
+const CHROME_NOTE = "yt-dlp cannot read this browser's cookies on Windows. Export a cookies file.";
+const browserOpt = (over: Partial<BrowserOption> & Pick<BrowserOption, "id" | "label">) => ({
+  supported: true, blocked: false, signedIn: false, note: null, ...over,
+});
 const BROWSERS: BrowserOption[] = [
-  { id: "firefox", label: "Firefox", supported: true, note: null },
-  { id: "chrome", label: "Chrome", supported: false, note: CHROME_NOTE },
+  browserOpt({ id: "chrome", label: "Chrome", supported: false, signedIn: null, note: CHROME_NOTE }),
+  browserOpt({ id: "firefox", label: "Firefox" }),
 ];
+const SCAN: BrowserScan = { browsers: BROWSERS, automatic: "firefox", accessHint: null };
+const FILE_INFO: CookiesFileInfo = {
+  format: "JSON cookie export", cookies: 24, skipped: 0, youtube: true, signedIn: true,
+};
 
 const tool = (over: Partial<ToolStatus> & Pick<ToolStatus, "kind">): ToolStatus => ({
   path: null, version: null, source: "missing", state: "ready", error: null, lastCheck: null,
@@ -76,13 +84,16 @@ const TOOLS_BROKEN: ToolStatus[] = [
 
 let settings: Settings = SETTINGS;
 let players: PlayerOption[] = PLAYERS;
-let browsers: BrowserOption[] = BROWSERS;
+let scan: BrowserScan = SCAN;
 let tools: ToolStatus[] = TOOLS_OK;
 
 const saveSettings = vi.fn<(s: Settings) => Promise<void>>(() => Promise.resolve());
 const exportConfig = vi.fn<(p: string, t: boolean) => Promise<void>>(() => Promise.resolve());
 const transferEstimate = vi.fn<() => Promise<TransferEstimate>>(() => Promise.resolve(ESTIMATE));
 const toolsUpdateNow = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve(TOOLS_OK));
+const inspectCookiesFile = vi.fn<(path: string) => Promise<CookiesFileInfo>>(
+  () => Promise.resolve(FILE_INFO),
+);
 
 vi.mock("../api", () => ({
   api: {
@@ -93,7 +104,8 @@ vi.mock("../api", () => ({
     readArchive: () => Promise.resolve(null),
     importConfig: () => Promise.resolve(null),
     detectPlayers: () => Promise.resolve(players),
-    detectBrowsers: () => Promise.resolve(browsers),
+    detectBrowsers: () => Promise.resolve(scan),
+    inspectCookiesFile: (path: string) => inspectCookiesFile(path),
     toolsStatus: () => Promise.resolve(tools),
     toolsUpdateNow: () => toolsUpdateNow(),
     appVersionInfo: () => Promise.resolve({
@@ -130,8 +142,10 @@ beforeEach(() => {
   toolsUpdateNow.mockImplementation(() => Promise.resolve(TOOLS_OK));
   settings = SETTINGS;
   players = PLAYERS;
-  browsers = BROWSERS;
+  scan = SCAN;
   tools = TOOLS_OK;
+  inspectCookiesFile.mockReset();
+  inspectCookiesFile.mockImplementation(() => Promise.resolve(FILE_INFO));
 });
 
 afterEach(() => cleanup());
@@ -292,35 +306,100 @@ describe("Player", () => {
 });
 
 describe("YouTube cookies", () => {
-  it("names what Automatic resolves to", async () => {
+  it("names the browser Automatic resolves to, whichever it is", async () => {
     const select = await cookiesSelect();
     expect(optionTexts(select)[0]).toBe("Automatic (Firefox)");
+    cleanup();
+    scan = {
+      ...SCAN,
+      browsers: [...BROWSERS, browserOpt({ id: "brave", label: "Brave", signedIn: true })],
+      automatic: "brave",
+    };
+    const again = await cookiesSelect();
+    expect(optionTexts(again)[0]).toBe("Automatic (Brave)");
+    expect(optionTexts(again)).toContain("Brave (signed in)");
+    const hint = document.getElementById(again.getAttribute("aria-describedby")!)!;
+    expect(hint.textContent).toContain("Uses Brave, which is signed in to YouTube");
   });
 
-  it("says Automatic finds nothing on a machine with no Firefox", async () => {
-    browsers = [BROWSERS[1]];
+  it("expects no browser in particular when Automatic has nothing to use", async () => {
+    scan = { browsers: [BROWSERS[0]], automatic: null, accessHint: null };
     await renderSettings();
     const select = screen.getByLabelText("YouTube cookies") as HTMLSelectElement;
-    await waitFor(() => expect(optionTexts(select)[0]).toBe("Automatic (none found)"));
+    await waitFor(() => expect(optionTexts(select)[0]).toBe("Automatic (none usable)"));
+    cleanup();
+
+    scan = { browsers: [], automatic: null, accessHint: null };
+    await renderSettings();
+    const empty = screen.getByLabelText("YouTube cookies") as HTMLSelectElement;
+    await waitFor(() => expect(optionTexts(empty)[0]).toBe("Automatic (none found)"));
+    const hint = document.getElementById(empty.getAttribute("aria-describedby")!)!;
+    expect(hint.textContent).toMatch(/^No browser found, so downloads run signed out/);
+    // Nothing on the field presumes a browser the machine does not have.
+    expect(empty.closest(".field")!.textContent).not.toMatch(/Firefox|Chrome|Safari/);
+  });
+
+  it("says when the browser Automatic uses is not signed in to YouTube", async () => {
+    const select = await cookiesSelect();
+    const hint = document.getElementById(select.getAttribute("aria-describedby")!)!;
+    expect(hint.textContent).toBe(
+      "Uses Firefox, the browser used last, but none MyTube can read is signed in to YouTube, so " +
+      "members-only and age-restricted videos will fail to download.",
+    );
   });
 
   it("disables a browser yt-dlp cannot read here and says why", async () => {
     const select = await cookiesSelect();
     const chrome = select.querySelector('option[value="chrome"]') as HTMLOptionElement;
     expect(chrome.disabled).toBe(true);
+    expect(chrome.textContent).toBe("Chrome (not supported here)");
     expect(screen.getByText(CHROME_NOTE, { exact: false })).toBeDefined();
     const firefox = select.querySelector('option[value="firefox"]') as HTMLOptionElement;
     expect(firefox.disabled).toBe(false);
   });
 
-  it("shows the cookies.txt file when one is set, since it wins", async () => {
-    settings = { ...SETTINGS, cookies_browser: "auto", cookies_file: "/home/someone/cookies.txt" };
+  it("marks a browser macOS keeps MyTube out of as no access, and says how to allow it", async () => {
+    const hintText = "Browser missing, or marked “no access”? … Full Disk Access …";
+    scan = {
+      browsers: [browserOpt({
+        id: "firefox", label: "Firefox", supported: false, blocked: true, signedIn: null,
+        note: "macOS is not letting MyTube read it.",
+      })],
+      automatic: null,
+      accessHint: hintText,
+    };
     const select = await cookiesSelect();
-    expect(select.value).toBe("__file");
-    expect(screen.getByText("/home/someone/cookies.txt")).toBeDefined();
+    const firefox = select.querySelector('option[value="firefox"]') as HTMLOptionElement;
+    expect(firefox.disabled).toBe(true);
+    expect(firefox.textContent).toBe("Firefox (no access)");
+    expect(screen.getByText("Firefox: macOS is not letting MyTube read it.")).toBeDefined();
+    expect(screen.getByText(hintText)).toBeDefined();
   });
 
-  it("clears the cookies.txt file when a browser is chosen", async () => {
+  it("shows the cookies file when one is set, since it wins, with what it holds", async () => {
+    settings = { ...SETTINGS, cookies_browser: "auto", cookies_file: "/home/someone/cookies.json" };
+    const select = await cookiesSelect();
+    expect(select.value).toBe("__file");
+    expect(screen.getByText("/home/someone/cookies.json")).toBeDefined();
+    expect(inspectCookiesFile).toHaveBeenCalledWith("/home/someone/cookies.json");
+    const hint = document.getElementById(select.getAttribute("aria-describedby")!)!;
+    await waitFor(() => expect(hint.textContent).toBe(
+      "JSON cookie export, 24 cookies, signed in to YouTube. It is used instead of any browser.",
+    ));
+  });
+
+  it("says why a cookies file already set can no longer be used", async () => {
+    inspectCookiesFile.mockImplementation(
+      () => Promise.reject("The cookies file /home/someone/cookies.txt no longer exists."),
+    );
+    settings = { ...SETTINGS, cookies_browser: "auto", cookies_file: "/home/someone/cookies.txt" };
+    const select = await cookiesSelect();
+    const hint = document.getElementById(select.getAttribute("aria-describedby")!)!;
+    await waitFor(() => expect(hint.textContent)
+      .toBe("The cookies file /home/someone/cookies.txt no longer exists."));
+  });
+
+  it("clears the cookies file when a browser is chosen", async () => {
     settings = { ...SETTINGS, cookies_browser: "auto", cookies_file: "/home/someone/cookies.txt" };
     const select = await cookiesSelect();
     fireEvent.change(select, { target: { value: "firefox" } });
@@ -336,14 +415,27 @@ describe("YouTube cookies", () => {
     expect(lastSaved().cookies_browser).toBe("");
   });
 
-  it("picks a cookies.txt through the file dialog", async () => {
-    openDialog.mockResolvedValueOnce("/home/someone/yt-cookies.txt");
+  it("picks a cookies file of any kind through the file dialog, checked first", async () => {
+    openDialog.mockResolvedValueOnce("/home/someone/yt-cookies.json");
     const select = await cookiesSelect();
     fireEvent.change(select, { target: { value: "__file" } });
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
-    const opts = openDialog.mock.calls[0][0] as { filters: { extensions: string[] }[] };
-    expect(opts.filters[0].extensions).toEqual(["txt"]);
-    expect(lastSaved().cookies_file).toBe("/home/someone/yt-cookies.txt");
+    const opts = openDialog.mock.calls[0][0] as { filters?: unknown };
+    expect(opts.filters).toBeUndefined();
+    expect(inspectCookiesFile).toHaveBeenCalledWith("/home/someone/yt-cookies.json");
+    expect(lastSaved().cookies_file).toBe("/home/someone/yt-cookies.json");
+  });
+
+  it("refuses a file it cannot read, says why, and saves nothing", async () => {
+    const why = "notes.txt can't be used as a cookies file: it is not a Netscape cookies.txt, " +
+      "a JSON cookie export, or a list of name=value pairs.";
+    inspectCookiesFile.mockImplementation(() => Promise.reject(why));
+    openDialog.mockResolvedValueOnce("/home/someone/notes.txt");
+    const select = await cookiesSelect();
+    fireEvent.change(select, { target: { value: "__file" } });
+    expect(await screen.findByText(why)).toBeDefined();
+    expect(saveSettings).not.toHaveBeenCalled();
+    expect(select.value).toBe("auto");
   });
 
   it("changes nothing when the file dialog is dismissed", async () => {
@@ -351,6 +443,7 @@ describe("YouTube cookies", () => {
     fireEvent.change(select, { target: { value: "__file" } });
     await waitFor(() => expect(openDialog).toHaveBeenCalled());
     expect(saveSettings).not.toHaveBeenCalled();
+    expect(inspectCookiesFile).not.toHaveBeenCalled();
     expect(select.value).toBe("auto");
   });
 

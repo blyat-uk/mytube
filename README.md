@@ -32,12 +32,13 @@ MyTube uses three programs it does not ship: **yt-dlp**, **ffmpeg** and **deno**
 
 Unpacked, all three take roughly 500 MB on disk (the static ffmpeg and ffprobe builds are about 350 MB of that). Any tool already on your system is used instead and not downloaded. Settings → Tools shows where each one came from; yt-dlp keeps itself up to date once a day.
 
-Downloads go out with the YouTube cookies of a browser you are signed in to (Settings → YouTube cookies; Automatic picks Firefox when it finds a profile). That is what reaches members-only videos and keeps YouTube's bot checks at bay. Firefox works on every OS and is the recommendation. Chrome, Edge and other Chromium browsers cannot be read on Windows; on macOS they ask for Keychain access. A `cookies.txt` file works everywhere.
+Downloads go out with the YouTube cookies of a browser you are signed in to (Settings → YouTube cookies). Automatic uses whichever browser on the machine is signed in to YouTube, or the one used most recently when none is, and the list marks which are signed in. That is what reaches members-only videos and keeps YouTube's bot checks at bay. On Windows, yt-dlp cannot read Chrome, Edge or other Chromium browsers; on macOS they ask for Keychain access. A cookies file exported from any browser works everywhere: a Netscape `cookies.txt`, a JSON export (Cookie-Editor, EditThisCookie, Cookie Quick Manager, Playwright, Selenium), or a `name=value; …` cookie header. MyTube reads it, tells you what it found, and gives yt-dlp its own copy, so your file is never modified.
 
 ## Platform notes
 
 - **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
 - **macOS:** the app is not notarized. After copying it to Applications, open it with right-click → Open, or allow it under System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/mytube.app`.
+- **macOS 27 and browser cookies:** macOS 27 keeps every other app out of the data of Firefox, Chrome, Brave and Edge, so Settings lists them as "no access" (Safari's cookies have always needed the same). Turn MyTube on under System Settings → Privacy & Security → Full Disk Access and restart it, or use a cookies file. The per-browser switch macOS adds under Files & Folders does not stick: it lasts only until MyTube quits. MyTube is ad-hoc signed, so macOS ties Full Disk Access to one exact build; after an update, switch it off and on again (or remove MyTube from the list and add it back).
 - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. If the AppImage does not start, install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with `--appimage-extract-and-run`. The tray icon needs a StatusNotifierItem host (built into KDE; GNOME needs the AppIndicator extension).
 
 ## Moving your library from a terminal

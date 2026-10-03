@@ -205,9 +205,24 @@ impl Tools {
     }
 
     /// Resolves yt-dlp, ffmpeg and deno for `s` and takes a lease. An `Err`
-    /// reads "yt-dlp is not available yet: <why>".
+    /// reads "yt-dlp is not available yet: <why>", or says why the cookies
+    /// file cannot be used.
+    ///
+    /// Settling the cookies reads a browser's profile folder or the cookies
+    /// file and may write the copy yt-dlp is given, so it runs on the blocking
+    /// pool: a home on a network mount must not stall a runtime worker.
     pub async fn ytdlp(&self, s: &Settings) -> Result<Invocation> {
-        self.invocation(s, crate::detect::resolve_cookies(s)).await
+        let owned = s.clone();
+        let cookies = tokio::task::spawn_blocking(move || crate::detect::resolve_cookies(&owned)).await??;
+        self.invocation(s, cookies).await
+    }
+
+    /// [`Tools::ytdlp`] for a run that sends no cookies -- a channel listing
+    /// (see `ytdlp::flat_playlist`) -- so a poll never opens a browser's
+    /// profile, which on macOS 27 is a permission check per channel, and a
+    /// broken cookies file cannot fail it.
+    pub async fn ytdlp_without_cookies(&self, s: &Settings) -> Result<Invocation> {
+        self.invocation(s, Cookies::None).await
     }
 
     /// [`Tools::ytdlp`] with the cookie source already decided -- the part

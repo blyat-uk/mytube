@@ -1414,7 +1414,7 @@ h3.field-label { font-size: inherit; letter-spacing: normal; }
 /* A label naming a select is a <label>, which is inline by default. */
 label.field-label { display: block; }
 
-/* Pickers wear their value, and the longest ("Automatic (Firefox)", a
+/* Pickers wear their value, and the longest ("Automatic (none usable)", a
    flatpak player's name) should not be cut off -- nor stretch to the page's
    full width the way a path field does. */
 .settings-select { min-width: 220px; max-width: 100%; }
@@ -1430,8 +1430,9 @@ label.field-label { display: block; }
   color: var(--text);
   word-break: break-all;
 }
-.field .cookies-unsupported { margin-top: 4px; }
-.field .cookies-unsupported:first-of-type { margin-top: 6px; }
+.field .cookies-note { margin-top: 4px; }
+.field .cookies-note:first-of-type { margin-top: 6px; }
+.cookies-error { color: #ffb9ba; }
 
 /* ------------------------------------------------------------------ *
  * Tools

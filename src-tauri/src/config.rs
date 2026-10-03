@@ -22,8 +22,9 @@ fn d_filename_template() -> String {
 fn d_player_command() -> String {
     String::new()
 }
-/// `auto` resolves at call time to Firefox when a Firefox profile exists and to
-/// no cookies otherwise; see `detect::resolve_cookies`.
+/// `auto` resolves at call time to the browser signed in to YouTube (else the
+/// one used last), and to no cookies when none can be read; see
+/// `detect::resolve_cookies`.
 fn d_cookies_browser() -> String {
     COOKIES_AUTO.into()
 }
@@ -172,7 +173,9 @@ pub struct Settings {
     /// (`firefox`, `chrome:Profile 1`). Machine-local: never exported.
     #[serde(default = "d_cookies_browser")]
     pub cookies_browser: String,
-    /// A Netscape cookies.txt. Non-empty wins over `cookies_browser`.
+    /// A cookies file in any shape `cookie_file::parse` reads (Netscape,
+    /// JSON, name=value pairs). Non-empty wins over `cookies_browser`. yt-dlp
+    /// is given a copy, never this file.
     #[serde(default)]
     pub cookies_file: String,
     /// `nightly` or `stable`; anything else is repaired to nightly on load.

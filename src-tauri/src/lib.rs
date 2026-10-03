@@ -2,6 +2,7 @@ pub mod app_update;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod cookie_file;
 pub mod db;
 pub mod detect;
 pub mod library_transfer;
@@ -189,6 +190,7 @@ pub fn run() {
             commands::import_config,
             commands::detect_players,
             commands::detect_browsers,
+            commands::inspect_cookies_file,
             commands::tools_status,
             commands::tools_update_now,
             commands::app_version_info,

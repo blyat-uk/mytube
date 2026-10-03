@@ -84,9 +84,10 @@ fn listing_limit(pending: usize, backfill: u32) -> u32 {
 /// The settings are re-read for each listing so a changed tool override takes
 /// effect on the next poll. The invocation's lease is held until the listing
 /// has finished, which is what keeps the updater from swapping yt-dlp under it;
-/// a yt-dlp that is not available yet is an ordinary listing failure.
+/// a yt-dlp that is not available yet is an ordinary listing failure. A
+/// listing sends no cookies, so none are resolved for it.
 async fn listing(tools: &Tools, channel_id: &str, limit: u32) -> Result<Vec<FlatEntry>> {
-    let inv = tools.ytdlp(&config::load().unwrap_or_default()).await?;
+    let inv = tools.ytdlp_without_cookies(&config::load().unwrap_or_default()).await?;
     ytdlp::flat_playlist(&inv, channel_id, limit).await
 }
 

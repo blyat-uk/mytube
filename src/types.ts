@@ -100,10 +100,12 @@ export interface Settings {
   quality: Quality;
   /* Machine-local keys, never exported. Always present: `#[serde(default)]`
    * fills each one before the object ever crosses the IPC boundary. */
-  /** `"auto"` (Firefox if a profile exists, else none), `""` for none, or a
-   *  `--cookies-from-browser` spec verbatim (`firefox`, `chrome:Profile 1`). */
+  /** `"auto"` (the browser signed in to YouTube, else the one used last; see
+   *  `BrowserScan.automatic`), `""` for none, or a `--cookies-from-browser`
+   *  spec verbatim (`chrome`, `firefox:work`). */
   cookies_browser: string;
-  /** A Netscape cookies.txt. Non-empty wins over `cookies_browser`. */
+  /** A cookies file in any shape `inspect_cookies_file` reads: Netscape, JSON
+   *  or name=value pairs. Non-empty wins over `cookies_browser`. */
   cookies_file: string;
   /** `"nightly"` or `"stable"`; anything else reads as nightly. */
   ytdlp_channel: string;
@@ -188,7 +190,8 @@ export interface VersionInfo {
   checksEnabled: boolean;
 }
 
-/** The `cookies_browser` value meaning "Firefox if there is one, else none". */
+/** The `cookies_browser` value meaning "whichever browser is signed in to
+ *  YouTube" -- resolved by the backend, named in `BrowserScan.automatic`. */
 export const COOKIES_AUTO = "auto";
 
 export interface PollSummary {
@@ -295,8 +298,35 @@ export interface ToolProgress {
  *  the "System default" entry, always first, has `""`. */
 export interface PlayerOption { id: string; label: string; command: string; }
 
-/** A browser whose cookies yt-dlp could read. `supported` is false where it
- *  cannot on this OS; `note` says why, or what the OS will ask for. */
+/** A browser whose data is on this machine. `supported` is false where
+ *  choosing it cannot work: yt-dlp cannot read it on this OS, or it is
+ *  `blocked` -- the OS refuses MyTube its data, as macOS 27 does for Firefox,
+ *  Chrome, Brave and Edge. `note` says why, or what the OS will ask for. */
 export interface BrowserOption {
-  id: string; label: string; supported: boolean; note: string | null;
+  id: string; label: string; supported: boolean; blocked: boolean;
+  /** Whether the cookies yt-dlp would read hold a YouTube sign-in; null where
+   *  MyTube cannot look. */
+  signedIn: boolean | null;
+  note: string | null;
+}
+
+/** What the cookies field is drawn from (`detect_browsers`). */
+export interface BrowserScan {
+  browsers: BrowserOption[];
+  /** The id Automatic resolves to right now; null when no browser can be used. */
+  automatic: string | null;
+  /** How to let MyTube see a browser the OS hides from it; macOS only. */
+  accessHint: string | null;
+}
+
+/** What a cookies file holds (`inspect_cookies_file`). */
+export interface CookiesFileInfo {
+  /** Which shape it was in, worded for the hint ("JSON cookie export"). */
+  format: string;
+  cookies: number;
+  /** Entries that were there but could not be read as a cookie. */
+  skipped: number;
+  /** Whether any cookie is for youtube.com at all. */
+  youtube: boolean;
+  signedIn: boolean;
 }

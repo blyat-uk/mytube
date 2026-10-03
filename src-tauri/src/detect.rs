@@ -8,9 +8,10 @@
 //! into a Windows path. Nothing here spawns a process.
 
 use crate::config::{Settings, COOKIES_AUTO};
-use crate::models::{BrowserOption, PlayerOption};
+use crate::cookie_file::{self, YOUTUBE_LOGIN_COOKIES};
+use crate::models::{BrowserOption, BrowserScan, PlayerOption};
 use crate::ytdlp::Cookies;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -48,6 +49,14 @@ pub trait Env {
     /// An environment variable; set-but-empty reads as unset.
     fn var(&self, name: &str) -> Option<String>;
     fn home(&self) -> Option<String>;
+    /// When `path` was last written, in milliseconds since the epoch.
+    fn modified(&self, path: &str) -> Option<u64>;
+    /// Whether `path` is there but this process is refused it -- what macOS
+    /// 27 answers for another browser's data (see [`blocked_note`]).
+    fn denied(&self, path: &str) -> bool;
+    /// Whether the cookie database at `db` holds a YouTube sign-in; `None`
+    /// when it cannot be read. See [`youtube_login_in`].
+    fn youtube_login(&self, db: &str, schema: CookieDb) -> Option<bool>;
 }
 
 /// The machine MyTube is running on.
@@ -73,6 +82,18 @@ impl Env for RealEnv {
     }
     fn home(&self) -> Option<String> {
         dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
+    }
+    fn modified(&self, path: &str) -> Option<u64> {
+        let t = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+    }
+    fn denied(&self, path: &str) -> bool {
+        // EPERM and EACCES both land here. macOS 27 lets the folder be
+        // stat'ed and refuses the listing, so a listing is what is asked.
+        matches!(std::fs::read_dir(path), Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+    fn youtube_login(&self, db: &str, schema: CookieDb) -> Option<bool> {
+        youtube_login_in(db, schema)
     }
 }
 
@@ -297,9 +318,68 @@ fn windows_players(env: &dyn Env, out: &mut Vec<PlayerOption>) {
 
 // --------------------------------------------------------------- browsers
 
-/// Browsers whose profile data exists, in yt-dlp's own paths.
-pub fn detect_browsers() -> Vec<BrowserOption> {
-    browsers_for(Os::current(), &RealEnv)
+/// Browsers whose profile data exists, in yt-dlp's own paths, and which of
+/// them Automatic would use.
+pub fn detect_browsers() -> BrowserScan {
+    scan_browsers(Os::current(), &RealEnv)
+}
+
+/// Which of the two cookie-database schemas a browser keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieDb {
+    /// `moz_cookies`, keyed by `host`.
+    Firefox,
+    /// `cookies`, keyed by `host_key`.
+    Chromium,
+}
+
+/// Whether the cookie database at `db` holds a YouTube sign-in
+/// ([`YOUTUBE_LOGIN_COOKIES`] on youtube.com); `None` when it cannot be read.
+/// Only names and hosts are read -- both stored in the clear by every browser,
+/// so nothing is decrypted and macOS asks for no Keychain access.
+///
+/// Opened `immutable=1`: SQLite then takes no lock and writes nothing beside
+/// the file, so a running browser is never disturbed. That also leaves out
+/// whatever still sits in the browser's `-wal`, which is what yt-dlp sees too:
+/// it copies the database file alone before reading it.
+fn youtube_login_in(db: &str, schema: CookieDb) -> Option<bool> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn = Connection::open_with_flags(
+        sqlite_uri(db),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let (table, host) = match schema {
+        CookieDb::Firefox => ("moz_cookies", "host"),
+        CookieDb::Chromium => ("cookies", "host_key"),
+    };
+    let names = vec!["?"; YOUTUBE_LOGIN_COOKIES.len()].join(", ");
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {table} \
+         WHERE ({host} = 'youtube.com' OR {host} LIKE '%.youtube.com') AND name IN ({names}))"
+    );
+    conn.query_row(&sql, rusqlite::params_from_iter(YOUTUBE_LOGIN_COOKIES), |r| r.get(0)).ok()
+}
+
+/// `path` as an SQLite URI, which `immutable` needs: `file:///…`, with a
+/// Windows drive path given its leading slash and every byte a URI could
+/// misread percent-encoded (a profile named `Profile #1?` is legal).
+fn sqlite_uri(path: &str) -> String {
+    let mut p = path.replace('\\', "/");
+    if !p.starts_with('/') {
+        p.insert(0, '/');
+    }
+    let mut out = String::from("file://");
+    for b in p.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out.push_str("?immutable=1");
+    out
 }
 
 /// yt-dlp's `_config_home()`: `$XDG_CONFIG_HOME`, else `~/.config`. (yt-dlp
@@ -343,26 +423,47 @@ fn firefox_roots(os: Os, env: &dyn Env) -> Vec<String> {
     }
 }
 
+/// A cookie database, and when it was last written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Db {
+    path: String,
+    modified: u64,
+}
+
+/// The most recently written of `candidates` that exist -- how yt-dlp picks
+/// between profiles (`_newest`, `_find_most_recently_used_file`), so the
+/// database read here is the one it will read.
+fn newest(env: &dyn Env, candidates: Vec<String>) -> Option<Db> {
+    candidates
+        .into_iter()
+        .filter(|p| env.is_file(p))
+        .map(|p| Db { modified: env.modified(&p).unwrap_or(0), path: p })
+        .fold(None, |best, d| match best {
+            Some(b) if b.modified >= d.modified => Some(b),
+            _ => Some(d),
+        })
+}
+
 /// yt-dlp's `_firefox_cookie_dbs()`: `cookies.sqlite` at `<root>/`,
 /// `<root>/*/` or `<root>/Profiles/*/`. A root that exists but holds no
 /// cookie database is exactly what yt-dlp fails on ("could not find firefox
 /// cookies database"), so the directory alone does not count. Python's glob
 /// `*` skips dot-names, and so does this.
-fn firefox_has_cookies(os: Os, env: &dyn Env) -> bool {
-    let db = "cookies.sqlite";
-    let in_children = |dir: &str| {
-        env.list_dir(dir)
-            .iter()
-            .filter(|n| !n.starts_with('.'))
-            .any(|n| env.is_file(&join(os, &join(os, dir, n), db)))
-    };
-    firefox_roots(os, env).iter().any(|root| {
-        env.is_file(&join(os, root, db)) || in_children(root) || in_children(&join(os, root, "Profiles"))
-    })
+fn firefox_db(os: Os, env: &dyn Env) -> Option<Db> {
+    let file = "cookies.sqlite";
+    let mut candidates = Vec::new();
+    for root in firefox_roots(os, env) {
+        candidates.push(join(os, &root, file));
+        for dir in [root.clone(), join(os, &root, "Profiles")] {
+            for n in env.list_dir(&dir).into_iter().filter(|n| !n.starts_with('.')) {
+                candidates.push(join(os, &join(os, &dir, &n), file));
+            }
+        }
+    }
+    newest(env, candidates)
 }
 
-/// The Chromium family in the order the Settings view lists them:
-/// (`--cookies-from-browser` name, label).
+/// The Chromium family: (`--cookies-from-browser` name, label).
 const CHROMIUM_BROWSERS: &[(&str, &str)] = &[
     ("chrome", "Chrome"),
     ("chromium", "Chromium"),
@@ -419,91 +520,196 @@ fn chromium_dir(os: Os, env: &dyn Env, browser: &str) -> Option<String> {
     }
 }
 
-/// Whether a Chromium `Cookies` database sits where one lives: in the data
-/// dir itself or its `Network/` (Opera keeps no profiles), or in a profile
-/// dir (`Default`, `Profile 1`, …) or its `Network/`. yt-dlp walks the whole
-/// tree for the newest `Cookies`; every real layout keeps it at one of these
+/// The newest Chromium `Cookies` database where one lives: in the data dir
+/// itself or its `Network/` (Opera keeps no profiles), or in a profile dir
+/// (`Default`, `Profile 1`, …) or its `Network/`. yt-dlp walks the whole tree
+/// for the newest `Cookies`; every real layout keeps it at one of these
 /// depths, and a bounded look keeps detection from walking gigabytes of cache.
-fn chromium_has_cookies(os: Os, env: &dyn Env, dir: &str) -> bool {
-    let here = |d: &str| env.is_file(&join(os, d, "Cookies")) || env.is_file(&join(os, d, "Network/Cookies"));
-    here(dir) || env.list_dir(dir).iter().any(|n| here(&join(os, dir, n)))
+fn chromium_db(os: Os, env: &dyn Env, dir: &str) -> Option<Db> {
+    let here = |d: &str| [join(os, d, "Cookies"), join(os, d, "Network/Cookies")];
+    let mut candidates: Vec<String> = here(dir).into();
+    for n in env.list_dir(dir) {
+        candidates.extend(here(&join(os, dir, &n)));
+    }
+    newest(env, candidates)
 }
 
-/// yt-dlp's two Safari cookie files. Without Full Disk Access the sandboxed
-/// container is invisible to MyTube as much as to yt-dlp, which is exactly the
-/// case the note is for, so Safari is also listed when the app itself is there.
-fn safari_present(env: &dyn Env) -> bool {
-    let files = env.home().map(|h| {
-        [
-            join(Os::MacOs, &h, "Library/Cookies/Cookies.binarycookies"),
-            join(Os::MacOs, &h, "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"),
-        ]
-    });
-    files.is_some_and(|fs| fs.iter().any(|f| env.is_file(f))) || env.is_dir("/Applications/Safari.app")
+/// yt-dlp's two Safari cookie files, which only Full Disk Access makes
+/// visible -- to MyTube as much as to yt-dlp.
+fn safari_db(env: &dyn Env) -> Option<Db> {
+    let h = env.home()?;
+    newest(env, vec![
+        join(Os::MacOs, &h, "Library/Cookies/Cookies.binarycookies"),
+        join(Os::MacOs, &h, "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"),
+    ])
 }
 
 const NOTE_WINDOWS_CHROMIUM: &str = "yt-dlp cannot read this browser's cookies on Windows \
-    (app-bound encryption). Use Firefox, or export a cookies.txt file.";
+    (app-bound encryption). Export a cookies file from it instead.";
 const NOTE_MACOS_CHROMIUM: &str = "macOS will ask to allow Keychain access.";
-const NOTE_SAFARI: &str = "Needs Full Disk Access for MyTube \
-    (System Settings → Privacy & Security → Full Disk Access).";
 
-pub(crate) fn browsers_for(os: Os, env: &dyn Env) -> Vec<BrowserOption> {
-    let mut out = Vec::new();
-    if firefox_has_cookies(os, env) {
-        out.push(BrowserOption { id: "firefox".into(), label: "Firefox".into(), supported: true, note: None });
+/// Why a browser whose data is there is marked "no access". macOS 27 keeps
+/// every other app out of the Application Support folders of Firefox,
+/// Chrome, Brave and Edge (among others) -- the open fails with EPERM even
+/// though the folder can be seen -- and Safari's cookies have always needed
+/// Full Disk Access; [`MACOS_ACCESS_HINT`] says what to do about it.
+fn blocked_note(os: Os) -> &'static str {
+    match os {
+        Os::MacOs => "macOS is not letting MyTube read it.",
+        _ => "MyTube is not allowed to read its profile folder.",
     }
-    if os == Os::MacOs && safari_present(env) {
-        out.push(BrowserOption {
-            id: "safari".into(),
-            label: "Safari".into(),
-            supported: true,
-            note: Some(NOTE_SAFARI.into()),
+}
+
+/// Said under the cookies list on every Mac: a browser macOS hides from
+/// MyTube may not show up at all, and the fix is in System Settings.
+///
+/// The per-app switch macOS 27 adds under Files & Folders (MyTube →
+/// Firefox.app) is no answer: seen on 27.0.1 to be off again at MyTube's next
+/// launch, which is Apple's stated design for consent to another app's data --
+/// "transient, process lifetime", every new pid asks again (DTS,
+/// developer.apple.com/forums/thread/742147). Full Disk Access is the grant
+/// that persists -- until an update, since TCC identifies an ad-hoc signed
+/// app by the hash of the very build.
+const MACOS_ACCESS_HINT: &str = "Browser missing, or marked “no access”? macOS lets MyTube \
+    read another app's data only with Full Disk Access: System Settings → Privacy & Security → \
+    Full Disk Access → MyTube, then restart MyTube. After updating MyTube, switch it off and on \
+    again. A cookies file needs no permission at all.";
+
+/// One browser as this machine has it.
+struct Found {
+    id: &'static str,
+    label: &'static str,
+    /// `None` for Safari, whose binary cookie format is not looked into.
+    schema: Option<CookieDb>,
+    db: Option<Db>,
+    /// Its data is there, but the OS refuses MyTube it.
+    blocked: bool,
+    /// Whether yt-dlp can read this browser on this OS at all.
+    readable: bool,
+    note: Option<&'static str>,
+    /// Whether `db` holds a YouTube sign-in; looked up once, by [`scan`].
+    signed_in: Option<bool>,
+}
+
+/// Every browser whose data is on this machine, readable or not.
+fn scan(os: Os, env: &dyn Env) -> Vec<Found> {
+    let mut out = Vec::new();
+    let db = firefox_db(os, env);
+    let blocked = db.is_none() && firefox_roots(os, env).iter().any(|r| env.denied(r));
+    if db.is_some() || blocked {
+        out.push(Found {
+            id: "firefox", label: "Firefox", schema: Some(CookieDb::Firefox), db, blocked,
+            readable: true, note: None, signed_in: None,
         });
+    }
+    if os == Os::MacOs {
+        // Without Full Disk Access neither file can be seen, so Safari being
+        // installed at all is what puts it in the list -- as "no access".
+        let db = safari_db(env);
+        if db.is_some() || env.is_dir("/Applications/Safari.app") {
+            out.push(Found {
+                id: "safari", label: "Safari", schema: None, blocked: db.is_none(), db,
+                readable: true, note: None, signed_in: None,
+            });
+        }
     }
     for (id, label) in CHROMIUM_BROWSERS {
         let Some(dir) = chromium_dir(os, env, id) else { continue };
-        if !chromium_has_cookies(os, env, &dir) {
+        let db = chromium_db(os, env, &dir);
+        let blocked = db.is_none() && env.denied(&dir);
+        if db.is_none() && !blocked {
             continue;
         }
-        let (supported, note) = match os {
+        let (readable, note) = match os {
             Os::Windows => (false, Some(NOTE_WINDOWS_CHROMIUM)),
             Os::MacOs => (true, Some(NOTE_MACOS_CHROMIUM)),
             Os::Linux => (true, None),
         };
-        out.push(BrowserOption {
-            id: (*id).into(),
-            label: (*label).into(),
-            supported,
-            note: note.map(String::from),
+        out.push(Found {
+            id, label, schema: Some(CookieDb::Chromium), db, blocked, readable, note, signed_in: None,
         });
     }
+    for f in &mut out {
+        f.signed_in = match (&f.db, f.schema) {
+            (Some(db), Some(schema)) if f.usable() => env.youtube_login(&db.path, schema),
+            _ => None,
+        };
+    }
+    // Alphabetical: the list is a choice, not a ranking.
+    out.sort_by_key(|f| f.label);
     out
+}
+
+impl Found {
+    /// Whether choosing it can work: yt-dlp reads it here and MyTube can see it.
+    fn usable(&self) -> bool {
+        self.readable && !self.blocked && self.db.is_some()
+    }
+}
+
+/// What Automatic resolves to: of the browsers that can be used, one signed
+/// in to YouTube, and between several -- or none -- the one used last, whose
+/// cookie database was written most recently. No browser is preferred over
+/// another for what it is; the only question is where your YouTube session is.
+fn automatic(found: &[Found]) -> Option<&Found> {
+    found
+        .iter()
+        .filter(|f| f.usable())
+        .map(|f| (f, (f.signed_in == Some(true), f.db.as_ref().map_or(0, |d| d.modified))))
+        .fold(None, |best: Option<(&Found, (bool, u64))>, cur| match best {
+            Some(b) if b.1 >= cur.1 => Some(b),
+            _ => Some(cur),
+        })
+        .map(|(f, _)| f)
+}
+
+pub(crate) fn scan_browsers(os: Os, env: &dyn Env) -> BrowserScan {
+    let found = scan(os, env);
+    let browsers = found
+        .iter()
+        .map(|f| BrowserOption {
+            id: f.id.into(),
+            label: f.label.into(),
+            supported: f.readable && !f.blocked,
+            blocked: f.blocked,
+            signed_in: f.signed_in,
+            note: if f.blocked { Some(blocked_note(os)) } else { f.note }.map(String::from),
+        })
+        .collect();
+    BrowserScan {
+        browsers,
+        automatic: automatic(&found).map(|f| f.id.to_string()),
+        access_hint: (os == Os::MacOs).then(|| MACOS_ACCESS_HINT.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------- cookies
 
-/// The cookie source a yt-dlp run should use for these settings:
-/// `cookies_file` wins; `auto` is Firefox when a Firefox profile exists, else
-/// none; `""` is none; anything else is a browser spec verbatim.
-pub fn resolve_cookies(s: &Settings) -> Cookies {
-    resolve_cookies_for(s, Os::current(), &RealEnv)
+/// The cookie source for a yt-dlp run that sends cookies: the cookies file
+/// when one is set -- as the copy [`cookie_file::prepare`] makes of it -- else
+/// `cookies_browser`, where `auto` is [`automatic`]'s pick and `""` is none.
+/// An `Err` is a cookies file that cannot be used, which fails the run
+/// rather than letting it go out signed out without a word.
+pub fn resolve_cookies(s: &Settings) -> anyhow::Result<Cookies> {
+    resolve_cookies_in(s, Os::current(), &RealEnv, &cookie_file::store_dir())
 }
 
-/// `auto` asks for exactly what yt-dlp will look for — a Firefox cookie
-/// database — because `--cookies-from-browser firefox` on a machine without
-/// one fails every download rather than degrading to no cookies.
-pub(crate) fn resolve_cookies_for(s: &Settings, os: Os, env: &dyn Env) -> Cookies {
+/// `auto` asks for a browser that is really there and readable, because a
+/// `--cookies-from-browser` naming one that is not fails every download
+/// rather than degrading to no cookies.
+pub(crate) fn resolve_cookies_in(s: &Settings, os: Os, env: &dyn Env, store: &Path) -> anyhow::Result<Cookies> {
     let file = s.cookies_file.trim();
     if !file.is_empty() {
-        return Cookies::File(PathBuf::from(file));
+        return cookie_file::prepare(Path::new(file), store).map(Cookies::File);
     }
-    match s.cookies_browser.trim() {
+    Ok(match s.cookies_browser.trim() {
         "" => Cookies::None,
-        COOKIES_AUTO if firefox_has_cookies(os, env) => Cookies::Browser("firefox".into()),
-        COOKIES_AUTO => Cookies::None,
+        COOKIES_AUTO => match automatic(&scan(os, env)) {
+            Some(f) => Cookies::Browser(f.id.into()),
+            None => Cookies::None,
+        },
         spec => Cookies::Browser(spec.into()),
-    }
+    })
 }
 
 // ------------------------------------------------------------------ tests
@@ -512,7 +718,7 @@ pub(crate) fn resolve_cookies_for(s: &Settings, os: Os, env: &dyn Env) -> Cookie
 /// named explicitly), a PATH, environment variables and a home.
 #[cfg(test)]
 pub(crate) mod fake {
-    use super::{Env, Os};
+    use super::{CookieDb, Env, Os};
     use std::collections::{BTreeSet, HashMap};
 
     pub struct FakeEnv {
@@ -522,6 +728,13 @@ pub(crate) mod fake {
         pub path: HashMap<String, String>,
         pub vars: HashMap<String, String>,
         pub home: Option<String>,
+        /// Modification times; a file not in here reads as 0.
+        pub mtimes: HashMap<String, u64>,
+        /// Cookie databases holding a YouTube sign-in.
+        pub logins: BTreeSet<String>,
+        /// Directories this process is refused: everything at or under one
+        /// is invisible, the way macOS 27 hides a browser's data.
+        pub refused: BTreeSet<String>,
     }
 
     impl FakeEnv {
@@ -533,7 +746,28 @@ pub(crate) mod fake {
                 path: HashMap::new(),
                 vars: HashMap::new(),
                 home: Some(home.into()),
+                mtimes: HashMap::new(),
+                logins: BTreeSet::new(),
+                refused: BTreeSet::new(),
             }
+        }
+        /// A file last written at `t`.
+        pub fn file_at(mut self, p: &str, t: u64) -> Self {
+            self.mtimes.insert(p.into(), t);
+            self.file(p)
+        }
+        /// A cookie database holding a YouTube sign-in.
+        pub fn login(mut self, p: &str) -> Self {
+            self.logins.insert(p.into());
+            self.file(p)
+        }
+        /// A directory this process may not read.
+        pub fn refuse(mut self, p: &str) -> Self {
+            self.refused.insert(p.into());
+            self
+        }
+        fn hidden(&self, p: &str) -> bool {
+            self.refused.iter().any(|d| p == d || p.starts_with(&format!("{d}{}", self.sep())))
         }
         pub fn file(mut self, p: &str) -> Self {
             self.files.insert(p.into());
@@ -573,12 +807,15 @@ pub(crate) mod fake {
 
     impl Env for FakeEnv {
         fn is_file(&self, path: &str) -> bool {
-            self.files.contains(path)
+            self.files.contains(path) && !self.hidden(path)
         }
         fn is_dir(&self, path: &str) -> bool {
             self.all_dirs().contains(path)
         }
         fn list_dir(&self, path: &str) -> Vec<String> {
+            if self.hidden(path) {
+                return Vec::new();
+            }
             let prefix = format!("{path}{}", self.sep());
             let mut names: BTreeSet<String> = BTreeSet::new();
             for p in self.files.iter().chain(self.all_dirs().iter()) {
@@ -598,6 +835,15 @@ pub(crate) mod fake {
         }
         fn home(&self) -> Option<String> {
             self.home.clone()
+        }
+        fn modified(&self, path: &str) -> Option<u64> {
+            self.is_file(path).then(|| self.mtimes.get(path).copied().unwrap_or(0))
+        }
+        fn denied(&self, path: &str) -> bool {
+            self.hidden(path) && (self.files.contains(path) || self.all_dirs().contains(path))
+        }
+        fn youtube_login(&self, db: &str, _schema: CookieDb) -> Option<bool> {
+            self.is_file(db).then(|| self.logins.contains(db))
         }
     }
 }
@@ -759,6 +1005,13 @@ mod tests {
 
     // -- browsers
 
+    fn scanned(os: Os, env: &FakeEnv) -> BrowserScan {
+        scan_browsers(os, env)
+    }
+    fn browser<'a>(scan: &'a BrowserScan, id: &str) -> &'a BrowserOption {
+        scan.browsers.iter().find(|b| b.id == id).unwrap_or_else(|| panic!("no {id}"))
+    }
+
     #[test]
     fn linux_firefox_is_found_in_every_directory_yt_dlp_reads() {
         for db in [
@@ -771,7 +1024,7 @@ mod tests {
             "/home/u/.mozilla/firefox/cookies.sqlite",
         ] {
             let env = FakeEnv::new(Os::Linux, H).file(db);
-            assert_eq!(bids(&browsers_for(Os::Linux, &env)), ["firefox"], "{db}");
+            assert_eq!(bids(&scanned(Os::Linux, &env).browsers), ["firefox"], "{db}");
         }
     }
 
@@ -781,7 +1034,7 @@ mod tests {
             .file("/home/u/.mozilla/firefox/profiles.ini")
             .file("/home/u/.mozilla/firefox/.hidden/cookies.sqlite")
             .file("/home/u/.mozilla/firefox/a/b/cookies.sqlite");
-        assert!(browsers_for(Os::Linux, &env).is_empty());
+        assert!(scanned(Os::Linux, &env).browsers.is_empty());
     }
 
     #[test]
@@ -789,11 +1042,20 @@ mod tests {
         let env = FakeEnv::new(Os::Linux, H)
             .var("XDG_CONFIG_HOME", "/cfg")
             .file("/cfg/mozilla/firefox/p/cookies.sqlite");
-        assert_eq!(bids(&browsers_for(Os::Linux, &env)), ["firefox"]);
+        assert_eq!(bids(&scanned(Os::Linux, &env).browsers), ["firefox"]);
         let stale = FakeEnv::new(Os::Linux, H)
             .var("XDG_CONFIG_HOME", "/cfg")
             .file("/home/u/.config/mozilla/firefox/p/cookies.sqlite");
-        assert!(browsers_for(Os::Linux, &stale).is_empty());
+        assert!(scanned(Os::Linux, &stale).browsers.is_empty());
+    }
+
+    #[test]
+    fn browsers_are_listed_alphabetically_not_by_preference() {
+        let env = FakeEnv::new(Os::Linux, H)
+            .file("/home/u/.mozilla/firefox/p/cookies.sqlite")
+            .file("/home/u/.config/vivaldi/Default/Cookies")
+            .file("/home/u/.config/BraveSoftware/Brave-Browser/Default/Cookies");
+        assert_eq!(bids(&scanned(Os::Linux, &env).browsers), ["brave", "firefox", "vivaldi"]);
     }
 
     #[test]
@@ -804,53 +1066,89 @@ mod tests {
             .file("/home/u/.config/opera/Cookies")
             // A data dir with no cookie database anywhere is not a browser.
             .file("/home/u/.config/chromium/Local State");
-        let bs = browsers_for(Os::Linux, &env);
-        assert_eq!(bids(&bs), ["chrome", "brave", "opera"]);
-        assert!(bs.iter().all(|b| b.supported && b.note.is_none()));
+        let scan = scanned(Os::Linux, &env);
+        assert_eq!(bids(&scan.browsers), ["brave", "chrome", "opera"]);
+        assert!(scan.browsers.iter().all(|b| b.supported && !b.blocked && b.note.is_none()));
+        assert_eq!(scan.access_hint, None);
     }
 
     #[test]
-    fn windows_chromium_is_listed_as_unsupported_and_firefox_includes_the_store_build() {
+    fn windows_chromium_is_unsupported_and_its_note_names_no_other_browser() {
         let env = win()
             .file(r"C:\Users\u\AppData\Local\Packages\Mozilla.Firefox_n80bbvh6b1yt2\LocalCache\Roaming\Mozilla\Firefox\Profiles\p.default\cookies.sqlite")
             .file(r"C:\Users\u\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies")
             .file(r"C:\Users\u\AppData\Local\Microsoft\Edge\User Data\Default\Network\Cookies")
             .file(r"C:\Users\u\AppData\Roaming\Opera Software\Opera Stable\Network\Cookies")
             .file(r"C:\Users\u\AppData\Local\Naver\Naver Whale\User Data\Default\Cookies");
-        let bs = browsers_for(Os::Windows, &env);
-        assert_eq!(bids(&bs), ["firefox", "chrome", "edge", "opera", "whale"]);
-        assert!(bs[0].supported && bs[0].note.is_none());
-        for b in &bs[1..] {
-            assert!(!b.supported, "{}", b.id);
-            assert!(b.note.as_deref().unwrap().contains("Firefox"), "{}", b.id);
+        let scan = scanned(Os::Windows, &env);
+        assert_eq!(bids(&scan.browsers), ["chrome", "edge", "firefox", "opera", "whale"]);
+        let firefox = browser(&scan, "firefox");
+        assert!(firefox.supported && firefox.note.is_none());
+        for b in scan.browsers.iter().filter(|b| b.id != "firefox") {
+            assert!(!b.supported && !b.blocked, "{}", b.id);
+            assert_eq!(b.signed_in, None, "{}", b.id);
+            let note = b.note.as_deref().unwrap();
+            assert!(note.contains("cookies file") && !note.contains("Firefox"), "{note}");
         }
+        assert_eq!(scan.access_hint, None);
     }
 
     #[test]
     fn windows_firefox_classic_profiles_dir() {
         let env = win().file(r"C:\Users\u\AppData\Roaming\Mozilla\Firefox\Profiles\x.default-release\cookies.sqlite");
-        assert_eq!(bids(&browsers_for(Os::Windows, &env)), ["firefox"]);
+        assert_eq!(bids(&scanned(Os::Windows, &env).browsers), ["firefox"]);
     }
 
     #[test]
-    fn macos_lists_safari_with_a_disk_access_note_and_chromium_with_a_keychain_note() {
+    fn macos_lists_what_it_can_read_with_a_keychain_note_on_chromium() {
         let env = FakeEnv::new(Os::MacOs, "/Users/u")
             .file("/Users/u/Library/Application Support/Firefox/Profiles/p/cookies.sqlite")
             .file("/Users/u/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
             .file("/Users/u/Library/Application Support/Google/Chrome/Default/Cookies")
             .file("/Users/u/Library/Application Support/Microsoft Edge/Default/Cookies")
             .file("/Users/u/Library/Application Support/Naver/Whale/Default/Cookies");
-        let bs = browsers_for(Os::MacOs, &env);
-        assert_eq!(bids(&bs), ["firefox", "safari", "chrome", "edge", "whale"]);
-        assert!(bs.iter().all(|b| b.supported));
-        assert!(bs[1].note.as_deref().unwrap().contains("Full Disk Access"));
-        assert!(bs[2].note.as_deref().unwrap().contains("Keychain"));
+        let scan = scanned(Os::MacOs, &env);
+        assert_eq!(bids(&scan.browsers), ["chrome", "edge", "firefox", "safari", "whale"]);
+        assert!(scan.browsers.iter().all(|b| b.supported && !b.blocked));
+        assert!(browser(&scan, "chrome").note.as_deref().unwrap().contains("Keychain"));
+        // Safari's cookies are visible, so Full Disk Access is already given.
+        assert_eq!(browser(&scan, "safari").note, None);
+        assert_eq!(browser(&scan, "safari").signed_in, None);
+        assert!(scan.access_hint.as_deref().unwrap().contains("Full Disk Access"));
+    }
+
+    /// macOS 27 refuses every other app the Application Support folders of
+    /// Firefox, Chrome, Brave and Edge: the folder can be seen, its listing
+    /// fails with EPERM. That used to read as "no Firefox here".
+    #[test]
+    fn macos_27_shows_a_refused_browser_as_no_access_rather_than_missing() {
+        let env = FakeEnv::new(Os::MacOs, "/Users/u")
+            .refuse("/Users/u/Library/Application Support/Firefox")
+            .login("/Users/u/Library/Application Support/Firefox/Profiles/p/cookies.sqlite")
+            .refuse("/Users/u/Library/Application Support/Google/Chrome")
+            .file("/Users/u/Library/Application Support/Google/Chrome/Default/Cookies")
+            .file("/Users/u/Library/Application Support/Vivaldi/Default/Cookies");
+        let scan = scanned(Os::MacOs, &env);
+        assert_eq!(bids(&scan.browsers), ["chrome", "firefox", "vivaldi"]);
+        for id in ["chrome", "firefox"] {
+            let b = browser(&scan, id);
+            assert!(b.blocked && !b.supported, "{id}");
+            assert_eq!(b.signed_in, None, "{id}");
+            assert_eq!(b.note.as_deref(), Some(blocked_note(Os::MacOs)), "{id}");
+        }
+        assert!(browser(&scan, "vivaldi").supported);
+        // Automatic never names a browser it cannot read.
+        assert_eq!(scan.automatic.as_deref(), Some("vivaldi"));
+        assert!(scan.access_hint.as_deref().unwrap().contains("System Settings"));
     }
 
     #[test]
-    fn macos_lists_safari_when_its_cookies_are_hidden_but_the_app_is_there() {
+    fn macos_lists_safari_as_no_access_when_its_cookies_are_hidden_but_the_app_is_there() {
         let env = FakeEnv::new(Os::MacOs, "/Users/u").dir("/Applications/Safari.app");
-        assert_eq!(bids(&browsers_for(Os::MacOs, &env)), ["safari"]);
+        let scan = scanned(Os::MacOs, &env);
+        assert_eq!(bids(&scan.browsers), ["safari"]);
+        assert!(scan.browsers[0].blocked && !scan.browsers[0].supported);
+        assert_eq!(scan.automatic, None);
     }
 
     #[test]
@@ -858,7 +1156,114 @@ mod tests {
         let env = FakeEnv::new(Os::Linux, H)
             .file("/home/u/Library/Cookies/Cookies.binarycookies")
             .dir("/Applications/Safari.app");
-        assert!(browsers_for(Os::Linux, &env).is_empty());
+        assert!(scanned(Os::Linux, &env).browsers.is_empty());
+    }
+
+    #[test]
+    fn a_refused_profile_folder_elsewhere_gets_a_plain_note() {
+        let env = FakeEnv::new(Os::Linux, H)
+            .refuse("/home/u/.config/google-chrome")
+            .file("/home/u/.config/google-chrome/Default/Cookies");
+        let scan = scanned(Os::Linux, &env);
+        let chrome = browser(&scan, "chrome");
+        assert!(chrome.blocked && !chrome.supported);
+        assert_eq!(chrome.note.as_deref(), Some(blocked_note(Os::Linux)));
+        assert_eq!(scan.access_hint, None);
+    }
+
+    #[test]
+    fn the_youtube_sign_in_is_read_from_the_profile_yt_dlp_would_use() {
+        // yt-dlp reads the newest profile; a sign-in in an older one is not
+        // what it will send.
+        let env = FakeEnv::new(Os::Linux, H)
+            .login("/home/u/.mozilla/firefox/old/cookies.sqlite")
+            .file_at("/home/u/.mozilla/firefox/new/cookies.sqlite", 200)
+            .login("/home/u/.config/BraveSoftware/Brave-Browser/Default/Cookies");
+        let scan = scanned(Os::Linux, &env);
+        assert_eq!(browser(&scan, "firefox").signed_in, Some(false));
+        assert_eq!(browser(&scan, "brave").signed_in, Some(true));
+    }
+
+    #[test]
+    fn automatic_follows_the_youtube_sign_in_whichever_browser_has_it() {
+        // Firefox was used last, but only Brave is signed in.
+        let env = FakeEnv::new(Os::Linux, H)
+            .file_at("/home/u/.mozilla/firefox/p/cookies.sqlite", 900)
+            .login("/home/u/.config/BraveSoftware/Brave-Browser/Default/Cookies")
+            .file_at("/home/u/.config/google-chrome/Default/Cookies", 500);
+        assert_eq!(scanned(Os::Linux, &env).automatic.as_deref(), Some("brave"));
+
+        // Signed in to two: the one used last.
+        let env = env
+            .login("/home/u/.mozilla/firefox/p/cookies.sqlite");
+        assert_eq!(scanned(Os::Linux, &env).automatic.as_deref(), Some("firefox"));
+    }
+
+    #[test]
+    fn automatic_falls_back_to_the_browser_used_last() {
+        let env = FakeEnv::new(Os::Linux, H)
+            .file_at("/home/u/.mozilla/firefox/p/cookies.sqlite", 100)
+            .file_at("/home/u/.config/google-chrome/Default/Cookies", 300)
+            .file_at("/home/u/.config/chromium/Default/Cookies", 200);
+        assert_eq!(scanned(Os::Linux, &env).automatic.as_deref(), Some("chrome"));
+    }
+
+    #[test]
+    fn automatic_skips_a_browser_yt_dlp_cannot_read_here() {
+        let env = win()
+            .file_at(r"C:\Users\u\AppData\Roaming\Mozilla\Firefox\Profiles\p\cookies.sqlite", 100)
+            .login(r"C:\Users\u\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies");
+        assert_eq!(scanned(Os::Windows, &env).automatic.as_deref(), Some("firefox"));
+        let chrome_only = win().login(r"C:\Users\u\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies");
+        assert_eq!(scanned(Os::Windows, &chrome_only).automatic, None);
+    }
+
+    #[test]
+    fn sqlite_uris_survive_any_path() {
+        assert_eq!(sqlite_uri("/home/u/a b#c?d%e/cookies.sqlite"),
+                   "file:///home/u/a%20b%23c%3Fd%25e/cookies.sqlite?immutable=1");
+        assert_eq!(sqlite_uri(r"C:\Users\u\Profile 1\Cookies"),
+                   "file:///C:/Users/u/Profile%201/Cookies?immutable=1");
+    }
+
+    /// The real reader, against real databases in both schemas, under a path
+    /// that needs escaping -- and without leaving a journal or lock file
+    /// beside a browser's database.
+    #[test]
+    fn youtube_login_reads_both_schemas_and_writes_nothing_beside_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |dir: &str, schema: CookieDb, rows: &[(&str, &str)]| -> String {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let p = d.join(if schema == CookieDb::Firefox { "cookies.sqlite" } else { "Cookies" });
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            let (table, host) = match schema {
+                CookieDb::Firefox => ("moz_cookies", "host"),
+                CookieDb::Chromium => ("cookies", "host_key"),
+            };
+            conn.execute_batch(&format!("CREATE TABLE {table} ({host} TEXT, name TEXT, value TEXT)")).unwrap();
+            for (h, n) in rows {
+                conn.execute(&format!("INSERT INTO {table} VALUES (?1, ?2, 'secret')"), [h, n]).unwrap();
+            }
+            p.to_string_lossy().into_owned()
+        };
+        let ff = make("Profile #1 %20", CookieDb::Firefox, &[(".youtube.com", "LOGIN_INFO")]);
+        let cr = make("chrome", CookieDb::Chromium, &[("www.youtube.com", "__Secure-3PSID")]);
+        let out = make("signed-out", CookieDb::Firefox, &[(".youtube.com", "VISITOR_INFO1_LIVE"), (".google.com", "SID")]);
+        let near = make("lookalike", CookieDb::Chromium, &[(".notyoutube.com", "SAPISID")]);
+        assert_eq!(youtube_login_in(&ff, CookieDb::Firefox), Some(true));
+        assert_eq!(youtube_login_in(&cr, CookieDb::Chromium), Some(true));
+        assert_eq!(youtube_login_in(&out, CookieDb::Firefox), Some(false));
+        assert_eq!(youtube_login_in(&near, CookieDb::Chromium), Some(false));
+        // The wrong schema, or no database at all, is "cannot tell".
+        assert_eq!(youtube_login_in(&ff, CookieDb::Chromium), None);
+        let junk = tmp.path().join("junk");
+        std::fs::write(&junk, "not a database").unwrap();
+        assert_eq!(youtube_login_in(&junk.to_string_lossy(), CookieDb::Firefox), None);
+
+        let beside: Vec<_> = std::fs::read_dir(tmp.path().join("Profile #1 %20")).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(beside, ["cookies.sqlite"]);
     }
 
     // -- cookies
@@ -871,44 +1276,66 @@ mod tests {
         FakeEnv::new(Os::Linux, H).file("/home/u/.mozilla/firefox/p/cookies.sqlite")
     }
 
-    #[test]
-    fn a_cookies_file_wins_over_any_browser() {
-        let s = settings("chrome", " /home/u/cookies.txt ");
-        assert_eq!(
-            resolve_cookies_for(&s, Os::Linux, &with_firefox()),
-            Cookies::File("/home/u/cookies.txt".into())
-        );
+    fn resolve(s: &Settings, os: Os, env: &FakeEnv) -> Cookies {
+        resolve_cookies_in(s, os, env, Path::new("/nonexistent/store")).unwrap()
     }
 
     #[test]
-    fn auto_is_firefox_only_where_a_firefox_cookie_database_exists() {
+    fn a_cookies_file_wins_over_any_browser_as_a_copy_yt_dlp_can_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("cookies.json");
+        std::fs::write(&src, r#"[{"name": "SID", "value": "a", "domain": ".youtube.com"}]"#).unwrap();
+        let store = tmp.path().join("store");
+        let s = settings("chrome", &format!(" {} ", src.display()));
+        let Cookies::File(copy) = resolve_cookies_in(&s, Os::Linux, &with_firefox(), &store).unwrap() else {
+            panic!("not a file");
+        };
+        assert_eq!(copy.parent(), Some(store.as_path()));
+        assert!(std::fs::read_to_string(copy).unwrap().starts_with("# Netscape HTTP Cookie File\n"));
+    }
+
+    #[test]
+    fn a_cookies_file_that_cannot_be_used_is_an_error_never_a_signed_out_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("cookies.txt");
+        std::fs::write(&src, "remember the milk").unwrap();
+        let s = settings(COOKIES_AUTO, &src.to_string_lossy());
+        let e = resolve_cookies_in(&s, Os::Linux, &with_firefox(), &tmp.path().join("store")).unwrap_err();
+        assert!(e.to_string().starts_with("cookies.txt can't be used as a cookies file"), "{e}");
+    }
+
+    #[test]
+    fn auto_is_whichever_browser_automatic_picks() {
         let s = settings(COOKIES_AUTO, "");
-        assert_eq!(resolve_cookies_for(&s, Os::Linux, &with_firefox()), Cookies::Browser("firefox".into()));
-        // No Firefox: no cookie flag at all, never `--cookies-from-browser firefox`.
-        assert_eq!(resolve_cookies_for(&s, Os::Linux, &FakeEnv::new(Os::Linux, H)), Cookies::None);
-        assert_eq!(resolve_cookies_for(&s, Os::Windows, &win()), Cookies::None);
+        assert_eq!(resolve(&s, Os::Linux, &with_firefox()), Cookies::Browser("firefox".into()));
+        let brave = FakeEnv::new(Os::Linux, H).file("/home/u/.config/BraveSoftware/Brave-Browser/Default/Cookies");
+        assert_eq!(resolve(&s, Os::Linux, &brave), Cookies::Browser("brave".into()));
+        // Nothing usable: no cookie flag at all, never a browser that is not there.
+        assert_eq!(resolve(&s, Os::Linux, &FakeEnv::new(Os::Linux, H)), Cookies::None);
+        assert_eq!(resolve(&s, Os::Windows, &win()), Cookies::None);
+        let refused = FakeEnv::new(Os::MacOs, "/Users/u")
+            .refuse("/Users/u/Library/Application Support/Firefox")
+            .file("/Users/u/Library/Application Support/Firefox/Profiles/p/cookies.sqlite");
+        assert_eq!(resolve(&s, Os::MacOs, &refused), Cookies::None);
     }
 
     #[test]
-    fn empty_means_no_cookies_even_with_firefox_installed() {
-        assert_eq!(resolve_cookies_for(&settings("", ""), Os::Linux, &with_firefox()), Cookies::None);
-        assert_eq!(resolve_cookies_for(&settings("  ", "  "), Os::Linux, &with_firefox()), Cookies::None);
+    fn empty_means_no_cookies_even_with_a_browser_installed() {
+        assert_eq!(resolve(&settings("", ""), Os::Linux, &with_firefox()), Cookies::None);
+        assert_eq!(resolve(&settings("  ", "  "), Os::Linux, &with_firefox()), Cookies::None);
     }
 
     #[test]
     fn any_other_browser_spec_is_passed_verbatim() {
         let s = settings("chrome:Profile 1", "");
-        assert_eq!(
-            resolve_cookies_for(&s, Os::Linux, &FakeEnv::new(Os::Linux, H)),
-            Cookies::Browser("chrome:Profile 1".into())
-        );
+        assert_eq!(resolve(&s, Os::Linux, &FakeEnv::new(Os::Linux, H)), Cookies::Browser("chrome:Profile 1".into()));
     }
 
     #[test]
     fn the_default_settings_resolve_through_auto() {
         let s = Settings::default();
         assert_eq!(s.cookies_browser, COOKIES_AUTO);
-        assert_eq!(resolve_cookies_for(&s, Os::Linux, &with_firefox()), Cookies::Browser("firefox".into()));
+        assert_eq!(resolve(&s, Os::Linux, &with_firefox()), Cookies::Browser("firefox".into()));
     }
 
     /// What this machine has. Run with
@@ -919,9 +1346,14 @@ mod tests {
         for p in detect_players() {
             println!("player  {:<18} {:<22} {}", p.id, p.label, p.command);
         }
-        for b in detect_browsers() {
-            println!("browser {:<10} {:<10} supported={} note={:?}", b.id, b.label, b.supported, b.note);
+        let scan = detect_browsers();
+        for b in &scan.browsers {
+            println!(
+                "browser {:<10} {:<10} supported={} blocked={} signed_in={:?} note={:?}",
+                b.id, b.label, b.supported, b.blocked, b.signed_in, b.note
+            );
         }
+        println!("automatic {:?}", scan.automatic);
         println!("cookies {:?}", resolve_cookies(&Settings::default()));
     }
 }

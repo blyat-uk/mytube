@@ -84,7 +84,7 @@ These are not bundled, and most of them no longer need installing by hand.
 | `yt-dlp`       | Fetches video metadata and performs all downloads. MyTube downloads and updates its own copy in `~/.local/share/mytube/bin` and prefers it over a system one, so YouTube fixes arrive. |
 | `ffmpeg`       | Required by `yt-dlp` to merge the separate video and audio streams into the `.mkv` output. A system copy is used if present; otherwise MyTube downloads one.                           |
 | `deno`         | The JavaScript runtime `yt-dlp` needs for YouTube. A system copy (2.3 or newer) is used if present; otherwise MyTube downloads one.                                                    |
-| YouTube cookies | Settings → YouTube cookies. The default, Automatic, reads Firefox's cookies when a Firefox profile exists; a `cookies.txt` file works too.                                          |
+| YouTube cookies | Settings → YouTube cookies. The default, Automatic, uses whichever browser is signed in to YouTube; a cookies file (Netscape, JSON or name=value) works too.                        |
 | A video player | Used to play downloaded files. Settings → Player lists the ones installed (mpv, SMPlayer, VLC, Celluloid, Haruna, flatpak exports…), or "System default" for your desktop's choice. |
 
 See [the top-level README](../README.md#download) for where the managed tools

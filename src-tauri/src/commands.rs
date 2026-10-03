@@ -804,10 +804,17 @@ pub async fn detect_players() -> Vec<PlayerOption> {
 
 /// Browsers yt-dlp could read cookies from, as found on this machine.
 #[tauri::command]
-pub async fn detect_browsers() -> Vec<BrowserOption> {
+pub async fn detect_browsers() -> BrowserScan {
     tauri::async_runtime::spawn_blocking(crate::detect::detect_browsers)
         .await
         .unwrap_or_default()
+}
+
+/// What a cookies file holds, or why it cannot be used -- asked before the
+/// Settings view saves a chosen file, and again whenever it is shown.
+#[tauri::command]
+pub async fn inspect_cookies_file(path: String) -> R<crate::cookie_file::CookiesFileInfo> {
+    blocking(move || crate::cookie_file::inspect(std::path::Path::new(&path))).await
 }
 
 #[tauri::command]

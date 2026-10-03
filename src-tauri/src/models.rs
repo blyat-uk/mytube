@@ -538,16 +538,33 @@ pub struct PlayerOption {
     pub command: String,
 }
 
-/// A browser whose cookies yt-dlp could read. `id` is the
-/// `--cookies-from-browser` name; `supported` is false where yt-dlp cannot read
-/// it on this OS (Chromium-family on Windows), and `note` says why or what the
-/// OS will ask for.
+/// A browser whose data is on this machine. `id` is the
+/// `--cookies-from-browser` name; `supported` is false where choosing it
+/// cannot work -- yt-dlp cannot read it on this OS (Chromium-family on
+/// Windows), or `blocked`: its data is there but the OS refuses MyTube it
+/// (macOS 27, for Firefox, Chrome, Brave and Edge). `note` says why, or what
+/// the OS will ask for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserOption {
     pub id: String,
     pub label: String,
     pub supported: bool,
+    pub blocked: bool,
+    /// Whether the cookies yt-dlp would read hold a YouTube sign-in; `None`
+    /// where MyTube cannot look (Safari, or a browser it cannot use).
+    pub signed_in: Option<bool>,
     pub note: Option<String>,
+}
+
+/// What the cookies field is drawn from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserScan {
+    pub browsers: Vec<BrowserOption>,
+    /// The `id` Automatic resolves to right now, if any browser can be used.
+    pub automatic: Option<String>,
+    /// How to let MyTube see a browser the OS hides from it; macOS only.
+    pub access_hint: Option<String>,
 }
 

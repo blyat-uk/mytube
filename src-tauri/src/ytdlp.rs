@@ -17,7 +17,8 @@ pub enum Cookies {
     None,
     /// A `--cookies-from-browser` spec, verbatim (`firefox`, `chrome:Profile 1`).
     Browser(String),
-    /// A Netscape cookies.txt, passed as `--cookies`.
+    /// The Netscape copy `cookie_file::prepare` made of the user's cookies
+    /// file, passed as `--cookies`; never the user's file itself.
     File(PathBuf),
 }
 
@@ -97,8 +98,8 @@ fn encoding_args() -> Vec<String> {
 }
 
 /// The cookie flag, if any. No cookie source means no flag at all: a
-/// `--cookies-from-browser firefox` on a machine with no Firefox profile fails
-/// every run outright, where no cookies only costs the videos that need them.
+/// `--cookies-from-browser` naming a browser with no profile here fails every
+/// run outright, where no cookies only costs the videos that need them.
 fn cookie_args(c: &Cookies) -> Vec<String> {
     match c {
         Cookies::None => Vec::new(),
@@ -835,8 +836,8 @@ mod tests {
 
     #[test]
     fn no_cookie_source_passes_no_cookie_flag_at_all() {
-        // `cookies_browser: "auto"` on a machine with no Firefox resolves to
-        // this, and a `--cookies-from-browser firefox` there fails every run.
+        // `cookies_browser: "auto"` on a machine with no usable browser
+        // resolves to this, and naming an absent browser fails every run.
         for a in video_argvs(&bare()) {
             assert!(!a.iter().any(|x| x.starts_with("--cookies")), "{a:?}");
         }
