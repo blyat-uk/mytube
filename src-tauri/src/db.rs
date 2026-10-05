@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::sync::Mutex;
 
 use crate::models::*;
 use crate::quality::Quality;
+use crate::search;
 use crate::siblings;
 
 pub struct Db { conn: Mutex<Connection> }
@@ -192,10 +194,32 @@ fn backfill_downloaded_at(conn: &Connection) -> Result<()> {
 
 fn now() -> i64 { chrono::Utc::now().timestamp() }
 
-/// Escapes LIKE wildcards so a literal `%` or `_` in a search box is literal.
-fn like_pattern(term: &str) -> String {
-    let escaped = term.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
-    format!("%{escaped}%")
+/// `search_match(query, title, channel)`: the feed's search box, as a
+/// [`search::Query`]. A function rather than LIKE because the box takes a small
+/// language of its own -- regex, exclusion, phrases -- and it stays inside the
+/// SQL so that `LIMIT`/`OFFSET` and the grouping walk still count only the rows
+/// it keeps. The parse is held as SQLite auxiliary data on the first argument,
+/// which is a bound parameter, so it runs once per statement rather than once
+/// per row.
+///
+/// It exists only on connections this process opened. Nothing persistent -- a
+/// view, an index, a trigger -- may call it: the scripts in `scripts/` open the
+/// same file without it, and SQLite would refuse them the schema.
+fn register_search(conn: &Connection) -> rusqlite::Result<()> {
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    conn.create_scalar_function(
+        "search_match",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let query = ctx.get_or_create_aux(0, |v| -> std::result::Result<_, BoxError> {
+                Ok(search::Query::parse(v.as_str()?))
+            })?;
+            let title = ctx.get_raw(1).as_str().unwrap_or("");
+            let channel = ctx.get_raw(2).as_str().unwrap_or("");
+            Ok(query.matches(title, channel))
+        },
+    )
 }
 
 /// Every ready video on a channel as the grouping rule sees it, plus what each
@@ -294,10 +318,8 @@ fn feed_query(
         if f.hide_watched { sql.push_str(" AND v.watched=0"); }
         if f.downloaded_only { sql.push_str(" AND v.download_state='done'"); }
         if let Some(term) = f.search.as_ref().filter(|s| !s.trim().is_empty()) {
-            args.push(Box::new(like_pattern(term.trim())));
-            let i = args.len();
-            sql.push_str(&format!(
-                " AND (v.title LIKE ?{i} ESCAPE '\\' OR c.title LIKE ?{i} ESCAPE '\\')"));
+            args.push(Box::new(term.clone()));
+            sql.push_str(&format!(" AND search_match(?{}, v.title, c.title)", args.len()));
         }
     }
     sql.push_str(order_by(f.sort));
@@ -433,6 +455,7 @@ impl Db {
         // the file on disk untracked) made in those last moments is lost.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        register_search(&conn)?;
         migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -2040,6 +2063,38 @@ mod tests {
         assert_eq!(d.list_videos(&f("alpha")).unwrap().len(), 2, "channel name should match");
         // A literal % must not behave as a wildcard.
         assert_eq!(d.list_videos(&f("%")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_takes_regex_and_exclusions_in_sql() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "Alpha")).unwrap();
+        d.upsert_channel(&chan("UC2", "Beta")).unwrap();
+        for (id, ch, title, at) in [
+            ("a", "UC1", "Part one of the tapes", 4),
+            ("b", "UC1", "Part two of the tapes", 3),
+            ("c", "UC1", "Part three, a finale", 2),
+            ("d", "UC2", "Part one, elsewhere", 1),
+        ] {
+            let mut v = vid(id, ch, Some(at));
+            v.title = title.into();
+            d.insert_video_if_new(&v).unwrap();
+        }
+        let ids = |s: &str| -> Vec<String> {
+            let f = VideoFilter { search: Some(s.into()), ..Default::default() };
+            d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect()
+        };
+        assert_eq!(ids("part.*tapes"), ["a", "b"]);
+        assert_eq!(ids("(one|three)"), ["a", "c", "d"]);
+        assert_eq!(ids("part -(two|finale)"), ["a", "d"]);
+        // An exclusion reaches the channel name as a match does.
+        assert_eq!(ids("one -beta"), ["a"]);
+
+        // The grouping walk shares the WHERE clause, so it keeps the same rows.
+        let grouped = VideoFilter { search: Some("-alpha".into()), ..Default::default() };
+        let groups = d.list_video_groups(&grouped).unwrap();
+        let ids: Vec<&str> = groups.iter().flat_map(|g| g.videos.iter().map(|v| v.id.as_str())).collect();
+        assert_eq!(ids, ["d"]);
     }
 
     #[test]

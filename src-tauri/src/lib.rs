@@ -14,6 +14,7 @@ pub mod quality;
 pub mod queue;
 pub mod resolve;
 pub mod rss;
+pub mod search;
 pub mod siblings;
 pub mod tools;
 pub mod transfer;
