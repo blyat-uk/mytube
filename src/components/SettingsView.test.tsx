@@ -94,6 +94,7 @@ const toolsUpdateNow = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve(
 const inspectCookiesFile = vi.fn<(path: string) => Promise<CookiesFileInfo>>(
   () => Promise.resolve(FILE_INFO),
 );
+const openFullDiskAccess = vi.fn<() => Promise<void>>(() => Promise.resolve());
 
 vi.mock("../api", () => ({
   api: {
@@ -106,6 +107,7 @@ vi.mock("../api", () => ({
     detectPlayers: () => Promise.resolve(players),
     detectBrowsers: () => Promise.resolve(scan),
     inspectCookiesFile: (path: string) => inspectCookiesFile(path),
+    openFullDiskAccess: () => openFullDiskAccess(),
     toolsStatus: () => Promise.resolve(tools),
     toolsUpdateNow: () => toolsUpdateNow(),
     appVersionInfo: () => Promise.resolve({
@@ -145,6 +147,7 @@ beforeEach(() => {
   scan = SCAN;
   tools = TOOLS_OK;
   inspectCookiesFile.mockReset();
+  openFullDiskAccess.mockClear();
   inspectCookiesFile.mockImplementation(() => Promise.resolve(FILE_INFO));
 });
 
@@ -374,6 +377,15 @@ describe("YouTube cookies", () => {
     expect(firefox.textContent).toBe("Firefox (no access)");
     expect(screen.getByText("Firefox: macOS is not letting MyTube read it.")).toBeDefined();
     expect(screen.getByText(hintText)).toBeDefined();
+    // MyTube is not in the Full Disk Access list until added, so the way
+    // there is one click.
+    fireEvent.click(screen.getByRole("button", { name: "Open Full Disk Access settings" }));
+    expect(openFullDiskAccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Full Disk Access only where the backend gives an access hint", async () => {
+    await cookiesSelect();
+    expect(screen.queryByRole("button", { name: "Open Full Disk Access settings" })).toBeNull();
   });
 
   it("shows the cookies file when one is set, since it wins, with what it holds", async () => {

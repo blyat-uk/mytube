@@ -810,6 +810,22 @@ pub async fn detect_browsers() -> BrowserScan {
         .unwrap_or_default()
 }
 
+/// System Settings at Full Disk Access, where a Mac user adds MyTube with +
+/// so it may read a browser's cookies (see `detect::MACOS_ACCESS_HINT`). Opened
+/// from here rather than the frontend's opener, whose scope admits only web
+/// links.
+#[tauri::command]
+pub async fn open_full_disk_access() -> R<()> {
+    if !cfg!(target_os = "macos") {
+        return Err("Full Disk Access is a macOS setting.".into());
+    }
+    blocking(|| {
+        tauri_plugin_opener::open_url(crate::detect::MACOS_FULL_DISK_ACCESS_URL, None::<&str>)
+            .map_err(anyhow::Error::from)
+    })
+    .await
+}
+
 /// What a cookies file holds, or why it cannot be used -- asked before the
 /// Settings view saves a chosen file, and again whenever it is shown.
 #[tauri::command]

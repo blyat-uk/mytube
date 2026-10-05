@@ -1433,6 +1433,7 @@ label.field-label { display: block; }
 .field .cookies-note { margin-top: 4px; }
 .field .cookies-note:first-of-type { margin-top: 6px; }
 .cookies-error { color: #ffb9ba; }
+.cookies-access { margin-top: 8px; }
 
 /* ------------------------------------------------------------------ *
  * Tools

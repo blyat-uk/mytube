@@ -132,6 +132,12 @@ export default function CookiesField({ browser, file, onPick }: Props) {
     }
   }
 
+  // Opening System Settings is fire-and-forget, like About's links: there is
+  // nothing to wait for, so no pending state.
+  function openFullDiskAccess() {
+    api.openFullDiskAccess().catch((err) => toast.error(errText(err)));
+  }
+
   function choose(value: string) {
     if (value === FILE) {
       void pickFile();
@@ -197,7 +203,16 @@ export default function CookiesField({ browser, file, onPick }: Props) {
           {b.label}: {b.note}
         </span>
       ))}
-      {scan?.accessHint && <span className="field-hint cookies-note">{scan.accessHint}</span>}
+      {scan?.accessHint && (
+        <>
+          <span className="field-hint cookies-note">{scan.accessHint}</span>
+          <div className="cookies-access">
+            <button type="button" className="btn" onClick={openFullDiskAccess}>
+              Open Full Disk Access settings
+            </button>
+          </div>
+        </>
+      )}
     </Field>
   );
 }

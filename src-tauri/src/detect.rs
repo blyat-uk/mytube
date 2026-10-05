@@ -563,17 +563,32 @@ fn blocked_note(os: Os) -> &'static str {
 /// Said under the cookies list on every Mac: a browser macOS hides from
 /// MyTube may not show up at all, and the fix is in System Settings.
 ///
-/// The per-app switch macOS 27 adds under Files & Folders (MyTube →
-/// Firefox.app) is no answer: seen on 27.0.1 to be off again at MyTube's next
-/// launch, which is Apple's stated design for consent to another app's data --
-/// "transient, process lifetime", every new pid asks again (DTS,
-/// developer.apple.com/forums/thread/742147). Full Disk Access is the grant
-/// that persists -- until an update, since TCC identifies an ad-hoc signed
-/// app by the hash of the very build.
+/// Two different permissions are in play, and only one of them helps. Reading
+/// a browser's folder trips macOS 27's per-app-data consent
+/// (`kTCCServiceSystemPolicyAppDataDetailed`), which is why MyTube appears
+/// under Files & Folders with a switch per browser -- but that consent lasts
+/// one process: seen on 27.0.1 to be off again at MyTube's next launch, which
+/// is Apple's stated design ("transient, process lifetime", DTS,
+/// developer.apple.com/forums/thread/742147). Full Disk Access persists, and
+/// unlocks the folder: reported on macOS 27 by Finicky
+/// (github.com/johnste/finicky/issues/556). But there is no API to ask for it,
+/// and macOS lists an app under Full Disk Access only once it has opened a file
+/// nothing less unlocks (DTS, developer.apple.com/forums/thread/757768) --
+/// which MyTube never does -- so the user has to add it with +. And since TCC
+/// identifies an ad-hoc signed app by the hash of the very build, it has to be
+/// added again after every update.
 const MACOS_ACCESS_HINT: &str = "Browser missing, or marked “no access”? macOS lets MyTube \
-    read another app's data only with Full Disk Access: System Settings → Privacy & Security → \
-    Full Disk Access → MyTube, then restart MyTube. After updating MyTube, switch it off and on \
-    again. A cookies file needs no permission at all.";
+    read a browser's data only with Full Disk Access, and MyTube is not in that list until you \
+    add it: in System Settings → Privacy & Security → Full Disk Access (the button below opens \
+    it), click +, choose MyTube in Applications, then restart MyTube. Add it again after each \
+    MyTube update. The per-browser switches under Files & Folders last only until MyTube \
+    quits. A cookies file needs no permission at all.";
+
+/// System Settings → Privacy & Security → Full Disk Access. The legacy
+/// `com.apple.preference.security` form is the one every macOS since 10.14
+/// answers; an anchor it does not know still lands on Privacy & Security.
+pub const MACOS_FULL_DISK_ACCESS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 
 /// One browser as this machine has it.
 struct Found {

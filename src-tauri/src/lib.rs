@@ -192,6 +192,7 @@ pub fn run() {
             commands::detect_players,
             commands::detect_browsers,
             commands::inspect_cookies_file,
+            commands::open_full_disk_access,
             commands::tools_status,
             commands::tools_update_now,
             commands::app_version_info,

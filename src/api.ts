@@ -79,6 +79,8 @@ export const api = {
   detectBrowsers: () => invoke<BrowserScan>("detect_browsers"),
   /** What a cookies file holds; rejects, saying why, when it cannot be used. */
   inspectCookiesFile: (path: string) => invoke<CookiesFileInfo>("inspect_cookies_file", { path }),
+  /** macOS: System Settings at Privacy & Security → Full Disk Access. */
+  openFullDiskAccess: () => invoke<void>("open_full_disk_access"),
   toolsStatus: () => invoke<ToolStatus[]>("tools_status"),
   /** Forces the yt-dlp update check and retries any failed install. Rejects
    *  while a download holds yt-dlp, since nothing is swapped under a live job. */
