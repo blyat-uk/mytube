@@ -77,7 +77,9 @@ export interface SeriesTally {
 }
 
 interface Props {
-  channelId: string | null;
+  /** The channels to show, sorted; empty for every channel. Held in the
+   *  shell's state, so it keeps its identity until the pick changes. */
+  channelIds: string[];
   search: string;
   hideWatched: boolean;
   downloadedOnly: boolean;
@@ -122,7 +124,7 @@ export default function SubscriptionsView(p: Props) {
   const request = useRef(0);
 
   const {
-    channelId, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken, siblingOf,
+    channelIds, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken, siblingOf,
     onSeriesTally, scrollRef,
   } = p;
   // A series view is a flat list of parts on purpose, so grouping stands down
@@ -135,7 +137,7 @@ export default function SubscriptionsView(p: Props) {
   // each make a different one; `grouped` is the derived value above, so opening
   // a series out of the grouped feed counts as one change of list, not two.
   const listKey = JSON.stringify([
-    channelId, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped, groupsOnly,
+    channelIds, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped, groupsOnly,
     inProgress, siblingOf?.id ?? null,
   ]);
   // Where each list this view has shown was left. Coming back to one -- leaving
@@ -186,7 +188,7 @@ export default function SubscriptionsView(p: Props) {
     }
     // The limit counts cards either way, which for the grouped feed means groups.
     const filter = {
-      channelId,
+      channelIds,
       hideWatched,
       downloadedOnly,
       showHidden,
@@ -217,7 +219,7 @@ export default function SubscriptionsView(p: Props) {
     } finally {
       if (id === request.current) setLoading(false);
     }
-  }, [channelId, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, groupsOnly,
+  }, [channelIds, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, groupsOnly,
       inProgress, listKey, scrollRef, toast]);
 
   useEffect(() => { void fetchPage(0); }, [fetchPage, reloadToken]);
@@ -566,7 +568,7 @@ export default function SubscriptionsView(p: Props) {
   }, []);
 
   const filtered =
-    channelId !== null || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
+    channelIds.length > 0 || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
     inProgress;
   /** Any mark or unlink slow enough to show; see `SIBLINGS`. */
   const refreshing = useMemo(() => [...slow].some((k) => k.startsWith(SIBLINGS)), [slow]);

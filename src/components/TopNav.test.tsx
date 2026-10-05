@@ -26,8 +26,8 @@ function props(over: Partial<Props> = {}): Props {
     tab: "subscriptions",
     onTab: vi.fn(),
     channels: CHANNELS,
-    channelId: null,
-    onChannelId: vi.fn(),
+    channelIds: [],
+    onChannelIds: vi.fn(),
     search: "",
     onSearch: vi.fn(),
     hideWatched: false,
@@ -62,6 +62,12 @@ function renderNav(over: Partial<Props> = {}) {
 }
 
 const button = (name: string) => screen.getByRole("button", { name }) as HTMLButtonElement;
+const channelButton = () =>
+  screen.getByRole("button", { name: /^Filter by channel/ }) as HTMLButtonElement;
+const openChannels = () => {
+  fireEvent.click(channelButton());
+  return screen.getByRole("dialog", { name: "Channels" });
+};
 
 afterEach(cleanup);
 
@@ -72,7 +78,7 @@ afterEach(cleanup);
  * They keep their slots, though: the row must not reflow on the way in or out.
  */
 describe("TopNav while a series is open", () => {
-  const SELECTS = ["Search videos", "Filter by channel"];
+  const SELECTS = ["Search videos"];
   const TOGGLES = ["Unwatched", "Downloaded", "Include hidden", "Grouped"];
 
   it("disables the filters it cannot honour", () => {
@@ -81,6 +87,15 @@ describe("TopNav while a series is open", () => {
       expect((screen.getByLabelText(label) as HTMLInputElement).disabled).toBe(true);
     }
     for (const name of TOGGLES) expect(button(name).disabled).toBe(true);
+    expect(channelButton().disabled).toBe(true);
+  });
+
+  it("closes the channel list when a series opens", () => {
+    const p = props();
+    const { rerender } = render(<TopNav {...p} />);
+    openChannels();
+    rerender(<TopNav {...p} series={SERIES} />);
+    expect(screen.queryByRole("dialog", { name: "Channels" })).toBeNull();
   });
 
   it("leaves sort alone, which still applies", () => {
@@ -94,6 +109,7 @@ describe("TopNav while a series is open", () => {
       expect((screen.getByLabelText(label) as HTMLInputElement).disabled).toBe(false);
     }
     for (const name of TOGGLES) expect(button(name).disabled).toBe(false);
+    expect(channelButton().disabled).toBe(false);
   });
 });
 
@@ -151,32 +167,74 @@ describe("the filters on the row", () => {
     renderNav();
     const row = screen.getByLabelText("Sort order").closest(".topnav-row");
     expect(row).not.toBeNull();
-    expect(row!.contains(screen.getByLabelText("Filter by channel"))).toBe(true);
+    expect(row!.contains(channelButton())).toBe(true);
   });
 
-  it("offers every subscription plus an all-channels reset", () => {
+  it("reads All channels, untinted, while nothing is picked", () => {
     renderNav();
-    const select = screen.getByLabelText("Filter by channel") as HTMLSelectElement;
-    expect([...select.options].map((o) => o.text))
-      .toEqual(["All channels", "Chills Narrated", "Nexpo"]);
+    expect(channelButton().textContent).toBe("All channels");
+    expect(channelButton().getAttribute("aria-label")).toBe("Filter by channel: All channels");
+    expect(channelButton().classList.contains("is-on")).toBe(false);
   });
 
-  it("emits the picked channel id, and null for all channels", () => {
-    const p = renderNav({ channelId: "UC1" });
-    const select = screen.getByLabelText("Filter by channel") as HTMLSelectElement;
-    expect(select.value).toBe("UC1");
+  it("wears the first picked name and how many more, every name in its tooltip", () => {
+    renderNav({ channelIds: ["UC1", "UC2"] });
+    const btn = channelButton();
+    expect(btn.querySelector(".channel-picker-name")?.textContent).toBe("Chills Narrated");
+    expect(btn.querySelector(".channel-picker-more")?.textContent).toBe("+1");
+    expect(btn.getAttribute("aria-label")).toBe("Filter by channel: Chills Narrated and 1 more");
+    expect(btn.title).toBe("Chills Narrated\nNexpo");
+    expect(btn.classList.contains("is-on")).toBe(true);
+  });
 
-    fireEvent.change(select, { target: { value: "UC2" } });
-    expect(p.onChannelId).toHaveBeenLastCalledWith("UC2");
+  it("opens a checklist of every subscription plus an all-channels reset", () => {
+    renderNav();
+    const pop = openChannels();
+    const rows = Array.from(pop.querySelectorAll(".chan-row")).map((r) => r.textContent);
+    expect(rows).toEqual(["All channels", "Chills Narrated", "Nexpo"]);
+    expect(channelButton().getAttribute("aria-expanded")).toBe("true");
+    // It opens to pick, so typing goes straight into the filter box.
+    expect(document.activeElement).toBe(screen.getByRole("searchbox", { name: "Filter channels" }));
+  });
 
-    fireEvent.change(select, { target: { value: "" } });
-    expect(p.onChannelId).toHaveBeenLastCalledWith(null);
+  it("adds to the pick, switches to one with Only, and resets with All channels", () => {
+    const p = renderNav({ channelIds: ["UC1"] });
+    openChannels();
+    fireEvent.click(button("Nexpo"));
+    expect(p.onChannelIds).toHaveBeenLastCalledWith(["UC1", "UC2"]);
+    fireEvent.click(button("Show only Nexpo"));
+    expect(p.onChannelIds).toHaveBeenLastCalledWith(["UC2"]);
+    fireEvent.click(button("All channels"));
+    expect(p.onChannelIds).toHaveBeenLastCalledWith([]);
+    // Ticks apply as they are made, so the list stays open for the next one.
+    expect(screen.getByRole("dialog", { name: "Channels" })).toBeDefined();
+  });
+
+  it("closes the checklist on Esc, handing focus back, and on a click outside", () => {
+    const p = renderNav({ series: null });
+    openChannels();
+    act(() => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })); });
+    expect(screen.queryByRole("dialog", { name: "Channels" })).toBeNull();
+    expect(document.activeElement).toBe(channelButton());
+    expect(p.onExitSeries).not.toHaveBeenCalled();
+
+    openChannels();
+    act(() => { document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); });
+    expect(screen.queryByRole("dialog", { name: "Channels" })).toBeNull();
+  });
+
+  it("closes the checklist from its own button too", () => {
+    renderNav();
+    openChannels();
+    fireEvent.click(channelButton());
+    expect(screen.queryByRole("dialog", { name: "Channels" })).toBeNull();
   });
 
   /** The whole cluster belongs to the feed, so it leaves with it. */
   it("is absent on tabs the filters cannot affect", () => {
     renderNav({ tab: "downloads" });
-    for (const label of ["Filter by channel", "Search videos", "Sort order"]) {
+    expect(screen.queryByRole("button", { name: /^Filter by channel/ })).toBeNull();
+    for (const label of ["Search videos", "Sort order"]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }
     for (const name of ["Unwatched", "Downloaded", "Include hidden", "Grouped"]) {

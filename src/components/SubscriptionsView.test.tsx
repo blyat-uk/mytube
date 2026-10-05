@@ -85,7 +85,7 @@ function renderView(over: ViewProps = {}) {
   const view = (props: ViewProps) => (
     <ToastProvider>
       <SubscriptionsView
-        channelId={null} search="" hideWatched={false} downloadedOnly={false}
+        channelIds={[]} search="" hideWatched={false} downloadedOnly={false}
         sort="newest" showHidden={false} grouped={false} groupsOnly={false} inProgress={false}
         siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
@@ -784,8 +784,8 @@ describe("keeping your place in the feed", () => {
   it("starts a list it has not shown before at the top", async () => {
     const { scroller, rerender } = await twoPagesIn(3100);
 
-    rerender({ channelId: "UC1" });
-    await waitFor(() => expect(lastFilter().channelId).toBe("UC1"));
+    rerender({ channelIds: ["UC1"] });
+    await waitFor(() => expect(lastFilter().channelIds).toEqual(["UC1"]));
 
     // A different feed, so the pages the old one had mean nothing here.
     expect(lastFilter().limit).toBe(100);

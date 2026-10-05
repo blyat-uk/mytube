@@ -456,14 +456,37 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .search-input::-webkit-search-cancel-button { filter: invert(0.7); cursor: pointer; }
 
 /* Both pickers wear their value instead of a label beside it: "Newest first"
-   and a channel name say what they are, and the row has no width to spare. */
-.channel-select,
+   and "Haru Senpai +2" say what they are, and the row has no width to spare. */
+.channel-picker,
 .sort-select {
   flex: none;
   font-size: 13px;
   padding: 5px 26px 5px 10px;
 }
-.channel-select { max-width: 170px; }
+/* A button dressed as the select beside it, since it opens a checklist rather
+   than a list of one choice. The name gives way to an ellipsis; the "+2" never
+   does, or a narrow box would hide that more than one channel is on. */
+.channel-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 190px;
+  line-height: inherit;
+  text-align: left;
+  white-space: nowrap;
+}
+.channel-picker-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.channel-picker-more { flex: none; font-weight: 600; }
+/* Narrowing the list reads like every other filter that is on: the accent
+   tint. `background-color` alone, so the select's caret survives. */
+.select.channel-picker.is-on {
+  background-color: var(--accent-soft);
+  border-color: rgba(62, 166, 255, 0.5);
+  color: #9ed3ff;
+}
+.select.channel-picker.is-open { border-color: var(--accent); }
+.channel-picker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.channel-picker:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* --- the filter segment -------------------------------------------------- */
 
@@ -659,12 +682,108 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 .pop-radio.is-on .pop-dot { border: 4px solid var(--accent); }
 .pop-sep { height: 1px; background: var(--line); margin: 6px 4px; }
-.select.pop-select {
-  width: calc(100% - 16px);
-  margin: 2px 8px 8px;
-  font-size: 13px;
-  padding: 5px 26px 5px 10px;
+.pop-head-note {
+  float: right;
+  letter-spacing: 0;
+  text-transform: none;
+  color: #9ed3ff;
 }
+
+/* The left column alone sets the Filters panel's height. `contain: size`
+   gives the channel column no intrinsic height of its own, the grid's stretch
+   makes it as tall as the row the left column sets, and the list takes what
+   is left under its head and filter box, scrolling past that -- so a long
+   subscription list never makes the panel taller. */
+.pop-col-fill { contain: size; display: flex; flex-direction: column; }
+.pop-col-fill .chan-list { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.pop-col-fill .chan-rows { flex: 1; min-height: 0; }
+
+/* --- the channel checklist ----------------------------------------------- */
+
+/* The full row's own popover; in the Filters panel the same list fills a
+   column instead. */
+.channel-pop { width: 280px; }
+.channel-pop .chan-rows { max-height: min(360px, 60vh); }
+
+.chan-list { padding: 2px 4px 4px; }
+.text-input.chan-filter {
+  display: block;
+  width: 100%;
+  font-size: 13px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+}
+.chan-rows { overflow-y: auto; overscroll-behavior: contain; }
+.chan-row-wrap, .chan-all { position: relative; }
+.chan-row {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  color: var(--muted);
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: background 120ms ease, color 120ms ease;
+}
+.chan-row:hover:not(:disabled),
+.chan-row-wrap:hover .chan-row:not(:disabled) { background: var(--card); color: var(--text); }
+.chan-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.chan-row:disabled { opacity: 0.4; cursor: not-allowed; }
+.chan-row.is-on { color: var(--text); }
+.chan-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chan-box {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 4px;
+  border: 1.5px solid var(--faint);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.chan-box .icon { width: 11px; height: 11px; color: var(--accent-ink); }
+.chan-row.is-on .chan-box { background: var(--accent); border-color: var(--accent); }
+/* "All channels" is the state of having picked nothing, so a dot, not a box. */
+.chan-dot {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--faint);
+  transition: border 120ms ease;
+}
+.chan-row.is-on .chan-dot { border: 4.5px solid var(--accent); }
+/* Shown on hover or focus, over the end of the name: its background is the
+   hovered row's, so it covers the text it sits on rather than mixing with it. */
+.chan-only {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  appearance: none;
+  font: 600 11.5px/1 var(--font);
+  color: #9ed3ff;
+  background: var(--card);
+  border: 1px solid rgba(62, 166, 255, 0.5);
+  border-radius: 999px;
+  padding: 4px 9px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease, background 120ms ease;
+}
+.chan-row-wrap:hover .chan-only:not(:disabled),
+.chan-row-wrap:focus-within .chan-only:not(:disabled) { opacity: 1; pointer-events: auto; }
+.chan-only:hover { background: #2c3a47; }
+.chan-only:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chan-empty { color: var(--faint); font-size: 13px; padding: 10px; }
 
 /* --- video grid ---------------------------------------------------------- */
 

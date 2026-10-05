@@ -166,7 +166,9 @@ pub enum SortOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoFilter {
-    pub channel_id: Option<String>,
+    /// The channels to show, any of them; empty is every channel.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     pub hide_watched: bool,
     pub downloaded_only: bool,
     pub show_hidden: bool,
@@ -194,7 +196,7 @@ pub struct VideoFilter {
 impl Default for VideoFilter {
     fn default() -> Self {
         Self {
-            channel_id: None,
+            channel_ids: Vec::new(),
             hide_watched: false,
             downloaded_only: false,
             show_hidden: false,

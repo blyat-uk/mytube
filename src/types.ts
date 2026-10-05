@@ -58,7 +58,8 @@ export interface VideoGroup {
 }
 
 export interface VideoFilter {
-  channelId: string | null; hideWatched: boolean; downloadedOnly: boolean;
+  /** The channels to show, any of them; empty is every channel. */
+  channelIds: string[]; hideWatched: boolean; downloadedOnly: boolean;
   showHidden: boolean;
   /** Grouped feed only: drop lone videos, keeping multi-part series. */
   groupsOnly: boolean;
@@ -81,7 +82,8 @@ export interface ImportProgress { done: number; total: number; current: string; 
  * deliberately absent: a launch always lands on Subscriptions.
  */
 export interface ViewState {
-  channel_id: string | null; search: string;
+  /** Sorted channel ids; empty for every channel. */
+  channel_ids: string[]; search: string;
   hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
   grouped: boolean; groups_only: boolean; in_progress: boolean; sort: SortOrder;
 }

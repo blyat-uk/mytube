@@ -38,12 +38,13 @@ describe("pickFit", () => {
 describe("activeFilterCount", () => {
   const none = {
     hideWatched: false, downloadedOnly: false, showHidden: false,
-    grouped: false, groupsOnly: false, inProgress: false, channelId: null,
+    grouped: false, groupsOnly: false, inProgress: false, channelIds: [] as string[],
   };
 
-  it("counts what narrows the list, and a chosen channel", () => {
+  it("counts what narrows the list, and the channel pick as one however many it holds", () => {
     expect(activeFilterCount(none)).toBe(0);
-    expect(activeFilterCount({ ...none, hideWatched: true, downloadedOnly: true, channelId: "UC1" })).toBe(3);
+    expect(activeFilterCount({ ...none, hideWatched: true, downloadedOnly: true, channelIds: ["UC1"] })).toBe(3);
+    expect(activeFilterCount({ ...none, channelIds: ["UC1", "UC2", "UC3"] })).toBe(1);
   });
 
   it("does not count grouping, which only arranges the list", () => {

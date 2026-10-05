@@ -70,12 +70,12 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
       // a burst of queued rows fills the first.
       const [recent, done] = await Promise.all([
         api.listVideos({
-          channelId: null, hideWatched: false, downloadedOnly: false, showHidden: true,
+          channelIds: [], hideWatched: false, downloadedOnly: false, showHidden: true,
           groupsOnly: false, inProgress: false, search: null, siblingOf: null, sort: "downloaded",
           limit: SWEEP, offset: 0,
         }),
         api.listVideos({
-          channelId: null, hideWatched: false, downloadedOnly: true, showHidden: true,
+          channelIds: [], hideWatched: false, downloadedOnly: true, showHidden: true,
           groupsOnly: false, inProgress: false, search: null, siblingOf: null, sort: "downloaded",
           limit: SWEEP, offset: 0,
         }),

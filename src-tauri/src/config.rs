@@ -78,8 +78,13 @@ fn d_sort() -> SortOrder {
 /// prevent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewState {
-    #[serde(default)]
-    pub channel_id: Option<String>,
+    /// The channels the feed is narrowed to; empty is every channel. Kept
+    /// sorted by `sanitize`, so the same pick always serialises the same way.
+    /// A view saved before 3.2 held one channel as `channel_id`: it is read as
+    /// a list of one, so an upgrade opens on the filter that was on screen,
+    /// and only `channel_ids` is ever written back.
+    #[serde(default, alias = "channel_id", deserialize_with = "one_or_many")]
+    pub channel_ids: Vec<String>,
     #[serde(default)]
     pub search: String,
     #[serde(default)]
@@ -105,7 +110,7 @@ pub struct ViewState {
 impl Default for ViewState {
     fn default() -> Self {
         Self {
-            channel_id: None,
+            channel_ids: Vec::new(),
             search: String::new(),
             hide_watched: false,
             downloaded_only: false,
@@ -142,10 +147,26 @@ impl ViewState {
         } else {
             trimmed.to_string()
         };
-        if self.channel_id.as_deref() == Some("") {
-            self.channel_id = None;
-        }
+        self.channel_ids.retain(|id| !id.is_empty());
+        self.channel_ids.sort();
+        self.channel_ids.dedup();
     }
+}
+
+/// `channel_ids` as written now (a list), or as `channel_id` was (one id, or
+/// null for every channel).
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(id)) => vec![id],
+        Some(OneOrMany::Many(ids)) => ids,
+    })
 }
 
 fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ViewState, D::Error> {
@@ -513,7 +534,7 @@ mod tests {
     fn a_populated_view_round_trips_through_to_json_string_and_from_json_str() {
         let mut s = Settings::default();
         s.view = ViewState {
-            channel_id: Some("UC123".into()),
+            channel_ids: vec!["UC123".into(), "UC456".into()],
             search: "cats".into(),
             hide_watched: true,
             downloaded_only: true,
@@ -526,6 +547,33 @@ mod tests {
         let json = s.to_json_string().unwrap();
         let back = Settings::from_json_str(&json).unwrap();
         assert_eq!(back.view, s.view);
+    }
+
+    #[test]
+    fn a_single_channel_saved_before_3_2_becomes_a_list_of_one() {
+        // An upgrade keeps the filter that was on screen, rather than opening
+        // on every channel.
+        let s = Settings::from_json_str(r#"{"view":{"channel_id":"UC123","hide_watched":true}}"#)
+            .unwrap();
+        assert_eq!(s.view.channel_ids, ["UC123"]);
+        assert!(s.view.hide_watched);
+        let all = Settings::from_json_str(r#"{"view":{"channel_id":null}}"#).unwrap();
+        assert!(all.view.channel_ids.is_empty());
+        // Written back under the new key only.
+        let json = s.to_json_string().unwrap();
+        assert!(json.contains(r#""channel_ids": ["#), "{json}");
+        assert!(!json.contains(r#""channel_id":"#), "{json}");
+    }
+
+    #[test]
+    fn channel_ids_are_sorted_deduplicated_and_never_empty_strings() {
+        // Sorted so that picking A then B saves what picking B then A does:
+        // `App.tsx` compares the serialised view to decide whether to write.
+        let s = Settings::from_json_str(
+            r#"{"view":{"channel_ids":["UC2","","UC1","UC2"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.view.channel_ids, ["UC1", "UC2"]);
     }
 
     #[test]

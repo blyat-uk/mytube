@@ -58,7 +58,7 @@ import App from "./App";
 
 function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
-    channel_id: null, search: "", hide_watched: false, downloaded_only: false,
+    channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
     ...over,
   };
@@ -126,17 +126,15 @@ describe("restoring the saved view on launch", () => {
 
 /**
  * `getSettings` and `listChannels` are two independent IPC calls with no
- * ordering guarantee between them. Before this feature `channelId` always
- * started null, so the channel-validity effect (in App.tsx, just above the
- * hydration effect) could never see a non-null one before `channels` was
- * populated. Restoring `channelId` from the saved view changes that: if
- * `getSettings` resolves first, the effect sees a restored `channelId`
- * against a still-unfetched `channels === []` and, without a guard, reads
- * that as "this channel was deleted."
+ * ordering guarantee between them. Restoring `channelIds` from the saved view
+ * means that if `getSettings` resolves first, the channel-validity effect (in
+ * App.tsx, just above the hydration effect) sees a restored pick against a
+ * still-unfetched `channels === []` and, without a guard, reads that as
+ * "these channels were deleted."
  */
 describe("restoring a channel filter while the channel list is still loading", () => {
   it("keeps a restored channel that the list, once it arrives, actually contains", async () => {
-    settings = settingsWith({ channel_id: "UC1" });
+    settings = settingsWith({ channel_ids: ["UC1"] });
 
     let resolveChannels!: (channels: Channel[]) => void;
     listChannels.mockImplementation(
@@ -146,10 +144,10 @@ describe("restoring a channel filter while the channel list is still loading", (
     render(<App />);
 
     // The render gate waits only on getSettings, so the search box (and the
-    // restored channelId behind it) exist well before listChannels resolves.
+    // restored channelIds behind it) exist well before listChannels resolves.
     await screen.findByLabelText("Search videos");
     // Real time, not a bare `act()` flush: a missing guard prunes
-    // `channelId` through a cascade of renders (the newly-mounted
+    // `channelIds` through a cascade of renders (the newly-mounted
     // SubscriptionsView fetches with "UC1" before Shell's own effect corrects
     // it), and how much of that cascade a single `act()` pass settles is not
     // dependable. A real wait lets it fully play out one way or the other
@@ -169,7 +167,26 @@ describe("restoring a channel filter while the channel list is still loading", (
     await pause(100);
 
     const lastCall = listVideos.mock.calls[listVideos.mock.calls.length - 1];
-    expect(lastCall?.[0]).toMatchObject({ channelId: "UC1" });
+    expect(lastCall?.[0]).toMatchObject({ channelIds: ["UC1"] });
+  });
+
+  it("drops only the picked channels the list no longer has", async () => {
+    settings = settingsWith({ channel_ids: ["UC1", "UCgone"] });
+    listChannels.mockImplementation(() => Promise.resolve([
+      {
+        id: "UC1", title: "Chills Narrated", handle: null,
+        url: "https://youtube.com/channel/UC1", thumb_path: null,
+        subscribed: true, member: false, auto_download: false, added_at: 0, last_polled_at: null,
+        terminated: false,
+      },
+    ]));
+
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => {
+      const lastCall = listVideos.mock.calls[listVideos.mock.calls.length - 1];
+      expect(lastCall?.[0]).toMatchObject({ channelIds: ["UC1"] });
+    });
   });
 });
 

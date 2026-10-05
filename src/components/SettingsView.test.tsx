@@ -32,7 +32,7 @@ const SETTINGS: Settings = {
   ytdlp_path: "", ffmpeg_path: "", deno_path: "",
   quality: { ...DEFAULT_QUALITY },
   view: {
-    channel_id: null, search: "", hide_watched: false, downloaded_only: false,
+    channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
   },
 };

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CARD_DEFAULT, clampCardSize } from "./format";
+import { normalizeIds, pruneIds } from "./channelPick";
 import TopNav, { type Tab } from "./components/TopNav";
 import SubscriptionsView, { type SeriesTally } from "./components/SubscriptionsView";
 import DownloadsView from "./components/DownloadsView";
@@ -30,12 +31,12 @@ export default function App() {
 // insertion order, and that order now comes from this literal, not from
 // whatever order the IPC payload's keys arrived in.
 function buildViewState(
-  channelId: string | null, search: string, hideWatched: boolean,
+  channelIds: string[], search: string, hideWatched: boolean,
   downloadedOnly: boolean, showHidden: boolean, grouped: boolean, groupsOnly: boolean,
   inProgress: boolean, sort: SortOrder,
 ): ViewState {
   return {
-    channel_id: channelId, search,
+    channel_ids: channelIds, search,
     hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
     grouped, groups_only: groupsOnly, in_progress: inProgress, sort,
   };
@@ -46,7 +47,12 @@ function Shell() {
 
   const [tab, setTab] = useState<Tab>("subscriptions");
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [channelId, setChannelId] = useState<string | null>(null);
+  // The channels the feed is narrowed to; empty is every channel. Always held
+  // normalised (sorted, no duplicates), so the same pick is the same JSON to
+  // the view writer below and the same list to SubscriptionsView's scroll
+  // memory, however it was ticked.
+  const [channelIds, setChannelIds] = useState<string[]>([]);
+  const pickChannels = useCallback((ids: string[]) => setChannelIds(normalizeIds(ids)), []);
   const [search, setSearch] = useState("");
   const [hideWatched, setHideWatched] = useState(false);
   const [downloadedOnly, setDownloadedOnly] = useState(false);
@@ -251,16 +257,19 @@ function Shell() {
     }
   }, [polling, loadChannels, reload, toast]);
 
-  // A channel filter pointing at a channel that no longer exists shows nothing.
-  // Gated on the list having actually been fetched: hydration can restore
-  // `channelId` from settings.json before `listChannels` resolves, and until
-  // then `channels` is its unfetched `[]` default -- indistinguishable from
-  // "you have no channels" -- so pruning against it would silently discard a
-  // channel filter that the list, once it arrives, would have kept.
+  // A picked channel that no longer exists narrows the feed to nothing, so it
+  // leaves the pick; the others stay. Gated on the list having actually been
+  // fetched: hydration can restore `channelIds` from settings.json before
+  // `listChannels` resolves, and until then `channels` is its unfetched `[]`
+  // default -- indistinguishable from "you have no channels" -- so pruning
+  // against it would silently discard a channel filter that the list, once it
+  // arrives, would have kept. `pruneIds` hands back the same array when nothing
+  // went, so a channel refresh is not a new filter.
   useEffect(() => {
     if (!channelsFetched.current) return;
-    if (channelId && !channels.some((c) => c.id === channelId)) setChannelId(null);
-  }, [channels, channelId]);
+    const kept = pruneIds(channelIds, channels);
+    if (kept !== channelIds) setChannelIds(kept);
+  }, [channels, channelIds]);
 
   // Card size and the feed's filters both live in settings.json, so both are
   // read up front and rendering waits for them -- see the early return below.
@@ -274,7 +283,8 @@ function Shell() {
       .then((s) => {
         setCardSize(clampCardSize(s.card_size ?? CARD_DEFAULT));
         const v = s.view;
-        setChannelId(v.channel_id);
+        const restored = normalizeIds(v.channel_ids);
+        setChannelIds(restored);
         setSearch(v.search);
         setHideWatched(v.hide_watched);
         setDownloadedOnly(v.downloaded_only);
@@ -285,7 +295,7 @@ function Shell() {
         setSort(v.sort);
         persistedView.current = JSON.stringify(
           buildViewState(
-            v.channel_id, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
+            restored, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
             v.groups_only, v.in_progress, v.sort,
           ),
         );
@@ -299,7 +309,7 @@ function Shell() {
         // never actually managed to read.
         persistedView.current = JSON.stringify(
           buildViewState(
-            channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
+            channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
             inProgress, sort,
           ),
         );
@@ -329,7 +339,7 @@ function Shell() {
   useEffect(() => {
     if (!hydrated) return;
     const view = buildViewState(
-      channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
+      channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
       inProgress, sort,
     );
     const serialised = JSON.stringify(view);
@@ -340,7 +350,7 @@ function Shell() {
         .catch(() => {});
     }, 400);
     return () => window.clearTimeout(t);
-  }, [hydrated, channelId, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
+  }, [hydrated, channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
       inProgress, sort]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
@@ -354,8 +364,8 @@ function Shell() {
         tab={tab}
         onTab={setTab}
         channels={channels}
-        channelId={channelId}
-        onChannelId={setChannelId}
+        channelIds={channelIds}
+        onChannelIds={pickChannels}
         search={search}
         onSearch={setSearch}
         hideWatched={hideWatched}
@@ -384,7 +394,7 @@ function Shell() {
       <main className="content" ref={contentRef}>
         {tab === "subscriptions" && (
           <SubscriptionsView
-            channelId={channelId}
+            channelIds={channelIds}
             search={search}
             hideWatched={hideWatched}
             downloadedOnly={downloadedOnly}

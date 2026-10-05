@@ -1,7 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactElement, type RefObject } from "react";
+import { useRef, type ReactElement, type RefObject } from "react";
 import {
   IconContinue, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconUnwatched, IconCheck,
 } from "./Icons";
+import ChannelList from "./ChannelList";
+import { usePopover } from "./usePopover";
 import type { Channel, SortOrder } from "../types";
 
 export const SORTS: { value: SortOrder; label: string }[] = [
@@ -12,16 +14,17 @@ export const SORTS: { value: SortOrder; label: string }[] = [
   { value: "parts", label: "Most parts first" },
 ];
 
-/** How many things narrow the list: the five filters and a chosen channel.
- *  Grouping and the sort only arrange it, so they do not count. The two
- *  series-only filters count only while grouped, which is when they apply. */
+/** How many things narrow the list: the five filters and the channel pick,
+ *  which is one filter however many channels it holds. Grouping and the sort
+ *  only arrange it, so they do not count. The two series-only filters count
+ *  only while grouped, which is when they apply. */
 export function activeFilterCount(f: {
   hideWatched: boolean; downloadedOnly: boolean; showHidden: boolean;
-  grouped: boolean; groupsOnly: boolean; inProgress: boolean; channelId: string | null;
+  grouped: boolean; groupsOnly: boolean; inProgress: boolean; channelIds: readonly string[];
 }): number {
   return [
     f.hideWatched, f.downloadedOnly, f.showHidden,
-    f.grouped && f.groupsOnly, f.grouped && f.inProgress, f.channelId !== null,
+    f.grouped && f.groupsOnly, f.grouped && f.inProgress, f.channelIds.length > 0,
   ].filter(Boolean).length;
 }
 
@@ -33,8 +36,8 @@ interface Props {
   off: boolean;
   offHint?: string;
   channels: Channel[];
-  channelId: string | null;
-  onChannelId: (id: string | null) => void;
+  channelIds: string[];
+  onChannelIds: (ids: string[]) => void;
   hideWatched: boolean;
   onHideWatched: (b: boolean) => void;
   downloadedOnly: boolean;
@@ -73,48 +76,17 @@ function Toggle({ label, icon: Icon, on, disabled, title, onChange }: {
 
 /**
  * Everything the folded filter row keeps behind its one button, in two
- * columns: what is in the list and how it is arranged, then the order and the
- * channel. Changes apply as they are made, like the controls they stand in
- * for, so the panel stays open until a click lands outside it or Esc.
+ * columns: what is in the list, how it is arranged and in what order, then
+ * which channels. Changes apply as they are made, like the controls they stand
+ * in for, so the panel stays open until a click lands outside it or Esc.
+ *
+ * The left column alone sets the panel's height. The channel list takes what
+ * that leaves on the right and scrolls past it, so a long subscription list
+ * never makes the panel taller (`.pop-col-fill`).
  */
 export default function FiltersPanel(p: Props) {
   const ref = useRef<HTMLDivElement>(null);
-  const [right, setRight] = useState(0);
-
-  // Hung from the button's right edge, measured against the nav it sits in —
-  // the panel lives outside the button's cluster, which clips while it slides.
-  useLayoutEffect(() => {
-    const place = () => {
-      const btn = p.anchor.current;
-      const host = ref.current?.offsetParent as HTMLElement | null;
-      if (!btn || !host) return;
-      setRight(Math.max(8, host.getBoundingClientRect().right - btn.getBoundingClientRect().right));
-    };
-    place();
-    window.addEventListener("resize", place);
-    return () => window.removeEventListener("resize", place);
-  }, [p.anchor]);
-
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (ref.current?.contains(t) || p.anchor.current?.contains(t)) return;
-      p.onClose(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // Esc also leaves an open series; closing the panel is all this one means.
-      e.stopPropagation();
-      p.onClose(true);
-    };
-    document.addEventListener("mousedown", onDown);
-    // Capture, so it is heard before the shell's series handler on window.
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey, true);
-    };
-  }, [p.onClose, p.anchor]);
+  const right = usePopover(ref, p.anchor, p.onClose);
 
   const hint = p.offHint;
   return (
@@ -143,9 +115,7 @@ export default function FiltersPanel(p: Props) {
           <Toggle label="Group siblings" icon={IconSeries} on={p.grouped} disabled={p.off}
             title={hint} onChange={p.onGrouped} />
         </div>
-      </div>
-
-      <div className="pop-col">
+        <div className="pop-sep" />
         <div className="pop-head" id="filters-sort">Sort</div>
         <div role="radiogroup" aria-labelledby="filters-sort">
           {SORTS.filter((s) => s.value !== "parts" || p.grouped).map((s) => (
@@ -162,21 +132,20 @@ export default function FiltersPanel(p: Props) {
             </button>
           ))}
         </div>
-        <div className="pop-sep" />
-        <div className="pop-head">Channel</div>
-        <select
-          className="select pop-select"
-          value={p.channelId ?? ""}
-          aria-label="Filter by channel"
+      </div>
+
+      <div className="pop-col pop-col-fill">
+        <div className="pop-head">
+          Channels
+          {p.channelIds.length > 0 && <span className="pop-head-note">{p.channelIds.length} picked</span>}
+        </div>
+        <ChannelList
+          channels={p.channels}
+          picked={p.channelIds}
+          onPick={p.onChannelIds}
           disabled={p.off}
           title={hint}
-          onChange={(e) => p.onChannelId(e.currentTarget.value || null)}
-        >
-          <option value="">All channels</option>
-          {p.channels.map((c) => (
-            <option key={c.id} value={c.id}>{c.title}</option>
-          ))}
-        </select>
+        />
       </div>
     </div>
   );

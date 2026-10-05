@@ -17,7 +17,7 @@ type Props = ComponentProps<typeof TopNav>;
 
 function renderNav(over: Partial<Props> = {}) {
   const p: Props = {
-    tab: "subscriptions", onTab: vi.fn(), channels: CHANNELS, channelId: null, onChannelId: vi.fn(),
+    tab: "subscriptions", onTab: vi.fn(), channels: CHANNELS, channelIds: [], onChannelIds: vi.fn(),
     search: "", onSearch: vi.fn(), hideWatched: false, onHideWatched: vi.fn(),
     downloadedOnly: false, onDownloadedOnly: vi.fn(), showHidden: false, onShowHidden: vi.fn(),
     grouped: false, onGrouped: vi.fn(), groupsOnly: false, onGroupsOnly: vi.fn(),
@@ -49,9 +49,14 @@ describe("the folded filter row", () => {
   });
 
   it("wears the number of filters applied as a chip", () => {
-    renderNav({ hideWatched: true, downloadedOnly: true, channelId: "UC1" });
+    renderNav({ hideWatched: true, downloadedOnly: true, channelIds: ["UC1"] });
     const btn = screen.getByRole("button", { name: "Filters, 3 applied" });
     expect(btn.querySelector(".count")?.textContent).toBe("3");
+  });
+
+  it("counts a pick of several channels as one filter", () => {
+    renderNav({ channelIds: ["UC1", "UC2"] });
+    expect(screen.getByRole("button", { name: "Filters, 1 applied" })).toBeDefined();
   });
 
   it("shows no chip when nothing is applied", () => {
@@ -59,16 +64,32 @@ describe("the folded filter row", () => {
     expect(screen.getByRole("button", { name: "Filters" }).querySelector(".count")).toBeNull();
   });
 
-  it("opens a panel with Show and Arrange, then Sort and Channel", () => {
+  it("opens a panel with Show, Arrange and Sort, then Channels in a column of their own", () => {
     renderNav({ grouped: true });
     const panel = openPanel();
     const heads = Array.from(panel.querySelectorAll(".pop-head")).map((h) => h.textContent);
-    expect(heads).toEqual(["Show", "Arrange", "Sort", "Channel"]);
+    expect(heads).toEqual(["Show", "Arrange", "Sort", "Channels"]);
     const cols = panel.querySelectorAll(".pop-col");
     expect(cols[0].textContent).toContain("Continue watching");
     expect(cols[0].textContent).toContain("Group siblings");
-    expect(cols[1].textContent).toContain("Most parts first");
+    expect(cols[0].textContent).toContain("Most parts first");
+    // The left column sets the height; the list fills what it leaves (CSS).
+    expect(cols[1].classList.contains("pop-col-fill")).toBe(true);
+    expect(cols[1].textContent).toContain("All channels");
+    expect(cols[1].textContent).toContain("Chills Narrated");
     expect(filtersButton().getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("says how many channels are picked beside the Channels head", () => {
+    renderNav({ channelIds: ["UC1"] });
+    const panel = openPanel();
+    expect(panel.querySelector(".pop-head-note")?.textContent).toBe("1 picked");
+  });
+
+  it("leaves the filter box alone on opening, unlike the toolbar's own list", () => {
+    renderNav();
+    openPanel();
+    expect(document.activeElement).not.toBe(screen.getByRole("searchbox", { name: "Filter channels" }));
   });
 
   it("applies each change as it is made and stays open", () => {
@@ -78,8 +99,8 @@ describe("the folded filter row", () => {
     expect(p.onHideWatched).toHaveBeenCalledWith(true);
     fireEvent.click(screen.getByRole("radio", { name: "Longest first" }));
     expect(p.onSort).toHaveBeenCalledWith("length");
-    fireEvent.change(screen.getByRole("combobox", { name: "Filter by channel" }), { target: { value: "UC1" } });
-    expect(p.onChannelId).toHaveBeenCalledWith("UC1");
+    fireEvent.click(screen.getByRole("button", { name: "Chills Narrated" }));
+    expect(p.onChannelIds).toHaveBeenCalledWith(["UC1"]);
     expect(screen.getByRole("dialog", { name: "Filters" })).toBeDefined();
   });
 
@@ -114,7 +135,8 @@ describe("the folded filter row", () => {
     renderNav({ series: { name: "Tapes", parts: 3, runtime: "", unknown: 0 } });
     openPanel();
     expect((screen.getByRole("button", { name: "Unwatched" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("combobox", { name: "Filter by channel" }) as HTMLSelectElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Chills Narrated" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("searchbox", { name: "Filter channels" }) as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByRole("radio", { name: "Oldest first" }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

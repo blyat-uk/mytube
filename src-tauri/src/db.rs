@@ -310,9 +310,13 @@ fn feed_query(
             .join(",");
         sql.push_str(&format!(" AND v.id IN ({holes})"));
     } else {
-        if let Some(ch) = &f.channel_id {
-            args.push(Box::new(ch.clone()));
-            sql.push_str(&format!(" AND v.channel_id=?{}", args.len()));
+        if !f.channel_ids.is_empty() {
+            let holes = f.channel_ids
+                .iter()
+                .map(|id| { args.push(Box::new(id.clone())); format!("?{}", args.len()) })
+                .collect::<Vec<_>>()
+                .join(",");
+            sql.push_str(&format!(" AND v.channel_id IN ({holes})"));
         }
         if !f.show_hidden { sql.push_str(" AND v.hidden=0"); }
         if f.hide_watched { sql.push_str(" AND v.watched=0"); }
@@ -1542,7 +1546,7 @@ mod tests {
             downloaded_only: true,
             show_hidden: false,
             search: Some("nothing matches this".into()),
-            channel_id: Some("UC-other".into()),
+            channel_ids: vec!["UC-other".into()],
             ..Default::default()
         };
         let mut got: Vec<String> = d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
@@ -2038,7 +2042,7 @@ mod tests {
         d.set_watched("a", true).unwrap();
         d.set_download_state("b", DownloadState::Done, Some("/tmp/b.mkv"), None).unwrap();
 
-        let by_channel = VideoFilter { channel_id: Some("UC1".into()), ..Default::default() };
+        let by_channel = VideoFilter { channel_ids: vec!["UC1".into()], ..Default::default() };
         assert_eq!(d.list_videos(&by_channel).unwrap().len(), 2);
 
         let unwatched = VideoFilter { hide_watched: true, ..Default::default() };
@@ -2095,6 +2099,39 @@ mod tests {
         let groups = d.list_video_groups(&grouped).unwrap();
         let ids: Vec<&str> = groups.iter().flat_map(|g| g.videos.iter().map(|v| v.id.as_str())).collect();
         assert_eq!(ids, ["d"]);
+    }
+
+    #[test]
+    fn a_channel_filter_keeps_any_of_its_channels_and_nothing_else() {
+        let d = db();
+        for (id, title) in [("UC1", "Alpha"), ("UC2", "Beta"), ("UC3", "Gamma")] {
+            d.upsert_channel(&chan(id, title)).unwrap();
+        }
+        d.insert_video_if_new(&vid("a", "UC1", Some(4))).unwrap();
+        d.insert_video_if_new(&vid("b", "UC2", Some(3))).unwrap();
+        d.insert_video_if_new(&vid("c", "UC3", Some(2))).unwrap();
+        d.insert_video_if_new(&vid("d", "UC1", Some(1))).unwrap();
+        d.set_watched("d", true).unwrap();
+
+        let ids = |f: &VideoFilter| -> Vec<String> {
+            d.list_videos(f).unwrap().into_iter().map(|v| v.id).collect()
+        };
+        let two = VideoFilter { channel_ids: vec!["UC1".into(), "UC3".into()], ..Default::default() };
+        assert_eq!(ids(&two), ["a", "c", "d"]);
+        // An empty list is no filter at all, not a filter that matches nothing.
+        assert_eq!(ids(&VideoFilter::default()), ["a", "b", "c", "d"]);
+        // The channels are one filter among the others, ANDed with them.
+        let unwatched = VideoFilter { hide_watched: true, ..two.clone() };
+        assert_eq!(ids(&unwatched), ["a", "c"]);
+        // A channel that is gone narrows to nothing rather than erroring.
+        let gone = VideoFilter { channel_ids: vec!["UC-gone".into()], ..Default::default() };
+        assert!(ids(&gone).is_empty());
+
+        // The grouping walk shares the WHERE clause, so it keeps the same rows.
+        let groups = d.list_video_groups(&two).unwrap();
+        let grouped: Vec<&str> =
+            groups.iter().flat_map(|g| g.videos.iter().map(|v| v.id.as_str())).collect();
+        assert_eq!(grouped, ["a", "c", "d"]);
     }
 
     #[test]

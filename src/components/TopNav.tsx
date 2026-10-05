@@ -4,6 +4,7 @@ import {
   IconSeries, IconSettings, IconSubscriptions, IconUnwatched,
 } from "./Icons";
 import FiltersPanel, { activeFilterCount, SORTS } from "./FiltersPanel";
+import { ChannelButton, ChannelPopover } from "./ChannelPicker";
 import { useToolbarFit } from "../toolbarFit";
 import type { Channel, SortOrder, VersionInfo } from "../types";
 
@@ -44,8 +45,9 @@ interface Props {
   tab: Tab;
   onTab: (t: Tab) => void;
   channels: Channel[];
-  channelId: string | null;
-  onChannelId: (id: string | null) => void;
+  /** The channels the feed is narrowed to, sorted; empty for every channel. */
+  channelIds: string[];
+  onChannelIds: (ids: string[]) => void;
   search: string;
   onSearch: (s: string) => void;
   hideWatched: boolean;
@@ -94,6 +96,7 @@ export default function TopNav(p: Props) {
   const fullRef = useRef<HTMLDivElement | null>(null);
   const compactRef = useRef<HTMLDivElement | null>(null);
   const filtersBtnRef = useRef<HTMLButtonElement | null>(null);
+  const channelBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const showFilters = p.tab === "subscriptions";
   const fit = useToolbarFit(
@@ -114,6 +117,19 @@ export default function TopNav(p: Props) {
   const closePanel = useCallback((refocus: boolean) => {
     setPanelOpen(false);
     if (refocus) filtersBtnRef.current?.focus();
+  }, []);
+
+  // The full row's channel checklist. It belongs to that row the way the
+  // panel belongs to the folded one, so folding closes it -- as does a series
+  // opening or a tab without the filters, either of which takes its button
+  // away or switches it off.
+  const [channelsOpen, setChannelsOpen] = useState(false);
+  useEffect(() => {
+    if (folded || p.series !== null || !showFilters) setChannelsOpen(false);
+  }, [folded, p.series, showFilters]);
+  const closeChannels = useCallback((refocus: boolean) => {
+    setChannelsOpen(false);
+    if (refocus) channelBtnRef.current?.focus();
   }, []);
 
   /** The folded row's search box is out: asked for, or holding a query. */
@@ -208,10 +224,6 @@ export default function TopNav(p: Props) {
     setFocusWanted(true);
   };
   const filterCount = activeFilterCount(p);
-
-  const channelTitle = p.channelId
-    ? p.channels.find((c) => c.id === p.channelId)?.title ?? "All channels"
-    : "All channels";
 
   return (
     <header className={`topnav fit-${fit}`}>
@@ -407,20 +419,15 @@ export default function TopNav(p: Props) {
                     <option key={o.value} value={o.value}>{o.label}</option>
                   ))}
                 </select>
-                <select
-                  className="select channel-select"
-                  value={p.channelId ?? ""}
-                  aria-label="Filter by channel"
+                <ChannelButton
+                  channels={p.channels}
+                  picked={p.channelIds}
+                  open={channelsOpen}
+                  onToggle={() => setChannelsOpen((o) => !o)}
                   disabled={off}
-                  // A long name is cut short in the box, so the full name lives here.
-                  title={offHint ?? channelTitle}
-                  onChange={(e) => p.onChannelId(e.currentTarget.value || null)}
-                >
-                  <option value="">All channels</option>
-                  {p.channels.map((c) => (
-                    <option key={c.id} value={c.id}>{c.title}</option>
-                  ))}
-                </select>
+                  offHint={offHint}
+                  buttonRef={channelBtnRef}
+                />
               </div>
             </div>
 
@@ -505,6 +512,16 @@ export default function TopNav(p: Props) {
         </button>
       </div>
 
+      {showFilters && !folded && channelsOpen && (
+        <ChannelPopover
+          anchor={channelBtnRef}
+          onClose={closeChannels}
+          channels={p.channels}
+          picked={p.channelIds}
+          onPick={p.onChannelIds}
+        />
+      )}
+
       {showFilters && folded && panelOpen && (
         <FiltersPanel
           anchor={filtersBtnRef}
@@ -512,8 +529,8 @@ export default function TopNav(p: Props) {
           off={off}
           offHint={offHint}
           channels={p.channels}
-          channelId={p.channelId}
-          onChannelId={p.onChannelId}
+          channelIds={p.channelIds}
+          onChannelIds={p.onChannelIds}
           hideWatched={p.hideWatched}
           onHideWatched={p.onHideWatched}
           downloadedOnly={p.downloadedOnly}
