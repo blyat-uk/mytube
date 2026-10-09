@@ -57,6 +57,15 @@ The command is `mytube` with the `.deb` and `.rpm`, the AppImage file itself (`.
 
 If MyTube is running on the machine you import into, its window shows the import after its next poll.
 
+## Syncing your computers
+
+Settings → Sync keeps your subscriptions, channel memberships and every video you have watched, hidden, linked into a series or added by hand the same on all your computers. Settings, downloads and thumbnails stay on each computer.
+
+1. On one computer, choose **Turn on sync**. A small window asks you to confirm you are a person (Cloudflare Turnstile), and MyTube then shows your sync code, `MYT1-…`.
+2. On each other computer, paste that code under **Have a code from another computer?** and choose **Join**. Up to five computers can share one code.
+
+Changes are sent within about a minute and picked up when you bring MyTube's window to the front. There is no account and no email: your library is encrypted on your computer, with a key made from the sync code, before it is sent, so the sync server only ever stores data it cannot read. Anyone with the code can see and change your synced library, so keep it like a password. **Reset code…** makes a new one (enter it on your other computers again), and **Turn off sync…** makes a computer forget the code without changing its library. A code nothing syncs with for 90 days is deleted from the server. The server's source is in [`sync-server/`](sync-server/).
+
 ## Uninstalling
 
 Uninstalling removes the app but not your data or the tools it downloaded. Delete these folders as well to remove everything:
