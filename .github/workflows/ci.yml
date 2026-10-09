@@ -1,8 +1,8 @@
 name: CI
 
 # Every push to main and every pull request runs the frontend and backend
-# suites on the three OSes MyTube ships for. Bundling and the tool self-test
-# live in release.yml; this is the fast check.
+# suites on the three OSes MyTube ships for, plus the sync server's suite.
+# Bundling and the tool self-test live in release.yml; this is the fast check.
 
 on:
   push:
@@ -96,3 +96,26 @@ jobs:
               body = body.strip()[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print(f"::error title={name.replace('::', '.')}::{body}")
           PY
+
+  # The Cloudflare Worker in sync-server/ is its own bun project. Its tests run
+  # in workerd, which is the same on every OS, so Linux alone is enough.
+  sync-server:
+    name: Sync server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sync-server
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bun run typecheck
+
+      - name: Tests
+        run: bun run test

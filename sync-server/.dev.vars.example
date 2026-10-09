@@ -1,0 +1,5 @@
+# Cloudflare's published Turnstile test keys: the widget always passes and siteverify accepts
+# any token, including the dummy XXXX.DUMMY.TOKEN.XXXX. Copy to .dev.vars for `bun run dev`.
+# Never put the real secret here; production uses `bunx wrangler secret put TURNSTILE_SECRET`.
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET=1x0000000000000000000000000000000AA

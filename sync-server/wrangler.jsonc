@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mytube-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-23",
+
+  // The custom domain is the only address. A *.workers.dev or preview URL would sit outside the
+  // zone's WAF and rate-limit rules, so anyone could hit the Worker (and spend the shared free
+  // quota) with no edge filtering at all.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "mytube-sync.blyat.uk", "custom_domain": true }],
+
+  // Nothing is logged or kept: no request ever needs to be read back, and a log line is one more
+  // place a bearer could end up.
+  "observability": { "enabled": false },
+
+  "durable_objects": {
+    "bindings": [{ "name": "GROUPS", "class_name": "SyncGroup" }]
+  },
+  // SQLite-backed, which is the only kind the Workers Free plan allows.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncGroup"] }],
+
+  // The site key is public and goes in the /verify page. It stays empty in the repository: the
+  // page answers 503 until the owner pastes the real widget's key here (see README).
+  "vars": { "TURNSTILE_SITE_KEY": "" }
+  // TURNSTILE_SECRET is a secret: `bunx wrangler secret put TURNSTILE_SECRET` in production,
+  // .dev.vars locally. Without it POST /v1/group answers 503 not_configured. It is deliberately
+  // not listed under `secrets.required`, which makes every test run warn that it is missing.
+}
