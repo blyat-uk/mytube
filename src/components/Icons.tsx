@@ -26,6 +26,32 @@ import { Star } from "@phosphor-icons/react/dist/icons/Star";
 import { Trash } from "@phosphor-icons/react/dist/icons/Trash";
 import { Stack } from "@phosphor-icons/react/dist/icons/Stack";
 import { X } from "@phosphor-icons/react/dist/icons/X";
+import { User } from "@phosphor-icons/react/dist/icons/User";
+import { Clock } from "@phosphor-icons/react/dist/icons/Clock";
+import { ArrowsClockwise } from "@phosphor-icons/react/dist/icons/ArrowsClockwise";
+import { Archive } from "@phosphor-icons/react/dist/icons/Archive";
+import { Wrench } from "@phosphor-icons/react/dist/icons/Wrench";
+import { Info } from "@phosphor-icons/react/dist/icons/Info";
+import { Folder } from "@phosphor-icons/react/dist/icons/Folder";
+import { Minus } from "@phosphor-icons/react/dist/icons/Minus";
+import { Plus } from "@phosphor-icons/react/dist/icons/Plus";
+import { FilmStrip } from "@phosphor-icons/react/dist/icons/FilmStrip";
+import { MusicNotes } from "@phosphor-icons/react/dist/icons/MusicNotes";
+import { CaretRight } from "@phosphor-icons/react/dist/icons/CaretRight";
+import { Monitor } from "@phosphor-icons/react/dist/icons/Monitor";
+import { Laptop } from "@phosphor-icons/react/dist/icons/Laptop";
+import { PencilSimple } from "@phosphor-icons/react/dist/icons/PencilSimple";
+import { Globe } from "@phosphor-icons/react/dist/icons/Globe";
+import { FileText } from "@phosphor-icons/react/dist/icons/FileText";
+import { Prohibit } from "@phosphor-icons/react/dist/icons/Prohibit";
+import { Sparkle } from "@phosphor-icons/react/dist/icons/Sparkle";
+import { ShieldCheck } from "@phosphor-icons/react/dist/icons/ShieldCheck";
+import { Eye } from "@phosphor-icons/react/dist/icons/Eye";
+import { Copy } from "@phosphor-icons/react/dist/icons/Copy";
+import { ArrowUp } from "@phosphor-icons/react/dist/icons/ArrowUp";
+import { Warning } from "@phosphor-icons/react/dist/icons/Warning";
+import { TerminalWindow } from "@phosphor-icons/react/dist/icons/TerminalWindow";
+import { UploadSimple } from "@phosphor-icons/react/dist/icons/UploadSimple";
 
 /* Size comes from CSS (`.icon`), which scales with the grid zoom, so the
    components only pin the weight. */
@@ -78,3 +104,39 @@ export const IconClose = () => <X className="icon" weight="bold" />;
 export const IconFilters = () => <Funnel className="icon" weight="bold" />;
 export const IconSearch = () => <MagnifyingGlass className="icon" weight="bold" />;
 export const IconCaret = () => <CaretDown className="icon icon-caret" weight="bold" />;
+
+/* Settings. Each section's glyph names the section, and its rail entry, its page
+   header and its folded tile all wear the same one. */
+export const IconSectionDownloads = () => <DownloadSimple className="icon" weight="bold" />;
+export const IconSectionSignIn = () => <User className="icon" weight="bold" />;
+export const IconSectionPlayer = () => <Play className="icon" weight="fill" />;
+export const IconSectionNewVideos = () => <Clock className="icon" weight="bold" />;
+export const IconSectionSync = () => <ArrowsClockwise className="icon" weight="bold" />;
+export const IconSectionBackup = () => <Archive className="icon" weight="bold" />;
+export const IconSectionTools = () => <Wrench className="icon" weight="bold" />;
+export const IconSectionAbout = () => <Info className="icon" weight="bold" />;
+
+export const IconFolder = () => <Folder className="icon" weight="bold" />;
+export const IconMinus = () => <Minus className="icon" weight="bold" />;
+export const IconPlus = () => <Plus className="icon" weight="bold" />;
+export const IconVideoMode = () => <FilmStrip className="icon" weight="bold" />;
+export const IconAudioMode = () => <MusicNotes className="icon" weight="bold" />;
+export const IconChevron = () => <CaretRight className="icon" weight="bold" />;
+/** A computer in Sync's list: this one and desktops alike — a peer's kind is unknown. */
+export const IconComputer = () => <Monitor className="icon" weight="bold" />;
+export const IconLaptop = () => <Laptop className="icon" weight="bold" />;
+export const IconEdit = () => <PencilSimple className="icon" weight="bold" />;
+export const IconBrowser = () => <Globe className="icon" weight="bold" />;
+export const IconFile = () => <FileText className="icon" weight="bold" />;
+export const IconNone = () => <Prohibit className="icon" weight="bold" />;
+/** Automatic: picked for you. */
+export const IconAutomatic = () => <Sparkle className="icon" weight="fill" />;
+export const IconShield = () => <ShieldCheck className="icon" weight="bold" />;
+export const IconShow = () => <Eye className="icon" weight="bold" />;
+export const IconCopy = () => <Copy className="icon" weight="bold" />;
+export const IconNewRelease = () => <ArrowUp className="icon" weight="bold" />;
+export const IconWarning = () => <Warning className="icon" weight="bold" />;
+export const IconInfo = () => <Info className="icon" weight="bold" />;
+export const IconTerminal = () => <TerminalWindow className="icon" weight="bold" />;
+export const IconExport = () => <UploadSimple className="icon" weight="bold" />;
+export const IconImport = () => <DownloadSimple className="icon" weight="bold" />;

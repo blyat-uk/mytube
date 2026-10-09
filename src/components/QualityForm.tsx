@@ -9,14 +9,13 @@ import {
 import type { Quality, VideoFormats } from "../types";
 
 interface GenericProps {
-  /** Edits a `Quality` with preference selects: what Settings holds. */
+  /** Edits a `Quality` with preference selects, the shape Settings holds. */
   source: "generic";
   value: Quality;
-  /** Typing in the raw field: held, not saved, until blur. */
+  /** Typing in the raw field. */
   onEdit: (q: Quality) => void;
-  /** A select changed, which has no "done editing" moment: saved now. */
+  /** A select changed. */
   onPick: (q: Quality) => void;
-  onBlur?: () => void;
 }
 
 interface ExactProps {
@@ -30,18 +29,20 @@ interface ExactProps {
 type Props = GenericProps | ExactProps;
 
 /**
- * One form, two sources. Settings edits preferences that yt-dlp sorts by and
- * never fails over; the custom-download dialog picks exact streams out of what
- * one video was found to have. Both keep the Advanced raw `-f` field, and a
- * non-empty one disables the selects it replaces rather than leaving them
- * looking as if they still did something.
+ * The custom-download dialog's form, with two sources. `exact` picks streams
+ * out of what one video was found to have; `generic` edits preferences that
+ * yt-dlp sorts by and never fails over, and stands in when the probe fails.
+ * (Settings used to draw `generic` too; its Downloads page now has controls of
+ * its own -- a resolution ladder and chips -- over the same `Quality`.) Both
+ * keep the Advanced raw `-f` field, and a non-empty one disables the selects it
+ * replaces rather than leaving them looking as if they still did something.
  */
 export default function QualityForm(p: Props) {
   const id = useId();
   return p.source === "generic" ? <Generic {...p} id={id} /> : <Exact {...p} id={id} />;
 }
 
-function Generic({ value: q, onEdit, onPick, onBlur, id }: GenericProps & { id: string }) {
+function Generic({ value: q, onEdit, onPick, id }: GenericProps & { id: string }) {
   const raw = overriddenByFormat(q);
   const set = <K extends keyof Quality>(key: K, v: Quality[K]) => onPick({ ...q, [key]: v });
   return (
@@ -86,7 +87,6 @@ function Generic({ value: q, onEdit, onPick, onBlur, id }: GenericProps & { id: 
         id={`${id}-format`}
         value={q.format}
         onChange={(format) => onEdit({ ...q, format })}
-        onBlur={onBlur}
       />
     </div>
   );
@@ -219,8 +219,8 @@ function TrackSelect<T>({ id, label, choices, current, disabled, onlyIfChoice, o
   );
 }
 
-function Advanced({ id, value, onChange, onBlur }: {
-  id: string; value: string; onChange: (v: string) => void; onBlur?: () => void;
+function Advanced({ id, value, onChange }: {
+  id: string; value: string; onChange: (v: string) => void;
 }) {
   // Open from the start when there is something in it: a raw format hidden
   // behind a closed disclosure would leave the disabled selects unexplained.
@@ -247,7 +247,6 @@ function Advanced({ id, value, onChange, onBlur }: {
           spellCheck={false}
           aria-describedby={hintId(id)}
           onChange={(e) => onChange(e.currentTarget.value)}
-          onBlur={onBlur}
         />
       </Field>
     </details>

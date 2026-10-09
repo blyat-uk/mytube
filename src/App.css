@@ -127,7 +127,6 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 
 .page { max-width: 1100px; margin: 0 auto; }
-.page-narrow { max-width: 720px; }
 
 /* --- top navigation ------------------------------------------------------ */
 
@@ -1465,40 +1464,17 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   white-space: nowrap;
 }
 
-/* --- settings ------------------------------------------------------------ */
+/* --- fields --------------------------------------------------------------- */
 
-.settings-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 20px;
-}
-
-.saved-flash {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--ok);
-  background: var(--ok-soft);
-  border: 1px solid rgba(86, 211, 100, 0.35);
-  border-radius: 999px;
-  padding: 2px 10px;
-  animation: fadeout 2.4s ease forwards;
-}
-@keyframes fadeout {
-  0%, 55% { opacity: 1; }
-  100% { opacity: 0; }
-}
-
+/* A label over its control (Field.tsx), as the dialogs draw them -- the
+   quality form in Download (custom)… most of all. Settings itself is built
+   from the st-* parts at the end of this file. */
 .field { margin-bottom: 20px; }
 .field-label { font-weight: 600; margin-bottom: 6px; }
-/* A section's caption is a real heading for screen readers, drawn exactly as
-   the caption it replaced. */
-h3.field-label { font-size: inherit; letter-spacing: normal; }
+/* A label naming a select is a <label>, which is inline by default. */
+label.field-label { display: block; }
 .field-hint { display: block; font-size: 12.5px; color: var(--faint); margin-top: 6px; }
 .field .text-input { width: 100%; }
-
-.row-inline { display: flex; gap: 8px; align-items: center; }
-.row-inline .text-input { flex: 1 1 auto; }
 
 .settings-grid {
   display: grid;
@@ -1506,235 +1482,18 @@ h3.field-label { font-size: inherit; letter-spacing: normal; }
   gap: 0 16px;
 }
 
-.switch-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 11px;
-  padding: 14px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-.switch-row input[type="checkbox"] {
-  width: 17px; height: 17px;
-  margin: 2px 0 0;
-  accent-color: var(--accent);
-  cursor: pointer;
-  flex: none;
-}
-.switch-label { display: block; font-weight: 600; }
-.switch-row .field-hint { margin-top: 2px; }
-
-/* Caption for the field stack above it, not a page foot: the Tools and
-   Backup & transfer blocks sit below it. */
-.settings-note { color: var(--faint); font-size: 12.5px; margin-top: 22px; }
-
-/* A label naming a select is a <label>, which is inline by default. */
-label.field-label { display: block; }
-
-/* Pickers wear their value, and the longest ("Automatic (none usable)", a
-   flatpak player's name) should not be cut off -- nor stretch to the page's
-   full width the way a path field does. */
+/* Pickers wear their value, and the longest should not be cut off -- nor
+   stretch to the dialog's full width the way a path field does. */
 .settings-select { min-width: 220px; max-width: 100%; }
-.player-custom { margin-top: 8px; }
 
-.cookies-file {
-  display: block;
-  margin-top: 8px;
-  padding: 7px 10px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  color: var(--text);
-  word-break: break-all;
-}
-.field .cookies-note { margin-top: 4px; }
-.field .cookies-note:first-of-type { margin-top: 6px; }
-.cookies-error { color: #ffb9ba; }
-.cookies-access { margin-top: 8px; }
-
-/* ------------------------------------------------------------------ *
- * Tools
- * ------------------------------------------------------------------ */
-
-/* Set off like Backup & transfer: these rows report on the machine rather
-   than edit a preference, and most of the time there is nothing to do. */
-.settings-block {
-  margin-top: 26px;
-  padding-top: 22px;
-  border-top: 1px solid var(--line);
-}
-.settings-block > .field-hint { margin: 0 0 14px; max-width: 62ch; }
-
-.tools-loading {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 14px 0;
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.tool-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-.tool-row { padding: 11px 14px; }
-.tool-row + .tool-row { border-top: 1px solid var(--line-soft); }
-.tool-row.is-error { background: linear-gradient(90deg, var(--danger-soft), transparent 70%); }
-
-.tool-head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}
-.tool-name { font-weight: 600; }
-.tool-version {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-/* Pushed to the row's end so the three sources read down one column. */
-.tool-source {
-  margin-left: auto;
-  flex: none;
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  background: var(--surface-2);
-  color: var(--muted);
-}
-.tool-source.is-managed { background: var(--accent-soft); color: #9ed3ff; }
-.tool-source.is-missing { color: var(--faint); }
-.tool-source.is-override { color: var(--text); border: 1px solid var(--line); }
-
-/* Small and quiet: the path is there to be checked when something is odd,
-   not read on every visit. The whole path is in the tooltip. */
-.tool-path {
-  margin-top: 3px;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--faint);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-progress { margin-top: 9px; max-width: 420px; }
-.tool-progress .progress-track { height: 6px; }
-.tool-status {
-  display: block;
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-/* No Content-Length, so no fraction to show: a sliver that travels says
-   "still going" without inventing a percentage. */
-.progress-track.is-indeterminate .progress-fill {
-  width: 30%;
-  animation: tool-indeterminate 1.3s ease-in-out infinite;
-}
-@keyframes tool-indeterminate {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(340%); }
-}
-
+/* Why something cannot be done, in the inline-problem pink: a reason, never
+   an alarm. */
 .tool-error {
   margin: 7px 0 0;
   font-size: 12.5px;
   color: #ffb9ba;
   overflow-wrap: anywhere;
 }
-/* The same line in the row's own quiet voice: the tool works, this is only
-   why it may not be the newest. */
-.tool-note {
-  margin: 7px 0 0;
-  font-size: 12.5px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
-
-.tools-actions { margin-top: 12px; flex-wrap: wrap; }
-.tools-checked { color: var(--faint); font-size: 12.5px; }
-
-.about-version { margin: 0 0 4px; font-weight: 600; }
-.about-number { font-family: var(--mono); font-weight: 500; }
-.about-status { margin: 0 0 12px; min-height: 1.4em; }
-
-.tools-prefs { margin-top: 20px; }
-
-/* ------------------------------------------------------------------ *
- * Sync
- * ------------------------------------------------------------------ */
-
-.sync-actions { flex-wrap: wrap; }
-/* Sync now while it runs: a turning glyph beside "Syncing…". Busy is not
-   unavailable, so it keeps more of its colour than a plain disabled button. */
-.sync-actions .btn[aria-busy="true"]:disabled { opacity: 0.8; cursor: progress; }
-.btn-spinner { display: inline-flex; vertical-align: -2px; margin-right: 6px; }
-.btn-spinner .icon { width: 14px; height: 14px; }
-.btn.is-spinning .btn-spinner { animation: spin 900ms linear infinite; }
-/* Under the button that is waiting on it, not in the intro's slot above. */
-.sync-block > .sync-wait { margin: 8px 0 0; color: var(--muted); }
-
-/* Captioned like the template presets: a small label over the one thing it
-   names, so the field itself can stay plain. */
-.sync-code-label,
-.sync-join-label {
-  display: block;
-  margin-bottom: 6px;
-  color: var(--faint);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-.sync-join-label { text-transform: none; letter-spacing: normal; font-size: 12.5px; color: var(--muted); }
-
-.sync-code-row { flex-wrap: wrap; }
-/* Sized to the code, not the page: its 35 characters in the mono face plus the
-   field's padding and border, so the masked and the shown code take exactly
-   the same room. Any letter-spacing would have to be added in here too. */
-.sync-code-row .text-input.sync-code {
-  flex: 0 1 auto;
-  width: calc(35ch + 26px);
-  max-width: 100%;
-  font-variant-numeric: tabular-nums;
-}
-.sync-code-block > .field-hint { max-width: 62ch; }
-.sync-copy-note { color: var(--muted); }
-
-.sync-machines { margin-top: 16px; font-size: 13px; color: var(--muted); }
-.sync-machines p { margin: 0; overflow-wrap: anywhere; }
-.sync-machines p + p { margin-top: 2px; }
-.sync-machine { color: var(--text); }
-
-/* Quiet while all is well, and the inline-problem pink once it is not -- the
-   same voice as a tool's error: a reason, never an alarm. */
-.sync-status {
-  margin: 10px 0 12px;
-  min-height: 1.4em;
-  font-size: 12.5px;
-  color: var(--faint);
-  overflow-wrap: anywhere;
-}
-.sync-status.is-warn { color: #ffb9ba; }
-
-.sync-join { margin-top: 18px; max-width: 460px; }
-.sync-join .text-input { flex: 1 1 auto; }
-.sync-join-error { margin: 7px 0 0; font-size: 12.5px; color: #ffb9ba; overflow-wrap: anywhere; }
 
 /* --- modal --------------------------------------------------------------- */
 
@@ -2229,23 +1988,8 @@ label.field-label { display: block; }
 .progress-label { margin: 10px 0 4px; font-size: 13px; }
 
 /* ------------------------------------------------------------------ *
- * Backup & transfer
+ * The import dialog's archive checklist (TransferDialog)
  * ------------------------------------------------------------------ */
-
-/* Set off from the fields above it: everything else on the page edits one
-   setting, and this writes or rewrites the lot. */
-.transfer-block {
-  margin-top: 26px;
-  padding-top: 22px;
-  border-top: 1px solid var(--line);
-}
-.transfer-block > .field-hint { margin: 0 0 14px; max-width: 62ch; }
-.transfer-thumbs { margin-bottom: 12px; }
-.transfer-actions { flex-wrap: wrap; }
-.transfer-estimate { color: var(--faint); font-size: 12.5px; }
-.transfer-progress { margin-top: 16px; max-width: 420px; }
-
-/* --- the archive checklist ----------------------------------------------- */
 
 .transfer-origin { margin: 0; font-size: 13px; color: var(--muted); }
 .transfer-host { color: var(--text); }
@@ -2294,20 +2038,11 @@ label.field-label { display: block; }
 .transfer-warn code { word-break: break-all; }
 
 /* ------------------------------------------------------------------ *
- * Filename template presets
+ * Chips: the import dialog's Merge / Replace
  * ------------------------------------------------------------------ */
 
-.preset-block { margin-top: 10px; }
-.preset-label {
-  display: block;
-  margin-bottom: 6px;
-  color: var(--faint);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.preset-chip, .token-chip {
+.preset-chip {
   padding: 5px 10px;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -2316,24 +2051,23 @@ label.field-label { display: block; }
   font-size: 12px;
   cursor: pointer;
 }
-.preset-chip:hover, .token-chip:hover { background: var(--card-hover); border-color: #454545; }
+.preset-chip:hover { background: var(--card-hover); border-color: #454545; }
 .preset-chip.is-on {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent);
 }
-.token-chip { font-size: 11.5px; color: var(--muted); }
 
 
 /* ------------------------------------------------------------------ *
  * Download quality
  *
- * One form in two places: the Settings section edits preferences, the
- * custom-download dialog picks exact tracks. The selects sit in the same
- * auto-fit grid as the numeric settings, so a narrow window stacks them.
+ * The custom-download dialog's form: exact tracks, or the generic
+ * preferences when the probe fails. The selects sit in an auto-fit grid, so
+ * a narrow dialog stacks them. (Settings edits the same preferences with the
+ * Downloads page's ladder and chips.)
  * ------------------------------------------------------------------ */
 
-.quality-section > .quality-intro { margin: 0 0 12px; max-width: 62ch; }
 .quality-form .field { margin-bottom: 12px; }
 /* The grid gives each select its column; the Settings pickers' 220px floor
    would overflow a column that narrow. */
@@ -2372,3 +2106,1574 @@ label.field-label { display: block; }
 /* Overridden by a raw -f: kept on screen, since the value still shows what
    the selects would do once the raw field is cleared, but visibly inert. */
 .quality-select:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ------------------------------------------------------------------ *
+ * Settings
+ *
+ * A rail of sections and one section beside it. The rail is sticky inside
+ * `.content`'s scroll and reports each section's state on a second line, so
+ * it doubles as the overview; at narrow widths it folds to its glyphs, with
+ * the top row's fold timing. Every page is built from the parts below
+ * (settings/parts.tsx); page-specific rules follow under their own headings.
+ * ------------------------------------------------------------------ */
+
+.st-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 36px;
+  max-width: 1120px;
+  margin: 0 auto;
+}
+
+.st-pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 780px;
+  padding: 10px 0 24px;
+}
+
+/* --- rail ---------------------------------------------------------------- */
+
+.st-rail {
+  position: sticky;
+  top: 0;
+  flex: none;
+  width: 272px;
+  max-height: calc(100vh - 92px);
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #141414, #111111);
+  border: 1px solid var(--line-soft);
+  overflow: hidden auto;
+  transition: width var(--fold-time) var(--fold-ease), padding var(--fold-time) var(--fold-ease);
+}
+
+.st-rail-list { display: flex; flex-direction: column; }
+
+.st-tier {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #646464;
+  padding: 13px 12px 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  max-height: 40px;
+  transition: max-height var(--fold-time) var(--fold-ease), opacity var(--fold-time) var(--fold-ease),
+    padding var(--fold-time) var(--fold-ease);
+}
+.st-rail-group:first-child .st-tier { padding-top: 4px; }
+
+.st-item {
+  appearance: none;
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  width: 100%;
+  text-align: left;
+  position: relative;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 7px 10px;
+  border-radius: 11px;
+  cursor: pointer;
+  transition: background 120ms ease, gap var(--fold-time) var(--fold-ease),
+    padding var(--fold-time) var(--fold-ease);
+}
+.st-item:hover { background: #1a1a1a; }
+.st-item.is-on { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line); }
+/* Red is "you are here", as on the tabs. */
+.st-item.is-on::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 11px;
+  bottom: 11px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--brand);
+}
+
+.st-item-glyph {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: #bdbdbd;
+  transition: background 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+.st-item-glyph .icon { width: 16px; height: 16px; }
+.st-item.is-on .st-item-glyph {
+  background: linear-gradient(150deg, #ff5a5f, var(--brand));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(255, 45, 85, 0.32);
+}
+
+.st-item-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  max-width: 200px;
+  overflow: hidden;
+  transition: max-width var(--fold-time) var(--fold-ease), opacity var(--fold-time) var(--fold-ease);
+}
+.st-item-name { font-weight: 600; font-size: 13.5px; line-height: 1.3; white-space: nowrap; }
+.st-item-line {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-item.is-on .st-item-line { color: var(--muted); }
+.st-item.is-error .st-item-line { color: #ff9ea1; }
+.st-item-ok { color: var(--ok); }
+
+.st-flag {
+  font: 10.5px/1.6 var(--mono);
+  border-radius: 999px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  transition: opacity var(--fold-time) var(--fold-ease);
+}
+.st-flag.is-news { color: var(--accent); background: var(--accent-soft); border-color: rgba(62, 166, 255, 0.5); }
+.st-flag.is-error {
+  color: #ffb9ba;
+  background: var(--danger-soft);
+  border-color: rgba(255, 90, 95, 0.5);
+  font-family: var(--font);
+  font-weight: 700;
+  padding: 0 7px;
+}
+
+/* Only the folded rail shows these: the pill says it while there is room. */
+.st-marker {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid #131313;
+  opacity: 0;
+  transform: scale(0.4);
+  transition: opacity var(--fold-time) var(--fold-ease), transform var(--fold-time) var(--fold-ease);
+}
+.st-marker.is-news { background: var(--accent); }
+.st-marker.is-error { background: var(--danger); }
+
+.st-rail-foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 12px 12px 4px;
+  margin-top: 14px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.st-rail-foot .icon { width: 14px; height: 14px; color: var(--ok); flex: none; }
+.st-saved { color: var(--ok); font-weight: 600; animation: st-saved-in 220ms ease-out; }
+@keyframes st-saved-in { from { opacity: 0; transform: translateY(3px); } }
+
+/* Folded: glyphs only. Tier names become thin rules; markers move onto the
+   glyphs. Widths animate, so a resize shows the rail transforming. */
+@media (max-width: 900px) {
+  .st-layout { gap: 22px; }
+  .st-rail { width: 62px; padding: 10px 8px; }
+  .st-item { grid-template-columns: 32px 0 0; gap: 0; padding: 5px; }
+  .st-item.is-on::before { left: -8px; }
+  .st-item-text { max-width: 0; opacity: 0; }
+  .st-flag { opacity: 0; width: 0; padding: 0; border: 0; overflow: hidden; }
+  .st-marker { opacity: 1; transform: none; }
+  .st-tier {
+    max-height: 1px;
+    padding: 0;
+    margin: 8px 6px;
+    background: var(--line-soft);
+    color: transparent;
+  }
+  .st-rail-group:first-child .st-tier { display: none; }
+  .st-rail-foot { display: none; }
+}
+
+/* --- page header ----------------------------------------------------------- */
+
+.st-head { display: flex; align-items: center; gap: 16px; margin-bottom: 22px; }
+.st-head-glyph {
+  flex: none;
+  width: 50px;
+  height: 50px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: linear-gradient(150deg, #ff5a5f, var(--brand));
+  box-shadow: 0 10px 26px rgba(255, 45, 85, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.st-head-glyph .icon { width: 25px; height: 25px; }
+.st-head-text { min-width: 0; }
+.st-head-title { font-size: 25px; font-weight: 750; letter-spacing: -0.025em; line-height: 1.1; }
+.st-head-intro { margin: 4px 0 0; color: var(--muted); font-size: 13.5px; max-width: 62ch; }
+
+/* --- blocks, captions, rows ------------------------------------------------- */
+
+.st-block {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.st-block-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; min-height: 30px; }
+.st-block-title { font-size: 14.5px; font-weight: 650; letter-spacing: -0.005em; margin-right: auto; }
+.st-block-aside {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--faint);
+  text-align: right;
+}
+
+.st-cap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 8px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.st-block > .st-cap:first-child { margin-top: 0; }
+.st-cap-right {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 450;
+  font-size: 12px;
+}
+
+.st-row { display: flex; align-items: center; gap: 16px; }
+.st-row + .st-row { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
+.st-row-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.st-row-title { font-weight: 600; }
+.st-row-hint { font-size: 12.5px; color: var(--faint); }
+.st-row-control, .st-row-extra { flex: none; display: flex; align-items: center; gap: 8px; }
+.st-switch-row.is-disabled { opacity: 0.55; }
+label.st-row-title { cursor: pointer; }
+
+/* --- switch ----------------------------------------------------------------- */
+
+.st-switch { flex: none; display: inline-flex; cursor: pointer; }
+.st-switch-track {
+  position: relative;
+  width: 40px;
+  height: 23px;
+  border-radius: 999px;
+  background: #3a3a3a;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  transition: background 160ms ease;
+}
+.st-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #cfcfcf;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  transition: transform 180ms var(--fold-ease), background 160ms ease;
+}
+.st-switch input:checked + .st-switch-track { background: var(--accent); }
+.st-switch input:checked + .st-switch-track::after { transform: translateX(17px); background: #fff; }
+.st-switch input:focus-visible + .st-switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.st-switch input:disabled + .st-switch-track { cursor: not-allowed; }
+
+/* --- segmented and chips ------------------------------------------------------ */
+
+.st-seg {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 3px;
+  background: #131313;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  max-width: 100%;
+}
+.st-seg.is-wide { display: flex; }
+.st-seg.is-wide .st-opt-pill { flex: 1 1 0; justify-content: center; }
+.st-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.st-opt-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+.st-seg .st-opt-pill:hover { color: var(--text); }
+.st-seg .st-opt-pill.is-on {
+  background: var(--card-hover);
+  color: var(--text);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.st-seg.is-big .st-opt-pill { font-size: 13.5px; padding: 7px 16px; }
+.st-chips .st-opt-pill {
+  padding: 4px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.st-chips .st-opt-pill:hover { border-color: #444; color: var(--text); }
+.st-chips .st-opt-pill.is-on { background: var(--accent-soft); border-color: rgba(62, 166, 255, 0.5); color: #9ed3ff; }
+.st-opt-pill:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.st-opt-pill.is-off { opacity: 0.45; cursor: not-allowed; }
+.st-opt-icon { display: inline-flex; }
+.st-opt-icon .icon { width: 15px; height: 15px; }
+.st-opt-note { font-style: normal; font-weight: 400; color: var(--faint); margin-left: -3px; }
+.st-chips .st-opt-pill.is-on .st-opt-note { color: #6aaedf; }
+
+/* --- stepper ----------------------------------------------------------------- */
+
+.st-stepper {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  background: #131313;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.st-stepper-btn {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.st-stepper-btn:hover:not(:disabled) { background: var(--card-hover); color: var(--text); }
+.st-stepper-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.st-stepper-btn .icon { width: 13px; height: 13px; }
+.st-stepper-value {
+  min-width: 40px;
+  text-align: center;
+  font-weight: 750;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- status card ------------------------------------------------------------- */
+
+.st-status {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 15px 17px;
+  margin-bottom: 14px;
+  border-radius: 15px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+/* The sentence gives way to its buttons only so far: below that it is the
+   buttons that move, onto a line of their own, rather than the sentence that
+   shrinks to a word a line. */
+.st-status { flex-wrap: wrap; }
+.st-status-text { flex: 1 1 220px; min-width: 0; }
+.st-status-title { font-size: 15px; font-weight: 650; letter-spacing: -0.005em; overflow-wrap: anywhere; }
+.st-status-detail { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.st-status-action { flex: none; display: flex; gap: 8px; align-items: center; }
+.st-status-ring {
+  flex: none;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.st-status-ring .icon { width: 20px; height: 20px; }
+.st-status-dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin: 0 8px 0 6px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.st-status.is-ok {
+  background: linear-gradient(90deg, rgba(86, 211, 100, 0.10), rgba(86, 211, 100, 0.01) 75%), var(--surface);
+  border-color: rgba(86, 211, 100, 0.27);
+}
+.st-status.is-ok .st-status-ring { background: var(--ok-soft); color: var(--ok); border-color: rgba(86, 211, 100, 0.45); }
+.st-status.is-ok .st-status-dot { background: var(--ok); box-shadow: 0 0 0 6px rgba(86, 211, 100, 0.14), 0 0 16px rgba(86, 211, 100, 0.55); }
+
+.st-status.is-news, .st-status.is-busy {
+  background: linear-gradient(90deg, rgba(62, 166, 255, 0.14), rgba(62, 166, 255, 0.02) 80%), var(--surface);
+  border-color: rgba(62, 166, 255, 0.42);
+}
+.st-status.is-news .st-status-ring, .st-status.is-busy .st-status-ring {
+  background: var(--accent-soft); color: var(--accent); border-color: rgba(62, 166, 255, 0.5);
+}
+.st-status.is-busy .st-status-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 6px rgba(62, 166, 255, 0.14);
+  animation: st-pulse 1.6s ease-in-out infinite;
+}
+@keyframes st-pulse { 50% { box-shadow: 0 0 0 9px rgba(62, 166, 255, 0.05); } }
+
+/* Not amber: amber is the in-progress series. A warning is the quiet grey of
+   "this is how things are", with the glyph doing the talking. */
+.st-status.is-warn .st-status-ring { color: #e0e0e0; }
+
+.st-status.is-error {
+  background: linear-gradient(90deg, rgba(255, 90, 95, 0.12), rgba(255, 90, 95, 0.02) 75%), var(--surface);
+  border-color: rgba(255, 90, 95, 0.42);
+}
+.st-status.is-error .st-status-ring { background: var(--danger-soft); color: #ff8a8d; border-color: rgba(255, 90, 95, 0.5); }
+.st-status.is-error .st-status-dot { background: var(--danger); }
+.st-status.is-error .st-status-detail { color: #ffb9ba; }
+
+/* --- pills ------------------------------------------------------------------- */
+
+.st-pill {
+  flex: none;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.st-pill.is-ok { color: var(--ok); background: var(--ok-soft); }
+.st-pill.is-dim { color: var(--faint); background: #262626; }
+.st-pill.is-blue { color: #9ed3ff; background: var(--accent-soft); }
+.st-pill.is-warn { color: #e0e0e0; background: #2c2c2c; }
+.st-pill.is-error { color: #ffb9ba; background: var(--danger-soft); }
+
+/* --- choice list --------------------------------------------------------------- */
+
+.st-choices { display: flex; flex-direction: column; gap: 6px; }
+.st-choice-gap { height: 8px; }
+.st-choice {
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.st-choice:hover:not(.is-off) { border-color: #3d3d3d; }
+.st-choice.is-on {
+  border-color: rgba(62, 166, 255, 0.55);
+  background: linear-gradient(90deg, rgba(62, 166, 255, 0.11), rgba(62, 166, 255, 0.02));
+}
+.st-choice.is-off { opacity: 0.55; }
+.st-choice-row {
+  display: grid;
+  grid-template-columns: 18px 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 13px;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+.st-choice.is-off .st-choice-row { cursor: not-allowed; }
+.st-choice-row:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 12px; }
+.st-radio {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid #4b4b4b;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.st-choice.is-on .st-radio {
+  border-color: var(--accent);
+  background: radial-gradient(circle, var(--accent) 0 4px, transparent 4.5px);
+}
+.st-choice-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: #262626;
+  border: 1px solid #333;
+  color: #d0d0d0;
+}
+.st-choice-icon .icon { width: 18px; height: 18px; }
+.st-choice.is-on .st-choice-icon { color: #9ed3ff; background: rgba(62, 166, 255, 0.12); border-color: rgba(62, 166, 255, 0.3); }
+.st-choice-text { min-width: 0; display: flex; flex-direction: column; }
+.st-choice-title { font-weight: 600; }
+.st-choice-detail { font-size: 12.5px; color: var(--faint); overflow-wrap: anywhere; }
+.st-choice-more { padding: 0 14px 12px 79px; }
+
+@media (max-width: 640px) {
+  .st-head-glyph { width: 42px; height: 42px; border-radius: 12px; }
+  .st-head-title { font-size: 21px; }
+  .st-block { padding: 15px 15px; }
+  .st-choice-more { padding-left: 14px; }
+}
+
+/* --- Downloads ---------------------------------------------------------------- */
+
+/* Saved to: the folder as a path, its own name bold. */
+.st-dl-folder {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  transition: border-color 140ms ease;
+}
+.st-dl-folder.is-editing { border-color: rgba(62, 166, 255, 0.55); }
+.st-dl-folder-tile {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  background: linear-gradient(160deg, #323232, #242424);
+  border: 1px solid #3a3a3a;
+  color: #e6e6e6;
+}
+.st-dl-folder-tile .icon { width: 20px; height: 20px; }
+
+/* Trimmed from the left: in a right-to-left box an overflowing line spills
+   past its start, which is the left edge, and the ellipsis goes there too.
+   The path itself is isolated left-to-right so its order never changes. */
+.st-dl-path {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  direction: rtl;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 15.5px;
+  font-weight: 550;
+}
+.st-dl-path-inner { direction: ltr; unicode-bidi: isolate; }
+.st-dl-path-dim { color: var(--faint); font-weight: 450; }
+.st-dl-path-sep { color: #4a4a4a; font-weight: 400; margin: 0 6px; }
+
+.st-dl-folder-input { flex: 1 1 auto; min-width: 0; font-size: 14px; }
+.st-dl-folder-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+
+.st-dl-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  padding: 6px 14px;
+}
+.st-dl-btn .icon { width: 14px; height: 14px; }
+
+/* Each video is saved as: one line, folders as chips. */
+.st-dl-preview {
+  font-size: 13.5px;
+  padding: 10px 13px;
+  border-radius: 11px;
+  background: #131313;
+  border: 1px dashed #353535;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-dl-preview-root { color: var(--faint); }
+.st-dl-preview-sep { color: var(--faint); margin: 0 6px; }
+.st-dl-preview-dir {
+  background: var(--accent-soft);
+  color: #9ed3ff;
+  border-radius: 6px;
+  padding: 2px 7px;
+  font-weight: 550;
+}
+.st-dl-preview-file { color: var(--text); font-weight: 550; }
+
+.st-dl-tmpl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-top: 10px;
+}
+.st-dl-tmpl-raw {
+  flex: 1 1 140px;
+  min-width: 0;
+  font: 12px/1.4 var(--mono);
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}
+
+.st-dl-custom { margin-top: 12px; }
+.st-dl-custom-input { display: block; width: 100%; }
+.st-dl-custom .st-cap { margin-top: 12px; }
+.st-dl-tokens { display: flex; flex-wrap: wrap; gap: 6px; }
+.st-dl-token {
+  appearance: none;
+  font: 12px/1.4 var(--mono);
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+.st-dl-token:hover { color: #9ed3ff; border-color: rgba(62, 166, 255, 0.5); background: var(--accent-soft); }
+
+/* Quality: the resolution ladder. */
+.st-dl-ladder-cap {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 2px 12px;
+  margin-bottom: 7px;
+  font-size: 12px;
+  color: var(--faint);
+}
+.st-dl-ladder-cap strong { color: var(--text); font-weight: 600; }
+.st-dl-ladder-track { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.st-dl-step {
+  position: relative;
+  min-width: 0;
+  padding: 9px 0 8px;
+  border-radius: 9px;
+  background: #161616;
+  border: 1px solid var(--line-soft);
+  color: #5e5e5e;
+  font-size: 12.5px;
+  font-weight: 550;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  user-select: none;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+.st-dl-step:not(.is-in):not(.is-on):hover { color: var(--muted); border-color: var(--line); }
+/* Under the ceiling: what the setting lets through. */
+.st-dl-step.is-in {
+  background: rgba(62, 166, 255, 0.09);
+  border-color: rgba(62, 166, 255, 0.2);
+  color: #8cc8f5;
+}
+.st-dl-step.is-on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 750;
+  box-shadow: 0 5px 18px rgba(62, 166, 255, 0.35);
+}
+.st-dl-step:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* A raw -f picks the streams itself: the ladder stays to show what it would
+   do once the field is cleared, but visibly inert. */
+.st-dl-ladder.is-off .st-dl-step { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
+
+.st-dl-qrows { margin-top: 14px; display: grid; gap: 9px; }
+.st-dl-qrow { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 12px; }
+.st-dl-ql { font-size: 12.5px; color: var(--muted); }
+
+.st-dl-qsum {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 9px;
+  margin-top: 15px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.st-dl-qsum-icon { display: inline-flex; color: var(--ok); }
+.st-dl-qsum-icon .icon { width: 15px; height: 15px; }
+.st-dl-qsum-text { flex: 1 1 220px; min-width: 0; }
+.st-dl-adv {
+  appearance: none;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  color: var(--faint);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+.st-dl-adv:hover { color: var(--text); background: var(--card); }
+.st-dl-adv code { font: 11.5px var(--mono); color: var(--muted); }
+.st-dl-adv .icon { width: 13px; height: 13px; transition: transform 160ms var(--fold-ease); }
+.st-dl-adv[aria-expanded="true"] .icon { transform: rotate(90deg); }
+
+.st-dl-raw { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.st-dl-raw-label { font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.st-dl-raw-hint { margin: 0; font-size: 12.5px; color: var(--faint); }
+.st-dl-raw-hint code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+/* At once: a lane per download that may run side by side. */
+.st-dl-par { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
+.st-dl-par-text { flex: 1 1 180px; min-width: 0; }
+.st-dl-par-hint { margin: 2px 0 0; font-size: 12.5px; color: var(--faint); }
+.st-dl-lanes { flex: none; display: flex; align-items: center; gap: 3px; margin-left: auto; }
+.st-dl-lanes i {
+  width: 6px;
+  height: 22px;
+  border-radius: 3px;
+  background: #242424;
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+.st-dl-lanes i.is-on {
+  background: linear-gradient(180deg, #7cc4ff, var(--accent));
+  box-shadow: 0 0 10px rgba(62, 166, 255, 0.35);
+}
+
+@media (max-width: 640px) {
+  .st-dl-folder { gap: 10px; }
+  .st-dl-folder-tile { width: 34px; height: 34px; border-radius: 10px; }
+  .st-dl-qrow { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+  .st-dl-lanes { gap: 2px; }
+  .st-dl-lanes i { width: 5px; }
+}
+
+/* --- YouTube sign-in ------------------------------------------------------------ */
+
+/* The browser list's place while detection runs, at a row's height so the
+   list does not jump when the rows arrive. */
+.st-si-looking {
+  padding: 10px 14px;
+  font-size: 12.5px;
+  color: var(--faint);
+}
+
+/* A hand-written spec is shown exactly as settings.json holds it. */
+.st-si-spec { font-family: var(--mono); font-size: 13px; font-weight: 500; }
+
+/* The cookies file in use: its path, then Change… at the end of the line. */
+.st-si-file { display: flex; align-items: center; gap: 10px; }
+.st-si-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: #131313;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.st-si-file-hint { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); }
+
+/* macOS only: why a browser is missing or "no access", and the way there.
+   The hint says "the button below", so the button stays below it. */
+.st-si-access-text { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); max-width: 72ch; }
+
+@media (max-width: 640px) {
+  .st-si-file { flex-wrap: wrap; }
+}
+
+/* --- Player --------------------------------------------------------------------- */
+
+.st-pl-looking { margin: 0; padding: 4px 2px; font-size: 12.5px; color: var(--faint); }
+
+/* A detected player's command, under its name: what actually runs. */
+.st-pl-cmd { color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }
+
+.st-pl-field { width: 100%; }
+.st-pl-hint { margin: 6px 0 0; font-size: 12.5px; color: var(--faint); }
+
+/* --- New videos ---------------------------------------------------------------- */
+
+/* The page measures itself, not the window: the rail takes a share of the
+   width that no media query can see. */
+.st-nv { container: st-nv / inline-size; }
+
+/* Custom: the minutes field, under the presets it stands in for. */
+.st-nv-custom {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+.st-nv-custom-label { font-weight: 600; font-size: 13px; }
+.st-nv-minutes { width: 96px; font-variant-numeric: tabular-nums; }
+.st-nv-custom-hint { font-size: 12px; color: var(--faint); }
+
+.st-nv-last {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 0;
+  font-size: 12.5px;
+  color: var(--faint);
+}
+.st-nv-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.st-nv-dot.is-fresh { background: var(--ok); box-shadow: 0 0 8px rgba(86, 211, 100, 0.6); }
+
+.st-nv-startup {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* --- how far back --- */
+
+.st-nv-depth { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.st-nv-bignum { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.st-nv-bignum b {
+  font-size: 34px;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.st-nv-bignum span { color: var(--muted); font-size: 13.5px; }
+
+/* A native range, transparent, laid over the drawn track: the browser keeps
+   the dragging, clicking, touch and focus, the picture is ours. The native
+   thumb is sized to the drawn one, so both map a position to the same pixel:
+   its centre travels from half a thumb in to half a thumb short. */
+.st-nv-slider {
+  --thumb: 20px;
+  --at: calc(var(--thumb) / 2 + var(--p, 0) * (100% - var(--thumb)));
+  position: relative;
+  height: 30px;
+  margin-top: 12px;
+}
+.st-nv-range {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+.st-nv-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: var(--thumb);
+  height: var(--thumb);
+}
+.st-nv-range::-moz-range-thumb { width: var(--thumb); height: var(--thumb); border: 0; }
+
+.st-nv-track, .st-nv-fill {
+  position: absolute;
+  top: 13px;
+  height: 4px;
+  border-radius: 999px;
+  pointer-events: none;
+}
+.st-nv-track { left: 0; right: 0; background: #2a2a2a; }
+.st-nv-fill { left: 0; width: var(--at); background: linear-gradient(90deg, #2f7fc4, var(--accent)); }
+.st-nv-thumb {
+  position: absolute;
+  top: 5px;
+  left: var(--at);
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-left: calc(var(--thumb) / -2);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 5px rgba(62, 166, 255, 0.22), 0 2px 6px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  transition: box-shadow 140ms ease;
+}
+.st-nv-range:hover ~ .st-nv-thumb { box-shadow: 0 0 0 7px rgba(62, 166, 255, 0.26), 0 2px 6px rgba(0, 0, 0, 0.5); }
+.st-nv-range:active ~ .st-nv-thumb { box-shadow: 0 0 0 9px rgba(62, 166, 255, 0.3), 0 2px 6px rgba(0, 0, 0, 0.5); }
+.st-nv-range:focus-visible ~ .st-nv-thumb { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* Each label sits under the point its count is at, on the same mapping. */
+.st-nv-ticks {
+  --thumb: 20px;
+  position: relative;
+  height: 16px;
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.st-nv-ticks span {
+  position: absolute;
+  left: calc(var(--thumb) / 2 + var(--p, 0) * (100% - var(--thumb)));
+  transform: translateX(-50%);
+}
+
+.st-nv-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+.st-nv-tile {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 11px;
+  background: #151515;
+  border: 1px solid var(--line-soft);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.st-nv-tile strong { display: block; margin-bottom: 2px; color: var(--text); font-weight: 600; }
+
+/* Seven presets need about 600px in one row. Narrower, they settle into a
+   4 × 2 grid of equal pills rather than a ragged second row in a pill track. */
+@container st-nv (max-width: 640px) {
+  .st-nv .st-seg.is-wide {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-radius: 18px;
+  }
+}
+
+@container st-nv (max-width: 560px) {
+  .st-nv-tiles { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* --- Sync ---------------------------------------------------------------------
+ * Off: a hero that invites it, what travels, and joining with a code. On: how
+ * the last sync went (with Sync now beside it), the computers as cards, the
+ * code in a display of its own, what travels, and the two ways out at the
+ * foot. Expired: the status card alone, with both answers in it.
+ * --------------------------------------------------------------------------- */
+
+.st-sy .st-status-action { flex-wrap: wrap; margin-left: auto; }
+
+/* A button with a glyph before its word. `.is-spinning` turns the glyph,
+   which is why it sits in a span of its own. */
+.st-sy-btn { display: inline-flex; align-items: center; gap: 7px; }
+.st-sy-glyph { display: inline-flex; flex: none; }
+.st-sy-glyph .icon { width: 14px; height: 14px; }
+.st-sy-btn.is-spinning .st-sy-glyph { animation: spin 900ms linear infinite; }
+/* Busy is not unavailable, so a working button keeps more of its colour than
+   a plain disabled one. */
+.st-sy .btn[aria-busy="true"]:disabled { opacity: 0.8; cursor: progress; }
+
+/* Under the button that is waiting on the check window. */
+.st-sy-wait { margin: -4px 0 14px; font-size: 12.5px; color: var(--muted); }
+.st-sy-hero .st-sy-wait { margin: 10px 0 0; }
+.st-sy-wait.is-end { margin: 6px 0 0; text-align: right; }
+
+/* --- computers --------------------------------------------------------------- */
+
+.st-sy-computers { container-type: inline-size; }
+.st-sy-devs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+@container (max-width: 520px) {
+  .st-sy-devs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (max-width: 330px) {
+  .st-sy-devs { grid-template-columns: minmax(0, 1fr); }
+}
+
+.st-sy-dev {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 112px;
+  padding: 14px;
+  border-radius: 13px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.st-sy-dev-glyph { display: inline-flex; color: #dcdcdc; margin-bottom: 2px; }
+.st-sy-dev-glyph .icon { width: 28px; height: 28px; }
+.st-sy-dev-name { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.st-sy-dev-label { font-weight: 650; overflow-wrap: anywhere; }
+.st-sy-dev-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #9ed3ff;
+  background: var(--accent-soft);
+  border-radius: 999px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+.st-sy-dev-meta { font-size: 12px; color: var(--faint); }
+
+/* This one: blue, the colour of "selected" -- it is the one you are on. */
+.st-sy-dev.is-here {
+  border-color: rgba(62, 166, 255, 0.45);
+  background: linear-gradient(160deg, rgba(62, 166, 255, 0.12), rgba(62, 166, 255, 0.02) 70%);
+}
+.st-sy-dev.is-here .st-sy-dev-glyph { color: #9ed3ff; }
+
+/* Not a computer, an instruction: an empty slot with the way to fill it. */
+.st-sy-dev.is-add {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--faint);
+  background: transparent;
+  border: 1px dashed #3a3a3a;
+}
+.st-sy-dev.is-add .st-sy-dev-glyph { color: var(--faint); }
+.st-sy-dev.is-add .st-sy-dev-glyph .icon { width: 20px; height: 20px; }
+.st-sy-dev-none { color: var(--muted); font-weight: 600; }
+
+/* --- the code ------------------------------------------------------------------ */
+
+.st-sy-code-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* Read-only, but an input still: that is what lets the copy fallback select
+   it. Its basis is the whole code -- 35 characters of the mono face, their
+   letter-spacing and the padding -- so the buttons drop to the next line
+   before the code is ever cut short, and the field is the same width masked
+   or shown because nothing about its width comes from its value. Scoped to
+   the page so it outranks `.text-input.mono`, which loads after it. */
+.st-sy .st-sy-code.text-input {
+  flex: 1 1 calc(35ch + 1.75em + 34px);
+  min-width: 0;
+  max-width: 100%;
+  padding: 12px 16px;
+  font: 600 16.5px/1.2 var(--mono);
+  letter-spacing: 0.05em;
+  font-variant-numeric: tabular-nums;
+  background: #121212;
+  border-radius: 11px;
+}
+.st-sy .st-sy-code.text-input:focus { background: #121212; }
+
+.st-sy-shield {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 11px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.st-sy-shield .st-sy-glyph { color: var(--faint); }
+.st-sy-shield .st-sy-glyph .icon { width: 16px; height: 16px; }
+.st-sy-note { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); }
+
+/* --- what syncs --------------------------------------------------------------- */
+
+.st-sy-what { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 24px; }
+.st-sy-what .st-cap { margin: 0 0 6px; }
+.st-sy-what-list { list-style: none; margin: 0; padding: 0; }
+.st-sy-what-list li { display: flex; align-items: center; gap: 9px; padding: 2.5px 0; font-size: 13px; }
+.st-sy-what-list .st-sy-glyph { color: var(--ok); }
+.st-sy-what-col.is-stays li { color: var(--muted); }
+.st-sy-what-col.is-stays .st-sy-glyph { color: #5a5a5a; }
+
+/* --- the way out -------------------------------------------------------------- */
+
+.st-sy-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; margin-top: 2px; }
+.st-sy-leave.btn-quiet { color: #ffb9ba; }
+.st-sy-leave.btn-quiet:hover:not(:disabled) { background: var(--danger-soft); color: #ffc9ca; }
+
+/* --- off: the invitation -------------------------------------------------------- */
+
+.st-sy-hero {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 26px;
+  padding: 22px 24px;
+  margin-bottom: 14px;
+  border-radius: 15px;
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(62, 166, 255, 0.13), rgba(62, 166, 255, 0) 60%),
+    var(--surface);
+  border: 1px solid rgba(62, 166, 255, 0.3);
+}
+.st-sy-hero-title { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+.st-sy-hero-intro { margin: 5px 0 14px; color: var(--muted); font-size: 13px; max-width: 58ch; }
+.st-sy-hero-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Two computers, one line between them with the lock on it. The dashes crawl
+   from this computer to the other one -- "in step", said without words; the
+   global reduced-motion rule stills them. */
+.st-sy-art { display: flex; align-items: center; width: 184px; }
+.st-sy-art-dev {
+  flex: none;
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  border-radius: 15px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: #dcdcdc;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+}
+.st-sy-art-dev .icon { width: 27px; height: 27px; }
+.st-sy-art-dev.is-here {
+  color: #9ed3ff;
+  border-color: rgba(62, 166, 255, 0.45);
+  background: linear-gradient(160deg, rgba(62, 166, 255, 0.2), rgba(62, 166, 255, 0.04) 75%), var(--surface-2);
+}
+.st-sy-art-link {
+  position: relative;
+  flex: 1;
+  height: 2px;
+  margin: 0 -1px;
+  background: repeating-linear-gradient(90deg, var(--accent) 0 6px, transparent 6px 11px);
+  animation: st-sy-flow 1.4s linear infinite;
+}
+@keyframes st-sy-flow { to { background-position: 11px 0; } }
+.st-sy-art-lock {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid rgba(62, 166, 255, 0.5);
+  color: var(--accent);
+}
+.st-sy-art-lock .icon { width: 14px; height: 14px; }
+
+/* --- off: joining ---------------------------------------------------------------- */
+
+.st-sy-join-label { display: block; font-weight: 600; margin-bottom: 9px; }
+.st-sy-join-row { display: flex; gap: 8px; max-width: 480px; }
+.st-sy-join-input.text-input { flex: 1 1 auto; }
+.st-sy-join-error { margin: 7px 0 0; font-size: 12.5px; color: #ffb9ba; overflow-wrap: anywhere; }
+
+@media (max-width: 640px) {
+  .st-sy-hero { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px; }
+  .st-sy-what { grid-template-columns: minmax(0, 1fr); }
+  .st-sy-wait.is-end { text-align: left; }
+}
+
+/* --- Backup & transfer ----------------------------------------------------------- */
+
+/* The page measures itself, not the window: the rail takes a share of the
+   width that no media query can see. */
+.st-bk { container: st-bk / inline-size; }
+
+/* Two cards, one per direction, side by side while both fit. */
+.st-bk-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
+  margin-bottom: 14px;
+}
+.st-bk-card {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.st-bk-card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.st-bk-glyph {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: #d0d0d0;
+}
+.st-bk-glyph .icon { width: 19px; height: 19px; }
+.st-bk-card-text { min-width: 0; }
+.st-bk-card-title { font-size: 14.5px; font-weight: 650; letter-spacing: -0.005em; line-height: 1.3; }
+.st-bk-card-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.st-bk-card-body { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+
+/* The switch row gets the card's rule above it, as rows do in a block. */
+.st-bk-card .st-switch-row { padding-top: 14px; border-top: 1px solid var(--line-soft); }
+
+/* The button sits at the card's foot whatever the text above it took, so
+   the two cards' buttons line up across the row. */
+.st-bk-actions { display: flex; margin-top: auto; padding-top: 16px; }
+.st-bk-btn { display: inline-flex; align-items: center; gap: 7px; }
+.st-bk-btn-glyph { display: inline-flex; }
+.st-bk-btn-glyph .icon { width: 15px; height: 15px; }
+
+.st-bk-progress { margin-top: 14px; }
+.st-bk-progress-label {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.st-bk-foot {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 4px 2px 0;
+  font-size: 12.5px;
+  color: var(--faint);
+}
+.st-bk-foot-glyph { display: inline-flex; flex: none; margin-top: 2px; }
+.st-bk-foot-glyph .icon { width: 15px; height: 15px; }
+.st-bk-foot code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 0 5px;
+}
+
+@container st-bk (max-width: 640px) {
+  .st-bk-cards { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* --- Tools ------------------------------------------------------------------- */
+
+/* One card per tool: a monogram tile wearing a health dot, what the tool is
+   and is for, and where it came from at the right. Most visits find three
+   green dots and nothing to do, so the cards read as a status board rather
+   than a form. */
+.st-tl-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.st-tl-card {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  gap: 15px;
+  align-items: center;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+.st-tl-card.is-error {
+  border-color: rgba(255, 90, 95, 0.42);
+  background: linear-gradient(90deg, rgba(255, 90, 95, 0.11), rgba(255, 90, 95, 0) 65%), var(--surface);
+}
+
+.st-tl-mono {
+  position: relative;
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
+  display: grid;
+  place-items: center;
+  font: 700 15px var(--mono);
+  letter-spacing: -0.03em;
+  color: #ececec;
+  background: linear-gradient(160deg, #313131, #222);
+  border: 1px solid #3a3a3a;
+}
+/* The ring is the card's own colour, so the dot reads as cut out of the tile's
+   corner; on a broken card that is the pink wash at the tile's position. */
+.st-tl-dot {
+  position: absolute;
+  right: -4px;
+  bottom: -4px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--ok);
+  border: 3px solid var(--surface);
+}
+.st-tl-card.is-busy .st-tl-dot { background: var(--accent); animation: st-tl-pulse 1.6s ease-in-out infinite; }
+.st-tl-card.is-error .st-tl-dot { background: var(--danger); border-color: #2f1e1f; }
+.st-tl-card.is-missing .st-tl-dot { background: var(--faint); }
+@keyframes st-tl-pulse { 50% { box-shadow: 0 0 0 4px rgba(62, 166, 255, 0.18); } }
+
+.st-tl-body { min-width: 0; }
+.st-tl-name {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+/* A nightly yt-dlp's version runs to "2026.10.07.234512": it gives way before
+   the name does. */
+.st-tl-version {
+  min-width: 0;
+  font: 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.st-tl-role { font-size: 12.5px; color: var(--muted); }
+
+/* Small and quiet: the path is there to be checked when something is odd,
+   not read on every visit. The whole path is in the tooltip. */
+.st-tl-path {
+  margin-top: 2px;
+  font: 11.5px var(--mono);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-tl-error {
+  margin: 3px 0 0;
+  font-size: 12.5px;
+  color: #ffb9ba;
+  overflow-wrap: anywhere;
+}
+/* The same line in the card's own quiet voice: the tool works, this is only
+   why it may not be the newest. */
+.st-tl-note {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.st-tl-end {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+.st-tl-source {
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 2px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.st-tl-source.is-managed { color: #9ed3ff; background: var(--accent-soft); border-color: rgba(62, 166, 255, 0.35); }
+.st-tl-source.is-override { color: var(--text); }
+.st-tl-source.is-missing { color: var(--faint); }
+
+.st-tl-progress { margin-top: 9px; max-width: 380px; }
+.st-tl-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: #262626;
+  overflow: hidden;
+}
+.st-tl-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #7cc4ff);
+  transition: width 220ms ease-out;
+}
+/* No Content-Length, or unpacking: no fraction to show. A sliver that travels
+   says "still going" without inventing a percentage. */
+.st-tl-bar.is-indeterminate .st-tl-fill {
+  width: 30%;
+  animation: st-tl-sliver 1.3s ease-in-out infinite;
+}
+@keyframes st-tl-sliver {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(340%); }
+}
+.st-tl-status {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.st-tl-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 2px 24px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.st-tl-load-error {
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  border-radius: 15px;
+  font-size: 12.5px;
+  color: #ffb9ba;
+  background: var(--danger-soft);
+  border: 1px solid rgba(255, 90, 95, 0.42);
+  overflow-wrap: anywhere;
+}
+
+/* "Last checked 2h ago" and the button share the head; when the pane is too
+   narrow for both beside the title, they drop under it rather than squeeze. */
+.st-tl-updates .st-block-head { flex-wrap: wrap; }
+
+.st-tl-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--faint);
+}
+.st-tl-foot .icon { width: 15px; height: 15px; flex: none; }
+.st-tl-foot code { font-size: 11.5px; color: var(--muted); }
+
+@media (max-width: 640px) {
+  /* The source and Retry move under the text: beside it they would leave the
+     path and the error a column too thin to read. */
+  .st-tl-card { grid-template-columns: 46px minmax(0, 1fr); align-items: start; }
+  .st-tl-end { grid-column: 2; flex-direction: row; align-items: center; flex-wrap: wrap; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .st-tl-card.is-busy .st-tl-dot,
+  .st-tl-bar.is-indeterminate .st-tl-fill { animation: none; }
+}
+
+/* --- About ------------------------------------------------------------------- */
+
+/* The hero is this page's header, so the shared one is kept for a screen
+   reader (the page's h2 and its region name) and not drawn: a red glyph tile
+   above the big red mark would be the same badge twice. */
+.st-ab-page > .st-head {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.st-ab-hero {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding: 26px;
+  margin-bottom: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: radial-gradient(110% 170% at 0% 0%, rgba(255, 45, 85, 0.16), rgba(255, 45, 85, 0) 50%), var(--surface);
+}
+
+/* The top row's `.brand-mark`, scaled up about 3.5x. The triangle sits a
+   little right of the box's centre, where its own weight is centred, so it
+   reads as centred. */
+.st-ab-mark {
+  position: relative;
+  flex: none;
+  width: 76px;
+  height: 56px;
+  border-radius: 17px;
+  background: linear-gradient(150deg, #ff5a5f, var(--brand));
+  box-shadow: 0 16px 36px rgba(255, 45, 85, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.st-ab-mark::after {
+  content: "";
+  position: absolute;
+  left: 30px;
+  top: 16px;
+  border-left: 21px solid #fff;
+  border-top: 12px solid transparent;
+  border-bottom: 12px solid transparent;
+}
+
+.st-ab-hero-text { min-width: 0; }
+.st-ab-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  font-size: 32px;
+  font-weight: 800;
+  letter-spacing: -0.035em;
+  line-height: 1;
+}
+.st-ab-version {
+  font: 600 13px/1.6 var(--mono);
+  letter-spacing: 0;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 10px;
+}
+.st-ab-tag { margin: 8px 0 0; color: var(--muted); font-size: 13.5px; max-width: 60ch; }
+
+.st-ab-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.st-ab-links .btn { display: inline-flex; align-items: center; gap: 7px; }
+.st-ab-link-icon { display: inline-flex; }
+.st-ab-link-icon .icon { width: 14px; height: 14px; }
+
+@media (max-width: 640px) {
+  .st-ab-hero { gap: 16px; padding: 20px; }
+  .st-ab-mark { width: 60px; height: 44px; border-radius: 14px; }
+  .st-ab-mark::after { left: 24px; top: 13px; border-left-width: 16px; border-top-width: 9px; border-bottom-width: 9px; }
+  .st-ab-name { font-size: 26px; }
+}

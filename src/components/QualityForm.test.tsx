@@ -18,10 +18,10 @@ const choose = (el: HTMLSelectElement, text: string) => {
 };
 
 describe("the generic form", () => {
+  /* What the custom-download dialog falls back to when the probe fails. */
   function renderGeneric(start: Quality = DEFAULT_QUALITY) {
     const onPick = vi.fn();
     const onEdit = vi.fn();
-    const onBlur = vi.fn();
     function Host() {
       const [q, setQ] = useState(start);
       return (
@@ -29,12 +29,11 @@ describe("the generic form", () => {
           source="generic" value={q}
           onPick={(n) => { setQ(n); onPick(n); }}
           onEdit={(n) => { setQ(n); onEdit(n); }}
-          onBlur={onBlur}
         />
       );
     }
     render(<Host />);
-    return { onPick, onEdit, onBlur };
+    return { onPick, onEdit };
   }
 
   it("shows the defaults", () => {
@@ -63,14 +62,12 @@ describe("the generic form", () => {
     expect(onPick).toHaveBeenLastCalledWith({ ...DEFAULT_QUALITY, mode: "audio", audio_format: "mp3" });
   });
 
-  it("holds raw typing until blur, and disables the selects it overrides", () => {
-    const { onEdit, onPick, onBlur } = renderGeneric();
+  it("hands raw typing to onEdit, and disables the selects it overrides", () => {
+    const { onEdit, onPick } = renderGeneric();
     const raw = screen.getByLabelText("Format (-f)");
     fireEvent.change(raw, { target: { value: "137+140" } });
     expect(onEdit).toHaveBeenLastCalledWith({ ...DEFAULT_QUALITY, format: "137+140" });
     expect(onPick).not.toHaveBeenCalled();
-    fireEvent.blur(raw);
-    expect(onBlur).toHaveBeenCalled();
 
     expect(select("Resolution").disabled).toBe(true);
     expect(select("Codec").disabled).toBe(true);

@@ -11,7 +11,7 @@ import { api, errText } from "./api";
 import {
   useAppUpdate, usePollEvents, useSyncFinished, useToolsStatus, useTransferFinished,
 } from "./events";
-import { toolsReadyMessage } from "./components/ToolsSection";
+import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
 import type {
   Channel, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
