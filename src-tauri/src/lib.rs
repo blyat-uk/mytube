@@ -16,6 +16,7 @@ pub mod resolve;
 pub mod rss;
 pub mod search;
 pub mod siblings;
+pub mod sync;
 pub mod tools;
 pub mod transfer;
 pub mod tray;

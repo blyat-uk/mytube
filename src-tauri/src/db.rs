@@ -3963,3 +3963,26 @@ mod auto_download_tests {
         assert!(!d.get_channel("UC1").unwrap().unwrap().auto_download);
     }
 }
+
+// ---- sync ----
+//
+// The two halves of `sync::snapshot`'s contract. See
+// docs/superpowers/specs/2026-10-09-cloud-sync-design.md, section 3.
+
+use crate::sync::snapshot::{ApplyReport, Snapshot};
+
+impl Db {
+    /// This machine's slim snapshot: subscribed channels, touched videos and
+    /// every tombstone, each list ordered by id.
+    pub fn sync_snapshot(&self, machine_name: &str) -> Result<Snapshot> {
+        let _ = machine_name;
+        bail!("sync_snapshot is not implemented yet")
+    }
+
+    /// Merges the other machines' snapshots into the library, in one
+    /// transaction, by per-field last-writer-wins.
+    pub fn apply_sync(&self, snapshots: &[Snapshot]) -> Result<ApplyReport> {
+        let _ = snapshots;
+        bail!("apply_sync is not implemented yet")
+    }
+}
