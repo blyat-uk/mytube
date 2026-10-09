@@ -99,7 +99,7 @@ pub fn run() {
             app.manage(state.clone());
 
             // Cloud sync, on a clock of its own: a minute's timer, or a nudge
-            // from `sync_now`. It does nothing at all while sync is off, and
+            // from `sync_nudge` / `sync_now`. It does nothing at all while sync is off, and
             // its first wake is the startup pull.
             let syncer = Arc::new(sync::Syncer::new(sync::state::path()));
             app.manage(syncer.clone());
@@ -213,6 +213,7 @@ pub fn run() {
             commands::sync_turn_on,
             commands::sync_join,
             commands::sync_leave,
+            commands::sync_nudge,
             commands::sync_now,
         ])
         .build(tauri::generate_context!())

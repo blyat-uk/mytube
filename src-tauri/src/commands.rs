@@ -919,13 +919,24 @@ pub async fn sync_leave(
     syncer.leave(&app, &state).await
 }
 
-/// Asks for one pull, at the clock's pace. Called on window focus, after a
-/// poll while the window is visible, and by the Sync now button.
+/// Asks for one pull, at the clock's minute pace. Called on window focus and
+/// after a poll while the window is visible; it does not wait for the pull.
 #[tauri::command]
-pub async fn sync_now(syncer: State<'_, Arc<crate::sync::Syncer>>) -> R<()> {
+pub async fn sync_nudge(syncer: State<'_, Arc<crate::sync::Syncer>>) -> R<()> {
     let syncer = syncer.inner().clone();
-    syncer.sync_now().await;
+    syncer.nudge().await;
     Ok(())
+}
+
+/// The Sync now button: syncs as soon as the edge allows and waits for it.
+/// True when other computers' changes came in; a failure is its sentence.
+#[tauri::command]
+pub async fn sync_now(
+    state: State<'_, Arc<AppState>>,
+    syncer: State<'_, Arc<crate::sync::Syncer>>,
+) -> R<bool> {
+    let (state, syncer) = (state.inner().clone(), syncer.inner().clone());
+    syncer.sync_now(&state).await
 }
 
 #[cfg(test)]

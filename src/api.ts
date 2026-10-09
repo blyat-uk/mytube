@@ -103,8 +103,12 @@ export const api = {
   /** Forgets the code on this computer. The library is left exactly as it is. */
   syncLeave: () => invoke<SyncStatus>("sync_leave"),
   /** Asks for a sync soon. A nudge, not a request: the backend sends at most
-   *  one a minute, and does nothing while sync is off. */
-  syncNow: () => invoke<void>("sync_now"),
+   *  one a minute, does nothing while sync is off, and does not wait. */
+  syncNudge: () => invoke<void>("sync_nudge"),
+  /** The Sync now button: syncs as soon as the server allows (about 10 s at
+   *  most) and resolves once it has. True when other computers' changes came
+   *  in; rejects with the reason when the sync failed. */
+  syncNow: () => invoke<boolean>("sync_now"),
   /** Hands a URL to the desktop's default browser. */
   openExternal: (url: string) => openUrl(url),
 };

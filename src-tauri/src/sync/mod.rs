@@ -11,7 +11,8 @@
 //! The pace is the whole cost model. The server's edge allows one request per
 //! 10 s per IP and the free plan must never be outgrown, so each machine sends
 //! at most one request a minute, and only when it has something to push or has
-//! been asked to pull. A hidden, idle machine sends nothing.
+//! been asked to pull. A hidden, idle machine sends nothing. The one exception
+//! is a person pressing Sync now (or Join), who waits only for the edge's 10 s.
 
 pub mod client;
 pub mod code;
@@ -24,7 +25,7 @@ pub mod verify;
 mod e2e;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,18 @@ pub const NEWER: &str = "Another computer runs a newer MyTube. Update this one t
 
 /// One request a minute, at most, per machine.
 pub const PACE: Duration = Duration::from_secs(60);
+
+/// What Sync now waits for instead: the edge's own limit, one request per 10 s
+/// per IP. The user is waiting on it, as on a Join, and a person pressing a
+/// button cannot spend the quota a timer could.
+pub const EDGE_PACE: Duration = Duration::from_secs(10);
+
+/// How long Sync now waits for its answer on top of the pace: the request's
+/// own 30 s timeout, plus room to read and apply a large library.
+const ANSWER_GRACE: Duration = Duration::from_secs(60);
+
+pub const OFF: &str = "Sync is off.";
+const SLOW: &str = "Sync is taking longer than usual. MyTube keeps trying in the background.";
 
 /// The longest a `Retry-After` is honoured for. The pace lives in memory only,
 /// so a restart would undo a longer one anyway; this just keeps a garbled
@@ -97,7 +110,28 @@ pub fn decide(
 /// When the next request may go, after one went at `now`: a minute, or longer
 /// if the edge asked for longer.
 pub fn next_allowed_after(now: Instant, retry_after: Option<Duration>) -> Instant {
-    now + retry_after.unwrap_or_default().min(MAX_RETRY_AFTER).max(PACE)
+    allowed_after(now, retry_after, PACE)
+}
+
+/// The same for Sync now: the edge's 10 s, or longer if the edge asked.
+pub fn edge_allowed_after(now: Instant, retry_after: Option<Duration>) -> Instant {
+    allowed_after(now, retry_after, EDGE_PACE)
+}
+
+fn allowed_after(now: Instant, retry_after: Option<Duration>, floor: Duration) -> Instant {
+    now + retry_after.unwrap_or_default().min(MAX_RETRY_AFTER).max(floor)
+}
+
+/// "45 seconds", "a minute", "12 minutes": how long a held Sync now has left,
+/// which is always more than the edge's 10 s.
+fn wait_words(wait: Duration) -> String {
+    match wait.as_secs() {
+        s if s < 60 => format!("{s} seconds"),
+        s => match s.div_ceil(60) {
+            1 => "a minute".to_string(),
+            m => format!("{m} minutes"),
+        },
+    }
 }
 
 // ------------------------------------------------------------- the library
@@ -497,17 +531,31 @@ pub async fn status(env: &Env) -> SyncStatus {
 
 // ------------------------------------------------------------- the clock
 
+/// When the next request may go: `minute` for the clock and its nudges, `edge`
+/// for a Sync now. Both stretch to a `Retry-After`.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    minute: Instant,
+    edge: Instant,
+}
+
 /// Sync as Tauri state. Not called `Sync`, which would shadow the marker trait
 /// in every module that names it.
 pub struct Syncer {
     /// Wakes the clock early: Sync now, window focus, a finished poll.
     wake: tokio::sync::Notify,
-    /// Startup, and every Sync now, ask for one pull. Cleared by a pull that
-    /// worked; see [`run_once`] for how one in flight is not lost.
+    /// Startup, every nudge and every Sync now ask for one pull. Cleared by a
+    /// pull that worked; see [`run_once`] for how one in flight is not lost.
     pull_wanted: AtomicBool,
-    /// No request before this. Memory only: a restart starts afresh, and the
-    /// edge's own limit is 10 s, so nothing is lost by forgetting it.
-    next_allowed: std::sync::Mutex<Instant>,
+    /// No request before these. Memory only: a restart starts afresh, and the
+    /// edge's own limit is 10 s, so nothing is lost by forgetting them.
+    pace: std::sync::Mutex<Pace>,
+    /// Sync now presses so far. Each takes the next number as its ticket.
+    asked: AtomicU64,
+    /// The highest ticket a tick has answered, and how that tick went: whether
+    /// other computers' changes came in, or the sentence for why not. A tick
+    /// with a ticket still unanswered goes at the edge's pace, not the minute.
+    answered: tokio::sync::watch::Sender<(u64, Result<bool, String>)>,
     /// Held by everything that sends, for the whole load → request → save, so
     /// the clock can never save over a Turn on, a Join or a Turn off that
     /// landed while its request was out.
@@ -521,7 +569,9 @@ impl Syncer {
         Self {
             wake: tokio::sync::Notify::new(),
             pull_wanted: AtomicBool::new(true),
-            next_allowed: std::sync::Mutex::new(Instant::now()),
+            pace: std::sync::Mutex::new(Pace { minute: Instant::now(), edge: Instant::now() }),
+            asked: AtomicU64::new(0),
+            answered: tokio::sync::watch::Sender::new((0, Ok(false))),
             send: tokio::sync::Mutex::new(()),
             state_path,
             machine_name: machine_name(),
@@ -545,30 +595,55 @@ impl Syncer {
         }
     }
 
-    fn next_allowed(&self) -> Instant {
-        *self.next_allowed.lock().unwrap()
+    fn pace(&self, retry_after: Option<Duration>) {
+        let now = Instant::now();
+        *self.pace.lock().unwrap() = Pace {
+            minute: next_allowed_after(now, retry_after),
+            edge: edge_allowed_after(now, retry_after),
+        };
     }
 
-    fn pace(&self, retry_after: Option<Duration>) {
-        *self.next_allowed.lock().unwrap() = next_allowed_after(Instant::now(), retry_after);
+    /// Answers every Sync now up to `ticket`. Never backwards: a tick that
+    /// started before a newer press must not answer it.
+    fn answer(&self, ticket: u64, result: Result<bool, String>) {
+        self.answered.send_if_modified(|answered| {
+            if ticket <= answered.0 {
+                return false;
+            }
+            *answered = (ticket, result);
+            true
+        });
     }
 
     /// One wake. Returns when it would next like to run, if sooner than the
     /// timer: the end of a `Wait`.
     async fn tick(&self, app: &AppHandle, app_state: &Arc<AppState>) -> Option<Instant> {
         let send = self.send.lock().await;
+        // Read before `run_once` reads `pull_wanted`, which Sync now sets before
+        // it takes its ticket: a tick that sees the ticket sees the pull too.
+        let ticket = self.asked.load(Ordering::SeqCst);
+        let hurry = ticket > self.answered.borrow().0;
         let env = self.env(app_state).await;
-        let outcome = match run_once(&env, self.next_allowed(), &self.pull_wanted).await {
+        let pace = *self.pace.lock().unwrap();
+        let allowed = if hurry { pace.edge } else { pace.minute };
+        let outcome = match run_once(&env, allowed, &self.pull_wanted).await {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("mytube: sync: {e:#}");
+                self.answer(ticket, Err(format!("{e:#}")));
                 return None;
             }
         };
         let result = match outcome {
-            Outcome::Off | Outcome::Idle(Decision::Skip) => return None,
+            Outcome::Off => {
+                self.answer(ticket, Err(OFF.to_string()));
+                return None;
+            }
             Outcome::Idle(Decision::Wait(until)) => return Some(until),
-            Outcome::Idle(Decision::Exchange { .. }) => return None,
+            Outcome::Idle(_) => {
+                self.answer(ticket, Ok(false));
+                return None;
+            }
             Outcome::Sent(result) => result,
         };
         self.pace(result.as_ref().err().and_then(Failure::retry_after));
@@ -577,7 +652,10 @@ impl Syncer {
             Ok(report) => follow_up(app, app_state, report),
             Err(f) => eprintln!("mytube: sync failed: {}", detail(f)),
         }
+        // The status goes out first, so the section has it before the button
+        // that asked comes back.
         emit_status(app, &env).await;
+        self.answer(ticket, result.map(|r| r.changed).map_err(|f| f.to_string()));
         None
     }
 
@@ -646,15 +724,44 @@ impl Syncer {
         Ok(emit_status(app, &env).await)
     }
 
-    /// Asks for one pull and wakes the clock, which still keeps the pace. A
-    /// no-op while sync is off, so nothing is left wanted for whenever it is
-    /// turned on.
-    pub async fn sync_now(&self) {
+    /// Window focus, or a poll finished while the window is visible: asks for
+    /// one pull and wakes the clock, which keeps the minute's pace. A no-op
+    /// while sync is off, so nothing is left wanted for whenever it is turned on.
+    pub async fn nudge(&self) {
         let path = self.state_path.clone();
         let on = tokio::task::spawn_blocking(move || path.exists()).await.unwrap_or(false);
         if on {
             self.pull_wanted.store(true, Ordering::SeqCst);
             self.wake.notify_one();
+        }
+    }
+
+    /// The Sync now button: one exchange as soon as the edge allows, and how it
+    /// went -- true when other computers' changes came in. The clock does the
+    /// exchange, so it is still the only sender, and it answers by ticket.
+    pub async fn sync_now(&self, app_state: &AppState) -> Result<bool, String> {
+        match load(&self.env(app_state).await).await {
+            Ok(Some(st)) if st.expired => return Err(EXPIRED.to_string()),
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(OFF.to_string()),
+            Err(e) => return Err(format!("{e:#}")),
+        }
+        self.pull_wanted.store(true, Ordering::SeqCst);
+        // Longer than the edge's 10 s only on a `Retry-After`: the server is
+        // shedding load, and a button must not argue with it. The pull stays
+        // wanted, so the clock goes once the wait is over.
+        let wait = self.pace.lock().unwrap().edge.saturating_duration_since(Instant::now());
+        if wait > EDGE_PACE {
+            return Err(format!("The sync server asked MyTube to wait. Try again in {}.", wait_words(wait)));
+        }
+        let mut answered = self.answered.subscribe();
+        let ticket = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        self.wake.notify_one();
+        let answer = async move { answered.wait_for(|a| a.0 >= ticket).await.map(|a| a.1.clone()) };
+        match tokio::time::timeout(wait + ANSWER_GRACE, answer).await {
+            Ok(Ok(result)) => result,
+            // The pull is still wanted; the clock carries on without the button.
+            _ => Err(SLOW.to_string()),
         }
     }
 }
@@ -778,6 +885,44 @@ mod tests {
         assert_eq!(next_allowed_after(t, Some(Duration::from_secs(10))), t + PACE);
         assert_eq!(next_allowed_after(t, Some(Duration::from_secs(300))), t + Duration::from_secs(300));
         assert_eq!(next_allowed_after(t, Some(Duration::from_secs(86_400))), t + MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn sync_now_waits_only_for_the_edge_or_what_it_asked() {
+        let t = Instant::now();
+        assert_eq!(edge_allowed_after(t, None), t + EDGE_PACE);
+        assert_eq!(edge_allowed_after(t, Some(Duration::from_secs(3))), t + EDGE_PACE);
+        assert_eq!(edge_allowed_after(t, Some(Duration::from_secs(300))), t + Duration::from_secs(300));
+        assert_eq!(edge_allowed_after(t, Some(Duration::from_secs(86_400))), t + MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn a_held_sync_now_says_how_long_in_words() {
+        let words = |s| wait_words(Duration::from_secs(s));
+        assert_eq!(words(45), "45 seconds");
+        assert_eq!(words(60), "a minute");
+        assert_eq!(words(61), "2 minutes");
+        assert_eq!(words(3600), "60 minutes");
+    }
+
+    #[tokio::test]
+    async fn sync_now_is_answered_by_its_own_tick_and_never_by_an_older_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let syncer = Syncer::new(dir.path().join("sync.json"));
+        let mut rx = syncer.answered.subscribe();
+
+        // Two presses: tickets 1 and 2.
+        syncer.asked.fetch_add(2, Ordering::SeqCst);
+        // A tick that began before either press answers nothing.
+        syncer.answer(0, Ok(true));
+        assert_eq!(*rx.borrow_and_update(), (0, Ok(false)));
+        // One that began after both answers both, at once.
+        syncer.answer(2, Ok(true));
+        assert_eq!(*rx.borrow_and_update(), (2, Ok(true)));
+        // A slower tick finishing later with an older ticket cannot overwrite it.
+        syncer.answer(1, Err("late".into()));
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(rx.borrow().1, Ok(true));
     }
 
     #[test]

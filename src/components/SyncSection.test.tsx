@@ -33,7 +33,7 @@ const syncStatus = vi.fn<() => Promise<SyncStatus>>(() => Promise.resolve(initia
 const syncTurnOn = vi.fn<() => Promise<SyncStatus>>(() => Promise.resolve(on()));
 const syncJoin = vi.fn<(code: string) => Promise<SyncStatus>>(() => Promise.resolve(on()));
 const syncLeave = vi.fn<() => Promise<SyncStatus>>(() => Promise.resolve(OFF));
-const syncNow = vi.fn<() => Promise<void>>(() => Promise.resolve());
+const syncNow = vi.fn<() => Promise<boolean>>(() => Promise.resolve(false));
 
 vi.mock("../api", () => ({
   api: {
@@ -46,7 +46,9 @@ vi.mock("../api", () => ({
   errText: (e: unknown) => String(e),
 }));
 
-import SyncSection, { EXPIRED_TEXT, maskCode, peersLine, statusLine } from "./SyncSection";
+import SyncSection, {
+  EXPIRED_TEXT, SYNCED_CHANGES_TEXT, SYNCED_TEXT, maskCode, peersLine, statusLine,
+} from "./SyncSection";
 import { ToastProvider } from "./Toast";
 
 function renderSync() {
@@ -80,7 +82,7 @@ beforeEach(() => {
   syncTurnOn.mockImplementation(() => Promise.resolve(on()));
   syncJoin.mockImplementation(() => Promise.resolve(on()));
   syncLeave.mockImplementation(() => Promise.resolve(OFF));
-  syncNow.mockImplementation(() => Promise.resolve());
+  syncNow.mockImplementation(() => Promise.resolve(false));
   writeText.mockImplementation(() => Promise.resolve());
   setClipboard({ writeText });
   listeners.clear();
@@ -279,16 +281,44 @@ describe("while sync is on", () => {
     expect(codeField().value).toBe(CODE);
   });
 
-  it("nudges a sync, and lets the next status answer it", async () => {
+  it("is busy for as long as Sync now runs, then says it is up to date", async () => {
+    const call = hold(syncNow);
     renderSync();
     await screen.findByText("Synced 2m ago");
     fireEvent.click(button("Sync now"));
     expect(syncNow).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText("Syncing…")).toBeDefined();
+    // Disabled at once, and visibly working once it is slow enough to notice.
+    const busy = await screen.findByRole("button", { name: "Syncing…" });
+    expect((busy as HTMLButtonElement).disabled).toBe(true);
+    expect(busy.getAttribute("aria-busy")).toBe("true");
+    expect(busy.className).toMatch(/\bis-spinning\b/);
+    fireEvent.click(busy);
+    expect(syncNow).toHaveBeenCalledTimes(1);
 
+    // The backend sends the status before it answers the button.
     act(() => listeners.get("sync://status")!({ payload: on({ lastSyncAt: real() }) }));
     expect(await screen.findByText("Synced just now")).toBeDefined();
-    expect(screen.queryByText("Syncing…")).toBeNull();
+    await call.resolve(false);
+    expect(await screen.findByText(SYNCED_TEXT)).toBeDefined();
+    expect(button("Sync now").disabled).toBe(false);
+    expect(button("Sync now").getAttribute("aria-busy")).toBe("false");
+  });
+
+  it("says so when Sync now brought other computers' changes in", async () => {
+    syncNow.mockImplementation(() => Promise.resolve(true));
+    renderSync();
+    fireEvent.click(await screen.findByRole("button", { name: "Sync now" }));
+    expect(await screen.findByText(SYNCED_CHANGES_TEXT)).toBeDefined();
+    expect(screen.queryByText(SYNCED_TEXT)).toBeNull();
+  });
+
+  it("toasts why Sync now failed and gives the button back", async () => {
+    syncNow.mockImplementation(() => Promise.reject("Could not reach the sync server. Retrying in a minute."));
+    renderSync();
+    fireEvent.click(await screen.findByRole("button", { name: "Sync now" }));
+    expect(await screen.findByText("Could not reach the sync server. Retrying in a minute.")).toBeDefined();
+    expect(screen.queryByText(SYNCED_TEXT)).toBeNull();
+    await waitFor(() => expect(button("Sync now").disabled).toBe(false));
   });
 
   it("asks before resetting the code, and does nothing on Cancel", async () => {

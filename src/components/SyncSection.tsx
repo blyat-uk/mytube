@@ -4,6 +4,7 @@ import { useSyncStatus } from "../events";
 import { formatRelative } from "../format";
 import { usePending } from "../pending";
 import ConfirmDialog from "./ConfirmDialog";
+import { IconBusy } from "./Icons";
 import { useToast } from "./Toast";
 import type { SyncPeer, SyncStatus } from "../types";
 
@@ -17,10 +18,9 @@ const NOW = "now";
 export const EXPIRED_TEXT =
   "This sync code is no longer in use: nothing synced with it for 90 days.";
 const WAIT_HINT = "Finish the check in the window that opened.";
+export const SYNCED_CHANGES_TEXT = "Synced. Changes from your other computers are in.";
+export const SYNCED_TEXT = "Synced. Everything is up to date.";
 
-/** How long "Syncing…" may stand in for a status that never came. The backend
- *  sends at most one request a minute, so a nudge is answered well inside it. */
-const NUDGE_TIMEOUT = 90_000;
 /** How often the relative times are redrawn while sync is on. */
 const TICK = 30_000;
 
@@ -73,8 +73,6 @@ export default function SyncSection() {
   const [selectCode, setSelectCode] = useState(0);
   const codeRef = useRef<HTMLInputElement | null>(null);
   const [confirm, setConfirm] = useState<"reset" | "leave" | null>(null);
-  // Sync now was pressed and no status has answered it yet.
-  const [nudged, setNudged] = useState(false);
   const [, setTick] = useState(0);
 
   useEffect(() => {
@@ -94,7 +92,6 @@ export default function SyncSection() {
     heard.current = true;
     setStatus(s);
     setLoadError(null);
-    setNudged(false);
   });
 
   const on = !!status?.enabled && !status.expired;
@@ -105,12 +102,6 @@ export default function SyncSection() {
     const t = window.setInterval(() => setTick((n) => n + 1), TICK);
     return () => window.clearInterval(t);
   }, [on]);
-
-  useEffect(() => {
-    if (!nudged) return;
-    const t = window.setTimeout(() => setNudged(false), NUDGE_TIMEOUT);
-    return () => window.clearTimeout(t);
-  }, [nudged]);
 
   useEffect(() => {
     if (!selectCode) return;
@@ -156,14 +147,13 @@ export default function SyncSection() {
     forgetCode();
   });
 
-  // "Syncing…" goes up before the call rather than after it: the status that
-  // answers the nudge could otherwise land first and be followed by a
-  // "Syncing…" that nothing would ever clear but the timeout.
-  const syncNow = () => run(NOW, () => api.syncNow(), {
-    optimistic: () => {
-      setNudged(true);
-      return () => setNudged(false);
-    },
+  // The call waits for the sync itself, so the button is busy for exactly as
+  // long as it takes. The status line has already moved by the time it
+  // answers (`sync://status` goes first); the toast says what came of it, and
+  // a failure is toasted by `run` as well as shown in the line.
+  const syncNow = () => run(NOW, async () => {
+    const changed = await api.syncNow();
+    toast.success(changed ? SYNCED_CHANGES_TEXT : SYNCED_TEXT);
   });
 
   async function copy() {
@@ -218,7 +208,7 @@ export default function SyncSection() {
       </>
     );
   } else if (status.enabled) {
-    const line = nudged ? { text: "Syncing…", warn: false } : statusLine(status);
+    const line = statusLine(status);
     body = (
       <>
         {status.code && (
@@ -273,11 +263,14 @@ export default function SyncSection() {
         <div className="row-inline sync-actions">
           <button
             type="button"
-            className="btn"
+            className={`btn${slow.has(NOW) ? " is-spinning" : ""}`}
             disabled={changing || pending.has(NOW)}
+            aria-busy={pending.has(NOW)}
             onClick={() => void syncNow()}
           >
-            Sync now
+            {slow.has(NOW)
+              ? <><span className="btn-spinner" aria-hidden="true"><IconBusy /></span>Syncing…</>
+              : "Sync now"}
           </button>
           <button
             type="button"

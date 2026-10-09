@@ -38,7 +38,7 @@ const listVideoGroups = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() =>
 const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([]));
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
 const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(VERSION));
-const syncNow = vi.fn<() => Promise<void>>(() => Promise.resolve());
+const syncNudge = vi.fn<() => Promise<void>>(() => Promise.resolve());
 
 vi.mock("./api", () => ({
   api: {
@@ -50,7 +50,7 @@ vi.mock("./api", () => ({
     toolsStatus: () => toolsStatus(),
     openExternal: (url: string) => openExternal(url),
     appVersionInfo: () => appVersionInfo(),
-    syncNow: () => syncNow(),
+    syncNudge: () => syncNudge(),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
@@ -103,7 +103,7 @@ beforeEach(() => {
   saveViewState.mockImplementation(() => Promise.resolve());
   toolsStatus.mockImplementation(() => Promise.resolve([]));
   appVersionInfo.mockImplementation(() => Promise.resolve(VERSION));
-  syncNow.mockImplementation(() => Promise.resolve());
+  syncNudge.mockImplementation(() => Promise.resolve());
   listeners.clear();
 });
 
@@ -525,19 +525,19 @@ describe("cloud sync", () => {
   it("asks for a sync when the window gains focus", async () => {
     render(<App />);
     await screen.findByLabelText("Search videos");
-    expect(syncNow).not.toHaveBeenCalled();
+    expect(syncNudge).not.toHaveBeenCalled();
 
     act(() => { window.dispatchEvent(new Event("focus")); });
-    await waitFor(() => expect(syncNow).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(syncNudge).toHaveBeenCalledTimes(1));
   });
 
   it("never toasts a failed nudge", async () => {
-    syncNow.mockImplementation(() => Promise.reject("Sync is off."));
+    syncNudge.mockImplementation(() => Promise.reject("Sync is off."));
     render(<App />);
     await screen.findByLabelText("Search videos");
 
     act(() => { window.dispatchEvent(new Event("focus")); });
-    await waitFor(() => expect(syncNow).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(syncNudge).toHaveBeenCalledTimes(1));
     await pause(20);
     expect(screen.queryByText("Sync is off.")).toBeNull();
   });
@@ -549,7 +549,7 @@ describe("cloud sync", () => {
     await waitFor(() => expect(listeners.has("poll://finished")).toBe(true));
 
     act(() => listeners.get("poll://finished")!({ payload: POLLED }));
-    await waitFor(() => expect(syncNow).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(syncNudge).toHaveBeenCalledTimes(1));
   });
 
   it("stays quiet after a poll behind a hidden window", async () => {
@@ -562,6 +562,6 @@ describe("cloud sync", () => {
     // The poll's own refetch is the sign the handler has run.
     await waitFor(() => expect(listChannels.mock.calls.length).toBeGreaterThan(1));
     await pause(20);
-    expect(syncNow).not.toHaveBeenCalled();
+    expect(syncNudge).not.toHaveBeenCalled();
   });
 });

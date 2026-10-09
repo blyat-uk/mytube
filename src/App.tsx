@@ -174,7 +174,7 @@ function Shell() {
   // Through `Promise.resolve()` so a missing bridge (`vite dev`) cannot throw
   // synchronously out of an event handler either.
   const nudgeSync = useCallback(() => {
-    Promise.resolve().then(() => api.syncNow()).catch(() => {});
+    Promise.resolve().then(() => api.syncNudge()).catch(() => {});
   }, []);
   useEffect(() => {
     window.addEventListener("focus", nudgeSync);

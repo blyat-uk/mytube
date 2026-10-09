@@ -1681,6 +1681,12 @@ label.field-label { display: block; }
  * ------------------------------------------------------------------ */
 
 .sync-actions { flex-wrap: wrap; }
+/* Sync now while it runs: a turning glyph beside "Syncing…". Busy is not
+   unavailable, so it keeps more of its colour than a plain disabled button. */
+.sync-actions .btn[aria-busy="true"]:disabled { opacity: 0.8; cursor: progress; }
+.btn-spinner { display: inline-flex; vertical-align: -2px; margin-right: 6px; }
+.btn-spinner .icon { width: 14px; height: 14px; }
+.btn.is-spinning .btn-spinner { animation: spin 900ms linear infinite; }
 /* Under the button that is waiting on it, not in the intro's slot above. */
 .sync-block > .sync-wait { margin: 8px 0 0; color: var(--muted); }
 
