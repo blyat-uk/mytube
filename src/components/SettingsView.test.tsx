@@ -117,6 +117,10 @@ vi.mock("../api", () => ({
       current: "2.1.0", update: null, checkedAt: 1_790_000_000, checksEnabled: true,
     }),
     openExternal: () => Promise.resolve(),
+    syncStatus: () => Promise.resolve({
+      enabled: false, code: null, machineName: "desktop", peers: [], lastSyncAt: null,
+      pending: false, error: null, expired: false,
+    }),
   },
   errText: (e: unknown) => String(e),
 }));
@@ -561,6 +565,16 @@ describe("Tools", () => {
     expect(screen.getByRole("heading", { name: "Tools" })).toBeDefined();
     expect(screen.getByRole("region", { name: "Tools" })).toBeDefined();
     expect(screen.getByRole("heading", { name: "Backup & transfer" })).toBeDefined();
+  });
+
+  it("puts Sync after Tools and before Backup & transfer", async () => {
+    await renderSettings();
+    const tools = screen.getByRole("heading", { name: "Tools" });
+    const sync = screen.getByRole("heading", { name: "Sync" });
+    const transfer = screen.getByRole("heading", { name: "Backup & transfer" });
+    expect(tools.compareDocumentPosition(sync) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(sync.compareDocumentPosition(transfer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Turn on sync" })).toBeDefined();
   });
 
   it("links the update channel's hint to its select", async () => {

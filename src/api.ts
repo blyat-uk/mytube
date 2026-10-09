@@ -4,6 +4,7 @@ import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
   PlayerOption, BrowserScan, CookiesFileInfo, ToolStatus, Quality, VideoFormats, VersionInfo,
+  SyncStatus,
 } from "./types";
 
 export const api = {
@@ -89,6 +90,21 @@ export const api = {
   appVersionInfo: () => invoke<VersionInfo>("app_version_info"),
   /** Asks GitHub now, whether or not a day has passed; rejects if it cannot. */
   checkAppUpdateNow: () => invoke<VersionInfo>("check_app_update_now"),
+  /** Whether sync is on, with whom, and how the last attempt went. No network. */
+  syncStatus: () => invoke<SyncStatus>("sync_status"),
+  /** Opens the server's verification window and resolves once it is passed and
+   *  the group exists -- which can take minutes, since a person is solving it.
+   *  Rejects if the window is closed first. While sync is on, this is Reset
+   *  code: a new group replaces the old one only when it succeeds. */
+  syncTurnOn: () => invoke<SyncStatus>("sync_turn_on"),
+  /** Joins the group another computer's code names. Nothing is saved when it
+   *  rejects. */
+  syncJoin: (code: string) => invoke<SyncStatus>("sync_join", { code }),
+  /** Forgets the code on this computer. The library is left exactly as it is. */
+  syncLeave: () => invoke<SyncStatus>("sync_leave"),
+  /** Asks for a sync soon. A nudge, not a request: the backend sends at most
+   *  one a minute, and does nothing while sync is off. */
+  syncNow: () => invoke<void>("sync_now"),
   /** Hands a URL to the desktop's default browser. */
   openExternal: (url: string) => openUrl(url),
 };

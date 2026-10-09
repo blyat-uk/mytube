@@ -1676,6 +1676,60 @@ label.field-label { display: block; }
 
 .tools-prefs { margin-top: 20px; }
 
+/* ------------------------------------------------------------------ *
+ * Sync
+ * ------------------------------------------------------------------ */
+
+.sync-actions { flex-wrap: wrap; }
+/* Under the button that is waiting on it, not in the intro's slot above. */
+.sync-block > .sync-wait { margin: 8px 0 0; color: var(--muted); }
+
+/* Captioned like the template presets: a small label over the one thing it
+   names, so the field itself can stay plain. */
+.sync-code-label,
+.sync-join-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.sync-join-label { text-transform: none; letter-spacing: normal; font-size: 12.5px; color: var(--muted); }
+
+.sync-code-row { flex-wrap: wrap; }
+/* Sized to the code, not the page: its 35 characters in the mono face plus the
+   field's padding and border, so the masked and the shown code take exactly
+   the same room. Any letter-spacing would have to be added in here too. */
+.sync-code-row .text-input.sync-code {
+  flex: 0 1 auto;
+  width: calc(35ch + 26px);
+  max-width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.sync-code-block > .field-hint { max-width: 62ch; }
+.sync-copy-note { color: var(--muted); }
+
+.sync-machines { margin-top: 16px; font-size: 13px; color: var(--muted); }
+.sync-machines p { margin: 0; overflow-wrap: anywhere; }
+.sync-machines p + p { margin-top: 2px; }
+.sync-machine { color: var(--text); }
+
+/* Quiet while all is well, and the inline-problem pink once it is not -- the
+   same voice as a tool's error: a reason, never an alarm. */
+.sync-status {
+  margin: 10px 0 12px;
+  min-height: 1.4em;
+  font-size: 12.5px;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+.sync-status.is-warn { color: #ffb9ba; }
+
+.sync-join { margin-top: 18px; max-width: 460px; }
+.sync-join .text-input { flex: 1 1 auto; }
+.sync-join-error { margin: 7px 0 0; font-size: 12.5px; color: #ffb9ba; overflow-wrap: anywhere; }
+
 /* --- modal --------------------------------------------------------------- */
 
 .modal-backdrop {

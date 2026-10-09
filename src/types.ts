@@ -332,3 +332,34 @@ export interface CookiesFileInfo {
   youtube: boolean;
   signedIn: boolean;
 }
+
+/* ------------------------------------------------------------------ *
+ * Cloud sync
+ *
+ * camelCase like every dialog payload. Times are Unix seconds.
+ * ------------------------------------------------------------------ */
+
+/** Another computer in this sync group. `lastWriteAt` is when it last sent
+ *  its library; null until it has. */
+export interface SyncPeer { name: string; lastWriteAt: number | null }
+
+/**
+ * `sync_status` and every command that changes sync, and `sync://status`,
+ * which the backend sends after every sync attempt and state change.
+ */
+export interface SyncStatus {
+  enabled: boolean;
+  /** The group's code. Null while sync is off. */
+  code: string | null;
+  /** This computer's name, as the others see it. */
+  machineName: string;
+  /** The other computers. This one is never among them. */
+  peers: SyncPeer[];
+  lastSyncAt: number | null;
+  /** This library has changes the server has not had yet. */
+  pending: boolean;
+  /** Why the last attempt failed, worded for the user; null once one succeeds. */
+  error: string | null;
+  /** Nothing synced with this code for 90 days, so the server let it go. */
+  expired: boolean;
+}

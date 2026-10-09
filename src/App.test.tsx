@@ -38,6 +38,7 @@ const listVideoGroups = vi.fn<(filter: VideoFilter) => Promise<unknown[]>>(() =>
 const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([]));
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
 const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(VERSION));
+const syncNow = vi.fn<() => Promise<void>>(() => Promise.resolve());
 
 vi.mock("./api", () => ({
   api: {
@@ -49,6 +50,7 @@ vi.mock("./api", () => ({
     toolsStatus: () => toolsStatus(),
     openExternal: (url: string) => openExternal(url),
     appVersionInfo: () => appVersionInfo(),
+    syncNow: () => syncNow(),
   },
   thumbSrc: () => "",
   errText: (e: unknown) => String(e),
@@ -101,6 +103,7 @@ beforeEach(() => {
   saveViewState.mockImplementation(() => Promise.resolve());
   toolsStatus.mockImplementation(() => Promise.resolve([]));
   appVersionInfo.mockImplementation(() => Promise.resolve(VERSION));
+  syncNow.mockImplementation(() => Promise.resolve());
   listeners.clear();
 });
 
@@ -481,5 +484,84 @@ describe("the version in the logo", () => {
     await act(async () => { resolve(VERSION); });
 
     expect(screen.getByRole("button", { name: /Update available: MyTube 2\.2\.0/ })).toBeDefined();
+  });
+});
+
+/**
+ * Sync's two touch points with the shell: another computer's changes refetch
+ * the views exactly as an import does, and the moments someone is looking --
+ * the window coming forward, a poll landing in front of them -- ask for a pull.
+ */
+describe("cloud sync", () => {
+  const POLLED = { channelsPolled: 3, newVideos: 0, shortsRejected: 0, errors: [] };
+
+  // Only this spy: restoring every mock would also take down test-setup's
+  // console.error spy, which is what fails a test on an update outside act().
+  let visibility: { mockRestore: () => void } | null = null;
+  const pretend = (state: DocumentVisibilityState) => {
+    visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue(state);
+  };
+  afterEach(() => {
+    visibility?.mockRestore();
+    visibility = null;
+  });
+
+  it("refetches the channels and the feed when a sync changes the library, and toasts nothing", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(listeners.has("sync://finished")).toBe(true));
+    await waitFor(() => expect(listVideos).toHaveBeenCalled());
+    await pause(50);
+    const feeds = listVideos.mock.calls.length;
+    const lists = listChannels.mock.calls.length;
+
+    act(() => listeners.get("sync://finished")!({ payload: null }));
+
+    await waitFor(() => expect(listVideos.mock.calls.length).toBeGreaterThan(feeds));
+    expect(listChannels.mock.calls.length).toBeGreaterThan(lists);
+    expect(screen.queryByText(/new video/)).toBeNull();
+  });
+
+  it("asks for a sync when the window gains focus", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(syncNow).not.toHaveBeenCalled();
+
+    act(() => { window.dispatchEvent(new Event("focus")); });
+    await waitFor(() => expect(syncNow).toHaveBeenCalledTimes(1));
+  });
+
+  it("never toasts a failed nudge", async () => {
+    syncNow.mockImplementation(() => Promise.reject("Sync is off."));
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+
+    act(() => { window.dispatchEvent(new Event("focus")); });
+    await waitFor(() => expect(syncNow).toHaveBeenCalledTimes(1));
+    await pause(20);
+    expect(screen.queryByText("Sync is off.")).toBeNull();
+  });
+
+  it("asks for a sync after a poll while the window is visible", async () => {
+    pretend("visible");
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(listeners.has("poll://finished")).toBe(true));
+
+    act(() => listeners.get("poll://finished")!({ payload: POLLED }));
+    await waitFor(() => expect(syncNow).toHaveBeenCalledTimes(1));
+  });
+
+  it("stays quiet after a poll behind a hidden window", async () => {
+    pretend("hidden");
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(listeners.has("poll://finished")).toBe(true));
+
+    act(() => listeners.get("poll://finished")!({ payload: POLLED }));
+    // The poll's own refetch is the sign the handler has run.
+    await waitFor(() => expect(listChannels.mock.calls.length).toBeGreaterThan(1));
+    await pause(20);
+    expect(syncNow).not.toHaveBeenCalled();
   });
 });

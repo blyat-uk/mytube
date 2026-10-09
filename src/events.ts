@@ -1,8 +1,8 @@
 import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
-  AppUpdate, DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, ToolProgress, ToolStatus,
-  TransferProgress, VersionInfo,
+  AppUpdate, DownloadProgress, DownloadStateEvent, ImportReport, PollSummary, SyncStatus,
+  ToolProgress, ToolStatus, TransferProgress, VersionInfo,
 } from "./types";
 
 /**
@@ -93,4 +93,19 @@ export function useAppUpdate(handler?: (update: AppUpdate) => void) {
  *  version pill and Settings' About block follow it without polling. */
 export function useVersionInfo(handler?: (info: VersionInfo) => void) {
   useTauriEvent<VersionInfo>("app://version-info", handler);
+}
+
+/** Sync's state, sent after every sync attempt and every change to it, so the
+ *  Settings section follows the clock without polling. */
+export function useSyncStatus(handler?: (status: SyncStatus) => void) {
+  useTauriEvent<SyncStatus>("sync://status", handler);
+}
+
+/**
+ * Another computer's changes have landed in this library. Its own event, like
+ * `transfer://finished` and for the same reason: `poll://finished` would toast
+ * "N new videos" and move the tray badge for videos that are not new at all.
+ */
+export function useSyncFinished(handler?: () => void) {
+  useTauriEvent<null>("sync://finished", () => handler?.());
 }

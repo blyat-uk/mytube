@@ -8,7 +8,9 @@ import SettingsView from "./components/SettingsView";
 import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
-import { useAppUpdate, usePollEvents, useToolsStatus, useTransferFinished } from "./events";
+import {
+  useAppUpdate, usePollEvents, useSyncFinished, useToolsStatus, useTransferFinished,
+} from "./events";
 import { toolsReadyMessage } from "./components/ToolsSection";
 import { useAppVersion } from "./appVersion";
 import type {
@@ -157,6 +159,28 @@ function Shell() {
     reload();
   });
 
+  // Another computer's changes landed here: the same refetch, for the same
+  // reason as an import, and likewise never `poll://finished` -- a synced
+  // video is one you already know about, so it earns no toast and no badge.
+  useSyncFinished(() => {
+    void loadChannels();
+    reload();
+  });
+
+  // Sync pulls only when asked, so a hidden, idle machine sends nothing: the
+  // moments someone is looking are what ask. Errors are swallowed -- this is a
+  // nudge nobody pressed, and sync's own status line reports what went wrong.
+  // Redundant nudges are free, since the backend sends at most one a minute.
+  // Through `Promise.resolve()` so a missing bridge (`vite dev`) cannot throw
+  // synchronously out of an event handler either.
+  const nudgeSync = useCallback(() => {
+    Promise.resolve().then(() => api.syncNow()).catch(() => {});
+  }, []);
+  useEffect(() => {
+    window.addEventListener("focus", nudgeSync);
+    return () => window.removeEventListener("focus", nudgeSync);
+  }, [nudgeSync]);
+
   // First-run provisioning is silent by design -- no dialog, no banner -- so
   // the one thing said about it is a toast the moment a tool finishes
   // installing. Heard here rather than in SettingsView, which is unmounted
@@ -227,6 +251,10 @@ function Shell() {
       setPolling(false);
       void loadChannels();
       reload();
+      // A poll is a moment the library may have moved on elsewhere too -- but
+      // only worth a pull while someone can see the result. An interval poll
+      // behind a hidden window stays as quiet as the machine it runs on.
+      if (document.visibilityState === "visible") nudgeSync();
       if (summary.newVideos > 0) {
         toast.success(
           `${summary.newVideos} new video${summary.newVideos === 1 ? "" : "s"}` +

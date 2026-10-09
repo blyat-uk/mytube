@@ -9,6 +9,7 @@ import { sanitizeQuality } from "../quality";
 import CookiesField from "./CookiesField";
 import AboutSection from "./AboutSection";
 import ToolsSection from "./ToolsSection";
+import SyncSection from "./SyncSection";
 import { useTransferProgress } from "../events";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
@@ -467,6 +468,8 @@ export default function SettingsView() {
         onChannel={(v) => setAndSave("ytdlp_channel", v)}
         onAutoUpdate={(on) => setAndSave("ytdlp_auto_update", on)}
       />
+
+      <SyncSection />
 
       <div className="transfer-block">
         <h3 className="field-label">Backup &amp; transfer</h3>
