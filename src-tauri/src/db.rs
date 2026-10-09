@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -162,6 +162,35 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Cloud sync. Each stamp is when its value last changed (unix seconds),
+    // which is what lets two machines settle a disagreement by last writer
+    // wins; NULL is a value nobody ever set. A tombstone is when a
+    // subscription or a manual video was removed, so a removal can travel
+    // and a stale copy elsewhere cannot bring it back. See `sync::snapshot`.
+    if version < 10 {
+        for (table, column) in [
+            ("videos", "watched_changed_at"),
+            ("videos", "hidden_changed_at"),
+            ("videos", "sibling_changed_at"),
+            ("channels", "subscribed_changed_at"),
+            ("channels", "member_changed_at"),
+        ] {
+            if !column_exists(conn, table, column)? {
+                conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"), [])?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tombstones (
+               kind       TEXT NOT NULL,
+               id         TEXT NOT NULL,
+               removed_at INTEGER NOT NULL,
+               PRIMARY KEY (kind, id)
+             );",
+        )?;
+        seed_sync_stamps(conn)?;
+        conn.execute_batch(SYNC_TRIGGERS)?;
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -191,6 +220,144 @@ fn backfill_downloaded_at(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// Stamps what a library already held when sync arrived, and only that.
+///
+/// A default value -- unwatched, visible, unmarked, not a member -- stays
+/// unstamped: every machine has it without anyone having chosen it, and a
+/// stamp would let it overrule a real choice made elsewhere. A set value must
+/// be stamped or it could never travel. Nobody recorded when most of these
+/// happened, so they are dated by the upgrade, which only has to beat a NULL;
+/// a watch has its own instant and a subscription its `added_at`, and both are
+/// truer than that.
+fn seed_sync_stamps(conn: &Connection) -> Result<()> {
+    let now = now();
+    for sql in [
+        "UPDATE videos SET watched_changed_at = COALESCE(watched_at, ?1)
+          WHERE watched <> 0 AND watched_changed_at IS NULL",
+        "UPDATE videos SET hidden_changed_at = ?1
+          WHERE hidden <> 0 AND hidden_changed_at IS NULL",
+        "UPDATE videos SET sibling_changed_at = ?1
+          WHERE sibling_group IS NOT NULL AND sibling_changed_at IS NULL",
+        "UPDATE channels SET member_changed_at = ?1
+          WHERE member <> 0 AND member_changed_at IS NULL",
+    ] {
+        conn.execute(sql, params![now])?;
+    }
+    conn.execute(
+        "UPDATE channels SET subscribed_changed_at = added_at
+          WHERE subscribed <> 0 AND subscribed_changed_at IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Sync's stamps and tombstones, kept by the database itself so that every
+/// write path keeps them -- the UI's commands, a transfer import, the CLI, the
+/// Python scripts in `scripts/` -- without one mutator having to remember to.
+/// Built-in SQL functions only: the scripts open this file without what
+/// `register_search` adds, and SQLite refuses a schema it cannot compile.
+///
+/// - **A changed value is stamped now**, unless the same write moved the stamp
+///   itself. That exception is `Db::apply_sync`, which copies another
+///   machine's stamp verbatim and must never have it replaced by this clock.
+/// - **An insert carrying a set value is stamped** -- a watch by its own
+///   instant when it has one -- so an import's rows travel like any other.
+/// - **Deleting a subscription or a manual video leaves a tombstone.** A
+///   tombstone covers every copy stamped at or before it. When the row deleted
+///   is one an existing tombstone already covers, which is how an apply
+///   deletes (the remote tombstone landed first), the tombstone keeps its
+///   time. When the row outlived it -- subscribed again, added again by hand --
+///   this is a new removal and the tombstone moves on to now: left where it
+///   was, it would not cover the comeback, and the second removal would never
+///   reach a machine that holds it. An ad-hoc uploader leaves none, since it
+///   was never a subscription, and neither does a polled video, which is the
+///   poll's to bring back.
+const SYNC_TRIGGERS: &str = "
+CREATE TRIGGER IF NOT EXISTS sync_watched_changed AFTER UPDATE OF watched ON videos
+WHEN NEW.watched IS NOT OLD.watched AND NEW.watched_changed_at IS OLD.watched_changed_at
+BEGIN
+  UPDATE videos SET watched_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_hidden_changed AFTER UPDATE OF hidden ON videos
+WHEN NEW.hidden IS NOT OLD.hidden AND NEW.hidden_changed_at IS OLD.hidden_changed_at
+BEGIN
+  UPDATE videos SET hidden_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_sibling_changed AFTER UPDATE OF sibling_group ON videos
+WHEN NEW.sibling_group IS NOT OLD.sibling_group
+ AND NEW.sibling_changed_at IS OLD.sibling_changed_at
+BEGIN
+  UPDATE videos SET sibling_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_subscribed_changed AFTER UPDATE OF subscribed ON channels
+WHEN NEW.subscribed IS NOT OLD.subscribed
+ AND NEW.subscribed_changed_at IS OLD.subscribed_changed_at
+BEGIN
+  UPDATE channels SET subscribed_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_member_changed AFTER UPDATE OF member ON channels
+WHEN NEW.member IS NOT OLD.member AND NEW.member_changed_at IS OLD.member_changed_at
+BEGIN
+  UPDATE channels SET member_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sync_watched_inserted AFTER INSERT ON videos
+WHEN NEW.watched <> 0 AND NEW.watched_changed_at IS NULL
+BEGIN
+  UPDATE videos
+     SET watched_changed_at = COALESCE(NEW.watched_at, CAST(strftime('%s','now') AS INTEGER))
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_hidden_inserted AFTER INSERT ON videos
+WHEN NEW.hidden <> 0 AND NEW.hidden_changed_at IS NULL
+BEGIN
+  UPDATE videos SET hidden_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_sibling_inserted AFTER INSERT ON videos
+WHEN NEW.sibling_group IS NOT NULL AND NEW.sibling_changed_at IS NULL
+BEGIN
+  UPDATE videos SET sibling_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_subscribed_inserted AFTER INSERT ON channels
+WHEN NEW.subscribed <> 0 AND NEW.subscribed_changed_at IS NULL
+BEGIN
+  UPDATE channels SET subscribed_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_member_inserted AFTER INSERT ON channels
+WHEN NEW.member <> 0 AND NEW.member_changed_at IS NULL
+BEGIN
+  UPDATE channels SET member_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sync_channel_removed AFTER DELETE ON channels
+WHEN OLD.subscribed <> 0
+BEGIN
+  INSERT INTO tombstones (kind, id, removed_at)
+  VALUES ('channel', OLD.id, CAST(strftime('%s','now') AS INTEGER))
+  ON CONFLICT (kind, id) DO UPDATE
+     SET removed_at = MAX(tombstones.removed_at, excluded.removed_at)
+   WHERE tombstones.removed_at < COALESCE(OLD.subscribed_changed_at, 0);
+END;
+CREATE TRIGGER IF NOT EXISTS sync_video_removed AFTER DELETE ON videos
+WHEN OLD.added_manually <> 0
+BEGIN
+  INSERT INTO tombstones (kind, id, removed_at)
+  VALUES ('video', OLD.id, CAST(strftime('%s','now') AS INTEGER))
+  ON CONFLICT (kind, id) DO UPDATE
+     SET removed_at = MAX(tombstones.removed_at, excluded.removed_at)
+   WHERE tombstones.removed_at < OLD.first_seen_at;
+END;
+";
 
 fn now() -> i64 { chrono::Utc::now().timestamp() }
 
@@ -390,6 +557,13 @@ const UPDATE_META: &str = "UPDATE videos SET
 const SET_PUBLISHED: &str = "UPDATE videos SET published_at=?2,
             sort_at = CASE WHEN added_manually=1 THEN sort_at ELSE ?2 END
      WHERE id=?1";
+
+/// Shared by `Db::prune_orphan_channel` and a sync apply that deleted the last
+/// manual video an uploader had, so the two can never disagree about which
+/// rows count as orphans.
+const PRUNE_ORPHAN_CHANNEL: &str = "DELETE FROM channels
+     WHERE id=?1 AND subscribed=0
+       AND NOT EXISTS (SELECT 1 FROM videos WHERE channel_id=?1)";
 
 const SET_PUBLISHED_IF_MISSING: &str = "UPDATE videos SET published_at=?2,
             sort_at = CASE WHEN added_manually=1 THEN sort_at
@@ -1208,12 +1382,7 @@ impl Db {
     /// uploaders do not accumulate as empty rows.
     pub fn prune_orphan_channel(&self, channel_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM channels
-             WHERE id=?1 AND subscribed=0
-               AND NOT EXISTS (SELECT 1 FROM videos WHERE channel_id=?1)",
-            params![channel_id],
-        )?;
+        conn.execute(PRUNE_ORPHAN_CHANNEL, params![channel_id])?;
         Ok(())
     }
 
@@ -1398,7 +1567,7 @@ mod tests {
                 let c = db.conn.lock().unwrap();
                 assert!(column_exists(&c, "videos", "download_quality").unwrap());
                 let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-                assert_eq!(v, 9);
+                assert_eq!(v, SCHEMA_VERSION);
             }
             assert_eq!(db.download_quality("a").unwrap(), None);
             assert_eq!(db.get_video("a").unwrap().unwrap().file_path.as_deref(), Some("/x.mkv"));
@@ -3969,20 +4138,1314 @@ mod auto_download_tests {
 // The two halves of `sync::snapshot`'s contract. See
 // docs/superpowers/specs/2026-10-09-cloud-sync-design.md, section 3.
 
-use crate::sync::snapshot::{ApplyReport, Snapshot};
+use crate::sync::snapshot::{
+    self, ApplyReport, Snapshot, SyncChannel, SyncVideo, Tombstone, TombstoneKind, SNAPSHOT_FORMAT,
+};
+
+/// The rows a snapshot carries: every manual add, and every row whose watched,
+/// hidden or sibling state anyone ever changed. A stamp outlives the change it
+/// records -- a watch taken back keeps its stamp -- which is how an un-watch
+/// travels at all.
+const SYNC_TOUCHED: &str = "(added_manually <> 0 OR watched_changed_at IS NOT NULL
+     OR hidden_changed_at IS NOT NULL OR sibling_changed_at IS NOT NULL)";
+
+const SYNC_VIDEO_COLUMNS: &str = "id, channel_id, title, published_at, sort_at, duration_secs,
+     added_manually, first_seen_at, watched, watched_at, watched_changed_at,
+     hidden, hidden_changed_at, sibling_group, sibling_changed_at";
+
+const SYNC_CHANNEL_COLUMNS: &str =
+    "id, title, handle, url, subscribed, subscribed_changed_at, member, member_changed_at";
+
+fn map_sync_video(r: &Row) -> rusqlite::Result<SyncVideo> {
+    Ok(SyncVideo {
+        id: r.get(0)?, channel_id: r.get(1)?, title: r.get(2)?,
+        published_at: r.get(3)?, sort_at: r.get(4)?, duration_secs: r.get(5)?,
+        added_manually: r.get(6)?, added_at: r.get(7)?,
+        watched: r.get(8)?, watched_at: r.get(9)?, watched_changed_at: r.get(10)?,
+        hidden: r.get(11)?, hidden_changed_at: r.get(12)?,
+        sibling_group: r.get(13)?, sibling_changed_at: r.get(14)?,
+    })
+}
+
+fn map_sync_channel(r: &Row) -> rusqlite::Result<SyncChannel> {
+    Ok(SyncChannel {
+        id: r.get(0)?, title: r.get(1)?, handle: r.get(2)?, url: r.get(3)?,
+        subscribed: r.get(4)?, subscribed_changed_at: r.get(5)?,
+        member: r.get(6)?, member_changed_at: r.get(7)?,
+    })
+}
+
+fn kind_name(kind: TombstoneKind) -> &'static str {
+    match kind {
+        TombstoneKind::Channel => "channel",
+        TombstoneKind::Video => "video",
+    }
+}
+
+fn read_tombstones(conn: &Connection, kind: TombstoneKind) -> Result<HashMap<String, i64>> {
+    let mut st = conn.prepare("SELECT id, removed_at FROM tombstones WHERE kind=?1")?;
+    let rows = st.query_map(params![kind_name(kind)], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+/// Whether a tombstone dated `removed_at` covers a copy stamped `stamp`. At or
+/// before counts: a removal in the same second as the change it removes is
+/// still the later of the two, and the delete triggers draw the line in the
+/// same place. A NULL stamp is older than any removal.
+fn covered(removed_at: Option<i64>, stamp: Option<i64>) -> bool {
+    removed_at.is_some_and(|t| t >= stamp.unwrap_or(0))
+}
+
+/// A copy of a channel whose subscription a tombstone has removed. Only a
+/// subscription can be: an ad-hoc uploader -- including one added back by hand
+/// after its subscription went -- is not what any channel tombstone records.
+fn removed_subscription(c: &SyncChannel, tombstones: &HashMap<String, i64>) -> bool {
+    c.subscribed && covered(tombstones.get(&c.id).copied(), c.subscribed_changed_at)
+}
+
+/// Everything about a channel that sync owns.
+fn channel_state(c: &SyncChannel) -> (bool, Option<i64>, bool, Option<i64>) {
+    (c.subscribed, c.subscribed_changed_at, c.member, c.member_changed_at)
+}
+
+/// Everything about a video that sync owns. `added_at` is `first_seen_at`.
+#[allow(clippy::type_complexity)]
+fn video_state(v: &SyncVideo)
+    -> (bool, Option<i64>, Option<i64>, bool, Option<i64>, Option<&str>, Option<i64>, bool, i64) {
+    (v.watched, v.watched_at, v.watched_changed_at, v.hidden, v.hidden_changed_at,
+     v.sibling_group.as_deref(), v.sibling_changed_at, v.added_manually, v.added_at)
+}
+
+/// `removed_at` only ever moves forward, so a second apply of the same
+/// snapshots writes nothing -- the WHERE is what keeps `changes()` honest.
+const UPSERT_TOMBSTONE: &str = "
+INSERT INTO tombstones (kind, id, removed_at) VALUES (?1, ?2, ?3)
+ON CONFLICT (kind, id) DO UPDATE SET removed_at = excluded.removed_at
+ WHERE excluded.removed_at > tombstones.removed_at";
+
+/// The manual uploads of a channel about to go, tombstoned as of its removal --
+/// or of their own add, for one added after it by a machine that had not yet
+/// heard. Either way the time comes from synced data: left to the delete
+/// trigger, it would be this machine's clock, and two machines would date one
+/// removal apart.
+const TOMBSTONE_MANUAL_UPLOADS: &str = "
+INSERT INTO tombstones (kind, id, removed_at)
+SELECT 'video', id, MAX(?2, first_seen_at) FROM videos
+ WHERE channel_id = ?1 AND added_manually <> 0
+ON CONFLICT (kind, id) DO UPDATE SET removed_at = excluded.removed_at
+ WHERE excluded.removed_at > tombstones.removed_at";
+
+/// `added_at` is this machine's own history and nothing sync carries, so a
+/// channel arriving now was added now.
+const INSERT_SYNC_CHANNEL: &str = "
+INSERT INTO channels (id, title, handle, url, subscribed, subscribed_changed_at,
+                      member, member_changed_at, added_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
+const SET_SYNC_CHANNEL: &str = "
+UPDATE channels SET subscribed = ?2, subscribed_changed_at = ?3,
+                    member = ?4, member_changed_at = ?5
+ WHERE id = ?1";
+
+/// Run after [`SET_SYNC_CHANNEL`]. A pair that wins a tie on the stamp keeps
+/// the stamp the row already had, and the triggers cannot tell that from a
+/// local edit that left the stamp alone, so they restamp it with this clock.
+/// Putting the copied stamp back undoes exactly that. A NULL winner (only ever
+/// a malformed snapshot) is left to the trigger, whose stamp is then the truth.
+const RESTAMP_SYNC_CHANNEL: &str = "
+UPDATE channels SET subscribed_changed_at = COALESCE(?2, subscribed_changed_at),
+                    member_changed_at     = COALESCE(?3, member_changed_at)
+ WHERE id = ?1";
+
+const INSERT_SYNC_VIDEO: &str = "
+INSERT INTO videos (id, channel_id, title, thumb_url, published_at, sort_at, feed_rank,
+                    added_manually, duration_secs, status, first_seen_at,
+                    watched, watched_at, watched_changed_at, hidden, hidden_changed_at,
+                    sibling_group, sibling_changed_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 'ready', ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+
+const SET_SYNC_VIDEO: &str = "
+UPDATE videos SET watched = ?2, watched_at = ?3, watched_changed_at = ?4,
+                  hidden = ?5, hidden_changed_at = ?6,
+                  sibling_group = ?7, sibling_changed_at = ?8,
+                  added_manually = ?9, first_seen_at = ?10
+ WHERE id = ?1";
+
+/// [`RESTAMP_SYNC_CHANNEL`], for a video.
+const RESTAMP_SYNC_VIDEO: &str = "
+UPDATE videos SET watched_changed_at = COALESCE(?2, watched_changed_at),
+                  hidden_changed_at  = COALESCE(?3, hidden_changed_at),
+                  sibling_changed_at = COALESCE(?4, sibling_changed_at)
+ WHERE id = ?1";
+
+fn insert_sync_channel(conn: &Connection, c: &SyncChannel) -> Result<()> {
+    conn.execute(
+        INSERT_SYNC_CHANNEL,
+        params![c.id, c.title, c.handle, c.url, c.subscribed as i64, c.subscribed_changed_at,
+                c.member as i64, c.member_changed_at, now()],
+    )?;
+    Ok(())
+}
+
+fn insert_sync_video(conn: &Connection, v: &SyncVideo) -> Result<()> {
+    conn.execute(
+        INSERT_SYNC_VIDEO,
+        params![v.id, v.channel_id, v.title, crate::ytdlp::thumb_url_for(&v.id),
+                v.published_at, v.sort_at.or(v.published_at), v.added_manually as i64,
+                v.duration_secs, v.added_at, v.watched as i64, v.watched_at,
+                v.watched_changed_at, v.hidden as i64, v.hidden_changed_at,
+                v.sibling_group, v.sibling_changed_at],
+    )?;
+    Ok(())
+}
 
 impl Db {
     /// This machine's slim snapshot: subscribed channels, touched videos and
-    /// every tombstone, each list ordered by id.
+    /// every tombstone, each list ordered by id so the same library always
+    /// serialises to the same bytes -- the sync clock hashes them to tell
+    /// whether there is anything to push.
+    ///
+    /// A channel rides along when it is a subscription, when its membership
+    /// was ever changed, or when a video in the snapshot hangs from it: an
+    /// ad-hoc uploader travels only as the parent its manual video needs.
     pub fn sync_snapshot(&self, machine_name: &str) -> Result<Snapshot> {
-        let _ = machine_name;
-        bail!("sync_snapshot is not implemented yet")
+        let mut conn = self.conn.lock().unwrap();
+        // One read transaction, so the three lists describe one instant even
+        // with a script writing to the same file beside us.
+        let tx = conn.transaction()?;
+        let videos = {
+            let mut st = tx.prepare(&format!(
+                "SELECT {SYNC_VIDEO_COLUMNS} FROM videos WHERE {SYNC_TOUCHED} ORDER BY id"))?;
+            let rows = st.query_map([], map_sync_video)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let channels = {
+            let mut st = tx.prepare(&format!(
+                "SELECT {SYNC_CHANNEL_COLUMNS} FROM channels
+                  WHERE subscribed <> 0 OR member_changed_at IS NOT NULL
+                     OR id IN (SELECT channel_id FROM videos WHERE {SYNC_TOUCHED})
+                  ORDER BY id"))?;
+            let rows = st.query_map([], map_sync_channel)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tombstones = {
+            // `kind` sorts as text, which is the order `TombstoneKind` derives.
+            let mut st = tx.prepare("SELECT kind, id, removed_at FROM tombstones ORDER BY kind, id")?;
+            let rows = st.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (kind, id, removed_at) = row?;
+                let kind = match kind.as_str() {
+                    "channel" => TombstoneKind::Channel,
+                    "video" => TombstoneKind::Video,
+                    // Nothing this build writes, so nothing it can speak for.
+                    _ => continue,
+                };
+                out.push(Tombstone { kind, id, removed_at });
+            }
+            out
+        };
+        tx.commit()?;
+        Ok(Snapshot {
+            format: SNAPSHOT_FORMAT,
+            machine_name: machine_name.to_string(),
+            channels,
+            videos,
+            tombstones,
+        })
     }
 
-    /// Merges the other machines' snapshots into the library, in one
-    /// transaction, by per-field last-writer-wins.
+    /// Merges the other machines' snapshots into the library, by per-field
+    /// last writer wins, in one transaction -- one lock, like `apply_import`,
+    /// and a failure halfway leaves the library as it was.
+    ///
+    /// **It never stamps with this machine's clock.** Every stamp and every
+    /// tombstone it writes is copied verbatim from what arrived, which is what
+    /// makes it idempotent (the same snapshots a second time write nothing and
+    /// report `changed == false`) and convergent (machines that have seen the
+    /// same snapshots hold the same library, whatever order they saw them in).
+    /// The local library is folded into the comparison as one more copy, by
+    /// the very functions `snapshot::merge` uses.
+    ///
+    /// Only sync's own columns are written on a row already here: a title,
+    /// date, status or download, and a channel's handle, url, polling and
+    /// auto-download, are this machine's poll's and this machine's user's.
+    /// `first_seen_at` is the one date that moves, and only forward, to the
+    /// latest copy's: it is what a video tombstone is measured against, so a
+    /// copy added again after a delete must not be taken for the one deleted;
+    /// and with it in step, two libraries' snapshots converge byte for byte.
     pub fn apply_sync(&self, snapshots: &[Snapshot]) -> Result<ApplyReport> {
-        let _ = snapshots;
-        bail!("apply_sync is not implemented yet")
+        // The caller skips and reports a slot from a newer build; skipping it
+        // here too means one that slips through is never half-understood.
+        let merged = snapshot::merge(snapshots.iter().filter(|s| s.format <= SNAPSHOT_FORMAT));
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut report = ApplyReport::default();
+        let mut writes = 0usize;
+
+        // 1. Tombstones, before anything is deleted. A delete trigger keeps a
+        //    tombstone that already covers the row it removes, so landing the
+        //    remote ones first is what keeps their times instead of this clock's.
+        {
+            let mut st = tx.prepare(UPSERT_TOMBSTONE)?;
+            for t in &merged.tombstones {
+                writes += st.execute(params![kind_name(t.kind), t.id, t.removed_at])?;
+            }
+        }
+        let channel_tombstones = read_tombstones(&tx, TombstoneKind::Channel)?;
+
+        // 2. Channels. A removed subscription is skipped whole: the local row,
+        //    if it is one, goes in step 3. Otherwise the local row takes the
+        //    winning pairs, and a channel missing here arrives only as a
+        //    subscription -- an uploader waits for a video that needs it.
+        {
+            let mut read = tx.prepare(&format!(
+                "SELECT {SYNC_CHANNEL_COLUMNS} FROM channels WHERE id=?1"))?;
+            for incoming in &merged.channels {
+                let local = read.query_row(params![incoming.id], map_sync_channel).optional()?;
+                let joined = match &local {
+                    Some(l) => snapshot::merge_channel(&[l, incoming]),
+                    None => incoming.clone(),
+                };
+                if removed_subscription(&joined, &channel_tombstones) {
+                    continue;
+                }
+                match local {
+                    Some(l) if channel_state(&l) != channel_state(&joined) => {
+                        tx.execute(SET_SYNC_CHANNEL, params![
+                            joined.id, joined.subscribed as i64, joined.subscribed_changed_at,
+                            joined.member as i64, joined.member_changed_at])?;
+                        tx.execute(RESTAMP_SYNC_CHANNEL, params![
+                            joined.id, joined.subscribed_changed_at, joined.member_changed_at])?;
+                        writes += 1;
+                        // An uploader here that another machine subscribed to
+                        // wants polling as much as a channel that just arrived.
+                        if joined.subscribed && !l.subscribed {
+                            report.channels_added.push(joined.id.clone());
+                        }
+                    }
+                    Some(_) => {}
+                    None if joined.subscribed => {
+                        insert_sync_channel(&tx, &joined)?;
+                        writes += 1;
+                        report.channels_added.push(joined.id.clone());
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        // 3. Local subscriptions a tombstone covers go, and the cascade takes
+        //    their uploads -- manual ones too, exactly as a local removal would.
+        let doomed: Vec<(String, i64)> = {
+            let mut st = tx.prepare(
+                "SELECT c.id, t.removed_at FROM channels c
+                   JOIN tombstones t ON t.kind = 'channel' AND t.id = c.id
+                  WHERE c.subscribed <> 0
+                    AND COALESCE(c.subscribed_changed_at, 0) <= t.removed_at")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, removed_at) in &doomed {
+            tx.execute(TOMBSTONE_MANUAL_UPLOADS, params![id, removed_at])?;
+            writes += tx.execute("DELETE FROM channels WHERE id=?1", params![id])?;
+        }
+
+        // 4. Videos.
+        let video_tombstones = read_tombstones(&tx, TombstoneKind::Video)?;
+        let incoming_channels: HashMap<&str, &SyncChannel> =
+            merged.channels.iter().map(|c| (c.id.as_str(), c)).collect();
+        // What is here once the removals are done: id -> subscribed.
+        let mut here: HashMap<String, bool> = {
+            let mut st = tx.prepare("SELECT id, subscribed FROM channels")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
+        {
+            let mut read = tx.prepare(&format!(
+                "SELECT {SYNC_VIDEO_COLUMNS} FROM videos WHERE id=?1"))?;
+            for incoming in &merged.videos {
+                if let Some(local) = read.query_row(params![incoming.id], map_sync_video).optional()? {
+                    let joined = snapshot::merge_video(&[&local, incoming]);
+                    if video_state(&local) != video_state(&joined) {
+                        tx.execute(SET_SYNC_VIDEO, params![
+                            joined.id, joined.watched as i64, joined.watched_at,
+                            joined.watched_changed_at, joined.hidden as i64,
+                            joined.hidden_changed_at, joined.sibling_group,
+                            joined.sibling_changed_at, joined.added_manually as i64,
+                            joined.added_at])?;
+                        tx.execute(RESTAMP_SYNC_VIDEO, params![
+                            joined.id, joined.watched_changed_at, joined.hidden_changed_at,
+                            joined.sibling_changed_at])?;
+                        writes += 1;
+                    }
+                    continue;
+                }
+
+                // Missing here. An upload of a removed subscription stays
+                // gone -- unless this library subscribes to it again, more
+                // recently than the removal -- and so does a video whose own
+                // tombstone covers this copy.
+                let parent = incoming_channels.get(incoming.channel_id.as_str()).copied();
+                let subscribed_here = here.get(&incoming.channel_id).copied();
+                if parent.is_some_and(|c| removed_subscription(c, &channel_tombstones))
+                    && subscribed_here != Some(true)
+                {
+                    continue;
+                }
+                if covered(video_tombstones.get(&incoming.id).copied(), Some(incoming.added_at)) {
+                    continue;
+                }
+                if subscribed_here.is_none() {
+                    // An uploader with no subscription behind it, inserted only
+                    // now that a video needs it, so the foreign key holds.
+                    let Some(parent) = parent else { continue };
+                    insert_sync_channel(&tx, parent)?;
+                    here.insert(parent.id.clone(), parent.subscribed);
+                    writes += 1;
+                }
+                insert_sync_video(&tx, incoming)?;
+                writes += 1;
+                report.videos_added.push(incoming.id.clone());
+            }
+        }
+
+        // 5. Local manual videos a tombstone covers go, measured against the
+        //    `first_seen_at` step 4 may just have moved on; then any uploader
+        //    left with nothing, by the same rule a local delete prunes by.
+        let condemned: Vec<(String, String)> = {
+            let mut st = tx.prepare(
+                "SELECT v.id, v.channel_id FROM videos v
+                   JOIN tombstones t ON t.kind = 'video' AND t.id = v.id
+                  WHERE v.added_manually <> 0 AND v.first_seen_at <= t.removed_at")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut uploaders: Vec<&str> = Vec::new();
+        for (id, channel) in &condemned {
+            writes += tx.execute("DELETE FROM videos WHERE id=?1", params![id])?;
+            uploaders.push(channel);
+        }
+        uploaders.sort_unstable();
+        uploaders.dedup();
+        for channel in uploaders {
+            writes += tx.execute(PRUNE_ORPHAN_CHANNEL, params![channel])?;
+        }
+
+        tx.commit()?;
+        report.changed = writes > 0;
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use std::ops::RangeInclusive;
+
+    fn db() -> Db { Db::open_in_memory().unwrap() }
+
+    fn chan(id: &str) -> Channel {
+        Channel { id: id.into(), title: format!("T-{id}"), handle: None,
+                  url: format!("https://www.youtube.com/channel/{id}"),
+                  thumb_path: None, subscribed: true, member: false, added_at: 0,
+                  last_polled_at: None, terminated: false, auto_download: false }
+    }
+
+    fn adhoc(id: &str) -> Channel { Channel { subscribed: false, ..chan(id) } }
+
+    fn polled(id: &str, ch: &str) -> NewVideo {
+        NewVideo { id: id.into(), channel_id: ch.into(), title: format!("t-{id}"),
+                   description: None, thumb_url: None, published_at: Some(1_000),
+                   sort_at: Some(1_000), feed_rank: 0, added_manually: false,
+                   duration_secs: Some(600), view_count: Some(1), status: VideoStatus::Ready }
+    }
+
+    fn manual(id: &str, ch: &str) -> NewVideo { NewVideo { added_manually: true, ..polled(id, ch) } }
+
+    /// A video row the way a transfer archive carries it.
+    fn archived(id: &str, ch: &str) -> Video {
+        Video { id: id.into(), channel_id: ch.into(), channel_title: format!("T-{ch}"),
+                title: format!("t-{id}"), description: None, thumb_url: None,
+                thumb_path: None, published_at: Some(1_000), sort_at: Some(1_000),
+                feed_rank: 0, added_manually: false, duration_secs: Some(600),
+                view_count: Some(1), status: VideoStatus::Ready, hidden: false,
+                watched: false, watched_at: None, download_state: DownloadState::None,
+                download_error: None, file_path: None, downloaded_at: None,
+                first_seen_at: 500, sibling_group: None }
+    }
+
+    /// Raw SQL, for what only a migration, the clock or another machine
+    /// produces. Tests run inside one second, and last writer wins needs its
+    /// stamps apart, so every edit below is made through the public method and
+    /// then pinned to a chosen instant here.
+    fn sql(d: &Db, s: &str) { d.conn.lock().unwrap().execute_batch(s).unwrap(); }
+
+    fn pin(d: &Db, table: &str, id: &str, assignments: &str) {
+        sql(d, &format!("UPDATE {table} SET {assignments} WHERE id='{id}'"));
+    }
+
+    fn video_stamps(d: &Db, id: &str) -> [Option<i64>; 3] {
+        d.conn.lock().unwrap().query_row(
+            "SELECT watched_changed_at, hidden_changed_at, sibling_changed_at FROM videos WHERE id=?1",
+            params![id], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?])).unwrap()
+    }
+
+    fn channel_stamps(d: &Db, id: &str) -> [Option<i64>; 2] {
+        d.conn.lock().unwrap().query_row(
+            "SELECT subscribed_changed_at, member_changed_at FROM channels WHERE id=?1",
+            params![id], |r| Ok([r.get(0)?, r.get(1)?])).unwrap()
+    }
+
+    fn tombstone(d: &Db, kind: &str, id: &str) -> Option<i64> {
+        d.conn.lock().unwrap()
+            .query_row("SELECT removed_at FROM tombstones WHERE kind=?1 AND id=?2",
+                       params![kind, id], |r| r.get(0))
+            .optional().unwrap()
+    }
+
+    fn trigger_names(d: &Db) -> Vec<String> {
+        let c = d.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name").unwrap();
+        let rows = st.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<String>>>().unwrap()
+    }
+
+    /// Runs `f`, returning what it returned and the clock either side of it, so
+    /// a stamp it wrote can be checked against "now" without racing the second.
+    fn around<T>(f: impl FnOnce() -> T) -> (T, RangeInclusive<i64>) {
+        let before = now();
+        let out = f();
+        (out, before..=now())
+    }
+
+    fn stamped_now(at: &RangeInclusive<i64>, stamp: Option<i64>) -> bool {
+        stamp.is_some_and(|s| at.contains(&s))
+    }
+
+    // ---- the v10 migration ----
+
+    /// A database exactly as v9 left it: every ALTER up to and including the
+    /// download-quality column, and nothing of sync's.
+    fn v9() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN downloaded_at INTEGER;
+             ALTER TABLE videos ADD COLUMN sibling_group TEXT;
+             ALTER TABLE channels ADD COLUMN member INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE channels ADD COLUMN backfill_depth INTEGER;
+             ALTER TABLE channels ADD COLUMN terminated_at INTEGER;
+             ALTER TABLE channels ADD COLUMN auto_download_since INTEGER;
+             ALTER TABLE videos ADD COLUMN auto_queued INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN download_quality TEXT;",
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn
+    }
+
+    #[test]
+    fn migrating_a_v9_database_stamps_only_what_was_ever_set() {
+        let conn = v9();
+        conn.execute_batch(
+            "INSERT INTO channels (id,title,url,subscribed,added_at,member) VALUES
+               ('UC1','One','u',1,7,1), ('UC2','Uploader','u',0,8,0), ('UC3','Three','u',1,9,0);
+             INSERT INTO videos (id,channel_id,title,status,first_seen_at,
+                                 watched,watched_at,hidden,sibling_group) VALUES
+               ('w', 'UC1','t','ready',1, 1,500, 0,NULL),
+               ('w0','UC1','t','ready',1, 1,NULL,0,NULL),
+               ('h', 'UC1','t','ready',1, 0,NULL,1,NULL),
+               ('s', 'UC1','t','ready',1, 0,NULL,0,'k'),
+               ('u', 'UC1','t','ready',1, 0,NULL,0,NULL);",
+        ).unwrap();
+
+        let (d, at) = around(|| Db::init(conn).unwrap());
+
+        assert_eq!(video_stamps(&d, "w"), [Some(500), None, None], "dated by the watch itself");
+        assert!(stamped_now(&at, video_stamps(&d, "w0")[0]), "no instant recorded: the upgrade's");
+        assert!(stamped_now(&at, video_stamps(&d, "h")[1]));
+        assert!(stamped_now(&at, video_stamps(&d, "s")[2]));
+        assert_eq!(video_stamps(&d, "u"), [None; 3], "an untouched row stays untouched");
+
+        let [sub, member] = channel_stamps(&d, "UC1");
+        assert_eq!(sub, Some(7), "a subscription dates from when it was added");
+        assert!(stamped_now(&at, member));
+        assert_eq!(channel_stamps(&d, "UC2"), [None, None], "an uploader is no subscription");
+        assert_eq!(channel_stamps(&d, "UC3"), [Some(9), None]);
+
+        {
+            let c = d.conn.lock().unwrap();
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "nothing has been removed yet");
+        }
+        assert_eq!(trigger_names(&d), trigger_names(&db()), "upgraded and fresh carry the same triggers");
+        assert!(!trigger_names(&d).is_empty());
+        // And the rows themselves came through untouched.
+        let w = d.get_video("w").unwrap().unwrap();
+        assert!(w.watched && w.watched_at == Some(500));
+    }
+
+    // ---- the triggers ----
+
+    fn one_video(id: &str) -> Db {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        d.insert_video_if_new(&polled(id, "UC1")).unwrap();
+        d
+    }
+
+    #[test]
+    fn watching_and_unwatching_are_both_stamped() {
+        let d = one_video("a");
+        assert_eq!(video_stamps(&d, "a"), [None; 3], "a polled row is untouched");
+
+        let (_, at) = around(|| d.set_watched("a", true).unwrap());
+        assert!(stamped_now(&at, video_stamps(&d, "a")[0]));
+
+        pin(&d, "videos", "a", "watched_changed_at=1");
+        d.set_watched("a", true).unwrap();
+        assert_eq!(video_stamps(&d, "a")[0], Some(1), "no change, no stamp");
+
+        let (_, at) = around(|| d.set_watched("a", false).unwrap());
+        assert!(stamped_now(&at, video_stamps(&d, "a")[0]), "an un-watch is a change too");
+    }
+
+    #[test]
+    fn hiding_and_unhiding_are_both_stamped() {
+        let d = one_video("a");
+        let (_, at) = around(|| d.set_hidden("a", true).unwrap());
+        assert!(stamped_now(&at, video_stamps(&d, "a")[1]));
+        pin(&d, "videos", "a", "hidden_changed_at=1");
+        let (_, at) = around(|| d.set_hidden("a", false).unwrap());
+        assert!(stamped_now(&at, video_stamps(&d, "a")[1]));
+        assert_eq!(video_stamps(&d, "a")[0], None, "the other clocks are not touched");
+    }
+
+    #[test]
+    fn marking_stamps_every_row_whose_key_moved_and_no_other() {
+        let d = one_video("a");
+        d.insert_video_if_new(&polled("b", "UC1")).unwrap();
+        d.insert_video_if_new(&polled("c", "UC1")).unwrap();
+        let (_, at) = around(|| d.mark_siblings(&["a".into(), "b".into()]).unwrap());
+        assert!(stamped_now(&at, video_stamps(&d, "a")[2]));
+        assert!(stamped_now(&at, video_stamps(&d, "b")[2]));
+        assert_eq!(video_stamps(&d, "c")[2], None);
+
+        sql(&d, "UPDATE videos SET sibling_changed_at=1 WHERE sibling_group IS NOT NULL");
+        let (_, at) = around(|| d.mark_siblings(&["b".into(), "c".into()]).unwrap());
+        assert!(stamped_now(&at, video_stamps(&d, "c")[2]), "c joined b's group");
+        assert_eq!(video_stamps(&d, "a")[2], Some(1), "a's key never moved");
+        assert_eq!(video_stamps(&d, "b")[2], Some(1));
+    }
+
+    #[test]
+    fn unlinking_stamps_the_row_and_the_partner_it_strands() {
+        let d = one_video("a");
+        d.insert_video_if_new(&polled("b", "UC1")).unwrap();
+        d.mark_siblings(&["a".into(), "b".into()]).unwrap();
+        sql(&d, "UPDATE videos SET sibling_changed_at=1");
+        let (_, at) = around(|| d.unlink_siblings("a").unwrap());
+        for id in ["a", "b"] {
+            assert_eq!(d.get_video(id).unwrap().unwrap().sibling_group, None);
+            assert!(stamped_now(&at, video_stamps(&d, id)[2]), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_membership_is_stamped_when_joined_and_when_left() {
+        let d = one_video("a");
+        assert_eq!(channel_stamps(&d, "UC1")[1], None);
+        let (_, at) = around(|| d.set_channel_member("UC1", true).unwrap());
+        assert!(stamped_now(&at, channel_stamps(&d, "UC1")[1]));
+        pin(&d, "channels", "UC1", "member_changed_at=1");
+        d.upsert_channel(&chan("UC1")).unwrap();
+        assert_eq!(channel_stamps(&d, "UC1")[1], Some(1), "a poll's upsert says nothing about it");
+        let (_, at) = around(|| d.set_channel_member("UC1", false).unwrap());
+        assert!(stamped_now(&at, channel_stamps(&d, "UC1")[1]));
+    }
+
+    #[test]
+    fn subscribing_is_stamped_and_a_polls_upsert_is_not() {
+        let d = db();
+        let (_, at) = around(|| d.upsert_channel(&chan("UC1")).unwrap());
+        assert!(stamped_now(&at, channel_stamps(&d, "UC1")[0]), "a fresh subscription");
+        pin(&d, "channels", "UC1", "subscribed_changed_at=1");
+        d.upsert_channel(&chan("UC1")).unwrap();
+        assert_eq!(channel_stamps(&d, "UC1")[0], Some(1), "every poll upserts to catch a rename");
+
+        d.upsert_channel(&adhoc("UC2")).unwrap();
+        assert_eq!(channel_stamps(&d, "UC2"), [None, None], "an uploader is no subscription");
+        let (_, at) = around(|| d.upsert_channel(&chan("UC2")).unwrap());
+        assert!(stamped_now(&at, channel_stamps(&d, "UC2")[0]), "subscribing to an uploader already here");
+    }
+
+    #[test]
+    fn removing_a_subscription_tombstones_it_and_the_manual_videos_it_takes() {
+        let d = one_video("p");
+        d.insert_video_if_new(&manual("m", "UC1")).unwrap();
+        let (_, at) = around(|| d.remove_channel("UC1").unwrap());
+        assert!(stamped_now(&at, tombstone(&d, "channel", "UC1")));
+        assert!(stamped_now(&at, tombstone(&d, "video", "m")), "the cascade counts as a delete");
+        assert_eq!(tombstone(&d, "video", "p"), None, "a polled video is the poll's to bring back");
+    }
+
+    #[test]
+    fn deleting_a_manual_video_tombstones_it_and_pruning_its_uploader_does_not() {
+        let d = one_video("p");
+        d.upsert_channel(&adhoc("UC2")).unwrap();
+        d.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        let (_, at) = around(|| {
+            d.delete_video("m").unwrap();
+            d.prune_orphan_channel("UC2").unwrap();
+        });
+        assert!(stamped_now(&at, tombstone(&d, "video", "m")));
+        assert_eq!(tombstone(&d, "channel", "UC2"), None, "an uploader was never a subscription");
+        d.delete_video("p").unwrap();
+        assert_eq!(tombstone(&d, "video", "p"), None);
+    }
+
+    #[test]
+    fn a_second_removal_after_a_comeback_moves_the_tombstone_on() {
+        // Removed once at 50, then subscribed again at 60. Were the tombstone
+        // kept at 50, the second removal would never reach a machine holding
+        // the comeback: 50 does not cover 60.
+        let d = one_video("p");
+        sql(&d, "INSERT INTO tombstones (kind,id,removed_at) VALUES ('channel','UC1',50);
+                 UPDATE channels SET subscribed_changed_at=60");
+        let (_, at) = around(|| d.remove_channel("UC1").unwrap());
+        assert!(stamped_now(&at, tombstone(&d, "channel", "UC1")));
+
+        // The same for a manual video deleted, added again and deleted again.
+        d.upsert_channel(&adhoc("UC2")).unwrap();
+        d.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        sql(&d, "INSERT INTO tombstones (kind,id,removed_at) VALUES ('video','m',50);
+                 UPDATE videos SET first_seen_at=60 WHERE id='m'");
+        let (_, at) = around(|| d.delete_video("m").unwrap());
+        assert!(stamped_now(&at, tombstone(&d, "video", "m")));
+    }
+
+    #[test]
+    fn a_delete_a_tombstone_already_covers_keeps_the_tombstones_time() {
+        // Which is how an apply deletes: the remote tombstone lands first, and
+        // the row it covers then goes without this machine's clock entering.
+        let d = one_video("p");
+        d.upsert_channel(&adhoc("UC2")).unwrap();
+        d.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        sql(&d, "INSERT INTO tombstones (kind,id,removed_at) VALUES ('channel','UC1',50),('video','m',50);
+                 UPDATE channels SET subscribed_changed_at=50 WHERE id='UC1';
+                 UPDATE videos SET first_seen_at=40 WHERE id='m'");
+        d.remove_channel("UC1").unwrap();
+        d.delete_video("m").unwrap();
+        assert_eq!(tombstone(&d, "channel", "UC1"), Some(50), "a tie is covered");
+        assert_eq!(tombstone(&d, "video", "m"), Some(50));
+    }
+
+    #[test]
+    fn a_write_that_brings_its_own_stamp_is_not_restamped() {
+        let d = one_video("a");
+        pin(&d, "videos", "a",
+            "watched=1, watched_at=3, watched_changed_at=42, hidden=1, hidden_changed_at=43,
+             sibling_group='k', sibling_changed_at=44");
+        assert_eq!(video_stamps(&d, "a"), [Some(42), Some(43), Some(44)]);
+        pin(&d, "channels", "UC1",
+            "subscribed=0, subscribed_changed_at=45, member=1, member_changed_at=46");
+        assert_eq!(channel_stamps(&d, "UC1"), [Some(45), Some(46)]);
+        sql(&d, "INSERT INTO videos (id,channel_id,title,status,first_seen_at,watched,watched_changed_at)
+                 VALUES ('b','UC1','t','ready',1,1,7)");
+        assert_eq!(video_stamps(&d, "b"), [Some(7), None, None]);
+    }
+
+    #[test]
+    fn an_import_that_lifts_or_brings_user_state_is_stamped() {
+        let d = one_video("a");
+        let a = Video { watched: true, watched_at: Some(77), ..archived("a", "UC1") };
+        let b = Video { watched: true, watched_at: Some(88), hidden: true,
+                        sibling_group: Some("k".into()), ..archived("b", "UC9") };
+        let joined = Channel { member: true, ..chan("UC9") };
+        let (_, at) = around(|| {
+            d.apply_import(&[chan("UC1"), joined], &[a, b], ImportMode::Merge, &[]).unwrap()
+        });
+
+        let [w, h, s] = video_stamps(&d, "a");
+        assert!(stamped_now(&at, w), "a merge lifting watched");
+        assert_eq!((h, s), (None, None));
+        let [w, h, s] = video_stamps(&d, "b");
+        assert_eq!(w, Some(88), "a watch arriving whole is dated by its own instant");
+        assert!(stamped_now(&at, h) && stamped_now(&at, s));
+        let [sub, member] = channel_stamps(&d, "UC9");
+        assert!(stamped_now(&at, sub) && stamped_now(&at, member));
+    }
+
+    // ---- the snapshot ----
+
+    /// One library holding something of every kind: an untouched upload, a
+    /// watch, a watch taken back, a hide, a marked pair, a manual add from an
+    /// ad-hoc uploader, a joined membership and a removed subscription.
+    fn touched() -> Db {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        d.upsert_channel(&chan("UC3")).unwrap();
+        d.upsert_channel(&adhoc("UC2")).unwrap();
+        d.upsert_channel(&adhoc("UC5")).unwrap();
+        d.upsert_channel(&chan("UC4")).unwrap();
+        d.remove_channel("UC4").unwrap();
+        // Inserted out of order on purpose: the snapshot orders by id.
+        for id in ["w", "u", "uw", "s2", "s1", "h"] {
+            d.insert_video_if_new(&polled(id, "UC1")).unwrap();
+        }
+        d.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        d.set_watched("w", true).unwrap();
+        d.set_watched("uw", true).unwrap();
+        d.set_watched("uw", false).unwrap();
+        d.set_hidden("h", true).unwrap();
+        d.mark_siblings(&["s1".into(), "s2".into()]).unwrap();
+        d.set_channel_member("UC1", true).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_snapshot_carries_what_was_touched_and_nothing_else() {
+        let d = touched();
+        let s = d.sync_snapshot("desk").unwrap();
+        assert_eq!(s.format, SNAPSHOT_FORMAT);
+        assert_eq!(s.machine_name, "desk");
+
+        let ids: Vec<&str> = s.videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["h", "m", "s1", "s2", "uw", "w"], "never the untouched 'u'");
+        let ids: Vec<&str> = s.channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["UC1", "UC2", "UC3"],
+                   "both subscriptions, and the uploader only because 'm' needs it");
+        assert_eq!(s.tombstones.len(), 1);
+        assert_eq!((s.tombstones[0].kind, s.tombstones[0].id.as_str()),
+                   (TombstoneKind::Channel, "UC4"));
+
+        let m = s.videos.iter().find(|v| v.id == "m").unwrap();
+        assert!(m.added_manually);
+        assert_eq!(m.channel_id, "UC2");
+        assert_eq!(m.added_at, d.get_video("m").unwrap().unwrap().first_seen_at);
+        let uw = s.videos.iter().find(|v| v.id == "uw").unwrap();
+        assert!(!uw.watched && uw.watched_at.is_none() && uw.watched_changed_at.is_some(),
+                "the stamp left behind by an un-watch is what carries it");
+        let s1 = s.videos.iter().find(|v| v.id == "s1").unwrap();
+        assert_eq!(s1.sibling_group, d.get_video("s1").unwrap().unwrap().sibling_group);
+        assert_eq!(s1.title, "t-s1");
+        assert_eq!((s1.published_at, s1.sort_at, s1.duration_secs), (Some(1_000), Some(1_000), Some(600)));
+
+        let uc1 = &s.channels[0];
+        assert!(uc1.subscribed && uc1.member && uc1.member_changed_at.is_some());
+        let uc2 = &s.channels[1];
+        assert!(!uc2.subscribed && uc2.subscribed_changed_at.is_none());
+        assert_eq!(uc2.url, "https://www.youtube.com/channel/UC2");
+    }
+
+    #[test]
+    fn an_unsubscribed_channel_rides_along_for_a_membership_too() {
+        let d = touched();
+        pin(&d, "channels", "UC5", "member=1");
+        let s = d.sync_snapshot("desk").unwrap();
+        assert!(s.channels.iter().any(|c| c.id == "UC5"));
+    }
+
+    #[test]
+    fn the_same_library_always_snapshots_to_the_same_bytes() {
+        let d = touched();
+        let once = serde_json::to_string(&d.sync_snapshot("desk").unwrap()).unwrap();
+        let again = serde_json::to_string(&d.sync_snapshot("desk").unwrap()).unwrap();
+        assert_eq!(once, again);
+
+        // The same rows written in the opposite order, every clock pinned alike.
+        let build = |ids: &[&str]| {
+            let d = db();
+            d.upsert_channel(&chan("UC1")).unwrap();
+            for id in ids {
+                d.insert_video_if_new(&polled(id, "UC1")).unwrap();
+                d.set_hidden(id, true).unwrap();
+            }
+            sql(&d, "UPDATE videos SET first_seen_at=5, hidden_changed_at=6;
+                     UPDATE channels SET subscribed_changed_at=7");
+            serde_json::to_string(&d.sync_snapshot("desk").unwrap()).unwrap()
+        };
+        assert_eq!(build(&["a", "b", "c"]), build(&["c", "b", "a"]));
+    }
+
+    // ---- apply ----
+
+    /// One machine's library as a poll leaves it: a subscription and three of
+    /// its uploads, with every clock pinned at 100.
+    fn library() -> Db {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        for id in ["a", "b", "c"] {
+            d.insert_video_if_new(&polled(id, "UC1")).unwrap();
+        }
+        sql(&d, "UPDATE channels SET subscribed_changed_at=100; UPDATE videos SET first_seen_at=100");
+        d
+    }
+
+    fn sync(from: &Db, to: &Db) -> ApplyReport {
+        to.apply_sync(&[from.sync_snapshot("from").unwrap()]).unwrap()
+    }
+
+    /// A snapshot with the sender's name taken off, so two machines' can be compared.
+    fn anon(d: &Db) -> Snapshot {
+        Snapshot { machine_name: String::new(), ..d.sync_snapshot("x").unwrap() }
+    }
+
+    #[test]
+    fn a_watch_travels_and_so_does_taking_it_back() {
+        let (a, b) = (library(), library());
+        a.set_watched("a", true).unwrap();
+        pin(&a, "videos", "a", "watched_at=150, watched_changed_at=150");
+        assert!(sync(&a, &b).changed);
+        let v = b.get_video("a").unwrap().unwrap();
+        assert!(v.watched);
+        assert_eq!(v.watched_at, Some(150));
+        assert_eq!(video_stamps(&b, "a")[0], Some(150), "copied, never restamped here");
+
+        b.set_watched("a", false).unwrap();
+        pin(&b, "videos", "a", "watched_changed_at=200");
+        assert!(sync(&b, &a).changed);
+        let v = a.get_video("a").unwrap().unwrap();
+        assert!(!v.watched);
+        assert_eq!(v.watched_at, None);
+        assert_eq!(video_stamps(&a, "a")[0], Some(200));
+    }
+
+    #[test]
+    fn a_hide_travels_and_so_does_taking_it_back() {
+        let (a, b) = (library(), library());
+        a.set_hidden("b", true).unwrap();
+        pin(&a, "videos", "b", "hidden_changed_at=150");
+        sync(&a, &b);
+        assert!(b.get_video("b").unwrap().unwrap().hidden);
+
+        b.set_hidden("b", false).unwrap();
+        pin(&b, "videos", "b", "hidden_changed_at=200");
+        sync(&b, &a);
+        assert!(!a.get_video("b").unwrap().unwrap().hidden);
+        assert_eq!(video_stamps(&a, "b")[1], Some(200));
+    }
+
+    #[test]
+    fn a_mark_travels_and_so_does_an_unlink() {
+        let (a, b) = (library(), library());
+        a.mark_siblings(&["a".into(), "b".into()]).unwrap();
+        sql(&a, "UPDATE videos SET sibling_changed_at=150 WHERE sibling_group IS NOT NULL");
+        sync(&a, &b);
+        let key = a.get_video("a").unwrap().unwrap().sibling_group;
+        assert!(key.is_some());
+        assert_eq!(b.get_video("a").unwrap().unwrap().sibling_group, key);
+        assert_eq!(b.get_video("b").unwrap().unwrap().sibling_group, key);
+
+        b.unlink_siblings("a").unwrap();
+        sql(&b, "UPDATE videos SET sibling_changed_at=200 WHERE id IN ('a','b')");
+        sync(&b, &a);
+        assert_eq!(a.get_video("a").unwrap().unwrap().sibling_group, None);
+        assert_eq!(a.get_video("b").unwrap().unwrap().sibling_group, None, "the partner it stranded");
+    }
+
+    #[test]
+    fn a_membership_travels_and_so_does_its_end() {
+        let (a, b) = (library(), library());
+        a.set_channel_member("UC1", true).unwrap();
+        pin(&a, "channels", "UC1", "member_changed_at=150");
+        sync(&a, &b);
+        assert!(b.get_channel("UC1").unwrap().unwrap().member);
+
+        b.set_channel_member("UC1", false).unwrap();
+        pin(&b, "channels", "UC1", "member_changed_at=200");
+        sync(&b, &a);
+        assert!(!a.get_channel("UC1").unwrap().unwrap().member);
+        assert_eq!(channel_stamps(&a, "UC1")[1], Some(200));
+    }
+
+    #[test]
+    fn a_new_subscription_arrives_and_is_handed_back_for_polling() {
+        let (a, b) = (library(), library());
+        a.upsert_channel(&Channel { handle: Some("@three".into()), ..chan("UC3") }).unwrap();
+        pin(&a, "channels", "UC3", "subscribed_changed_at=150");
+        let r = sync(&a, &b);
+        assert_eq!(r.channels_added, ["UC3"]);
+        assert!(r.videos_added.is_empty());
+        let c = b.get_channel("UC3").unwrap().unwrap();
+        assert!(c.subscribed);
+        assert_eq!((c.title.as_str(), c.handle.as_deref()), ("T-UC3", Some("@three")));
+        assert_eq!(channel_stamps(&b, "UC3")[0], Some(150));
+    }
+
+    #[test]
+    fn a_channel_removal_travels_and_takes_its_videos() {
+        let (a, b) = (library(), library());
+        b.set_watched("a", true).unwrap();
+        pin(&b, "videos", "a", "watched_at=150, watched_changed_at=150");
+        let stale = b.sync_snapshot("b").unwrap();
+        a.remove_channel("UC1").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+
+        assert!(sync(&a, &b).changed);
+        assert!(b.get_channel("UC1").unwrap().is_none());
+        assert!(b.get_video("a").unwrap().is_none());
+        assert_eq!(tombstone(&b, "channel", "UC1"), Some(300), "the remover's time, not this clock's");
+
+        // B's copy from before it heard is not enough to bring any of it back.
+        let r = a.apply_sync(&[stale]).unwrap();
+        assert_eq!(r, ApplyReport::default());
+        assert!(a.get_channel("UC1").unwrap().is_none());
+        assert!(a.get_video("a").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_resubscribe_after_a_removal_beats_the_older_tombstone() {
+        let (a, b) = (library(), library());
+        a.remove_channel("UC1").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+        sync(&a, &b);
+        assert!(b.get_channel("UC1").unwrap().is_none());
+
+        b.upsert_channel(&chan("UC1")).unwrap();
+        pin(&b, "channels", "UC1", "subscribed_changed_at=400");
+        let r = sync(&b, &a);
+        assert_eq!(r.channels_added, ["UC1"]);
+        assert!(a.get_channel("UC1").unwrap().unwrap().subscribed);
+        assert_eq!(channel_stamps(&a, "UC1")[0], Some(400));
+        assert_eq!(tombstone(&a, "channel", "UC1"), Some(300), "kept, and no longer covering it");
+        assert!(!sync(&a, &b).changed);
+    }
+
+    #[test]
+    fn a_manual_delete_travels_and_prunes_its_uploader() {
+        let (a, b) = (library(), library());
+        a.upsert_channel(&adhoc("UC2")).unwrap();
+        a.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=120");
+        sync(&a, &b);
+        assert!(b.get_video("m").unwrap().is_some());
+
+        a.delete_video("m").unwrap();
+        a.prune_orphan_channel("UC2").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+        assert!(sync(&a, &b).changed);
+        assert!(b.get_video("m").unwrap().is_none());
+        assert!(b.get_channel("UC2").unwrap().is_none(), "an uploader left with nothing goes too");
+        assert!(b.get_channel("UC1").unwrap().is_some(), "a subscription is never pruned");
+        assert_eq!(tombstone(&b, "video", "m"), Some(300));
+    }
+
+    #[test]
+    fn a_stale_copy_never_brings_a_deleted_manual_video_back() {
+        let (a, b) = (library(), library());
+        a.upsert_channel(&adhoc("UC2")).unwrap();
+        a.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=120");
+        sync(&a, &b);
+        let stale = b.sync_snapshot("b").unwrap();
+
+        a.delete_video("m").unwrap();
+        a.prune_orphan_channel("UC2").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+        let r = a.apply_sync(&[stale]).unwrap();
+        assert_eq!(r, ApplyReport::default());
+        assert!(a.get_video("m").unwrap().is_none());
+        assert!(a.get_channel("UC2").unwrap().is_none(), "nor the uploader it would have needed");
+    }
+
+    #[test]
+    fn a_manual_video_added_again_outlives_its_older_tombstone() {
+        let (a, b) = (library(), library());
+        a.upsert_channel(&adhoc("UC2")).unwrap();
+        a.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=120");
+        sync(&a, &b);
+
+        // Deleted at 300 and added again at 400; B still holds the first copy.
+        a.delete_video("m").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+        a.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=400");
+        sync(&a, &b);
+        assert!(b.get_video("m").unwrap().is_some(), "the comeback is newer than the removal");
+        assert_eq!(b.get_video("m").unwrap().unwrap().first_seen_at, 400);
+        assert_eq!(tombstone(&b, "video", "m"), Some(300));
+
+        let c = library();
+        assert_eq!(sync(&a, &c).videos_added, ["m"], "and a machine that never had it gets it");
+    }
+
+    #[test]
+    fn an_uploader_arrives_with_the_manual_video_that_needs_it() {
+        let (a, b) = (library(), library());
+        a.upsert_channel(&adhoc("UC2")).unwrap();
+        a.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=120, sort_at=130");
+        let r = sync(&a, &b);
+        assert_eq!(r.videos_added, ["m"]);
+        assert!(r.channels_added.is_empty(), "an uploader is not a subscription to poll");
+
+        let c = b.get_channel("UC2").unwrap().unwrap();
+        assert!(!c.subscribed);
+        assert_eq!(c.title, "T-UC2");
+        let v = b.get_video("m").unwrap().unwrap();
+        assert!(v.added_manually);
+        assert_eq!(v.status, VideoStatus::Ready);
+        assert_eq!(v.first_seen_at, 120, "the sender's clock, not this one's");
+        assert_eq!((v.published_at, v.sort_at), (Some(1_000), Some(130)));
+        assert_eq!(v.thumb_url.as_deref(), Some(crate::ytdlp::thumb_url_for("m").as_str()));
+        assert_eq!((v.title.as_str(), v.duration_secs, v.feed_rank), ("t-m", Some(600), 0));
+        assert_eq!(b.list_videos(&VideoFilter::default()).unwrap().len(), 4, "and it is in the feed");
+    }
+
+    #[test]
+    fn a_missing_sort_date_falls_back_to_the_upload_date() {
+        let (a, b) = (library(), library());
+        a.set_hidden("a", true).unwrap();
+        let mut s = a.sync_snapshot("a").unwrap();
+        s.videos[0].id = "fresh".into();
+        s.videos[0].sort_at = None;
+        s.videos[0].published_at = Some(777);
+        b.apply_sync(&[s]).unwrap();
+        assert_eq!(b.get_video("fresh").unwrap().unwrap().sort_at, Some(777));
+    }
+
+    #[test]
+    fn an_uploader_added_back_by_hand_is_not_taken_for_the_removed_subscription() {
+        // A removed UC1 at 300 and then added one of its uploads by hand at
+        // 400, which brings UC1 back as an ad-hoc uploader: no subscription
+        // for the old tombstone to cover.
+        let (a, b) = (library(), library());
+        a.remove_channel("UC1").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+        a.upsert_channel(&adhoc("UC1")).unwrap();
+        a.insert_video_if_new(&manual("m", "UC1")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=400");
+
+        let r = sync(&a, &b);
+        assert_eq!(r.videos_added, ["m"]);
+        assert!(!b.get_channel("UC1").unwrap().unwrap().subscribed, "back as an uploader");
+        assert!(b.get_video("a").unwrap().is_none(), "the subscription's uploads went with it");
+        assert!(!sync(&b, &a).changed);
+        assert_eq!(anon(&a), anon(&b));
+    }
+
+    #[test]
+    fn manual_videos_going_with_a_removed_channel_are_tombstoned_at_the_removal() {
+        // B holds a manual upload of UC1 that A never had. Its tombstone has to
+        // come from the removal it went with, never from B's clock, or B's
+        // snapshot would move for no reason and two machines would date it apart.
+        let (a, b) = (library(), library());
+        b.insert_video_if_new(&manual("m", "UC1")).unwrap();
+        pin(&b, "videos", "m", "first_seen_at=120");
+        a.remove_channel("UC1").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300");
+        sync(&a, &b);
+        assert!(b.get_video("m").unwrap().is_none());
+        assert_eq!(tombstone(&b, "video", "m"), Some(300));
+        sync(&b, &a);
+        assert_eq!(anon(&a), anon(&b));
+    }
+
+    #[test]
+    fn a_tie_on_the_stamp_is_settled_without_restamping() {
+        let (a, b) = (library(), library());
+        a.set_hidden("a", true).unwrap();
+        pin(&a, "videos", "a", "hidden_changed_at=500");
+        a.set_channel_member("UC1", true).unwrap();
+        pin(&a, "channels", "UC1", "member_changed_at=600");
+        b.set_hidden("a", true).unwrap();
+        b.set_hidden("a", false).unwrap();
+        pin(&b, "videos", "a", "hidden_changed_at=500");
+        b.set_channel_member("UC1", true).unwrap();
+        b.set_channel_member("UC1", false).unwrap();
+        pin(&b, "channels", "UC1", "member_changed_at=600");
+
+        sync(&a, &b);
+        assert!(b.get_video("a").unwrap().unwrap().hidden, "true wins the tie");
+        assert_eq!(video_stamps(&b, "a")[1], Some(500), "with the stamp it tied on");
+        assert!(b.get_channel("UC1").unwrap().unwrap().member);
+        assert_eq!(channel_stamps(&b, "UC1")[1], Some(600));
+        assert_eq!(anon(&a), anon(&b));
+    }
+
+    #[test]
+    fn apply_leaves_titles_dates_downloads_and_channel_settings_alone() {
+        let (a, b) = (library(), library());
+        sql(&a, "UPDATE videos SET title='renamed on a', published_at=5, sort_at=5, duration_secs=5;
+                 UPDATE channels SET title='Renamed', handle='@r', url='u2'");
+        a.set_watched("a", true).unwrap();
+        a.set_channel_member("UC1", true).unwrap();
+        b.set_download_state("a", DownloadState::Done, Some("/v/a.mkv"), None).unwrap();
+        b.set_channel_auto_download("UC1", true).unwrap();
+        b.set_backfill_depth("UC1", 30).unwrap();
+
+        sync(&a, &b);
+        let v = b.get_video("a").unwrap().unwrap();
+        assert!(v.watched);
+        assert_eq!(v.title, "t-a");
+        assert_eq!((v.published_at, v.sort_at, v.duration_secs), (Some(1_000), Some(1_000), Some(600)));
+        assert_eq!(v.download_state, DownloadState::Done);
+        assert_eq!(v.file_path.as_deref(), Some("/v/a.mkv"));
+        let c = b.get_channel("UC1").unwrap().unwrap();
+        assert!(c.member);
+        assert_eq!((c.title.as_str(), c.handle, c.url.as_str()),
+                   ("T-UC1", None, "https://www.youtube.com/channel/UC1"));
+        assert!(c.auto_download);
+        assert!(b.channels_shallower_than(30).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_from_a_newer_build_is_left_alone() {
+        let (a, b) = (library(), library());
+        a.set_watched("a", true).unwrap();
+        let mut s = a.sync_snapshot("a").unwrap();
+        s.format = SNAPSHOT_FORMAT + 1;
+        assert_eq!(b.apply_sync(&[s]).unwrap(), ApplyReport::default());
+        assert!(!b.get_video("a").unwrap().unwrap().watched);
+        assert_eq!(b.apply_sync(&[]).unwrap(), ApplyReport::default(), "nor is nothing an error");
+    }
+
+    // ---- two machines ----
+
+    /// Two machines that spent a while apart, each with its own edits -- and
+    /// some that collide.
+    fn apart() -> (Db, Db) {
+        let (a, b) = (library(), library());
+        // B's poll saw the same uploads a little later than A's did.
+        sql(&b, "UPDATE videos SET first_seen_at=110");
+        // Both held one manual upload from an ad-hoc uploader before parting.
+        for d in [&a, &b] {
+            d.upsert_channel(&adhoc("UC2")).unwrap();
+            d.insert_video_if_new(&manual("gone", "UC2")).unwrap();
+            pin(d, "videos", "gone", "first_seen_at=90");
+        }
+
+        // A watches 'a', hides 'b', marks 'b' and 'c', joins UC1, subscribes
+        // to UC3 and watches one of its uploads, and adds 'm1' by hand.
+        a.set_watched("a", true).unwrap();
+        pin(&a, "videos", "a", "watched_at=200, watched_changed_at=200");
+        a.set_hidden("b", true).unwrap();
+        pin(&a, "videos", "b", "hidden_changed_at=210");
+        a.mark_siblings(&["b".into(), "c".into()]).unwrap();
+        // The minted key carries the millisecond it was made in; pinned, so two
+        // runs of this setup can be compared with each other.
+        sql(&a, "UPDATE videos SET sibling_group='k-bc', sibling_changed_at=220
+                  WHERE sibling_group IS NOT NULL");
+        a.set_channel_member("UC1", true).unwrap();
+        pin(&a, "channels", "UC1", "member_changed_at=230");
+        a.upsert_channel(&chan("UC3")).unwrap();
+        pin(&a, "channels", "UC3", "subscribed_changed_at=240");
+        a.insert_video_if_new(&polled("x", "UC3")).unwrap();
+        a.set_watched("x", true).unwrap();
+        pin(&a, "videos", "x", "first_seen_at=240, watched_at=245, watched_changed_at=245");
+        a.insert_video_if_new(&manual("m1", "UC2")).unwrap();
+        pin(&a, "videos", "m1", "first_seen_at=250");
+
+        // B watched 'a' earlier and took it back, hides 'c', deletes the shared
+        // manual upload, subscribes to UC4 and removes it again, and adds 'm2'.
+        b.set_watched("a", true).unwrap();
+        b.set_watched("a", false).unwrap();
+        pin(&b, "videos", "a", "watched_changed_at=160");
+        b.set_hidden("c", true).unwrap();
+        pin(&b, "videos", "c", "hidden_changed_at=215");
+        b.delete_video("gone").unwrap();
+        b.prune_orphan_channel("UC2").unwrap();
+        sql(&b, "UPDATE tombstones SET removed_at=260 WHERE id='gone'");
+        b.upsert_channel(&chan("UC4")).unwrap();
+        b.remove_channel("UC4").unwrap();
+        sql(&b, "UPDATE tombstones SET removed_at=280 WHERE id='UC4'");
+        b.insert_video_if_new(&manual("m2", "UC1")).unwrap();
+        pin(&b, "videos", "m2", "first_seen_at=290");
+        (a, b)
+    }
+
+    /// Trades snapshots the way the sync clock does -- each side pulls what the
+    /// other pushed last, and pushes again whenever that moved its own -- until
+    /// a round moves nothing on either side. Returns how many rounds it took.
+    fn settle(first: &Db, second: &Db) -> usize {
+        for round in 1..=4 {
+            let moved_second = sync(first, second).changed;
+            let moved_first = sync(second, first).changed;
+            if !moved_first && !moved_second { return round; }
+        }
+        panic!("still moving after four rounds");
+    }
+
+    /// [`settle`], with both sides pulling at the same moment each round.
+    fn settle_at_once(a: &Db, b: &Db) -> usize {
+        for round in 1..=4 {
+            let (sa, sb) = (a.sync_snapshot("a").unwrap(), b.sync_snapshot("b").unwrap());
+            let moved_a = a.apply_sync(&[sb]).unwrap().changed;
+            let moved_b = b.apply_sync(&[sa]).unwrap().changed;
+            if !moved_a && !moved_b { return round; }
+        }
+        panic!("still moving after four rounds");
+    }
+
+    /// What the two machines must agree on once they have talked.
+    fn assert_settled_as_expected(d: &Db) {
+        let v = |id: &str| d.get_video(id).unwrap();
+        let a = v("a").unwrap();
+        assert!(a.watched, "A's watch at 200 is later than B's un-watch at 160");
+        assert_eq!(a.watched_at, Some(200));
+        let (b, c) = (v("b").unwrap(), v("c").unwrap());
+        assert!(b.hidden && c.hidden);
+        assert!(b.sibling_group.is_some() && b.sibling_group == c.sibling_group);
+        assert!(v("x").unwrap().watched);
+        assert!(v("m1").is_some() && v("m2").is_some());
+        assert!(v("gone").is_none(), "B's delete outlives A's older copy");
+        let ch = |id: &str| d.get_channel(id).unwrap();
+        assert!(ch("UC1").unwrap().member);
+        assert!(ch("UC3").unwrap().subscribed);
+        assert!(!ch("UC2").unwrap().subscribed, "back as m1's uploader");
+        assert!(ch("UC4").is_none());
+        assert_eq!(tombstone(d, "channel", "UC4"), Some(280));
+        assert_eq!(tombstone(d, "video", "gone"), Some(260));
+    }
+
+    #[test]
+    fn two_libraries_converge_whichever_pulls_first() {
+        let (a, b) = apart();
+        assert!(settle(&a, &b) <= 3);
+        assert_eq!(anon(&a), anon(&b));
+        assert_settled_as_expected(&a);
+
+        let (a2, b2) = apart();
+        assert!(settle(&b2, &a2) <= 3);
+        assert_eq!(anon(&a2), anon(&b2));
+        assert_eq!(anon(&a2), anon(&a), "and the order of the pulls changes nothing");
+    }
+
+    #[test]
+    fn two_libraries_pulling_at_the_same_moment_converge_too() {
+        let (a, b) = apart();
+        assert!(settle_at_once(&a, &b) <= 3);
+        assert_eq!(anon(&a), anon(&b));
+        assert_settled_as_expected(&a);
+
+        // A third machine pulling both of them in one go lands on the same library.
+        let c = library();
+        c.apply_sync(&[a.sync_snapshot("a").unwrap(), b.sync_snapshot("b").unwrap()]).unwrap();
+        assert_eq!(anon(&c), anon(&a));
+    }
+
+    #[test]
+    fn applying_the_same_snapshots_twice_changes_nothing_the_second_time() {
+        let (a, b) = apart();
+        let c = library();
+        c.upsert_channel(&chan("UC5")).unwrap();
+        c.set_hidden("c", true).unwrap();
+        let snaps = [a.sync_snapshot("a").unwrap(), c.sync_snapshot("c").unwrap()];
+
+        let first = b.apply_sync(&snaps).unwrap();
+        assert!(first.changed);
+        assert!(!first.channels_added.is_empty() && !first.videos_added.is_empty());
+        let after_first = anon(&b);
+
+        assert_eq!(b.apply_sync(&snaps).unwrap(), ApplyReport::default());
+        assert_eq!(anon(&b), after_first);
     }
 }
