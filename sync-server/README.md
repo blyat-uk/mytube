@@ -59,20 +59,33 @@ limit, 90-day slot expiry, the alarm deleting the group, unknown routes, and the
 
 ## Deploying
 
-Everything below is done once, by hand. The zone `blyat.uk` must already be on the account.
+Everything below is done once. The zone `blyat.uk` must already be on the account. Steps 1–4 are
+wrangler; 5 and 6 are the dashboard, because wrangler's login can't read or change a zone's WAF
+rules.
 
 1. **Log in.** `bunx wrangler login`.
-2. **Create the Turnstile widget.** Dashboard → *Turnstile* → *Add widget*. Name it
-   `MyTube sync`, add the hostname `mytube-sync.blyat.uk`, choose widget mode **Managed**, and
-   leave pre-clearance off. Keep the page open: it shows the site key and the secret key.
-3. **Configure the Worker.**
-   - Put the **site key** in `wrangler.jsonc` as `vars.TURNSTILE_SITE_KEY` and commit it; it is
-     public, and `/verify` answers 503 until it is set.
-   - Store the **secret key**: `bunx wrangler secret put TURNSTILE_SECRET`, then paste it. On the
-     very first run wrangler says there is no Worker called `mytube-sync` yet and offers to
-     create one; answer yes. That placeholder is replaced by the next step. The secret never goes
-     in a file in this repository (`.dev.vars` is git-ignored and holds only the test keys).
-4. **Deploy.** `bun run deploy`. Wrangler attaches the custom domain `mytube-sync.blyat.uk`,
+2. **Create the Turnstile widget**, somewhere outside this repository, since the output holds the
+   secret key:
+
+   ```sh
+   bunx wrangler turnstile widget create "MyTube sync" --domain mytube-sync.blyat.uk \
+     --mode managed --clearance-level no_clearance --json > ~/widget.json
+   ```
+
+   (Dashboard → *Turnstile* → *Add widget* does the same.)
+3. **Put the site key** (`sitekey` in that output) in `wrangler.jsonc` as
+   `vars.TURNSTILE_SITE_KEY` and commit it; it is public, and `/verify` answers 503 without it.
+   The secret key never goes in a file in this repository (`.dev.vars` is git-ignored and holds
+   only the test keys).
+4. **Deploy with the secret.**
+
+   ```sh
+   jq '{TURNSTILE_SECRET: .secret}' ~/widget.json > ~/secrets.json
+   bunx wrangler deploy --secrets-file ~/secrets.json
+   rm ~/widget.json ~/secrets.json   # the dashboard shows the secret again if it is ever needed
+   ```
+
+   Wrangler attaches the custom domain `mytube-sync.blyat.uk`,
    creating its DNS record and certificate. `workers_dev` and `preview_urls` are off on purpose:
    a `*.workers.dev` or preview address would reach the same Worker without passing through the
    zone's WAF and rate-limit rules below, so anyone could spend the account's shared quota

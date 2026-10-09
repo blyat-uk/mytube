@@ -21,9 +21,9 @@
   // SQLite-backed, which is the only kind the Workers Free plan allows.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncGroup"] }],
 
-  // The site key is public and goes in the /verify page. It stays empty in the repository: the
-  // page answers 503 until the owner pastes the real widget's key here (see README).
-  "vars": { "TURNSTILE_SITE_KEY": "" }
+  // The site key is public and goes in the /verify page: the "MyTube sync" widget (managed mode,
+  // hostname mytube-sync.blyat.uk). Empty, the page answers 503.
+  "vars": { "TURNSTILE_SITE_KEY": "0x4AAAAAAFSeZAiFnB7Jn8N6" }
   // TURNSTILE_SECRET is a secret: `bunx wrangler secret put TURNSTILE_SECRET` in production,
   // .dev.vars locally. Without it POST /v1/group answers 503 not_configured. It is deliberately
   // not listed under `secrets.required`, which makes every test run warn that it is missing.
