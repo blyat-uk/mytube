@@ -864,6 +864,70 @@ pub async fn check_app_update_now(
     app_update::check_now(&app, &state.http, &s).await.map_err(e)
 }
 
+// ---- cloud sync ----
+//
+// Thin on purpose: the operations, the clock and the events all live in
+// `sync`, which owns the request lock that keeps a Turn on, a Join or a Turn
+// off from crossing an exchange in flight. Each command clones its two `Arc`s
+// up front so no `State` borrow is held across the awaits (see "Async gotchas"
+// in CLAUDE.md).
+
+/// What the Settings section draws: on or off, the code, the other computers,
+/// and whether anything is waiting to go out.
+#[tauri::command]
+pub async fn sync_status(
+    state: State<'_, Arc<AppState>>,
+    syncer: State<'_, Arc<crate::sync::Syncer>>,
+) -> R<SyncStatus> {
+    let (state, syncer) = (state.inner().clone(), syncer.inner().clone());
+    Ok(syncer.status(&state).await)
+}
+
+/// Turn on sync, or Reset code while it is on: a Turnstile check in a window
+/// of its own, then a new group holding this library. The old code is
+/// replaced only once the new group exists.
+#[tauri::command]
+pub async fn sync_turn_on(
+    state: State<'_, Arc<AppState>>,
+    syncer: State<'_, Arc<crate::sync::Syncer>>,
+    app: AppHandle,
+) -> R<SyncStatus> {
+    let (state, syncer) = (state.inner().clone(), syncer.inner().clone());
+    syncer.turn_on(&app, &state).await
+}
+
+/// Join the group another computer shows the code of. A refusal saves nothing.
+#[tauri::command]
+pub async fn sync_join(
+    code: String,
+    state: State<'_, Arc<AppState>>,
+    syncer: State<'_, Arc<crate::sync::Syncer>>,
+    app: AppHandle,
+) -> R<SyncStatus> {
+    let (state, syncer) = (state.inner().clone(), syncer.inner().clone());
+    syncer.join(&app, &state, code).await
+}
+
+/// Turn off sync. Forgets the code; the library is not touched.
+#[tauri::command]
+pub async fn sync_leave(
+    state: State<'_, Arc<AppState>>,
+    syncer: State<'_, Arc<crate::sync::Syncer>>,
+    app: AppHandle,
+) -> R<SyncStatus> {
+    let (state, syncer) = (state.inner().clone(), syncer.inner().clone());
+    syncer.leave(&app, &state).await
+}
+
+/// Asks for one pull, at the clock's pace. Called on window focus, after a
+/// poll while the window is visible, and by the Sync now button.
+#[tauri::command]
+pub async fn sync_now(syncer: State<'_, Arc<crate::sync::Syncer>>) -> R<()> {
+    let syncer = syncer.inner().clone();
+    syncer.sync_now().await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

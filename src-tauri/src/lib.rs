@@ -98,6 +98,17 @@ pub fn run() {
             });
             app.manage(state.clone());
 
+            // Cloud sync, on a clock of its own: a minute's timer, or a nudge
+            // from `sync_now`. It does nothing at all while sync is off, and
+            // its first wake is the startup pull.
+            let syncer = Arc::new(sync::Syncer::new(sync::state::path()));
+            app.manage(syncer.clone());
+            tauri::async_runtime::spawn(sync::run_clock(
+                app.handle().clone(),
+                state.clone(),
+                syncer,
+            ));
+
             // Startup poll, then a repeating background timer.
             let handle = app.handle().clone();
             // The external tools, on a clock of their own rather than the
@@ -198,6 +209,11 @@ pub fn run() {
             commands::tools_update_now,
             commands::app_version_info,
             commands::check_app_update_now,
+            commands::sync_status,
+            commands::sync_turn_on,
+            commands::sync_join,
+            commands::sync_leave,
+            commands::sync_now,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

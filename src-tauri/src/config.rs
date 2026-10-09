@@ -217,6 +217,12 @@ pub struct Settings {
     pub ffmpeg_path: String,
     #[serde(default)]
     pub deno_path: String,
+    /// The cloud sync server, hand-edit only: empty is the public one
+    /// (`sync::client::DEFAULT_SERVER`), anything else a `wrangler dev` or a
+    /// self-hosted Worker. Machine-local, like the tool paths: a named field so
+    /// it never rides `extra` into an export, and `adopt_portable` leaves it be.
+    #[serde(default)]
+    pub sync_server: String,
     #[serde(default = "d_card_size")]
     pub card_size: u32,
     #[serde(default = "d_window_width")]
@@ -290,11 +296,12 @@ impl Settings {
     /// view mounted before that edit still holds the old value, and saving
     /// anything from it -- a new download folder, the update channel -- would
     /// silently put the old path back. Nothing in the app ever changes these,
-    /// so the file's copy always wins.
+    /// so the file's copy always wins. `sync_server` is the same kind of key.
     pub fn keep_machine_overrides_of(&mut self, disk: &Settings) {
         self.ytdlp_path = disk.ytdlp_path.clone();
         self.ffmpeg_path = disk.ffmpeg_path.clone();
         self.deno_path = disk.deno_path.clone();
+        self.sync_server = disk.sync_server.clone();
     }
 
     /// Takes the portable half of `incoming`, keeping this machine's window
@@ -693,6 +700,27 @@ mod tests {
         assert_eq!(incoming.ffmpeg_path, r"C:\ff\ffmpeg-7.exe");
         assert_eq!(incoming.deno_path, "", "a removed override stays removed");
         assert_eq!(incoming.download_dir, "/new/videos", "what the view did change is kept");
+    }
+
+    #[test]
+    fn the_sync_server_is_a_named_hand_edit_that_a_stale_view_cannot_revert() {
+        assert_eq!(Settings::default().sync_server, "");
+        let disk = Settings::from_json_str(r#"{"sync_server":"http://127.0.0.1:8787"}"#).unwrap();
+        assert_eq!(disk.sync_server, "http://127.0.0.1:8787");
+        // Named, not `extra`: `extra` is what an export carries off the machine.
+        assert!(disk.extra.is_empty(), "{:?}", disk.extra);
+        let mut incoming = Settings::default();
+        incoming.keep_machine_overrides_of(&disk);
+        assert_eq!(incoming.sync_server, "http://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn adopt_portable_leaves_the_sync_server_alone() {
+        let mut local = Settings::from_json_str(r#"{"sync_server":"http://mine.test"}"#).unwrap();
+        let mut incoming = an_incoming_file();
+        incoming.sync_server = "http://theirs.test".into();
+        local.adopt_portable_with(&incoming, |_| true);
+        assert_eq!(local.sync_server, "http://mine.test");
     }
 
     /// A settings file as an archive from another machine would carry it: every

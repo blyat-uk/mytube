@@ -570,3 +570,36 @@ pub struct BrowserScan {
     pub access_hint: Option<String>,
 }
 
+/// Cloud sync as the Settings section draws it, and the payload of
+/// `sync://status`. A dialog-style payload, so camelCase like the others.
+/// Nothing secret beyond `code`, which the section masks until Show.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    pub enabled: bool,
+    /// `MYT1-…`, while sync is on.
+    pub code: Option<String>,
+    /// This computer's hostname, as the others will see it.
+    pub machine_name: String,
+    /// The other computers in the group, by name.
+    pub peers: Vec<SyncPeer>,
+    /// The last successful exchange, Unix seconds.
+    pub last_sync_at: Option<i64>,
+    /// A local change has not been pushed yet. False whenever sync is off, and
+    /// when the library could not be read to tell.
+    pub pending: bool,
+    /// What went wrong last, in words; `None` once an exchange succeeds.
+    pub error: Option<String>,
+    /// The group is gone: nothing wrote to it for 90 days. Nothing is sent
+    /// until sync is turned on again or off.
+    pub expired: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPeer {
+    pub name: String,
+    /// When the server last stored a slot from it, Unix seconds.
+    pub last_write_at: Option<i64>,
+}
+

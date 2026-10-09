@@ -58,6 +58,23 @@ which = "8"
 # `fuzzy`, the channel checklist filters by plain substring -- what the import
 # dialog's own filter box does -- and pulls in no matcher crate.
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+# Cloud sync (sync/): every slot is sealed on this machine with
+# XChaCha20-Poly1305 under a key HKDF derives from the sync code, so the server
+# only ever holds ciphertext. 0.11 shares chacha20 0.10 with what is already in
+# the tree; hkdf stays on 0.12 because 0.13 wants sha2 0.11 and the crate's own
+# `sha2` above is 0.10.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+hkdf = "0.12"
+# The sync code, machine ids and nonces. Already in the tree through tempfile.
+getrandom = "0.4"
+# Bearer, machine id and blob are all base64url without padding on the wire.
+base64 = "0.22"
+# A slot is gzipped before it is sealed. zlib-rs named explicitly for the same
+# reason as `zip` above: without it this would pull miniz_oxide in as a second
+# backend.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# The readable machine name that travels inside the ciphertext.
+gethostname = "1.1"
 
 # The tray. Linux speaks StatusNotifierItem itself (see tray/sni.rs for why
 # Tauri's libayatana-backed tray cannot report a left click); macOS and Windows
