@@ -49,48 +49,23 @@ Get the latest build from the [releases page](https://github.com/blyat-uk/mytube
 
 Each release lists every file and what it is for, plus `SHA256SUMS.txt` to verify them against.
 
-## Platform notes
-
-- **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
-- **macOS:** the app is not notarized. After copying it to Applications, open it with right-click → Open, or allow it under System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/mytube.app`.
-- **macOS 27 and browser cookies:** macOS 27 keeps every other app out of the data of Firefox, Chrome, Brave and Edge, so Settings lists them as "no access" (Safari's cookies have always needed the same). MyTube can read them with Full Disk Access, but macOS does not put MyTube in that list on its own: in System Settings → Privacy & Security → Full Disk Access (Settings → YouTube sign-in has a button that opens it), click +, choose MyTube in Applications, and restart MyTube. The per-browser switches macOS shows for MyTube under Files & Folders are a different permission that lasts only until MyTube quits. MyTube is ad-hoc signed, so macOS ties Full Disk Access to one exact build: after an update, remove MyTube from the list and add it again. A cookies file needs none of this.
-- **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. If the AppImage does not start, install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with `--appimage-extract-and-run`. The tray icon needs a StatusNotifierItem host (built into KDE; GNOME needs the AppIndicator extension).
-
-## First run
-
-1. **Tools arrive by themselves.** MyTube downloads whichever of yt-dlp, ffmpeg and deno it can't find on your system: about 150 MB, from each publisher's own releases, SHA-256-checked.
-2. **Add your channels.** Click **Add** and paste a channel URL or `@handle`, or import all your YouTube subscriptions from a Google Takeout CSV.
-3. **Check your sign-in.** Downloads use the YouTube sign-in of a browser on your computer (or a cookies file). That is what unlocks members-only videos and keeps YouTube's bot checks at bay. *Automatic* picks for you; Settings → YouTube sign-in shows which.
-
-**→ [Getting started](https://github.com/blyat-uk/mytube/wiki/Getting-Started)**
-
 ## Documentation
 
-Everything else lives in the **[wiki](https://github.com/blyat-uk/mytube/wiki)**:
+Everything lives in the **[wiki](https://github.com/blyat-uk/mytube/wiki)**. New here? Start with the first two.
 
 | Page | Covers |
 |---|---|
-| [Using MyTube](https://github.com/blyat-uk/mytube/wiki/Using-MyTube) | Filters, search, series, quality, auto-download, members-only, shortcuts |
-| [YouTube sign-in](https://github.com/blyat-uk/mytube/wiki/YouTube-Sign-In) | Browsers, cookies files, Full Disk Access on macOS |
-| [Cloud sync](https://github.com/blyat-uk/mytube/wiki/Cloud-Sync) | Setup, encryption, limits, running your own server |
-| [Backup & transfer](https://github.com/blyat-uk/mytube/wiki/Backup-and-Transfer) | Export and import a library, including over SSH |
-| [Tools](https://github.com/blyat-uk/mytube/wiki/Tools) | Where yt-dlp, ffmpeg and deno come from, and using your own |
-| [Privacy](https://github.com/blyat-uk/mytube/wiki/Privacy) | Every server MyTube talks to, and where your data lives |
-| [Troubleshooting](https://github.com/blyat-uk/mytube/wiki/Troubleshooting) | Fixes for the usual problems |
-| [Uninstalling](https://github.com/blyat-uk/mytube/wiki/Uninstalling) | Removing the app and everything it stored |
-
-## Build from source
-
-[Bun](https://bun.sh), a stable Rust toolchain, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
-
-```bash
-git clone https://github.com/blyat-uk/mytube.git
-cd mytube
-bun install
-bun run tauri dev
-```
-
-Tests, packaging and releases: [Building from source](https://github.com/blyat-uk/mytube/wiki/Building-from-Source).
+| 🚀 **[Getting started](https://github.com/blyat-uk/mytube/wiki/Getting-Started)** | Install, first run, adding your channels |
+| 💻 **[Platform notes](https://github.com/blyat-uk/mytube/wiki/Platform-Notes)** | First open on Windows and macOS, macOS 27 browser access, Linux AppImage and tray |
+| 📺 [Using MyTube](https://github.com/blyat-uk/mytube/wiki/Using-MyTube) | Filters, search, series, quality, auto-download, members-only, shortcuts |
+| 🔑 [YouTube sign-in](https://github.com/blyat-uk/mytube/wiki/YouTube-Sign-In) | Browsers, cookies files, members-only access |
+| 🔒 [Cloud sync](https://github.com/blyat-uk/mytube/wiki/Cloud-Sync) | Setup, encryption, limits, running your own server |
+| 📦 [Backup & transfer](https://github.com/blyat-uk/mytube/wiki/Backup-and-Transfer) | Export and import a library, including over SSH |
+| 🧰 [Tools](https://github.com/blyat-uk/mytube/wiki/Tools) | Where yt-dlp, ffmpeg and deno come from, and using your own |
+| 🛡️ [Privacy](https://github.com/blyat-uk/mytube/wiki/Privacy) | Every server MyTube talks to, and where your data lives |
+| 🩺 [Troubleshooting](https://github.com/blyat-uk/mytube/wiki/Troubleshooting) | Fixes for the usual problems |
+| 🗑️ [Uninstalling](https://github.com/blyat-uk/mytube/wiki/Uninstalling) | Removing the app and everything it stored |
+| 🛠️ [Building from source](https://github.com/blyat-uk/mytube/wiki/Building-from-Source) | Run, test and package MyTube yourself |
 
 ## License
 
