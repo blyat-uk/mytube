@@ -6,6 +6,35 @@
 
 **Website: [mytube.blyat.uk](https://mytube.blyat.uk/)**
 
+[![Latest release](https://img.shields.io/github/v/release/blyat-uk/mytube?label=release&color=2563eb)](https://github.com/blyat-uk/mytube/releases/latest)
+[![CI](https://github.com/blyat-uk/mytube/actions/workflows/ci.yml/badge.svg)](https://github.com/blyat-uk/mytube/actions/workflows/ci.yml)
+![Windows · macOS · Linux](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-555)
+[![MIT](https://img.shields.io/github/license/blyat-uk/mytube?color=555)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-wiki-2563eb)](https://github.com/blyat-uk/mytube/wiki)
+
+## Why MyTube
+
+- 📺 **Just the channels you follow.** Newest first. No recommendations, no Shorts, no algorithm.
+- ⬇️ **Real files, your player.** Every video lands on your disk at the quality you choose and plays in mpv, VLC or whatever you already use.
+- 🔁 **Runs itself.** Checks for new uploads every 30 minutes, and can download a channel's new videos as they arrive.
+- ⭐ **Members-only videos too.** Mark the channels you have joined and their members-only uploads arrive with the rest.
+- 🧩 **Series on one card.** Part 1, Part 2, Part 3 collapse into one card, and *Continue watching* shows the ones you are partway through.
+- 🔒 **Private sync.** Your library on all your computers, end-to-end encrypted, no account.
+- 🧰 **Zero setup.** yt-dlp, ffmpeg and deno are fetched, checked and kept up to date for you.
+
+## 🔒 New: sync your computers, privately
+
+> [!TIP]
+> Your subscriptions, memberships and every video you watched, hid or linked, the same on every computer. **Settings → Sync → Turn on sync.**
+
+- **End-to-end encrypted.** Your library is encrypted on your computer, with a key made from your sync code, before it is sent. The server only stores data it cannot read.
+- **No account.** No email, no password. One sync code (`MYT1-…`) pairs up to five computers.
+- **Off until you turn it on.** Settings, downloads and thumbnails never leave the computer. The [server is open source](sync-server/), and you can run your own.
+
+On the first computer choose **Turn on sync**; on the others paste the code under **Have a code from another computer?** → **Join**. Treat the code like a password.
+
+**→ [How sync works and what it protects](https://github.com/blyat-uk/mytube/wiki/Cloud-Sync)**
+
 ## Download
 
 Get the latest build from the [releases page](https://github.com/blyat-uk/mytube/releases/latest):
@@ -20,20 +49,6 @@ Get the latest build from the [releases page](https://github.com/blyat-uk/mytube
 
 Each release lists every file and what it is for, plus `SHA256SUMS.txt` to verify them against.
 
-## First run
-
-MyTube uses three programs it does not ship: **yt-dlp**, **ffmpeg** and **deno** (the JavaScript runtime yt-dlp needs for YouTube). The first time it starts it downloads whichever of them it cannot find on your system: about 150 MB, straight from each publisher's own releases, each checked against its published SHA-256, into your local data folder:
-
-| OS | Tools folder |
-|---|---|
-| Windows | `%LOCALAPPDATA%\mytube\bin` |
-| macOS | `~/Library/Application Support/mytube/bin` |
-| Linux | `~/.local/share/mytube/bin` |
-
-Unpacked, all three take roughly 500 MB on disk (the static ffmpeg and ffprobe builds are about 350 MB of that). Any tool already on your system is used instead and not downloaded. Settings → Tools shows where each one came from; yt-dlp keeps itself up to date once a day.
-
-Downloads go out with the YouTube cookies of a browser you are signed in to (Settings → YouTube sign-in). Automatic uses whichever browser on the machine is signed in to YouTube, or the one used most recently when none is, and the list marks which are signed in. That is what reaches members-only videos and keeps YouTube's bot checks at bay. On Windows, yt-dlp cannot read Chrome, Edge or other Chromium browsers; on macOS they ask for Keychain access. A cookies file exported from any browser works everywhere: a Netscape `cookies.txt`, a JSON export (Cookie-Editor, EditThisCookie, Cookie Quick Manager, Playwright, Selenium), or a `name=value; …` cookie header. MyTube reads it, tells you what it found, and gives yt-dlp its own copy, so your file is never modified.
-
 ## Platform notes
 
 - **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
@@ -41,46 +56,32 @@ Downloads go out with the YouTube cookies of a browser you are signed in to (Set
 - **macOS 27 and browser cookies:** macOS 27 keeps every other app out of the data of Firefox, Chrome, Brave and Edge, so Settings lists them as "no access" (Safari's cookies have always needed the same). MyTube can read them with Full Disk Access, but macOS does not put MyTube in that list on its own: in System Settings → Privacy & Security → Full Disk Access (Settings → YouTube sign-in has a button that opens it), click +, choose MyTube in Applications, and restart MyTube. The per-browser switches macOS shows for MyTube under Files & Folders are a different permission that lasts only until MyTube quits. MyTube is ad-hoc signed, so macOS ties Full Disk Access to one exact build: after an update, remove MyTube from the list and add it again. A cookies file needs none of this.
 - **Linux:** the `.deb` and `.rpm` pull in WebKitGTK 4.1 themselves. If the AppImage does not start, install your distribution's FUSE 2 package (`libfuse2` / `fuse2`) or run it with `--appimage-extract-and-run`. The tray icon needs a StatusNotifierItem host (built into KDE; GNOME needs the AppIndicator extension).
 
-## Moving your library from a terminal
+## First run
 
-Settings → Backup & transfer also works with no window at all, for a machine you can only reach over SSH (Linux and macOS). To carry the library at home to a laptop:
+1. **Tools arrive by themselves.** MyTube downloads whichever of yt-dlp, ffmpeg and deno it can't find on your system: about 150 MB, from each publisher's own releases, SHA-256-checked.
+2. **Add your channels.** Click **Add** and paste a channel URL or `@handle`, or import all your YouTube subscriptions from a Google Takeout CSV.
+3. **Check your sign-in.** Downloads use the YouTube sign-in of a browser on your computer (or a cookies file). That is what unlocks members-only videos and keeps YouTube's bot checks at bay. *Automatic* picks for you; Settings → YouTube sign-in shows which.
 
-```sh
-ssh -t home mytube export                  # writes ~/mytube-export-YYYY-MM-DD.zip on home
-scp 'home:mytube-export-*.zip' .
-mytube import mytube-export-2026-10-02.zip # or Settings → Backup & transfer → Import…
-```
+**→ [Getting started](https://github.com/blyat-uk/mytube/wiki/Getting-Started)**
 
-`mytube import` shows what the archive holds and then asks: Merge or Replace, which channels, whether to apply its settings, and finally to confirm. Esc at any question cancels before anything is written. Every question has a flag (`mytube export --help`, `mytube import --help`). With no terminal attached, such as a cron job or `ssh home mytube export` without `-t`, nothing is asked: thumbnails are included, every channel is merged and the settings are applied. `--replace` then needs `--yes` as well.
+## Documentation
 
-The command is `mytube` with the `.deb` and `.rpm`, the AppImage file itself (`./mytube-v4.1.0-linux-x86_64.AppImage export`), and `/Applications/mytube.app/Contents/MacOS/mytube` on macOS. On Windows, use Settings → Backup & transfer.
+Everything else lives in the **[wiki](https://github.com/blyat-uk/mytube/wiki)**:
 
-If MyTube is running on the machine you import into, its window shows the import after its next poll.
+| Page | Covers |
+|---|---|
+| [Using MyTube](https://github.com/blyat-uk/mytube/wiki/Using-MyTube) | Filters, search, series, quality, auto-download, members-only, shortcuts |
+| [YouTube sign-in](https://github.com/blyat-uk/mytube/wiki/YouTube-Sign-In) | Browsers, cookies files, Full Disk Access on macOS |
+| [Cloud sync](https://github.com/blyat-uk/mytube/wiki/Cloud-Sync) | Setup, encryption, limits, running your own server |
+| [Backup & transfer](https://github.com/blyat-uk/mytube/wiki/Backup-and-Transfer) | Export and import a library, including over SSH |
+| [Tools](https://github.com/blyat-uk/mytube/wiki/Tools) | Where yt-dlp, ffmpeg and deno come from, and using your own |
+| [Privacy](https://github.com/blyat-uk/mytube/wiki/Privacy) | Every server MyTube talks to, and where your data lives |
+| [Troubleshooting](https://github.com/blyat-uk/mytube/wiki/Troubleshooting) | Fixes for the usual problems |
+| [Uninstalling](https://github.com/blyat-uk/mytube/wiki/Uninstalling) | Removing the app and everything it stored |
 
-## Syncing your computers
+## Build from source
 
-Settings → Sync keeps your subscriptions, channel memberships and every video you have watched, hidden, linked into a series or added by hand the same on all your computers. Settings, downloads and thumbnails stay on each computer.
-
-1. On one computer, choose **Turn on sync**. A small window asks you to confirm you are a person (Cloudflare Turnstile), and MyTube then shows your sync code, `MYT1-…`.
-2. On each other computer, paste that code under **Have a code from another computer?** and choose **Join**. Up to five computers can share one code.
-
-Changes are sent within about a minute and picked up when you bring MyTube's window to the front. There is no account and no email: your library is encrypted on your computer, with a key made from the sync code, before it is sent, so the sync server only ever stores data it cannot read. Anyone with the code can see and change your synced library, so keep it like a password. **Reset code…** makes a new one (enter it on your other computers again), and **Turn off sync…** makes a computer forget the code without changing its library. A code nothing syncs with for 90 days is deleted from the server. The server's source is in [`sync-server/`](sync-server/).
-
-## Uninstalling
-
-Uninstalling removes the app but not your data or the tools it downloaded. Delete these folders as well to remove everything:
-
-| OS | Settings, library and thumbnails | Downloaded tools |
-|---|---|---|
-| Windows | `%APPDATA%\mytube` | `%LOCALAPPDATA%\mytube\bin` (the uninstaller leaves it) |
-| macOS | `~/Library/Application Support/mytube` | `~/Library/Application Support/mytube/bin` |
-| Linux | `~/.config/mytube` | `~/.local/share/mytube/bin` |
-
-Downloaded videos stay wherever you saved them.
-
-## Run from source
-
-[Bun](https://bun.sh) and a stable Rust toolchain, plus the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
+[Bun](https://bun.sh), a stable Rust toolchain, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
 
 ```bash
 git clone https://github.com/blyat-uk/mytube.git
@@ -89,15 +90,7 @@ bun install
 bun run tauri dev
 ```
 
-## Develop
-
-```bash
-bun run test                                        # frontend tests
-cargo test --manifest-path src-tauri/Cargo.toml     # backend tests
-bun run tauri build                                 # release build for this OS
-```
-
-Pushing a `vX.Y.Z` tag that matches the version in `tauri.conf.json`, `Cargo.toml` and `package.json` builds, tests and publishes a release for all three platforms. Its notes are the commits since the previous tag followed by the downloads table, nothing else, so anything a user needs to know goes in this README.
+Tests, packaging and releases: [Building from source](https://github.com/blyat-uk/mytube/wiki/Building-from-Source).
 
 ## License
 

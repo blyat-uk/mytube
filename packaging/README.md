@@ -87,8 +87,8 @@ These are not bundled, and most of them no longer need installing by hand.
 | YouTube cookies | Settings → YouTube cookies. The default, Automatic, uses whichever browser is signed in to YouTube; a cookies file (Netscape, JSON or name=value) works too.                        |
 | A video player | Used to play downloaded files. Settings → Player lists the ones installed (mpv, SMPlayer, VLC, Celluloid, Haruna, flatpak exports…), or "System default" for your desktop's choice. |
 
-See [the top-level README](../README.md#download) for where the managed tools
-come from and how to override them.
+See [Tools](https://github.com/blyat-uk/mytube/wiki/Tools) in the wiki for where the
+managed tools come from and how to override them.
 
 ## Configuration
 

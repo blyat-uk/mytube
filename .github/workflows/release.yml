@@ -338,7 +338,7 @@ jobs:
           cat SHA256SUMS.txt
 
       # The release page is the changelog, then the Downloads table, nothing
-      # else. First run, platform notes and uninstalling live in README.md.
+      # else. First run, platform notes and uninstalling live in the wiki.
       - name: Release notes
         env:
           TAG: ${{ github.ref_name }}
