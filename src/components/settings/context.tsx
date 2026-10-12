@@ -6,7 +6,8 @@ import type {
 } from "../../types";
 
 export type SectionId =
-  | "downloads" | "signin" | "player" | "new-videos" | "sync" | "backup" | "tools" | "about";
+  | "downloads" | "signin" | "player" | "new-videos" | "sync" | "backup" | "appearance" | "tools"
+  | "about";
 
 /**
  * Everything a settings page needs: the settings document and its save verbs,

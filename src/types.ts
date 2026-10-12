@@ -115,6 +115,10 @@ export interface Settings {
   /** Ask GitHub once a day whether a newer MyTube release exists. Off means no
    *  request at all. */
   check_app_updates: boolean;
+  /** Text size in percent, 80–200 in steps of 10 (Settings → Appearance), set
+   *  as `--text-scale`: text only, never icons, thumbnails or spacing. It
+   *  makes up for this machine's screen, which is why it is in this block. */
+  text_scale: number;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;

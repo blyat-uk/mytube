@@ -32,6 +32,7 @@ import { ArrowsClockwise } from "@phosphor-icons/react/dist/icons/ArrowsClockwis
 import { Archive } from "@phosphor-icons/react/dist/icons/Archive";
 import { Wrench } from "@phosphor-icons/react/dist/icons/Wrench";
 import { Info } from "@phosphor-icons/react/dist/icons/Info";
+import { TextAa } from "@phosphor-icons/react/dist/icons/TextAa";
 import { Folder } from "@phosphor-icons/react/dist/icons/Folder";
 import { Minus } from "@phosphor-icons/react/dist/icons/Minus";
 import { Plus } from "@phosphor-icons/react/dist/icons/Plus";
@@ -115,6 +116,7 @@ export const IconSectionSync = () => <ArrowsClockwise className="icon" weight="b
 export const IconSectionBackup = () => <Archive className="icon" weight="bold" />;
 export const IconSectionTools = () => <Wrench className="icon" weight="bold" />;
 export const IconSectionAbout = () => <Info className="icon" weight="bold" />;
+export const IconSectionAppearance = () => <TextAa className="icon" weight="bold" />;
 
 export const IconFolder = () => <Folder className="icon" weight="bold" />;
 export const IconMinus = () => <Minus className="icon" weight="bold" />;

@@ -28,7 +28,7 @@ export const SETTINGS: Settings = {
   window_width: 1280, window_height: 880, window_x: null, window_y: null,
   window_maximized: false,
   cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
-  check_app_updates: true,
+  check_app_updates: true, text_scale: 100,
   ytdlp_path: "", ffmpeg_path: "", deno_path: "",
   quality: { ...DEFAULT_QUALITY },
   view: {

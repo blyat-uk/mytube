@@ -61,6 +61,10 @@ fn d_window_width() -> u32 {
 fn d_window_height() -> u32 {
     840
 }
+/// Text size in percent: 100 is the stylesheet's own sizes.
+fn d_text_scale() -> u32 {
+    100
+}
 fn d_sort() -> SortOrder {
     SortOrder::Newest
 }
@@ -225,6 +229,14 @@ pub struct Settings {
     pub sync_server: String,
     #[serde(default = "d_card_size")]
     pub card_size: u32,
+    /// Settings -> Appearance's text size, in percent, 80 to 200 in steps of
+    /// 10. The frontend turns it into `--text-scale`, which scales text only:
+    /// icons, thumbnails and spacing stay as they are. Machine-local, like the
+    /// window geometry: it makes up for one screen's size and distance, so a
+    /// named field that never rides `extra` into an export, and
+    /// `adopt_portable` leaves it be.
+    #[serde(default = "d_text_scale")]
+    pub text_scale: u32,
     #[serde(default = "d_window_width")]
     pub window_width: u32,
     #[serde(default = "d_window_height")]
@@ -267,6 +279,9 @@ impl Settings {
         v.poll_interval_minutes = v.poll_interval_minutes.clamp(1, 1440);
         v.backfill_count = v.backfill_count.clamp(1, 500);
         v.card_size = v.card_size.clamp(160, 640);
+        // Onto the slider's own stops, so a hand edit lands where the Settings
+        // page can show it.
+        v.text_scale = (v.text_scale.saturating_add(5) / 10 * 10).clamp(80, 200);
         // Floors match minWidth/minHeight in tauri.conf.json; a hand-edited or
         // corrupt value would otherwise restore a window too small to use.
         v.window_width = v.window_width.clamp(720, 16_384);
@@ -305,7 +320,7 @@ impl Settings {
     }
 
     /// Takes the portable half of `incoming`, keeping this machine's window
-    /// geometry and feed filters. The mirror of `keep_view_of`.
+    /// geometry, text size and feed filters. The mirror of `keep_view_of`.
     ///
     /// The split is between settings that describe *the library* — where
     /// downloads land, how they are named, what plays them, how hard to poll,
@@ -818,6 +833,39 @@ mod tests {
         incoming.check_app_updates = false;
         local.adopt_portable_with(&incoming, |_| true);
         assert!(local.check_app_updates, "another machine turned this one's check off");
+    }
+
+    #[test]
+    fn text_size_defaults_to_the_stylesheets_own() {
+        assert_eq!(Settings::default().text_scale, 100);
+        let s = Settings::from_json_str(r#"{"text_scale":150}"#).unwrap();
+        assert_eq!(s.text_scale, 150);
+        // Named, not `extra`: `extra` is what an export carries off the machine.
+        assert!(s.extra.is_empty(), "{:?}", s.extra);
+    }
+
+    #[test]
+    fn text_size_is_rounded_to_a_slider_step_and_clamped_to_its_ends() {
+        let read = |n: u64| {
+            Settings::from_json_str(&format!(r#"{{"text_scale":{n}}}"#)).unwrap().text_scale
+        };
+        assert_eq!(read(84), 80);
+        assert_eq!(read(85), 90, "a half step rounds up");
+        assert_eq!(read(126), 130);
+        assert_eq!(read(79), 80);
+        assert_eq!(read(0), 80);
+        assert_eq!(read(201), 200);
+        assert_eq!(read(u32::MAX as u64), 200, "no overflow on the way to the clamp");
+        assert_eq!(read(200), 200);
+    }
+
+    #[test]
+    fn adopt_portable_leaves_the_text_size_alone() {
+        let mut local = Settings::from_json_str(r#"{"text_scale":140}"#).unwrap();
+        let mut incoming = an_incoming_file();
+        incoming.text_scale = 90;
+        local.adopt_portable_with(&incoming, |_| true);
+        assert_eq!(local.text_scale, 140, "another machine's screen set this one's text");
     }
 
     #[test]

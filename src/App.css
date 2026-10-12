@@ -3645,6 +3645,29 @@ label.st-row-title { cursor: pointer; }
   .st-tl-bar.is-indeterminate .st-tl-fill { animation: none; }
 }
 
+/* --- Appearance --------------------------------------------------------------- */
+
+/* Text in rem like the rest, so this page's own words follow its slider; the
+   button's box and the slider stay px. The slider itself is New videos' drawn
+   track (`.st-nv-slider` and friends), so Settings has one look for a range. */
+.st-ap-now { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.st-ap-value {
+  font-size: 3.4rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+/* The scale's two ends, under the ends of the track. */
+.st-ap-ends {
+  display: flex;
+  justify-content: space-between;
+  font-size: 1.1rem;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.st-ap-hint { margin: 14px 0 0; font-size: 1.25rem; color: var(--faint); }
+
 /* --- About ------------------------------------------------------------------- */
 
 /* The hero is this page's header, so the shared one is kept for a screen
