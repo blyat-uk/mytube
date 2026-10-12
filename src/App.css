@@ -54,8 +54,19 @@
     "Noto Sans", "Liberation Sans", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
+  /* Settings > Appearance's text size, set on <html> by the page: 1 is 100%. */
+  --text-scale: 1;
+
   color-scheme: dark;
 }
+
+/* Text in rem, on a 10px root (1.3rem is 13px at 100%); icons, thumbnails,
+   spacing and borders in px. The text size setting scales text and nothing
+   else, so whatever is in rem grows with it and whatever is in px stays put --
+   a size in px is a statement that it is not text. A box that holds text grows
+   with it too (a pill's height, a line's slot); a glyph standing in for an
+   icon, in a circle of fixed size, does not. */
+html { font-size: calc(10px * var(--text-scale, 1)); }
 
 * { box-sizing: border-box; }
 
@@ -68,7 +79,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 1.4rem;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -118,6 +129,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
      top row, whose controls do not shrink, then pushed the page past the window
      instead of being told how much room it had. */
   grid-template-columns: minmax(0, 1fr);
+  /* The query container the rem breakpoints ask (see "narrow windows"). Being
+     one makes .app a stacking context and the containing block of the fixed
+     boxes inside it (modals, the right-click menu), which changes nothing: it
+     sits at 0,0 at exactly the window's size and never scrolls, and everything
+     that stacks against something else (the nav, modals, toasts) keeps its
+     order. Named, so the unnamed queries further down still find the
+     containers nearest them. */
+  container: app / inline-size;
 }
 
 .content {
@@ -164,7 +183,9 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 
 .topnav-row .icon { width: 15px; height: 15px; }
 /* The refresh button is the one circle in a row of pills; it matches their
-   height rather than the 34px it wears nowhere else. */
+   height rather than the 34px it wears nowhere else. Matches it at 100% text,
+   that is: the pills grow with the text size, and the glyph is an icon, so
+   the circle and its 15px stay as they are. */
 .topnav-row .icon-btn { width: 32px; height: 32px; font-size: 15px; }
 
 .brand-mark {
@@ -342,7 +363,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .crumb-x .icon { width: 11px; height: 11px; }
 .crumb-meta {
   color: var(--faint);
-  font-size: 12px;
+  font-size: 1.2rem;
   white-space: nowrap;
 }
 
@@ -376,7 +397,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   display: inline-flex;
   align-items: center;
   flex: none;
-  font-size: 13px;
+  font-size: 1.3rem;
   padding: 5px 13px;
 }
 
@@ -441,7 +462,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   background: var(--surface);
 }
 .text-input::placeholder { color: var(--faint); }
-.text-input.mono { font-family: var(--mono); font-size: 13px; }
+.text-input.mono { font-family: var(--mono); font-size: 1.3rem; }
 
 .select {
   padding-right: 26px;
@@ -463,7 +484,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .search-glyph {
   position: absolute;
   left: 10px;
-  font-size: 14px;
+  font-size: 1.4rem;
   color: var(--faint);
   pointer-events: none;
 }
@@ -473,12 +494,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   appearance: none;
   width: 100%;
   font: inherit;
-  font-size: 13px;
+  font-size: 1.3rem;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 5px 12px 5px 28px;
+  /* Clears the glyph, which is text and grows with it: its 10px inset, its own
+     width (0.9rem: ⌕ is about 0.64em of its 1.4rem) and 9px of air. */
+  padding: 5px 12px 5px calc(19px + 0.9rem);
   transition: border-color 120ms ease, background 120ms ease;
 }
 .search-input::placeholder { color: var(--faint); }
@@ -494,7 +517,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .channel-picker,
 .sort-select {
   flex: none;
-  font-size: 13px;
+  font-size: 1.3rem;
   padding: 5px 26px 5px 10px;
 }
 /* A button dressed as the select beside it, since it opens a checklist rather
@@ -541,7 +564,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 13px;
+  font-size: 1.3rem;
   font-weight: 500;
   display: inline-flex;
   align-items: center;
@@ -558,7 +581,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .chip {
   appearance: none;
   font: inherit;
-  font-size: 13px;
+  font-size: 1.3rem;
   font-weight: 500;
   color: var(--muted);
   background: var(--surface-2);
@@ -589,7 +612,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
    toolbarFit.ts can still read how wide it would be (`scrollWidth`). Gaps
    between a glyph and its word are margins on the word for the same reason --
    a flex gap would outlive the word it spaced. */
-.tab-glyph, .tab-label, .seg-glyph, .seg-label, .brand-word, .btn-add-label {
+.tab-glyph, .tab-label, .seg-glyph, .seg-label, .btn-add-label {
   display: inline-flex;
   align-items: center;
   overflow: hidden;
@@ -597,7 +620,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   transition: max-width var(--fold-time) var(--fold-ease), opacity 200ms ease,
     margin var(--fold-time) var(--fold-ease);
 }
-.tab-label, .seg-label, .brand-word, .btn-add-label { max-width: 12em; }
+.tab-label, .seg-label, .btn-add-label { max-width: 12em; }
 .btn-add-label { margin-left: 6px; }
 .tab-glyph, .seg-glyph { max-width: 0; opacity: 0; }
 .fit-glyphs .seg-label, .fit-folded .seg-label { max-width: 0; opacity: 0; }
@@ -606,7 +629,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
    would widen the row for a moment before the word beside it had given any
    room back. The delay belongs to the state being entered, so each rule below
    is the arriving half. */
-.tab-label, .seg-label, .brand-word, .btn-add-label,
+.tab-label, .seg-label, .btn-add-label,
 .fit-glyphs .seg-glyph, .fit-folded .seg-glyph { transition-delay: var(--fold-stagger); }
 .fit-glyphs .seg-label, .fit-folded .seg-label { transition-delay: 0s; }
 
@@ -647,7 +670,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .filters-btn { padding: 5px 11px; }
 .filters-btn.is-open { border-color: var(--accent); color: var(--text); }
 .filters-btn .count {
-  font: 600 11px/1 var(--font);
+  font: 600 1.1rem/1 var(--font);
   color: var(--accent-ink);
   background: var(--accent);
   border-radius: 999px;
@@ -676,7 +699,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   gap: 6px;
 }
 .pop-head {
-  font-size: 11px;
+  font-size: 1.1rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--faint);
@@ -687,7 +710,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border: 0;
   background: transparent;
   font: inherit;
-  font-size: 13px;
+  font-size: 1.3rem;
   color: var(--muted);
   width: 100%;
   display: flex;
@@ -743,7 +766,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .text-input.chan-filter {
   display: block;
   width: 100%;
-  font-size: 13px;
+  font-size: 1.3rem;
   padding: 6px 10px;
   margin-bottom: 4px;
 }
@@ -754,7 +777,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border: 0;
   background: transparent;
   font: inherit;
-  font-size: 13px;
+  font-size: 1.3rem;
   color: var(--muted);
   width: 100%;
   display: flex;
@@ -802,7 +825,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   top: 50%;
   transform: translateY(-50%);
   appearance: none;
-  font: 600 11.5px/1 var(--font);
+  font: 600 1.15rem/1 var(--font);
   color: #9ed3ff;
   background: var(--card);
   border: 1px solid rgba(62, 166, 255, 0.5);
@@ -817,7 +840,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .chan-row-wrap:focus-within .chan-only:not(:disabled) { opacity: 1; pointer-events: auto; }
 .chan-only:hover { background: #2c3a47; }
 .chan-only:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.chan-empty { color: var(--faint); font-size: 13px; padding: 10px; }
+.chan-empty { color: var(--faint); font-size: 1.3rem; padding: 10px; }
 
 /* --- video grid ---------------------------------------------------------- */
 
@@ -922,12 +945,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 
 /* The part count, standing in the same place a YouTube playlist puts it. Wide
    enough that "unwatched" still fits on one line at the smallest card size the
-   zoom allows (160px), which is what sets the 42%. */
+   zoom allows (160px), which is what sets the 42% -- of a card at 100% text.
+   The words grow with the text size and so must the panel, or they would run
+   out of its sides. */
 .series-count {
   position: absolute;
   z-index: 1;
   top: 0; right: 0; bottom: 0;
-  width: 42%;
+  width: min(100%, calc(42% * var(--text-scale, 1)));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -946,15 +971,17 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
    .card-thumb's overflow clips it on the way out, and the global reduced-motion
    block below already cuts the transition to nothing. */
 .series-card .card-thumb:hover .series-count:not(:hover) { transform: translateX(101%); }
-/* Everything in the panel scales with the grid zoom, like the hover buttons. */
+/* Everything in the panel scales with the grid zoom, like the hover buttons.
+   The text also follows the text size: every term of each clamp is scaled by
+   it (the bounds as rem), so the two settings multiply rather than fight. */
 .series-count-n {
-  font-size: clamp(15px, calc(var(--card-w, 260px) * 0.075), 30px);
+  font-size: clamp(1.5rem, calc(var(--card-w, 260px) * 0.075 * var(--text-scale, 1)), 3rem);
   font-weight: 700;
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
 .series-count-label {
-  font-size: clamp(10px, calc(var(--card-w, 260px) * 0.043), 15px);
+  font-size: clamp(1rem, calc(var(--card-w, 260px) * 0.043 * var(--text-scale, 1)), 1.5rem);
   color: #cfcfcf;
   letter-spacing: 0.02em;
 }
@@ -988,7 +1015,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   flex-direction: column;
   align-items: center;
   line-height: 1.35;
-  font-size: clamp(9px, calc(var(--card-w, 260px) * 0.038), 13px);
+  font-size: clamp(0.9rem, calc(var(--card-w, 260px) * 0.038 * var(--text-scale, 1)), 1.3rem);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -1008,9 +1035,17 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
    clipped to, and the runtime is the line that can go: it is the panel's least
    important fact, and the card's tooltip and aria-label still carry it. The
    thumb is already the positioning context for everything in here, so making it
-   the query container changes no layout. */
-@container (max-width: 200px) {
+   the query container changes no layout. 20rem is 200px at 100% text: the
+   larger the text, the larger the card the runtime needs. */
+@container (max-width: 20rem) {
   .series-runtime { display: none; }
+}
+/* With large text on the smallest cards the stack still runs off the thumb,
+   and "parts" is the next word that can go: the glyph above the number already
+   says what it counts. At 100% text this never applies -- the smallest card's
+   thumb is 158px. */
+@container (max-width: 15rem) {
+  .series-count-label { display: none; }
 }
 
 /* A finished series dims like a watched video, and the sheet edges behind it go
@@ -1072,7 +1107,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   z-index: 1;
   padding: 2px 6px;
   border-radius: 4px;
-  font-size: 11.5px;
+  font-size: 1.15rem;
   font-weight: 600;
   line-height: 1.5;
   letter-spacing: 0.01em;
@@ -1093,7 +1128,9 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   background: rgba(198, 160, 255, 0.92);
   color: #23103f;
 }
-.pill-added ~ .pill-linked { top: 32px; }
+/* Its top is the Added pill's: 7px in, 4px of padding, a 1.15rem line at 1.5,
+   and 3.75px of air -- 32px at 100%, lower as the text grows. */
+.pill-added ~ .pill-linked { top: calc(14.75px + 1.725rem); }
 .card-overlay {
   position: absolute;
   z-index: 2;
@@ -1189,7 +1226,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border: 1px solid rgba(255, 255, 255, 0.16);
   backdrop-filter: blur(4px);
   font-weight: 600;
-  font-size: 13px;
+  font-size: 1.3rem;
   cursor: pointer;
   transition: background 120ms ease, border-color 120ms ease;
 }
@@ -1206,10 +1243,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 
 /* The ring doubles as the cancel button, so it lives in the action row — but it
-   carries a percentage, so it never shrinks below legible. */
+   carries a percentage, so it never shrinks below legible. Nor below the
+   percentage: "100%" is about 2.6em wide, and the third term keeps it inside
+   the stroke once the text size has grown it. At 100% text that term is never
+   the largest, so the ring is the size it always was. */
 .card-btn.is-ring {
-  width: max(52px, var(--act));
-  height: max(52px, var(--act));
+  --ring-text: clamp(1.1rem, calc(var(--act) * 0.23 * var(--text-scale, 1)), 1.4rem);
+  width: max(52px, var(--act), calc(var(--ring-text) * 2.6 + 14px));
+  height: max(52px, var(--act), calc(var(--ring-text) * 2.6 + 14px));
   background: rgba(0, 0, 0, 0.6);
   border-color: rgba(255, 255, 255, 0.2);
   color: #fff;
@@ -1233,7 +1274,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   transition: stroke-dashoffset 220ms linear;
 }
 .ring-pct {
-  font-size: clamp(11px, calc(var(--act) * 0.23), 14px);
+  font-size: var(--ring-text);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
@@ -1264,7 +1305,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 
 .card-error {
   padding: 6px 12px;
-  font-size: 12px;
+  font-size: 1.2rem;
   color: #ffb9ba;
   background: var(--danger-soft);
   border-bottom: 1px solid rgba(255, 90, 95, 0.25);
@@ -1276,7 +1317,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .card-body { padding: 10px 12px 11px; }
 
 .card-title {
-  font-size: 14px;
+  font-size: 1.4rem;
   font-weight: 600;
   line-height: 1.35;
   margin-bottom: 4px;
@@ -1296,7 +1337,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   align-items: baseline;
   gap: 5px;
   flex-wrap: nowrap;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
   white-space: nowrap;
 }
@@ -1330,7 +1371,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   text-align: center;
   padding: 28px 0 8px;
   color: var(--faint);
-  font-size: 12.5px;
+  font-size: 1.25rem;
 }
 
 .spinner {
@@ -1351,7 +1392,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border: 1px solid var(--line);
   border-radius: 16px;
 }
-.empty h2 { font-size: 17px; margin-bottom: 8px; }
+.empty h2 { font-size: 1.7rem; margin-bottom: 8px; }
 .empty p { color: var(--muted); margin: 0 0 18px; }
 .empty p:last-child { margin-bottom: 0; }
 
@@ -1360,7 +1401,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .dl-section { margin-bottom: 30px; }
 
 .section-title {
-  font-size: 15px;
+  font-size: 1.5rem;
   margin-bottom: 12px;
   display: flex;
   align-items: center;
@@ -1370,14 +1411,15 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .section-count {
   display: inline-grid;
   place-items: center;
-  min-width: 21px;
-  height: 21px;
+  /* A disc round its number, so it grows with the number. */
+  min-width: 2.1rem;
+  height: 2.1rem;
   padding: 0 6px;
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--line);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 1.2rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
@@ -1445,7 +1487,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
   margin-bottom: 6px;
 }
@@ -1484,7 +1526,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 
 .row-progress-text {
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1492,7 +1534,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .row-error {
   display: block;
   max-width: 320px;
-  font-size: 12px;
+  font-size: 1.2rem;
   color: #ffb9ba;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1508,7 +1550,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .field-label { font-weight: 600; margin-bottom: 6px; }
 /* A label naming a select is a <label>, which is inline by default. */
 label.field-label { display: block; }
-.field-hint { display: block; font-size: 12.5px; color: var(--faint); margin-top: 6px; }
+.field-hint { display: block; font-size: 1.25rem; color: var(--faint); margin-top: 6px; }
 .field .text-input { width: 100%; }
 
 .settings-grid {
@@ -1525,7 +1567,7 @@ label.field-label { display: block; }
    an alarm. */
 .tool-error {
   margin: 7px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: #ffb9ba;
   overflow-wrap: anywhere;
 }
@@ -1548,7 +1590,9 @@ label.field-label { display: block; }
 
 .modal {
   width: 100%;
-  max-width: 560px;
+  /* In rem, like every box whose width is a measure for the words in it: a
+     dialog keeps its line length, rather than its words, as the text grows. */
+  max-width: 56rem;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -1568,8 +1612,8 @@ label.field-label { display: block; }
   gap: 12px;
   margin-bottom: 14px;
 }
-.modal-head h2 { font-size: 17px; }
-.modal-head h3 { font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.modal-head h2 { font-size: 1.7rem; }
+.modal-head h3 { font-size: 1.4rem; display: flex; align-items: center; gap: 8px; }
 
 .modal-divider {
   height: 1px;
@@ -1582,7 +1626,7 @@ label.field-label { display: block; }
 
 .add-hint {
   margin: 10px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
 }
 .add-hint.is-warn { color: #ffb9ba; }
@@ -1657,7 +1701,7 @@ label.field-label { display: block; }
    match the confirm modal too, laying its title, body and buttons out as three
    centred columns. */
 .inline-confirm { display: flex; align-items: center; gap: 6px; }
-.inline-confirm-text { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.inline-confirm-text { font-size: 1.25rem; color: var(--muted); white-space: nowrap; }
 
 /* "Turn auto-download on" asks how far back to reach, as a panel under its own
    row rather than a second modal: the choice is about that one channel, and
@@ -1680,7 +1724,7 @@ label.field-label { display: block; }
   background: var(--bg);
   border: 1px solid var(--line-soft);
   border-radius: 10px;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   animation: rise 160ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -1698,7 +1742,7 @@ label.field-label { display: block; }
 .auto-dl-heading { min-width: 0; }
 .auto-dl-title {
   margin: 0;
-  font-size: 13.5px;
+  font-size: 1.35rem;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
@@ -1740,7 +1784,7 @@ label.field-label { display: block; }
   box-shadow: inset 0 0 0 3px var(--bg), inset 0 0 0 8px var(--accent);
 }
 .auto-dl-opt-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.auto-dl-opt-title { font-size: 13px; font-weight: 500; color: var(--text); }
+.auto-dl-opt-title { font-size: 1.3rem; font-weight: 500; color: var(--text); }
 .auto-dl-opt-detail { color: var(--muted); }
 .auto-dl-opt.is-on .auto-dl-opt-detail { color: #a9cfee; }
 
@@ -1755,7 +1799,7 @@ label.field-label { display: block; }
   border-radius: 999px;
   background: var(--surface-2);
   color: var(--text);
-  font-size: 12px;
+  font-size: 1.2rem;
   cursor: pointer;
   user-select: none;
   transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
@@ -1795,7 +1839,7 @@ label.field-label { display: block; }
   display: flex;
   flex-direction: column-reverse;
   gap: 8px;
-  max-width: min(420px, calc(100vw - 36px));
+  max-width: min(42rem, calc(100vw - 36px));
   pointer-events: none;
 }
 
@@ -1832,7 +1876,7 @@ label.field-label { display: block; }
 .toast-action {
   flex: none;
   margin-right: 10px;
-  font-size: 13px;
+  font-size: 1.3rem;
   padding: 5px 13px;
 }
 @keyframes toast-in {
@@ -1864,27 +1908,36 @@ label.field-label { display: block; }
 
 /* The top row never wraps. The filter controls step down by measurement
    (toolbarFit.ts: words, then glyphs, then folded behind one button); what is
-   left -- the tabs, Add and the wordmark -- gives up its words here, once the
-   folded row is all there is beside them. */
+   left -- the tabs and Add -- gives up its words here, once the folded row is
+   all there is beside them.
 
-@media (max-width: 1000px) {
+   These widths are where words stop fitting, so they are in rem and move with
+   the text size: 100rem is 1000px at 100% and 2000px at 200%. A media query
+   cannot say that -- rem there is the browser's initial 16px, never the root's
+   -- so they ask the `app` container (.app, exactly as wide as the window),
+   where rem is the root's. Breakpoints that are about layout, not words, stay
+   media queries in px. */
+
+@container app (max-width: 100rem) {
   .tab-label, .btn-add-label { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
   .tab-glyph { max-width: 20px; opacity: 1; transition-delay: var(--fold-stagger); }
   .tab { margin: 0 4px; }
 }
 
-@media (max-width: 980px) {
+/* The Downloads row puts its actions (and a failure's reason) under the
+   title once the title would be squeezed: words again, so rem. */
+@container app (max-width: 98rem) {
   .crumb-name { max-width: 22ch; }
-  .content { padding: 16px 16px 56px; }
   .dl-row { grid-template-columns: 96px minmax(0, 1fr); }
   .dl-actions { grid-column: 1 / -1; justify-content: flex-start; }
   .row-error { max-width: none; }
 }
 
-@media (max-width: 860px) {
-  /* The mark already says which app; the number is what the pill is for. */
-  .brand-word { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
-  .brand-version-word { display: none; }
+@media (max-width: 980px) {
+  .content { padding: 16px 16px 56px; }
+}
+
+@container app (max-width: 86rem) {
   .crumb-meta { display: none; }
   .crumb-name { max-width: 16ch; }
   .topnav-row { padding: 8px 12px; }
@@ -1926,7 +1979,7 @@ label.field-label { display: block; }
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: 13px;
+  font-size: 1.3rem;
   text-align: left;
   cursor: pointer;
 }
@@ -1943,9 +1996,9 @@ label.field-label { display: block; }
  * Confirm dialog
  * ------------------------------------------------------------------ */
 
-.modal.confirm { width: min(460px, calc(100vw - 40px)); padding: 20px; }
-.modal-title { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
-.confirm-body { margin: 0 0 18px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.modal.confirm { width: min(46rem, calc(100vw - 40px)); padding: 20px; }
+.modal-title { margin: 0 0 8px; font-size: 1.6rem; font-weight: 600; }
+.confirm-body { margin: 0 0 18px; color: var(--muted); font-size: 1.3rem; line-height: 1.5; }
 .confirm-actions {
   display: flex;
   gap: 8px;
@@ -1963,13 +2016,13 @@ label.field-label { display: block; }
  * ------------------------------------------------------------------ */
 
 .modal.takeout, .modal.transfer {
-  width: min(620px, calc(100vw - 40px));
+  width: min(62rem, calc(100vw - 40px));
   padding: 20px;
   display: flex;
   flex-direction: column;
   max-height: min(78vh, 720px);
 }
-.takeout-count { color: var(--muted); font-size: 12px; }
+.takeout-count { color: var(--muted); font-size: 1.2rem; }
 .takeout-tools { display: flex; gap: 8px; margin: 4px 0 12px; }
 .takeout-tools .text-input { flex: 1; }
 .takeout-list {
@@ -1990,7 +2043,7 @@ label.field-label { display: block; }
   align-items: center;
   gap: 10px;
   padding: 7px 9px;
-  font-size: 13px;
+  font-size: 1.3rem;
   cursor: pointer;
 }
 .takeout-list li.is-existing label { cursor: default; color: var(--faint); }
@@ -2000,12 +2053,12 @@ label.field-label { display: block; }
   border-radius: 999px;
   background: var(--ok-soft);
   color: var(--ok);
-  font-size: 11px;
+  font-size: 1.1rem;
 }
 /* A tag for a fact rather than a good outcome: "not subscribed" is neutral,
    and the green pill would read as an achievement. */
 .takeout-tag.is-quiet { background: var(--surface-2); color: var(--faint); }
-.takeout-none { padding: 14px; color: var(--faint); font-size: 13px; text-align: center; }
+.takeout-none { padding: 14px; color: var(--faint); font-size: 1.3rem; text-align: center; }
 
 .takeout-progress { padding: 18px 2px 6px; }
 .progress-track {
@@ -2020,15 +2073,15 @@ label.field-label { display: block; }
   background: var(--accent);
   transition: width 220ms ease-out;
 }
-.progress-label { margin: 10px 0 4px; font-size: 13px; }
+.progress-label { margin: 10px 0 4px; font-size: 1.3rem; }
 
 /* ------------------------------------------------------------------ *
  * The import dialog's archive checklist (TransferDialog)
  * ------------------------------------------------------------------ */
 
-.transfer-origin { margin: 0; font-size: 13px; color: var(--muted); }
+.transfer-origin { margin: 0; font-size: 1.3rem; color: var(--muted); }
 .transfer-host { color: var(--text); }
-.transfer-counts { margin: 4px 0 0; font-size: 12.5px; color: var(--faint); }
+.transfer-counts { margin: 4px 0 0; font-size: 1.25rem; color: var(--faint); }
 
 /* Two options side by side, each keeping its own explanation under it — the
    consequence of Replace must be readable before it is chosen, not after. */
@@ -2044,7 +2097,7 @@ label.field-label { display: block; }
 .transfer-videos {
   flex: none;
   color: var(--faint);
-  font-size: 12px;
+  font-size: 1.2rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2053,7 +2106,7 @@ label.field-label { display: block; }
   align-items: flex-start;
   gap: 10px;
   margin-top: 14px;
-  font-size: 13px;
+  font-size: 1.3rem;
   cursor: pointer;
 }
 .transfer-opt input[type="checkbox"] {
@@ -2083,7 +2136,7 @@ label.field-label { display: block; }
   border-radius: 999px;
   background: var(--surface-2);
   color: var(--text);
-  font-size: 12px;
+  font-size: 1.2rem;
   cursor: pointer;
 }
 .preset-chip:hover { background: var(--card-hover); border-color: #454545; }
@@ -2114,17 +2167,17 @@ label.field-label { display: block; }
   width: fit-content;
   margin-bottom: 8px;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 1.25rem;
   cursor: pointer;
 }
 .quality-advanced > summary:hover { color: var(--text); }
 .quality-advanced .field { margin-bottom: 0; }
 
-.modal.quality-dialog { width: min(620px, calc(100vw - 40px)); padding: 20px; }
+.modal.quality-dialog { width: min(62rem, calc(100vw - 40px)); padding: 20px; }
 .quality-dialog-video {
   margin: 0 0 16px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 1.3rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2135,7 +2188,7 @@ label.field-label { display: block; }
   gap: 10px;
   padding: 18px 0;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 1.3rem;
 }
 .quality-probe-error { margin: 0 0 6px; }
 /* Overridden by a raw -f: kept on screen, since the value still shows what
@@ -2173,7 +2226,9 @@ label.field-label { display: block; }
   position: sticky;
   top: 0;
   flex: none;
-  width: 272px;
+  /* 272px at 100% text: 96px of padding, glyph and gaps, and a 176px column
+     of words that grows with the text size, so a name is never cut short. */
+  width: calc(96px + 17.6rem);
   max-height: calc(100vh - 92px);
   display: flex;
   flex-direction: column;
@@ -2188,7 +2243,7 @@ label.field-label { display: block; }
 .st-rail-list { display: flex; flex-direction: column; }
 
 .st-tier {
-  font-size: 10.5px;
+  font-size: 1.05rem;
   font-weight: 650;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2196,7 +2251,9 @@ label.field-label { display: block; }
   padding: 13px 12px 5px;
   white-space: nowrap;
   overflow: hidden;
-  max-height: 40px;
+  /* A ceiling to animate the fold from, so it is in rem: in px it would clip
+     the heading once the text outgrew it. */
+  max-height: 4rem;
   transition: max-height var(--fold-time) var(--fold-ease), opacity var(--fold-time) var(--fold-ease),
     padding var(--fold-time) var(--fold-ease);
 }
@@ -2259,13 +2316,13 @@ label.field-label { display: block; }
   min-width: 0;
   display: flex;
   flex-direction: column;
-  max-width: 200px;
+  max-width: 20rem;
   overflow: hidden;
   transition: max-width var(--fold-time) var(--fold-ease), opacity var(--fold-time) var(--fold-ease);
 }
-.st-item-name { font-weight: 600; font-size: 13.5px; line-height: 1.3; white-space: nowrap; }
+.st-item-name { font-weight: 600; font-size: 1.35rem; line-height: 1.3; white-space: nowrap; }
 .st-item-line {
-  font-size: 12px;
+  font-size: 1.2rem;
   line-height: 1.4;
   color: var(--faint);
   white-space: nowrap;
@@ -2277,7 +2334,7 @@ label.field-label { display: block; }
 .st-item-ok { color: var(--ok); }
 
 .st-flag {
-  font: 10.5px/1.6 var(--mono);
+  font: 1.05rem/1.6 var(--mono);
   border-radius: 999px;
   padding: 0 6px;
   border: 1px solid transparent;
@@ -2318,7 +2375,7 @@ label.field-label { display: block; }
   padding: 12px 12px 4px;
   margin-top: 14px;
   border-top: 1px solid var(--line-soft);
-  font-size: 12px;
+  font-size: 1.2rem;
   color: var(--faint);
   white-space: nowrap;
   overflow: hidden;
@@ -2328,8 +2385,10 @@ label.field-label { display: block; }
 @keyframes st-saved-in { from { opacity: 0; transform: translateY(3px); } }
 
 /* Folded: glyphs only. Tier names become thin rules; markers move onto the
-   glyphs. Widths animate, so a resize shows the rail transforming. */
-@media (max-width: 900px) {
+   glyphs. Widths animate, so a resize shows the rail transforming. In rem, like
+   the top row's breakpoints and for the same reason: it is the words that stop
+   fitting, so the larger the text, the sooner the rail folds. */
+@container app (max-width: 90rem) {
   .st-layout { gap: 22px; }
   .st-rail { width: 62px; padding: 10px 8px; }
   .st-item { grid-template-columns: 32px 0 0; gap: 0; padding: 5px; }
@@ -2364,8 +2423,8 @@ label.field-label { display: block; }
 }
 .st-head-glyph .icon { width: 25px; height: 25px; }
 .st-head-text { min-width: 0; }
-.st-head-title { font-size: 25px; font-weight: 750; letter-spacing: -0.025em; line-height: 1.1; }
-.st-head-intro { margin: 4px 0 0; color: var(--muted); font-size: 13.5px; max-width: 62ch; }
+.st-head-title { font-size: 2.5rem; font-weight: 750; letter-spacing: -0.025em; line-height: 1.1; }
+.st-head-intro { margin: 4px 0 0; color: var(--muted); font-size: 1.35rem; max-width: 62ch; }
 
 /* --- blocks, captions, rows ------------------------------------------------- */
 
@@ -2377,12 +2436,12 @@ label.field-label { display: block; }
   margin-bottom: 14px;
 }
 .st-block-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; min-height: 30px; }
-.st-block-title { font-size: 14.5px; font-weight: 650; letter-spacing: -0.005em; margin-right: auto; }
+.st-block-title { font-size: 1.45rem; font-weight: 650; letter-spacing: -0.005em; margin-right: auto; }
 .st-block-aside {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 12px;
+  font-size: 1.2rem;
   color: var(--faint);
   text-align: right;
 }
@@ -2392,7 +2451,7 @@ label.field-label { display: block; }
   align-items: center;
   gap: 8px;
   margin: 16px 0 8px;
-  font-size: 11px;
+  font-size: 1.1rem;
   font-weight: 650;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2404,14 +2463,14 @@ label.field-label { display: block; }
   text-transform: none;
   letter-spacing: 0;
   font-weight: 450;
-  font-size: 12px;
+  font-size: 1.2rem;
 }
 
 .st-row { display: flex; align-items: center; gap: 16px; }
 .st-row + .st-row { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
 .st-row-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .st-row-title { font-weight: 600; }
-.st-row-hint { font-size: 12.5px; color: var(--faint); }
+.st-row-hint { font-size: 1.25rem; color: var(--faint); }
 .st-row-control, .st-row-extra { flex: none; display: flex; align-items: center; gap: 8px; }
 /* Only what cannot be used dims. The hint is often the reason it cannot
    (Include subtitles in audio mode), and dimmed with the rest it fell to about
@@ -2471,7 +2530,7 @@ label.st-row-title { cursor: pointer; }
   gap: 7px;
   padding: 5px 12px;
   border-radius: 999px;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   font-weight: 500;
   color: var(--muted);
   white-space: nowrap;
@@ -2485,7 +2544,7 @@ label.st-row-title { cursor: pointer; }
   color: var(--text);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 2px 8px rgba(0, 0, 0, 0.4);
 }
-.st-seg.is-big .st-opt-pill { font-size: 13.5px; padding: 7px 16px; }
+.st-seg.is-big .st-opt-pill { font-size: 1.35rem; padding: 7px 16px; }
 .st-chips .st-opt-pill {
   padding: 4px 12px;
   background: var(--surface-2);
@@ -2531,7 +2590,7 @@ label.st-row-title { cursor: pointer; }
   min-width: 40px;
   text-align: center;
   font-weight: 750;
-  font-size: 16px;
+  font-size: 1.6rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2552,8 +2611,8 @@ label.st-row-title { cursor: pointer; }
    shrinks to a word a line. */
 .st-status { flex-wrap: wrap; }
 .st-status-text { flex: 1 1 220px; min-width: 0; }
-.st-status-title { font-size: 15px; font-weight: 650; letter-spacing: -0.005em; overflow-wrap: anywhere; }
-.st-status-detail { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.st-status-title { font-size: 1.5rem; font-weight: 650; letter-spacing: -0.005em; overflow-wrap: anywhere; }
+.st-status-detail { font-size: 1.25rem; color: var(--muted); overflow-wrap: anywhere; }
 .st-status-action { flex: none; display: flex; gap: 8px; align-items: center; }
 .st-status-ring {
   flex: none;
@@ -2624,7 +2683,7 @@ label.st-row-title { cursor: pointer; }
 
 .st-pill {
   flex: none;
-  font-size: 11.5px;
+  font-size: 1.15rem;
   font-weight: 600;
   padding: 2px 10px;
   border-radius: 999px;
@@ -2687,12 +2746,12 @@ label.st-row-title { cursor: pointer; }
 .st-choice.is-on .st-choice-icon { color: #9ed3ff; background: rgba(62, 166, 255, 0.12); border-color: rgba(62, 166, 255, 0.3); }
 .st-choice-text { min-width: 0; display: flex; flex-direction: column; }
 .st-choice-title { font-weight: 600; }
-.st-choice-detail { font-size: 12.5px; color: var(--faint); overflow-wrap: anywhere; }
+.st-choice-detail { font-size: 1.25rem; color: var(--faint); overflow-wrap: anywhere; }
 .st-choice-more { padding: 0 14px 12px 79px; }
 
 @media (max-width: 640px) {
   .st-head-glyph { width: 42px; height: 42px; border-radius: 12px; }
-  .st-head-title { font-size: 21px; }
+  .st-head-title { font-size: 2.1rem; }
   .st-block { padding: 15px 15px; }
   .st-choice-more { padding-left: 14px; }
 }
@@ -2736,28 +2795,28 @@ label.st-row-title { cursor: pointer; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 15.5px;
+  font-size: 1.55rem;
   font-weight: 550;
 }
 .st-dl-path-inner { direction: ltr; unicode-bidi: isolate; }
 .st-dl-path-dim { color: var(--faint); font-weight: 450; }
 .st-dl-path-sep { color: #4a4a4a; font-weight: 400; margin: 0 6px; }
 
-.st-dl-folder-input { flex: 1 1 auto; min-width: 0; font-size: 14px; }
+.st-dl-folder-input { flex: 1 1 auto; min-width: 0; font-size: 1.4rem; }
 .st-dl-folder-actions { flex: none; display: flex; align-items: center; gap: 6px; }
 
 .st-dl-btn {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  font-size: 13px;
+  font-size: 1.3rem;
   padding: 6px 14px;
 }
 .st-dl-btn .icon { width: 14px; height: 14px; }
 
 /* Each video is saved as: one line, folders as chips. */
 .st-dl-preview {
-  font-size: 13.5px;
+  font-size: 1.35rem;
   padding: 10px 13px;
   border-radius: 11px;
   background: #131313;
@@ -2788,7 +2847,7 @@ label.st-row-title { cursor: pointer; }
 .st-dl-tmpl-raw {
   flex: 1 1 140px;
   min-width: 0;
-  font: 12px/1.4 var(--mono);
+  font: 1.2rem/1.4 var(--mono);
   color: var(--faint);
   white-space: nowrap;
   overflow: hidden;
@@ -2802,7 +2861,7 @@ label.st-row-title { cursor: pointer; }
 .st-dl-tokens { display: flex; flex-wrap: wrap; gap: 6px; }
 .st-dl-token {
   appearance: none;
-  font: 12px/1.4 var(--mono);
+  font: 1.2rem/1.4 var(--mono);
   color: var(--muted);
   background: var(--surface-2);
   border: 1px solid var(--line);
@@ -2820,7 +2879,7 @@ label.st-row-title { cursor: pointer; }
   justify-content: space-between;
   gap: 2px 12px;
   margin-bottom: 7px;
-  font-size: 12px;
+  font-size: 1.2rem;
   color: var(--faint);
 }
 .st-dl-ladder-cap strong { color: var(--text); font-weight: 600; }
@@ -2833,7 +2892,7 @@ label.st-row-title { cursor: pointer; }
   background: #161616;
   border: 1px solid var(--line-soft);
   color: #5e5e5e;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   font-weight: 550;
   text-align: center;
   white-space: nowrap;
@@ -2863,8 +2922,8 @@ label.st-row-title { cursor: pointer; }
 .st-dl-ladder.is-off .st-dl-step { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
 
 .st-dl-qrows { margin-top: 14px; display: grid; gap: 9px; }
-.st-dl-qrow { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 12px; }
-.st-dl-ql { font-size: 12.5px; color: var(--muted); }
+.st-dl-qrow { display: grid; grid-template-columns: 9.2rem minmax(0, 1fr); align-items: center; gap: 12px; }
+.st-dl-ql { font-size: 1.25rem; color: var(--muted); }
 
 .st-dl-qsum {
   display: flex;
@@ -2874,7 +2933,7 @@ label.st-row-title { cursor: pointer; }
   margin-top: 15px;
   padding-top: 13px;
   border-top: 1px solid var(--line-soft);
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
 }
 .st-dl-qsum-icon { display: inline-flex; color: var(--ok); }
@@ -2897,19 +2956,19 @@ label.st-row-title { cursor: pointer; }
   transition: color 120ms ease, background 120ms ease;
 }
 .st-dl-adv:hover { color: var(--text); background: var(--card); }
-.st-dl-adv code { font: 11.5px var(--mono); color: var(--muted); }
+.st-dl-adv code { font: 1.15rem var(--mono); color: var(--muted); }
 .st-dl-adv .icon { width: 13px; height: 13px; transition: transform 160ms var(--fold-ease); }
 .st-dl-adv[aria-expanded="true"] .icon { transform: rotate(90deg); }
 
 .st-dl-raw { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
-.st-dl-raw-label { font-size: 12.5px; font-weight: 600; color: var(--muted); }
-.st-dl-raw-hint { margin: 0; font-size: 12.5px; color: var(--faint); }
-.st-dl-raw-hint code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.st-dl-raw-label { font-size: 1.25rem; font-weight: 600; color: var(--muted); }
+.st-dl-raw-hint { margin: 0; font-size: 1.25rem; color: var(--faint); }
+.st-dl-raw-hint code { font-family: var(--mono); font-size: 1.2rem; color: var(--muted); }
 
 /* At once: a lane per download that may run side by side. */
 .st-dl-par { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
 .st-dl-par-text { flex: 1 1 180px; min-width: 0; }
-.st-dl-par-hint { margin: 2px 0 0; font-size: 12.5px; color: var(--faint); }
+.st-dl-par-hint { margin: 2px 0 0; font-size: 1.25rem; color: var(--faint); }
 .st-dl-lanes { flex: none; display: flex; align-items: center; gap: 3px; margin-left: auto; }
 .st-dl-lanes i {
   width: 6px;
@@ -2937,12 +2996,12 @@ label.st-row-title { cursor: pointer; }
    list does not jump when the rows arrive. */
 .st-si-looking {
   padding: 10px 14px;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
 }
 
 /* A hand-written spec is shown exactly as settings.json holds it. */
-.st-si-spec { font-family: var(--mono); font-size: 13px; font-weight: 500; }
+.st-si-spec { font-family: var(--mono); font-size: 1.3rem; font-weight: 500; }
 
 /* The cookies file in use: its path, then Change… at the end of the line. */
 .st-si-file { display: flex; align-items: center; gap: 10px; }
@@ -2954,14 +3013,14 @@ label.st-row-title { cursor: pointer; }
   background: #131313;
   border: 1px solid var(--line);
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 1.25rem;
   overflow-wrap: anywhere;
 }
-.st-si-file-hint { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); }
+.st-si-file-hint { margin: 8px 0 0; font-size: 1.25rem; color: var(--muted); }
 
 /* macOS only: why a browser is missing or "no access", and the way there.
    The hint says "the button below", so the button stays below it. */
-.st-si-access-text { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); max-width: 72ch; }
+.st-si-access-text { margin: 0 0 12px; font-size: 1.25rem; color: var(--muted); max-width: 72ch; }
 
 @media (max-width: 640px) {
   .st-si-file { flex-wrap: wrap; }
@@ -2969,13 +3028,13 @@ label.st-row-title { cursor: pointer; }
 
 /* --- Player --------------------------------------------------------------------- */
 
-.st-pl-looking { margin: 0; padding: 4px 2px; font-size: 12.5px; color: var(--faint); }
+.st-pl-looking { margin: 0; padding: 4px 2px; font-size: 1.25rem; color: var(--faint); }
 
 /* A detected player's command, under its name: what actually runs. */
-.st-pl-cmd { color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }
+.st-pl-cmd { color: var(--faint); font-size: 1.2rem; overflow-wrap: anywhere; }
 
 .st-pl-field { width: 100%; }
-.st-pl-hint { margin: 6px 0 0; font-size: 12.5px; color: var(--faint); }
+.st-pl-hint { margin: 6px 0 0; font-size: 1.25rem; color: var(--faint); }
 
 /* --- New videos ---------------------------------------------------------------- */
 
@@ -2991,16 +3050,16 @@ label.st-row-title { cursor: pointer; }
   gap: 8px 12px;
   margin-top: 12px;
 }
-.st-nv-custom-label { font-weight: 600; font-size: 13px; }
+.st-nv-custom-label { font-weight: 600; font-size: 1.3rem; }
 .st-nv-minutes { width: 96px; font-variant-numeric: tabular-nums; }
-.st-nv-custom-hint { font-size: 12px; color: var(--faint); }
+.st-nv-custom-hint { font-size: 1.2rem; color: var(--faint); }
 
 .st-nv-last {
   display: flex;
   align-items: center;
   gap: 8px;
   margin: 12px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
 }
 .st-nv-dot {
@@ -3023,13 +3082,13 @@ label.st-row-title { cursor: pointer; }
 .st-nv-depth { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
 .st-nv-bignum { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .st-nv-bignum b {
-  font-size: 34px;
+  font-size: 3.4rem;
   font-weight: 800;
   letter-spacing: -0.04em;
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
-.st-nv-bignum span { color: var(--muted); font-size: 13.5px; }
+.st-nv-bignum span { color: var(--muted); font-size: 1.35rem; }
 
 /* A native range, transparent, laid over the drawn track: the browser keeps
    the dragging, clicking, touch and focus, the picture is ours. The native
@@ -3092,8 +3151,8 @@ label.st-row-title { cursor: pointer; }
 .st-nv-ticks {
   --thumb: 20px;
   position: relative;
-  height: 16px;
-  font-size: 11px;
+  height: 1.6rem;
+  font-size: 1.1rem;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
@@ -3115,14 +3174,15 @@ label.st-row-title { cursor: pointer; }
   border-radius: 11px;
   background: #151515;
   border: 1px solid var(--line-soft);
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
 }
 .st-nv-tile strong { display: block; margin-bottom: 2px; color: var(--text); font-weight: 600; }
 
-/* Seven presets need about 600px in one row. Narrower, they settle into a
-   4 × 2 grid of equal pills rather than a ragged second row in a pill track. */
-@container st-nv (max-width: 640px) {
+/* Seven presets need about 60rem in one row (600px at 100% text): it is their
+   words that need the room, so the measure is rem. Narrower, they settle into
+   a 4 × 2 grid of equal pills rather than a ragged second row in a pill track. */
+@container st-nv (max-width: 64rem) {
   .st-nv .st-seg.is-wide {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -3130,7 +3190,7 @@ label.st-row-title { cursor: pointer; }
   }
 }
 
-@container st-nv (max-width: 560px) {
+@container st-nv (max-width: 56rem) {
   .st-nv-tiles { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -3154,7 +3214,7 @@ label.st-row-title { cursor: pointer; }
 .st-sy .btn[aria-busy="true"]:disabled { opacity: 0.8; cursor: progress; }
 
 /* Under the button that is waiting on the check window. */
-.st-sy-wait { margin: -4px 0 14px; font-size: 12.5px; color: var(--muted); }
+.st-sy-wait { margin: -4px 0 14px; font-size: 1.25rem; color: var(--muted); }
 .st-sy-hero .st-sy-wait { margin: 10px 0 0; }
 .st-sy-wait.is-end { margin: 6px 0 0; text-align: right; }
 
@@ -3169,10 +3229,12 @@ label.st-row-title { cursor: pointer; }
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
-@container (max-width: 520px) {
+/* A card is a name and a line about it, so how many fit across is a matter
+   of words: rem, which grows with the text size. */
+@container (max-width: 52rem) {
   .st-sy-devs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-@container (max-width: 330px) {
+@container (max-width: 33rem) {
   .st-sy-devs { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -3191,7 +3253,7 @@ label.st-row-title { cursor: pointer; }
 .st-sy-dev-name { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
 .st-sy-dev-label { font-weight: 650; overflow-wrap: anywhere; }
 .st-sy-dev-tag {
-  font-size: 10px;
+  font-size: 1rem;
   font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
@@ -3201,7 +3263,7 @@ label.st-row-title { cursor: pointer; }
   padding: 1px 7px;
   white-space: nowrap;
 }
-.st-sy-dev-meta { font-size: 12px; color: var(--faint); }
+.st-sy-dev-meta { font-size: 1.2rem; color: var(--faint); }
 
 /* This one: blue, the colour of "selected" -- it is the one you are on. */
 .st-sy-dev.is-here {
@@ -3215,7 +3277,7 @@ label.st-row-title { cursor: pointer; }
   align-items: center;
   justify-content: center;
   text-align: center;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
   background: transparent;
   border: 1px dashed #3a3a3a;
@@ -3238,7 +3300,7 @@ label.st-row-title { cursor: pointer; }
   min-width: 0;
   max-width: 100%;
   padding: 12px 16px;
-  font: 600 16.5px/1.2 var(--mono);
+  font: 600 1.65rem/1.2 var(--mono);
   letter-spacing: 0.05em;
   font-variant-numeric: tabular-nums;
   background: #121212;
@@ -3251,19 +3313,19 @@ label.st-row-title { cursor: pointer; }
   align-items: center;
   gap: 9px;
   margin: 11px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
 }
 .st-sy-shield .st-sy-glyph { color: var(--faint); }
 .st-sy-shield .st-sy-glyph .icon { width: 16px; height: 16px; }
-.st-sy-note { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); }
+.st-sy-note { margin: 8px 0 0; font-size: 1.25rem; color: var(--muted); }
 
 /* --- what syncs --------------------------------------------------------------- */
 
 .st-sy-what { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 24px; }
 .st-sy-what .st-cap { margin: 0 0 6px; }
 .st-sy-what-list { list-style: none; margin: 0; padding: 0; }
-.st-sy-what-list li { display: flex; align-items: center; gap: 9px; padding: 2.5px 0; font-size: 13px; }
+.st-sy-what-list li { display: flex; align-items: center; gap: 9px; padding: 2.5px 0; font-size: 1.3rem; }
 .st-sy-what-list .st-sy-glyph { color: var(--ok); }
 .st-sy-what-col.is-stays li { color: var(--muted); }
 .st-sy-what-col.is-stays .st-sy-glyph { color: #5a5a5a; }
@@ -3289,8 +3351,8 @@ label.st-row-title { cursor: pointer; }
     var(--surface);
   border: 1px solid rgba(62, 166, 255, 0.3);
 }
-.st-sy-hero-title { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
-.st-sy-hero-intro { margin: 5px 0 14px; color: var(--muted); font-size: 13px; max-width: 58ch; }
+.st-sy-hero-title { font-size: 1.7rem; font-weight: 700; letter-spacing: -0.01em; }
+.st-sy-hero-intro { margin: 5px 0 14px; color: var(--muted); font-size: 1.3rem; max-width: 58ch; }
 .st-sy-hero-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* Two computers, one line between them with the lock on it. The dashes crawl
@@ -3345,7 +3407,7 @@ label.st-row-title { cursor: pointer; }
 .st-sy-join-label { display: block; font-weight: 600; margin-bottom: 9px; }
 .st-sy-join-row { display: flex; gap: 8px; max-width: 480px; }
 .st-sy-join-input.text-input { flex: 1 1 auto; }
-.st-sy-join-error { margin: 7px 0 0; font-size: 12.5px; color: #ffb9ba; overflow-wrap: anywhere; }
+.st-sy-join-error { margin: 7px 0 0; font-size: 1.25rem; color: #ffb9ba; overflow-wrap: anywhere; }
 
 @media (max-width: 640px) {
   .st-sy-hero { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px; }
@@ -3387,14 +3449,14 @@ label.st-row-title { cursor: pointer; }
 }
 .st-bk-glyph .icon { width: 19px; height: 19px; }
 .st-bk-card-text { min-width: 0; }
-.st-bk-card-title { font-size: 14.5px; font-weight: 650; letter-spacing: -0.005em; line-height: 1.3; }
+.st-bk-card-title { font-size: 1.45rem; font-weight: 650; letter-spacing: -0.005em; line-height: 1.3; }
 .st-bk-card-sub {
   margin: 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
-.st-bk-card-body { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+.st-bk-card-body { margin: 0 0 14px; font-size: 1.3rem; color: var(--muted); }
 
 /* The switch row gets the card's rule above it, as rows do in a block. */
 .st-bk-card .st-switch-row { padding-top: 14px; border-top: 1px solid var(--line-soft); }
@@ -3409,7 +3471,7 @@ label.st-row-title { cursor: pointer; }
 .st-bk-progress { margin-top: 14px; }
 .st-bk-progress-label {
   margin: 8px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -3422,14 +3484,14 @@ label.st-row-title { cursor: pointer; }
   align-items: flex-start;
   gap: 9px;
   margin: 4px 2px 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--faint);
 }
 .st-bk-foot-glyph { display: inline-flex; flex: none; margin-top: 2px; }
 .st-bk-foot-glyph .icon { width: 15px; height: 15px; }
 .st-bk-foot code {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 1.2rem;
   color: var(--muted);
   background: var(--surface-2);
   border: 1px solid var(--line-soft);
@@ -3437,7 +3499,8 @@ label.st-row-title { cursor: pointer; }
   padding: 0 5px;
 }
 
-@container st-bk (max-width: 640px) {
+/* Two cards of words, so "while both fit" is measured in rem. */
+@container st-bk (max-width: 64rem) {
   .st-bk-cards { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -3507,27 +3570,27 @@ label.st-row-title { cursor: pointer; }
   align-items: baseline;
   gap: 10px;
   min-width: 0;
-  font-size: 15px;
+  font-size: 1.5rem;
   font-weight: 650;
 }
 /* A nightly yt-dlp's version runs to "2026.10.07.234512": it gives way before
    the name does. */
 .st-tl-version {
   min-width: 0;
-  font: 12px var(--mono);
+  font: 1.2rem var(--mono);
   font-variant-numeric: tabular-nums;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.st-tl-role { font-size: 12.5px; color: var(--muted); }
+.st-tl-role { font-size: 1.25rem; color: var(--muted); }
 
 /* Small and quiet: the path is there to be checked when something is odd,
    not read on every visit. The whole path is in the tooltip. */
 .st-tl-path {
   margin-top: 2px;
-  font: 11.5px var(--mono);
+  font: 1.15rem var(--mono);
   color: var(--faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3536,7 +3599,7 @@ label.st-row-title { cursor: pointer; }
 
 .st-tl-error {
   margin: 3px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: #ffb9ba;
   overflow-wrap: anywhere;
 }
@@ -3544,7 +3607,7 @@ label.st-row-title { cursor: pointer; }
    why it may not be the newest. */
 .st-tl-note {
   margin: 4px 0 0;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: var(--muted);
   overflow-wrap: anywhere;
 }
@@ -3556,7 +3619,7 @@ label.st-row-title { cursor: pointer; }
   gap: 8px;
 }
 .st-tl-source {
-  font-size: 11.5px;
+  font-size: 1.15rem;
   font-weight: 500;
   padding: 2px 10px;
   border-radius: 999px;
@@ -3594,7 +3657,7 @@ label.st-row-title { cursor: pointer; }
 }
 .st-tl-status {
   margin-top: 5px;
-  font-size: 12px;
+  font-size: 1.2rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
@@ -3605,13 +3668,13 @@ label.st-row-title { cursor: pointer; }
   gap: 10px;
   padding: 14px 2px 24px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 1.3rem;
 }
 .st-tl-load-error {
   margin: 0 0 14px;
   padding: 14px 16px;
   border-radius: 15px;
-  font-size: 12.5px;
+  font-size: 1.25rem;
   color: #ffb9ba;
   background: var(--danger-soft);
   border: 1px solid rgba(255, 90, 95, 0.42);
@@ -3627,15 +3690,16 @@ label.st-row-title { cursor: pointer; }
   align-items: center;
   gap: 8px;
   margin: 4px 0 0;
-  font-size: 12px;
+  font-size: 1.2rem;
   color: var(--faint);
 }
 .st-tl-foot .icon { width: 15px; height: 15px; flex: none; }
-.st-tl-foot code { font-size: 11.5px; color: var(--muted); }
+.st-tl-foot code { font-size: 1.15rem; color: var(--muted); }
 
-@media (max-width: 640px) {
+@container app (max-width: 64rem) {
   /* The source and Retry move under the text: beside it they would leave the
-     path and the error a column too thin to read. */
+     path and the error a column too thin to read. A matter of words, so in rem
+     (see "narrow windows"): 640px at 100% text. */
   .st-tl-card { grid-template-columns: 46px minmax(0, 1fr); align-items: start; }
   .st-tl-end { grid-column: 2; flex-direction: row; align-items: center; flex-wrap: wrap; }
 }
@@ -3725,20 +3789,20 @@ label.st-row-title { cursor: pointer; }
   align-items: center;
   gap: 12px;
   margin: 0;
-  font-size: 32px;
+  font-size: 3.2rem;
   font-weight: 800;
   letter-spacing: -0.035em;
   line-height: 1;
 }
 .st-ab-version {
-  font: 600 13px/1.6 var(--mono);
+  font: 600 1.3rem/1.6 var(--mono);
   letter-spacing: 0;
   color: var(--muted);
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 0 10px;
 }
-.st-ab-tag { margin: 8px 0 0; color: var(--muted); font-size: 13.5px; max-width: 60ch; }
+.st-ab-tag { margin: 8px 0 0; color: var(--muted); font-size: 1.35rem; max-width: 60ch; }
 
 .st-ab-links { display: flex; flex-wrap: wrap; gap: 8px; }
 .st-ab-links .btn { display: inline-flex; align-items: center; gap: 7px; }
@@ -3749,7 +3813,7 @@ label.st-row-title { cursor: pointer; }
   .st-ab-hero { gap: 16px; padding: 20px; }
   .st-ab-mark { width: 60px; height: 44px; border-radius: 14px; }
   .st-ab-mark::after { left: 24px; top: 13px; border-left-width: 16px; border-top-width: 9px; border-bottom-width: 9px; }
-  .st-ab-name { font-size: 26px; }
+  .st-ab-name { font-size: 2.6rem; }
 }
 
 /* Installed → Available, in the update card's text column above its sentence.
