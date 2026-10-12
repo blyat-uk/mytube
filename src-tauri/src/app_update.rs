@@ -158,7 +158,7 @@ pub async fn fetch_latest(http: &reqwest::Client) -> Result<Release> {
 }
 
 fn show_in_tray(book: &Bookkeeping, current: &str) {
-    tray::set_update(newer_release(book, current).map(|r| (r.version.clone(), r.url.clone())));
+    tray::set_update(newer_release(book, current).map(|r| r.version.clone()));
 }
 
 /// What the nav's version pill and Settings' About block show. A dialog-style

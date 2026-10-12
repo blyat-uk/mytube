@@ -21,8 +21,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Wry};
 
 use super::{
-    badge_slot, open_release_page, show_window, toggle_window, tooltip_line, update_label, ICONS,
-    TRAY_ID,
+    badge_slot, open_about, show_window, toggle_window, tooltip_line, update_label, ICONS, TRAY_ID,
 };
 use crate::window;
 
@@ -55,12 +54,12 @@ fn badge() -> std::sync::MutexGuard<'static, Badge> {
     BADGE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A newer release as `(version, url)`. Unlike ksni, Tauri's tray does not
-/// diff menus, so this is also what tells [`set_update`] the menu on screen
-/// already says the same thing.
-static UPDATE: Mutex<Option<(String, String)>> = Mutex::new(None);
+/// A newer release's version. Unlike ksni, Tauri's tray does not diff menus,
+/// so this is also what tells [`set_update`] the menu on screen already says
+/// the same thing.
+static UPDATE: Mutex<Option<String>> = Mutex::new(None);
 
-fn update_slot() -> std::sync::MutexGuard<'static, Option<(String, String)>> {
+fn update_slot() -> std::sync::MutexGuard<'static, Option<String>> {
     UPDATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -76,8 +75,8 @@ pub(super) fn init(app: &AppHandle) -> Result<(), String> {
 /// fresh one cannot end up with the item twice or in the wrong place.
 fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let open = MenuItem::with_id(app, MENU_OPEN, "Open MyTube", true, None::<&str>)?;
-    let update = match update_slot().as_ref() {
-        Some((version, _)) => Some(MenuItem::with_id(
+    let update = match update_slot().as_deref() {
+        Some(version) => Some(MenuItem::with_id(
             app,
             MENU_UPDATE,
             update_label(version),
@@ -104,7 +103,7 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
     // is already there), so returning means the icon is really in the tray.
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(Image::from_bytes(ICONS[0])?)
-        .tooltip(tooltip_line(update_slot().as_ref().map(|(v, _)| v.as_str())))
+        .tooltip(tooltip_line(update_slot().as_deref()))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
@@ -114,12 +113,9 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
             } else if id == MENU_QUIT {
                 window::quit(app);
             } else if id == MENU_UPDATE {
-                // Read at click time, so a newer check since the menu was
-                // built still opens the current page.
-                let url = update_slot().as_ref().map(|(_, url)| url.clone());
-                if let Some(url) = url {
-                    open_release_page(&url);
-                }
+                // Nothing to read: About shows the current state itself, so a
+                // newer check since the menu was built still lands on it.
+                open_about(app);
             }
         })
         .on_tray_icon_event(|tray, event| {
@@ -181,20 +177,20 @@ fn refresh(app: &AppHandle) {
     }
 }
 
-/// Records the release and, if that changes the menu, rebuilds it on the main
+/// Records the version and, if that changes the menu, rebuilds it on the main
 /// thread -- menus are main-thread objects on both platforms, and this is
 /// called from the hourly update task.
-pub(super) fn set_update(release: Option<(String, String)>) {
+pub(super) fn set_update(version: Option<String>) {
     let Some(app) = APP.get() else {
         return;
     };
-    let tip = tooltip_line(release.as_ref().map(|(v, _)| v.as_str()));
+    let tip = tooltip_line(version.as_deref());
     {
         let mut slot = update_slot();
-        if *slot == release {
+        if *slot == version {
             return;
         }
-        *slot = release;
+        *slot = version;
     }
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {

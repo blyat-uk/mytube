@@ -15,7 +15,7 @@
 //! read and written -- and `set_update` for the release menu item, so the badge
 //! and the menu behave identically on every OS.
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::window;
 
@@ -119,21 +119,42 @@ pub fn clear() {
     backend::update(|pending| *pending = 0);
 }
 
-/// A newer MyTube release as `(version, url)`, or `None` for no menu item.
+/// The version of a newer MyTube release, or `None` for no menu item.
 ///
-/// While set, the menu carries `Update available: v{version}…` between "Open
-/// MyTube" and the separator, and picking it opens `url` in the browser. The
-/// item is the standing reminder: the toast fires once per release and may
-/// land while the window is hidden. Called hourly with the same value, so each
-/// backend ignores a value it already shows. A no-op when there is no tray.
-pub fn set_update(release: Option<(String, String)>) {
-    backend::set_update(release);
+/// While set, the menu carries `Update available: v{version}` between "Open
+/// MyTube" and the separator, and picking it raises the window on Settings →
+/// About ([`open_about`]). The item is the standing reminder: the toast fires
+/// once per release and may land while the window is hidden. Called hourly
+/// with the same value, so each backend ignores a value it already shows. A
+/// no-op when there is no tray.
+///
+/// Only the version: the release page's address is About's to offer, so the
+/// tray has no use for it.
+pub fn set_update(version: Option<String>) {
+    backend::set_update(version);
 }
 
-/// The menu label for an available update. The ellipsis says it leads
-/// somewhere else -- a browser, not an action taken in place.
+/// The menu label for an available update. No ellipsis: picking it acts inside
+/// the app, on About, rather than handing off to a browser.
 fn update_label(version: &str) -> String {
-    format!("Update available: v{version}\u{2026}")
+    format!("Update available: v{version}")
+}
+
+/// Asks the frontend to open Settings → About. No payload: About already has
+/// both versions from `app_version_info`, so the event carries nothing that
+/// could disagree with them.
+pub const OPEN_ABOUT_EVENT: &str = "app://open-about";
+
+/// The update item, on both backends: raise the window, then ask it for
+/// About, which shows the installed and the available version side by side
+/// and has the button to the release page. Shown first so the page opens in a
+/// window that is on screen. A window closed to the tray was only hidden
+/// (`prevent_close`), so its webview is still listening either way.
+fn open_about(app: &AppHandle) {
+    show_window(app);
+    if let Err(err) = app.emit(OPEN_ABOUT_EVENT, ()) {
+        eprintln!("mytube: could not open About: {err}");
+    }
 }
 
 /// The hover text, as `(title, body)`: which MyTube this is -- until now
@@ -151,12 +172,6 @@ fn tooltip_line(update: Option<&str>) -> String {
     match tooltip(update) {
         (title, body) if body.is_empty() => title,
         (title, body) => format!("{title} \u{2014} {body}"),
-    }
-}
-
-fn open_release_page(url: &str) {
-    if let Err(err) = tauri_plugin_opener::open_url(url, None::<&str>) {
-        eprintln!("mytube: could not open {url}: {err}");
     }
 }
 
@@ -211,7 +226,8 @@ mod tests {
 
     #[test]
     fn the_update_label_names_the_version_with_a_v() {
-        assert_eq!(update_label("0.1.2"), "Update available: v0.1.2\u{2026}");
+        // And no ellipsis: the item opens About in the app, not a browser.
+        assert_eq!(update_label("0.1.2"), "Update available: v0.1.2");
     }
 
     #[test]
