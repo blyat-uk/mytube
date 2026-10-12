@@ -49,8 +49,8 @@ function props(over: Partial<Props> = {}): Props {
     polling: false,
     onRefresh: vi.fn(),
     onAdd: vi.fn(),
-    version: null,
-    onOpenRelease: vi.fn(),
+    update: null,
+    onOpenAbout: vi.fn(),
     ...over,
   };
 }
@@ -530,30 +530,61 @@ describe("the action shortcuts", () => {
   });
 });
 
-describe("the version pill", () => {
-  const V = { current: "2.1.0", update: null, checkedAt: null, checksEnabled: true };
+/** The logo is the red mark alone: no name beside it, and no version. */
+describe("the logo", () => {
+  it("is the mark at the head of the row, with no name or version beside it", () => {
+    renderNav({ update: { version: "2.2.0", url: "https://example.org" } });
+    expect(screen.queryByText("MyTube")).toBeNull();
+    expect(screen.queryByText(/\d+\.\d+\.\d+/)).toBeNull();
+    const row = document.querySelector(".topnav-row")!;
+    expect(row.firstElementChild!.classList.contains("brand-mark")).toBe(true);
+  });
+});
 
-  it("says nothing until the version is known", () => {
+/**
+ * A newer release is a green chip beside the tab that leads to it. It opens
+ * Settings at About rather than the release page: About is where installed and
+ * available stand side by side, and where the link out already lives.
+ */
+describe("the update chip", () => {
+  const UPDATE = { version: "2.2.0", url: "https://github.com/blyat-uk/mytube/releases/tag/v2.2.0" };
+  const chip = () => screen.queryByRole("button", { name: /^Update available/ }) as HTMLButtonElement | null;
+
+  it("is absent while no newer release is known", () => {
     renderNav();
-    expect(screen.getByText("MyTube")).toBeDefined();
-    expect(screen.queryByText("2.1.0")).toBeNull();
+    expect(chip()).toBeNull();
   });
 
-  it("shows the running version as plain text, not a button", () => {
-    renderNav({ version: V });
-    expect(screen.getByText("2.1.0").tagName).toBe("SPAN");
-    expect(screen.queryByRole("button", { name: /Update available/ })).toBeNull();
+  it("sits right after the Settings tab, on every tab", () => {
+    for (const tab of ["subscriptions", "downloads", "settings"] as const) {
+      renderNav({ tab, update: UPDATE });
+      expect(chip()!.previousElementSibling).toBe(button("Settings"));
+      expect(screen.getByLabelText("Sections").contains(chip())).toBe(true);
+      cleanup();
+    }
   });
 
-  it("offers a newer release and opens its page", () => {
-    const url = "https://github.com/blyat-uk/mytube/releases/tag/v2.2.0";
-    const p = renderNav({ version: { ...V, update: { version: "2.2.0", url } } });
-    fireEvent.click(screen.getByRole("button", { name: /Update available: MyTube 2\.2\.0/ }));
-    expect(p.onOpenRelease).toHaveBeenCalledWith(url);
+  it("names the release and where it leads", () => {
+    renderNav({ update: UPDATE });
+    expect(chip()!.getAttribute("aria-label")).toBe("Update available: MyTube 2.2.0. Open About");
+    expect(chip()!.title).toContain("MyTube 2.2.0");
   });
 
-  it("stays beside the logo while a series is open", () => {
-    renderNav({ version: V, series: SERIES });
-    expect(screen.getByText("2.1.0")).toBeDefined();
+  /* Its words are there from the start, folded away: hover and focus only
+     uncover them, so nothing about the row changes but what is drawn. */
+  it("carries the words it spells out on hover", () => {
+    renderNav({ update: UPDATE });
+    expect(chip()!.textContent).toBe("Update available!");
+  });
+
+  it("opens About, not the release page", () => {
+    const p = renderNav({ update: UPDATE });
+    fireEvent.click(chip()!);
+    expect(p.onOpenAbout).toHaveBeenCalledTimes(1);
+  });
+
+  it("goes with the tabs while a series is open", () => {
+    renderNav({ update: UPDATE, series: SERIES });
+    expect(chip()).toBeNull();
   });
 });

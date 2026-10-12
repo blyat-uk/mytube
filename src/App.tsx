@@ -4,12 +4,12 @@ import { normalizeIds, pruneIds } from "./channelPick";
 import TopNav, { type Tab } from "./components/TopNav";
 import SubscriptionsView, { type SeriesTally } from "./components/SubscriptionsView";
 import DownloadsView from "./components/DownloadsView";
-import SettingsView from "./components/SettingsView";
+import SettingsView, { openSettingsSection } from "./components/SettingsView";
 import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
 import {
-  useAppUpdate, usePollEvents, useSyncFinished, useToolsStatus, useTransferFinished,
+  useAppUpdate, useOpenAbout, usePollEvents, useSyncFinished, useToolsStatus, useTransferFinished,
 } from "./events";
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
@@ -225,22 +225,29 @@ function Shell() {
   });
 
   // Notify only: MyTube never installs itself, because the way to update
-  // depends on how it was installed (deb, rpm, AppImage, NSIS, dmg), so the
-  // action opens the release page. Missed while the window is hidden, the
-  // tray menu's update item still says it.
-  const openRelease = useCallback((url: string) => {
-    api.openExternal(url).catch((err) => toast.error(errText(err)));
-  }, [toast]);
+  // depends on how it was installed (deb, rpm, AppImage, NSIS, dmg). So every
+  // place that says a release is out -- the nav's chip, the toast, the tray's
+  // menu item -- leads to Settings › About, which sets the installed version
+  // beside the available one and holds the way to its release page.
+  //
+  // An open series is left on the way: Settings under its breadcrumb would
+  // have no tabs to come back by, and the toast and the tray can both arrive
+  // while one is open.
+  const openAbout = useCallback(() => {
+    openSettingsSection("about");
+    closeSeries();
+    setTab("settings");
+  }, [closeSeries]);
 
   useAppUpdate((u) => {
-    toast.info(`MyTube ${u.version} is available.`, {
-      label: "Download",
-      onClick: () => openRelease(u.url),
-    });
+    toast.info(`MyTube ${u.version} is available.`, { label: "View", onClick: openAbout });
   });
 
-  // The toast is once per release; the version pill in the nav is the
-  // standing reminder, the in-window twin of the tray's menu item.
+  // The tray's item, once it has brought the window forward.
+  useOpenAbout(openAbout);
+
+  // The toast is once per release; the chip beside Settings is the standing
+  // reminder, the in-window twin of the tray's menu item.
   const [version] = useAppVersion();
 
   // A poll can also start on its own (startup and the interval timer), so the
@@ -415,8 +422,8 @@ function Shell() {
         polling={polling}
         onRefresh={() => void refresh()}
         onAdd={() => setAddOpen(true)}
-        version={version}
-        onOpenRelease={openRelease}
+        update={version?.update ?? null}
+        onOpenAbout={openAbout}
       />
 
       <main className="content" ref={contentRef}>

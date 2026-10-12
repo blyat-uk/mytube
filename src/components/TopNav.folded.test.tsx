@@ -23,7 +23,7 @@ function renderNav(over: Partial<Props> = {}) {
     grouped: false, onGrouped: vi.fn(), groupsOnly: false, onGroupsOnly: vi.fn(),
     inProgress: false, onInProgress: vi.fn(), sort: "newest", onSort: vi.fn(),
     series: null, onExitSeries: vi.fn(), polling: false, onRefresh: vi.fn(), onAdd: vi.fn(),
-    version: null, onOpenRelease: vi.fn(),
+    update: null, onOpenAbout: vi.fn(),
     ...over,
   };
   render(<TopNav {...p} />);

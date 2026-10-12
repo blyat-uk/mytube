@@ -10,7 +10,7 @@ import { useLayoutEffect, useRef, useState, type RefObject } from "react";
  *
  * Decided by measuring the row rather than by fixed breakpoints: what the full
  * row needs moves with grouping (two more filters), the channel's name, the
- * version pill and an open series' breadcrumb, and a breakpoint sized for the
+ * update chip and an open series' breadcrumb, and a breakpoint sized for the
  * worst of those folds far too early for everything else — or, sized for the
  * common case, lets the row spill out of the window, which is what it did.
  */

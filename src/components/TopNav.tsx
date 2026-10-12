@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconCaret, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly, IconHidden, IconSearch,
-  IconSeries, IconSettings, IconSubscriptions, IconUnwatched,
+  IconCaret, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly, IconHidden,
+  IconNewRelease, IconSearch, IconSeries, IconSettings, IconSubscriptions, IconUnwatched,
 } from "./Icons";
 import FiltersPanel, { activeFilterCount, SORTS } from "./FiltersPanel";
 import { ChannelButton, ChannelPopover } from "./ChannelPicker";
 import { useToolbarFit } from "../toolbarFit";
-import type { Channel, SortOrder, VersionInfo } from "../types";
+import type { AppUpdate, Channel, SortOrder } from "../types";
 
 export type Tab = "subscriptions" | "downloads" | "settings";
 
@@ -70,10 +70,11 @@ interface Props {
   polling: boolean;
   onRefresh: () => void;
   onAdd: () => void;
-  /** This build and any newer release; null until the first read lands. */
-  version: VersionInfo | null;
-  /** Opens a release page in the browser. */
-  onOpenRelease: (url: string) => void;
+  /** A release newer than this build, or null. The backend already holds it
+   *  back while update checks are off, so non-null means "say so". */
+  update: AppUpdate | null;
+  /** Opens Settings at About, where the update is spelled out. */
+  onOpenAbout: () => void;
 }
 
 export default function TopNav(p: Props) {
@@ -228,30 +229,9 @@ export default function TopNav(p: Props) {
   return (
     <header className={`topnav fit-${fit}`}>
       <div className="topnav-row" ref={rowRef}>
-        {/* The logo carries the version: nothing else in the app said which
-            MyTube was running. A newer release turns the pill into the way to
-            it — a link out, since how to update depends on how it was installed. */}
-        <span className="brand">
-          <span className="brand-mark" aria-hidden="true" />
-          <span className="brand-word">MyTube</span>
-          {p.version && (p.version.update ? (
-            <button
-              type="button"
-              className="brand-version is-update"
-              onClick={() => p.onOpenRelease(p.version!.update!.url)}
-              aria-label={`Update available: MyTube ${p.version.update.version}. Open the release page`}
-              title={`You have ${p.version.current}. Open the ${p.version.update.version} release page`}
-            >
-              <span aria-hidden="true">↑</span>
-              <span className="brand-version-word">Update</span>
-              {p.version.update.version}
-            </button>
-          ) : (
-            <span className="brand-version" title={`MyTube ${p.version.current}`}>
-              {p.version.current}
-            </span>
-          ))}
-        </span>
+        {/* The logo is the mark alone. Which MyTube is running is Settings ›
+            About's to say; the row keeps its width for the controls. */}
+        <span className="brand-mark" aria-hidden="true" />
 
         {p.series ? (
           /* The series replaces the tab strip rather than adding a bar of its
@@ -295,6 +275,26 @@ export default function TopNav(p: Props) {
                 <span className="tab-label">{t.label}</span>
               </button>
             ))}
+            {/* A newer release, beside the tab that leads to it (Settings is
+                the last one). It opens About rather than the release page:
+                that is where installed and available stand side by side, and
+                how to update depends on how MyTube was installed. Hover and
+                focus spell it out over the row rather than in it -- see
+                .update-chip in App.css for why the row must not move. */}
+            {p.update && (
+              <button
+                type="button"
+                className="update-chip"
+                onClick={p.onOpenAbout}
+                aria-label={`Update available: MyTube ${p.update.version}. Open About`}
+                title={`MyTube ${p.update.version} is available. Open Settings › About`}
+              >
+                <span className="update-chip-face">
+                  <IconNewRelease />
+                  <span className="update-chip-word">Update available!</span>
+                </span>
+              </button>
+            )}
           </nav>
         )}
 

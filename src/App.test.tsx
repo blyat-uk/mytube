@@ -40,21 +40,33 @@ const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve
 const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(VERSION));
 const syncNudge = vi.fn<() => Promise<void>>(() => Promise.resolve());
 
-vi.mock("./api", () => ({
-  api: {
-    getSettings: () => getSettings(),
-    listChannels: () => listChannels(),
-    saveViewState: (...a: unknown[]) => saveViewState(...(a as [])),
-    listVideos: (filter: VideoFilter) => listVideos(filter),
-    listVideoGroups: (filter: VideoFilter) => listVideoGroups(filter),
-    toolsStatus: () => toolsStatus(),
-    openExternal: (url: string) => openExternal(url),
-    appVersionInfo: () => appVersionInfo(),
-    syncNudge: () => syncNudge(),
-  },
-  thumbSrc: () => "",
-  errText: (e: unknown) => String(e),
-}));
+vi.mock("./api", () => {
+  // What the Settings view reads on its way up, for the tests that open it.
+  // They never answer: the rail then shows those lines loading, and nothing
+  // here is about them. Declared in here because the factory is hoisted above
+  // every top-level declaration in this file.
+  const unanswered = () => new Promise<never>(() => {});
+  return {
+    api: {
+      getSettings: () => getSettings(),
+      listChannels: () => listChannels(),
+      saveViewState: (...a: unknown[]) => saveViewState(...(a as [])),
+      listVideos: (filter: VideoFilter) => listVideos(filter),
+      listVideoGroups: (filter: VideoFilter) => listVideoGroups(filter),
+      toolsStatus: () => toolsStatus(),
+      openExternal: (url: string) => openExternal(url),
+      appVersionInfo: () => appVersionInfo(),
+      syncNudge: () => syncNudge(),
+      saveSettings: () => Promise.resolve(),
+      syncStatus: unanswered,
+      detectBrowsers: unanswered,
+      detectPlayers: unanswered,
+      transferEstimate: unanswered,
+    },
+    thumbSrc: () => "",
+    errText: (e: unknown) => String(e),
+  };
+});
 
 import App from "./App";
 
@@ -433,43 +445,82 @@ describe("the tools-ready toast", () => {
   });
 });
 
+/**
+ * Every way MyTube says a newer release is out -- the nav's chip, the toast,
+ * the tray's menu item -- leads to Settings at About, where the installed and
+ * the available version stand side by side and the release page is one click
+ * further. None of them opens the release page itself.
+ */
 describe("a newer MyTube release", () => {
-  const RELEASE = "https://github.com/blyat-uk/mytube/releases/tag/v0.1.2";
+  const RELEASE = "https://github.com/blyat-uk/mytube/releases/tag/v2.2.0";
+  const UPDATE = { version: "2.2.0", url: RELEASE };
+  const chip = () => screen.queryByRole("button", { name: /^Update available: MyTube 2\.2\.0/ });
 
-  it("toasts it with a Download button that opens the release page", async () => {
+  /** Settings is the tab on screen, opened at About. */
+  async function aboutShown() {
+    await waitFor(() => expect(button("Settings").getAttribute("aria-current")).toBe("page"));
+    const rail = await screen.findByRole("navigation", { name: "Settings sections" });
+    expect(rail).toBeDefined();
+    expect(button("About").getAttribute("aria-current")).toBe("page");
+    expect(screen.getByRole("heading", { level: 2, name: "About" })).toBeDefined();
+  }
+
+  it("toasts it with a View button that opens About", async () => {
     render(<App />);
     await waitFor(() => expect(listeners.has("app://update-available")).toBe(true));
 
-    act(() => listeners.get("app://update-available")!({ payload: { version: "0.1.2", url: RELEASE } }));
+    act(() => listeners.get("app://update-available")!({ payload: UPDATE }));
 
-    expect(await screen.findByText("MyTube 0.1.2 is available.")).toBeDefined();
-    fireEvent.click(button("Download"));
-    expect(openExternal).toHaveBeenCalledWith(RELEASE);
+    expect(await screen.findByText("MyTube 2.2.0 is available.")).toBeDefined();
+    fireEvent.click(button("View"));
+    await aboutShown();
+    expect(openExternal).not.toHaveBeenCalled();
     // Acting on the toast is also done with it.
-    await waitFor(() => expect(screen.queryByText("MyTube 0.1.2 is available.")).toBeNull());
-  });
-});
-
-describe("the version in the logo", () => {
-  const RELEASE = "https://github.com/blyat-uk/mytube/releases/tag/v2.2.0";
-
-  it("shows this build's version beside the name", async () => {
-    render(<App />);
-    expect(await screen.findByText("2.1.0")).toBeDefined();
-    expect(screen.getByText("MyTube")).toBeDefined();
+    await waitFor(() => expect(screen.queryByText("MyTube 2.2.0 is available.")).toBeNull());
   });
 
-  it("turns into a link to the release page when a newer one is out", async () => {
+  it("puts no chip in the nav, and no version, while this build is the newest", async () => {
     render(<App />);
-    await screen.findByText("2.1.0");
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(appVersionInfo).toHaveBeenCalled());
+    await pause(20);
+    expect(chip()).toBeNull();
+    expect(screen.queryByText("2.1.0")).toBeNull();
+    expect(screen.queryByText("MyTube")).toBeNull();
+  });
+
+  it("puts a chip beside Settings once a check finds one, which opens About", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
     await waitFor(() => expect(listeners.has("app://version-info")).toBe(true));
 
-    act(() => listeners.get("app://version-info")!({
-      payload: { ...VERSION, update: { version: "2.2.0", url: RELEASE } },
-    }));
+    act(() => listeners.get("app://version-info")!({ payload: { ...VERSION, update: UPDATE } }));
 
-    fireEvent.click(await screen.findByRole("button", { name: /Update available: MyTube 2\.2\.0/ }));
-    expect(openExternal).toHaveBeenCalledWith(RELEASE);
+    fireEvent.click(await screen.findByRole("button", { name: /^Update available: MyTube 2\.2\.0/ }));
+    await aboutShown();
+    expect(openExternal).not.toHaveBeenCalled();
+  });
+
+  it("opens About when the tray's update item asks", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(listeners.has("app://open-about")).toBe(true));
+
+    act(() => listeners.get("app://open-about")!({ payload: null }));
+    await aboutShown();
+  });
+
+  /* Settings under a series' breadcrumb would leave no tabs to get back by. */
+  it("leaves an open series to show About", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find siblings" }));
+    await screen.findByRole("navigation", { name: "Breadcrumb" });
+
+    act(() => listeners.get("app://open-about")!({ payload: null }));
+    await aboutShown();
+    expect(screen.queryByRole("navigation", { name: "Breadcrumb" })).toBeNull();
   });
 
   it("keeps a check that lands before the first read over that older read", async () => {

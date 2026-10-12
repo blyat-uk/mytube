@@ -9,7 +9,7 @@ import {
   api, backend, emit, lastSaved, resetHarness, SYNC_OFF, TOOLS_BROKEN, VERSION,
 } from "./settings/testApi";
 import { railItem, renderSettings } from "./settings/testRender";
-import SettingsView from "./SettingsView";
+import SettingsView, { openSettingsSection } from "./SettingsView";
 import { ToastProvider } from "./Toast";
 
 beforeEach(resetHarness);
@@ -147,5 +147,43 @@ describe("switching sections", () => {
     fireEvent.click(railItem("Sync"));
     expect((screen.getByRole("button", { name: /Turn on sync/ }) as HTMLButtonElement).disabled).toBe(true);
     expect(api.syncTurnOn).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The nav's update chip, the update toast and the tray all open Settings at
+ * About, whether or not Settings is the tab on screen. The ask is written as the
+ * section to show, so once seen it is simply where you are: a later visit lands
+ * wherever you went next, never back on About.
+ */
+describe("opening a section from outside", () => {
+  const settingsView = () => render(<ToastProvider><SettingsView /></ToastProvider>);
+  const isOpen = (label: string) =>
+    waitFor(() => expect(railItem(label).getAttribute("aria-current")).toBe("page"));
+
+  it("opens it when Settings mounts next", async () => {
+    openSettingsSection("about");
+    settingsView();
+    await isOpen("About");
+    expect(screen.getByRole("heading", { level: 2, name: "About" })).toBeTruthy();
+  });
+
+  it("switches to it at once when Settings is already showing", async () => {
+    await renderSettings("downloads");
+    act(() => openSettingsSection("tools"));
+    await isOpen("Tools");
+    expect(screen.getByRole("heading", { level: 2, name: "Tools" })).toBeTruthy();
+    expect(railItem("Downloads").getAttribute("aria-current")).toBeNull();
+  });
+
+  it("is not applied again on a later visit", async () => {
+    openSettingsSection("about");
+    const first = settingsView();
+    await isOpen("About");
+    fireEvent.click(railItem("Sync"));
+    first.unmount();
+    settingsView();
+    await isOpen("Sync");
+    expect(railItem("About").getAttribute("aria-current")).toBeNull();
   });
 });

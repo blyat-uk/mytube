@@ -90,9 +90,15 @@ export function useAppUpdate(handler?: (update: AppUpdate) => void) {
 }
 
 /** The version state — not the news: sent after every check, so the nav's
- *  version pill and Settings' About block follow it without polling. */
+ *  update chip and Settings' About page follow it without polling. */
 export function useVersionInfo(handler?: (info: VersionInfo) => void) {
   useTauriEvent<VersionInfo>("app://version-info", handler);
+}
+
+/** The tray's "Update available" item, sent once it has brought the window
+ *  forward: the shell opens Settings at About, as the nav's chip does. */
+export function useOpenAbout(handler?: () => void) {
+  useTauriEvent<null>("app://open-about", () => handler?.());
 }
 
 /** Sync's state, sent after every sync attempt and every change to it, so the

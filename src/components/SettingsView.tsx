@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAppVersion } from "../appVersion";
 import { SettingsContext, type SectionId, type SettingsCtx } from "./settings/context";
 import { useSettingsDoc } from "./settings/doc";
@@ -11,6 +11,24 @@ import { SECTIONS } from "./settings/sections";
 /* The section left open, kept for the session: leaving for Subscriptions and
    coming back lands where you were. Deliberately not persisted. */
 let lastSection: SectionId = "downloads";
+
+/* The mounted view's `go`, so an ask from outside reaches one already showing. */
+const mounted = new Set<(id: SectionId) => void>();
+
+/**
+ * Opens Settings at `id`: at once if the view is showing, else the next time it
+ * mounts. The update chip, the update toast and the tray all land on About
+ * through here, from whichever tab is in front.
+ *
+ * The ask is written as the remembered section rather than held as a request
+ * for the view to consume, so there is nothing left over to apply twice: once
+ * shown it is just where you are, and a later visit opens wherever you went
+ * next -- never back on About.
+ */
+export function openSettingsSection(id: SectionId) {
+  lastSection = id;
+  for (const go of mounted) go(id);
+}
 
 /**
  * Settings: a rail of sections on the left, one section on the right.
@@ -42,6 +60,11 @@ export default function SettingsView({ initialSection }: { initialSection?: Sect
     setActive(id);
     setOpened((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
   }, []);
+
+  useEffect(() => {
+    mounted.add(go);
+    return () => { mounted.delete(go); };
+  }, [go]);
 
   // A section opens at its top, not at whatever offset the last one was read to.
   useLayoutEffect(() => {
