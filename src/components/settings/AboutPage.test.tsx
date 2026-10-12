@@ -6,7 +6,7 @@ vi.mock("@tauri-apps/plugin-dialog", async () => (await import("./testApi")).dia
 vi.mock("../../api", async () => (await import("./testApi")).apiModule);
 
 import { api, backend, emit, lastSaved, resetHarness, SETTINGS } from "./testApi";
-import { renderSettings } from "./testRender";
+import { railItem, renderSettings } from "./testRender";
 import { aboutStatus, summary } from "./AboutPage";
 import type { SettingsCtx } from "./context";
 import type { VersionInfo } from "../../types";
@@ -31,14 +31,18 @@ afterEach(cleanup);
 
 const page = () => screen.getByRole("region", { name: "About" });
 
-/** The About page, once the version has been read. */
+/** The About page, once the version has been read. With a newer release the
+ *  running version shows twice, in the hero and in the comparison row. */
 async function renderAbout() {
   await renderSettings("about");
-  await within(page()).findByText("2.1.0");
+  await within(page()).findAllByText("2.1.0");
   return page();
 }
 
 const checkNow = () => screen.getByRole("button", { name: "Check now" }) as HTMLButtonElement;
+const releasePage = () => screen.getByRole("button", { name: "Open release page…" });
+/** The Installed → Available row; null while there is nothing newer to name. */
+const comparison = () => page().querySelector<HTMLElement>(".st-ab-compare");
 const releaseSwitch = () =>
   screen.getByRole("switch", { name: "Check GitHub for new releases" }) as HTMLInputElement;
 
@@ -114,8 +118,56 @@ describe("the About page", () => {
     const status = page().querySelector(".st-status")!;
     expect(status.className).toContain("is-news");
     expect(status.textContent).toMatch(/MyTube 2\.2\.0 is available/);
-    fireEvent.click(await screen.findByRole("button", { name: "Get 2.2.0…" }));
+    // The comparison comes first, and the sentence about how to update stays.
+    expect(status.querySelector(".st-status-detail")!.textContent).toBe(
+      "Installed2.1.0Available2.2.0MyTube never updates itself: get it the same way you installed this one.",
+    );
+    const open = releasePage();
+    expect(open.className).toContain("btn-primary");
+    fireEvent.click(open);
     expect(api.openExternal).toHaveBeenCalledWith(RELEASE);
+  });
+
+  it("sets the installed version beside the newer one", async () => {
+    backend.version = BEHIND;
+    await renderAbout();
+    const row = comparison()!;
+    expect(row.closest(".st-status")?.className).toContain("is-news");
+    // A term and its value each, so a screen reader hears "Installed 2.1.0",
+    // not two bare numbers.
+    expect(within(row).getAllByRole("term").map((t) => t.textContent)).toEqual(["Installed", "Available"]);
+    const values = within(row).getAllByRole("definition");
+    expect(values.map((v) => v.textContent)).toEqual(["2.1.0", "2.2.0"]);
+    expect(values.every((v) => v.className.includes("st-ab-compare-value"))).toBe(true);
+    expect(values[1].className).toContain("is-new");
+  });
+
+  it("has nothing to compare while up to date", async () => {
+    await renderAbout();
+    expect(comparison()).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open release page…" })).toBeNull();
+  });
+
+  it("has nothing to compare while checks are off, even with a newer release stored", async () => {
+    backend.settings = { ...SETTINGS, check_app_updates: false };
+    backend.version = { ...BEHIND, checksEnabled: false };
+    await renderAbout();
+    expect(within(page()).getByText("Update checks are off.")).toBeDefined();
+    expect(comparison()).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open release page…" })).toBeNull();
+  });
+
+  it("marks the rail's About entry with a green ↑ pill, named for a screen reader", async () => {
+    backend.version = BEHIND;
+    await renderAbout();
+    const item = railItem("About");
+    const flag = item.querySelector(".st-flag")!;
+    expect(flag.className).toContain("is-news");
+    expect(flag.textContent).toBe("↑ 2.2.0");
+    expect(flag.getAttribute("aria-hidden")).toBe("true");
+    expect(item.querySelector(".st-marker.is-news")).not.toBeNull();
+    expect(document.getElementById(item.getAttribute("aria-describedby")!)!.textContent)
+      .toBe("MyTube 2.1.0. MyTube 2.2.0 is available");
   });
 
   it("says when it has never looked", async () => {
@@ -135,7 +187,8 @@ describe("the About page", () => {
     checkAnswers(() => Promise.resolve(BEHIND));
     await renderAbout();
     fireEvent.click(checkNow());
-    expect(await screen.findByRole("button", { name: "Get 2.2.0…" })).toBeDefined();
+    expect(await screen.findByRole("button", { name: "Open release page…" })).toBeDefined();
+    expect(comparison()?.textContent).toMatch(/Installed.*2\.1\.0.*Available.*2\.2\.0/);
     expect(screen.queryByText(/is up to date/)).toBeNull();
     // The rail follows the same answer: one copy of the version, shared.
     expect(screen.getByRole("button", { name: "About" }).textContent).toMatch(/2\.2\.0/);
@@ -197,9 +250,11 @@ describe("the About page", () => {
   it("follows app://version-info", async () => {
     await renderAbout();
     await emit("app://version-info", BEHIND);
-    expect(screen.getByRole("button", { name: "Get 2.2.0…" })).toBeDefined();
+    expect(releasePage()).toBeDefined();
+    expect(comparison()).not.toBeNull();
     await emit("app://version-info", { ...BEHIND, checksEnabled: false });
-    expect(screen.queryByRole("button", { name: "Get 2.2.0…" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open release page…" })).toBeNull();
+    expect(comparison()).toBeNull();
     expect(within(page()).getByText("Update checks are off.")).toBeDefined();
   });
 });
@@ -229,10 +284,10 @@ describe("summary", () => {
     expect(summary(ctx(UP_TO_DATE))).toEqual({ text: "MyTube 2.1.0" });
   });
 
-  it("flags a newer release in blue", () => {
+  it("flags a newer release with the update signal, ↑ and the version", () => {
     expect(summary(ctx(BEHIND))).toEqual({
       text: "MyTube 2.1.0",
-      flag: { text: "2.2.0", tone: "news", label: "MyTube 2.2.0 is available" },
+      flag: { text: "↑ 2.2.0", tone: "news", label: "MyTube 2.2.0 is available" },
     });
   });
 

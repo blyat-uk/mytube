@@ -2249,7 +2249,8 @@ label.field-label { display: block; }
   white-space: nowrap;
   transition: opacity var(--fold-time) var(--fold-ease);
 }
-.st-flag.is-news { color: var(--accent); background: var(--accent-soft); border-color: rgba(62, 166, 255, 0.5); }
+/* "news" is only ever a newer MyTube, so it wears the update signal's green. */
+.st-flag.is-news { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }
 .st-flag.is-error {
   color: #ffb9ba;
   background: var(--danger-soft);
@@ -2272,7 +2273,7 @@ label.field-label { display: block; }
   transform: scale(0.4);
   transition: opacity var(--fold-time) var(--fold-ease), transform var(--fold-time) var(--fold-ease);
 }
-.st-marker.is-news { background: var(--accent); }
+.st-marker.is-news { background: var(--ok); }
 .st-marker.is-error { background: var(--danger); }
 
 .st-rail-foot {
@@ -2547,11 +2548,22 @@ label.st-row-title { cursor: pointer; }
 .st-status.is-ok .st-status-ring { background: var(--ok-soft); color: var(--ok); border-color: rgba(86, 211, 100, 0.45); }
 .st-status.is-ok .st-status-dot { background: var(--ok); box-shadow: 0 0 0 6px rgba(86, 211, 100, 0.14), 0 0 16px rgba(86, 211, 100, 0.55); }
 
-.st-status.is-news, .st-status.is-busy {
+/* A newer MyTube: the update signal's green, like the ↑ chip beside the
+   Settings tab and the rail's pill. A notch louder than `is-ok` -- a stronger
+   wash and frame, and the ↑ ring where "up to date" has a dot. */
+.st-status.is-news {
+  background: linear-gradient(90deg, rgba(86, 211, 100, 0.14), rgba(86, 211, 100, 0.02) 80%), var(--surface);
+  border-color: var(--ok-line);
+}
+.st-status.is-news .st-status-ring {
+  background: var(--ok-soft); color: var(--ok); border-color: var(--ok-line-strong);
+}
+
+.st-status.is-busy {
   background: linear-gradient(90deg, rgba(62, 166, 255, 0.14), rgba(62, 166, 255, 0.02) 80%), var(--surface);
   border-color: rgba(62, 166, 255, 0.42);
 }
-.st-status.is-news .st-status-ring, .st-status.is-busy .st-status-ring {
+.st-status.is-busy .st-status-ring {
   background: var(--accent-soft); color: var(--accent); border-color: rgba(62, 166, 255, 0.5);
 }
 .st-status.is-busy .st-status-dot {
@@ -3681,3 +3693,57 @@ label.st-row-title { cursor: pointer; }
   .st-ab-mark::after { left: 24px; top: 13px; border-left-width: 16px; border-top-width: 9px; border-bottom-width: 9px; }
   .st-ab-name { font-size: 26px; }
 }
+
+/* Installed → Available, in the update card's text column above its sentence.
+   Each version is a caption over a mono value, drawn like the hero's
+   `.st-ab-version` so a version number looks the same everywhere on the page;
+   the newer one wears the update green. The arrow is the second item's
+   ::before, placed in the values' row so it centres on the numbers rather than
+   on the captions. The second `content` hides it from a screen reader where
+   alt text is understood; where it is not, that line is dropped and the first
+   one still draws the arrow. */
+.st-ab-compare {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  row-gap: 6px;
+  margin: 10px 0;
+}
+.st-ab-compare-item {
+  display: grid;
+  grid-template-areas: "label" "value";
+  justify-items: start;
+  row-gap: 4px;
+}
+.st-ab-compare-item + .st-ab-compare-item {
+  grid-template-columns: auto auto;
+  grid-template-areas: ". label" "arrow value";
+}
+.st-ab-compare-item + .st-ab-compare-item::before {
+  content: "→";
+  content: "→" / "";
+  grid-area: arrow;
+  align-self: center;
+  padding: 0 12px;
+  font-size: 1.6rem;
+  line-height: 1;
+  color: var(--muted);
+}
+.st-ab-compare-label {
+  grid-area: label;
+  font-size: 1.1rem;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.st-ab-compare-value {
+  grid-area: value;
+  margin: 0;
+  font: 600 1.3rem/1.6 var(--mono);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 10px;
+}
+.st-ab-compare-value.is-new { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }

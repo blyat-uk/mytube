@@ -8,12 +8,18 @@ import { useSettingsCtx, type RailLine, type SettingsCtx } from "./context";
 import { Block, SettingsPage, StatusCard, Switch, type StatusTone } from "./parts";
 import type { VersionInfo } from "../../types";
 
-/** "MyTube 4.0.0", with a blue pill naming a newer release while checks are on. */
+/**
+ * "MyTube 4.0.0", with a green "↑ 4.1.0" pill while checks are on and a newer
+ * release is known: green and ↑ are the update signal everywhere, the chip
+ * beside the Settings tab included. The pill is drawn only; `label` is what a
+ * screen reader hears in its place.
+ */
 export function summary({ version }: SettingsCtx): RailLine {
   if (!version) return { text: "MyTube" };
   const line: RailLine = { text: `MyTube ${version.current}` };
   if (version.checksEnabled && version.update) {
-    line.flag = { text: version.update.version, tone: "news", label: `MyTube ${version.update.version} is available` };
+    const next = version.update.version;
+    line.flag = { text: `↑ ${next}`, tone: "news", label: `MyTube ${next} is available` };
   }
   return line;
 }
@@ -48,9 +54,34 @@ export function aboutStatus(info: VersionInfo | null, now?: number): AboutStatus
 const CHECK = "check";
 
 /**
+ * Installed → Available: the two numbers an update is about, each named. Terms
+ * and values rather than two bare numbers, so a screen reader hears "Installed
+ * 4.2.0, Available 4.3.0"; the arrow between them is CSS, which a `<dl>` needs
+ * anyway (it cannot hold a loose element) and which keeps it from being read.
+ */
+function VersionCompare({ installed, available }: { installed: string; available: string }) {
+  return (
+    <dl className="st-ab-compare">
+      <div className="st-ab-compare-item">
+        <dt className="st-ab-compare-label">Installed</dt>
+        <dd className="st-ab-compare-value">{installed}</dd>
+      </div>
+      <div className="st-ab-compare-item">
+        <dt className="st-ab-compare-label">Available</dt>
+        <dd className="st-ab-compare-value is-new">{available}</dd>
+      </div>
+    </dl>
+  );
+}
+
+/**
  * Which MyTube this is, whether a newer one is out, and the way to its release
- * page. Notify only, like the tray item and the nav's pill — how to update
- * depends on how MyTube was installed (deb, rpm, AppImage, NSIS, dmg).
+ * page. Every route to an update ends here: the nav has no version pill any
+ * more, so the green ↑ chip beside the Settings tab opens this page, and so do
+ * the once-per-release toast and the tray's "Update available" item. Notify
+ * only — how to update depends on how MyTube was installed (deb, rpm, AppImage,
+ * NSIS, dmg) — which is why a newer release is spelled out as Installed →
+ * Available and handed over as its release page.
  *
  * The hero stands in for the page header, which stays as the page's heading
  * for a screen reader but is not drawn: a second red tile above the big mark
@@ -62,6 +93,8 @@ export default function AboutPage() {
   const { pending, slow, run } = usePending();
   const status = aboutStatus(version);
   const checksOn = settings.check_app_updates;
+  // Only while the card says so: a release stored with checks off is not news.
+  const update = status?.tone === "news" && version?.update ? version.update : null;
 
   const open = (url: string) => {
     api.openExternal(url).catch((err) => toast.error(errText(err)));
@@ -97,13 +130,18 @@ export default function AboutPage() {
           tone={status.tone}
           icon={status.tone === "news" ? <IconNewRelease /> : undefined}
           title={status.title}
-          action={version?.update && status.tone === "news" ? (
-            <button type="button" className="btn btn-primary" onClick={() => open(version.update!.url)}>
-              Get {version.update.version}…
+          action={update ? (
+            <button type="button" className="btn btn-primary" onClick={() => open(update.url)}>
+              Open release page…
             </button>
           ) : undefined}
         >
-          {status.detail}
+          {update && version ? (
+            <>
+              <VersionCompare installed={version.current} available={update.version} />
+              {status.detail}
+            </>
+          ) : status.detail}
         </StatusCard>
       )}
 
