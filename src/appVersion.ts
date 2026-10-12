@@ -24,7 +24,7 @@ export function useAppVersion(): [VersionInfo | null, (info: VersionInfo) => voi
     let alive = true;
     api.appVersionInfo()
       .then((v) => { if (alive && !heard.current) setInfo(v); })
-      // Without it the pill and the About block simply stay empty; nothing
+      // Without it the update chip and the About page simply stay empty; nothing
       // else depends on knowing the version.
       .catch(() => {});
     return () => { alive = false; };

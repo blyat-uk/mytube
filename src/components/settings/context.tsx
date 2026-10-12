@@ -37,7 +37,8 @@ export interface SettingsCtx extends Omit<SettingsDoc, "settings" | "failed" | "
  * A section's second line in the rail, and whether it needs the user.
  * `tone: "ok"` puts a green dot before the text; `"error"` turns the text pink
  * and marks the item (a pink "!" pill, a red dot on the folded glyph). `flag`
- * is a pill at the item's end: `news` blue (a newer release), `error` pink.
+ * is a pill at the item's end: `news` green (a newer release, "↑ 4.3.0"),
+ * `error` pink.
  */
 export interface RailLine {
   text: string;
