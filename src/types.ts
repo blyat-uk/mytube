@@ -146,6 +146,12 @@ export interface Quality {
   audio_format: QualityAudioFormat;
   /** A raw yt-dlp `-f` string. Non-empty overrides the stream selects. */
   format: string;
+  /** Embed every subtitle track the uploader provided — never YouTube's
+   *  automatic captions. Only a merged MKV or MP4 takes them; see
+   *  `canEmbedSubtitles`. */
+  subtitles: boolean;
+  /** Embed the video's chapter markers; every container MyTube makes takes them. */
+  chapters: boolean;
 }
 
 export interface VideoTrack {

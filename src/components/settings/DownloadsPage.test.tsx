@@ -463,6 +463,108 @@ describe("Quality", () => {
   });
 });
 
+describe("Also in the file", () => {
+  const subtitles = () => screen.getByRole("switch", { name: "Include subtitles" }) as HTMLInputElement;
+  const chapters = () => screen.getByRole("switch", { name: "Include chapters" }) as HTMLInputElement;
+  const hint = (el: HTMLElement) =>
+    document.getElementById(el.getAttribute("aria-describedby")!)!.textContent;
+  const SUBS_HINT = "Every language the uploader provided — YouTube's automatic captions are never added.";
+
+  it("sits directly under Quality", async () => {
+    await renderSettings("downloads");
+    const page = screen.getByRole("region", { name: "Downloads" });
+    expect(within(page).getAllByRole("heading", { level: 3 }).map((h) => h.textContent))
+      .toEqual(["Quality", "Also in the file", "At once"]);
+  });
+
+  it("starts with subtitles off and chapters on, each saying what it adds", async () => {
+    await renderSettings("downloads");
+    expect(subtitles().checked).toBe(false);
+    expect(subtitles().disabled).toBe(false);
+    expect(hint(subtitles())).toBe(SUBS_HINT);
+    expect(chapters().checked).toBe(true);
+    expect(chapters().disabled).toBe(false);
+    expect(hint(chapters())).toBe(
+      "Chapter markers from the video's description, so your player can skip between them.",
+    );
+  });
+
+  it("saves each switch at once, the rest of the quality as it was", async () => {
+    backend.settings = withQuality({ max_height: 1080, container: "mp4" });
+    await renderSettings("downloads");
+    fireEvent.click(subtitles());
+    await waitFor(() => expect(saves()).toBe(1));
+    expect(lastSaved()).toEqual({
+      ...SETTINGS, quality: { ...DEFAULT_QUALITY, max_height: 1080, container: "mp4", subtitles: true },
+    });
+    expect(subtitles().checked).toBe(true);
+
+    fireEvent.click(chapters());
+    await waitFor(() => expect(saves()).toBe(2));
+    expect(lastSaved().quality).toEqual({
+      ...DEFAULT_QUALITY, max_height: 1080, container: "mp4", subtitles: true, chapters: false,
+    });
+    expect(chapters().checked).toBe(false);
+  });
+
+  it("is off and disabled in audio mode, says why, and keeps the stored choice", async () => {
+    backend.settings = withQuality({ mode: "audio", subtitles: true });
+    await renderSettings("downloads");
+    expect(subtitles().checked).toBe(false);
+    expect(subtitles().disabled).toBe(true);
+    expect(hint(subtitles())).toBe("Audio files can't hold subtitles.");
+    // An audio file still takes chapters.
+    expect(chapters().disabled).toBe(false);
+
+    // Drawn off is not saved off: another pick writes the choice back untouched.
+    fireEvent.click(radio("Audio format", "MP3"));
+    await waitFor(() => expect(saves()).toBe(1));
+    expect(lastSaved().quality).toEqual({
+      ...DEFAULT_QUALITY, mode: "audio", audio_format: "mp3", subtitles: true,
+    });
+
+    // Back to video, it applies again, and is on.
+    fireEvent.click(radio("Mode", "Video"));
+    expect(subtitles().disabled).toBe(false);
+    expect(subtitles().checked).toBe(true);
+    expect(hint(subtitles())).toBe(SUBS_HINT);
+    await waitFor(() => expect(lastSaved().quality.mode).toBe("video"));
+    expect(lastSaved().quality.subtitles).toBe(true);
+  });
+
+  it("saves nothing for a click on the disabled switch", async () => {
+    backend.settings = withQuality({ mode: "audio", subtitles: true });
+    await renderSettings("downloads");
+    fireEvent.click(subtitles());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(saves()).toBe(0);
+  });
+
+  it("is off and disabled for a raw single-stream -f, and comes back for a merge", async () => {
+    backend.settings = withQuality({ format: "18", subtitles: true });
+    await renderSettings("downloads");
+    expect(subtitles().checked).toBe(false);
+    expect(subtitles().disabled).toBe(true);
+    expect(hint(subtitles())).toBe("Needs a merged MKV or MP4 — the raw -f picks a single stream.");
+    expect(chapters().disabled).toBe(false);
+
+    // Follows the field as it is typed, before the blur saves it.
+    fireEvent.change(screen.getByLabelText("Format (-f)"), { target: { value: "399+251" } });
+    expect(subtitles().disabled).toBe(false);
+    expect(subtitles().checked).toBe(true);
+    expect(hint(subtitles())).toBe(SUBS_HINT);
+  });
+
+  it("is enabled for a raw merge like 399+251", async () => {
+    backend.settings = withQuality({ format: "399+251" });
+    await renderSettings("downloads");
+    expect(subtitles().disabled).toBe(false);
+    fireEvent.click(subtitles());
+    await waitFor(() => expect(saves()).toBe(1));
+    expect(lastSaved().quality).toEqual({ ...DEFAULT_QUALITY, format: "399+251", subtitles: true });
+  });
+});
+
 describe("At once", () => {
   const lit = () => document.querySelectorAll(".st-dl-lanes i.is-on").length;
   const increase = () => screen.getByRole("button", { name: "Increase concurrent downloads" }) as HTMLButtonElement;

@@ -218,6 +218,10 @@ pub fn unique_path(intended: &Path, is_taken: impl Fn(&Path) -> bool) -> PathBuf
 /// mkv/mka, ogg/opus/flac, m4a/mp4/m4v/mov`. An `original`-audio pick or a
 /// single-stream raw format may well be webm, and `final_ext` is `None` for
 /// exactly those.
+///
+/// Chapters and subtitles are download-only too, never in `common_format_args`:
+/// picking subtitles prints `[info] …: Downloading subtitles: …` to stdout,
+/// which the probe reads by position.
 pub fn download_args(r: &Runner, q: &Quality, video_id: &str, out_path: &Path,
                      print_file: &Path) -> Vec<String> {
     let mut a = common_format_args(r, q);
@@ -225,6 +229,36 @@ pub fn download_args(r: &Runner, q: &Quality, video_id: &str, out_path: &Path,
         a.extend([
             s("--embed-thumbnail"),
             s("--convert-thumbnails"), s("jpg"),
+        ]);
+    }
+    // Unlike a thumbnail, chapters go into anything. Verified 2026-10-12
+    // (yt-dlp 2026.10.10 nightly, cko1HzN9OA4, 7 chapters): all seven landed in
+    // mkv, mp4, m4a, mp3, opus and the original webm audio.
+    if q.chapters {
+        a.push(s("--embed-chapters"));
+    }
+    // Every track the uploader provided, as srt, embedded and then deleted.
+    // Verified on dQw4w9WgXcQ (en, de-DE, ja, pt-BR, es-419): mkv gets five
+    // subrip tracks, mp4 five mov_text, each tagged with its language.
+    //
+    // - No `--write-subs`. yt-dlp decides whether to keep the sidecar `.srt`
+    //   files from `writesubtitles` as given, *before* `--embed-subs` turns it
+    //   on for itself (`__init__.py`, `already_have_subtitle`): `--embed-subs`
+    //   alone deletes them once they are in the video, `--write-subs` with it
+    //   leaves them beside it.
+    // - No `--write-auto-subs`: those are YouTube's machine captions, and with
+    //   it set `--embed-subs` no longer turns the uploader's ones on at all.
+    // - `-live_chat`: a live replay lists its chat as a subtitle, and fetching
+    //   it downloads the entire chat. It must follow `all`, since yt-dlp reads
+    //   the list left to right and a later `all` would put it back.
+    // - srt, not vtt: YouTube serves srt directly, its vtt for automatic
+    //   captions repeats each line karaoke-style, and srt embeds in both
+    //   containers (mp4 converts it to mov_text).
+    if quality::embeds_subtitles(q) {
+        a.extend([
+            s("--embed-subs"),
+            s("--sub-langs"), s("all,-live_chat"),
+            s("--sub-format"), s("srt/best"),
         ]);
     }
     a.extend([
@@ -236,6 +270,13 @@ pub fn download_args(r: &Runner, q: &Quality, video_id: &str, out_path: &Path,
         watch_url(video_id),
     ]);
     a
+}
+
+/// Whether a failed download failed over a subtitle track. yt-dlp fetches
+/// subtitles before the video and turns one failed fetch into a failed
+/// download; `queue::run_one` then runs it again without them.
+pub fn is_subtitle_failure(stderr: &str) -> bool {
+    stderr.contains("Unable to download video subtitles")
 }
 
 /// Runs phase 1 and returns the resolved metadata plus intended path.
@@ -681,7 +722,10 @@ mod tests {
         if !cfg!(windows) {
             want.push("--no-windows-filenames".into());
         }
-        want.extend(["--embed-thumbnail", "--convert-thumbnails", "jpg", "--newline",
+        // The one deliberate change since: chapters are embedded by default
+        // (`Quality::chapters`), because every container takes them.
+        want.extend(["--embed-thumbnail", "--convert-thumbnails", "jpg",
+                     "--embed-chapters", "--newline",
                      "--progress-template", PROGRESS_TEMPLATE,
                      "--print-to-file", "after_move:filepath", "/tmp/p",
                      "-o", "/out/x.mkv", "https://www.youtube.com/watch?v=abc123"]
@@ -703,6 +747,150 @@ mod tests {
         assert!(!has(&Quality { format: "251".into(), ..Quality::default() }),
                 "one raw stream may be webm");
         assert!(has(&Quality { format: "399+251".into(), ..Quality::default() }));
+    }
+
+    const SUBTITLE_FLAGS: [&str; 3] = ["--embed-subs", "--sub-langs", "--sub-format"];
+
+    fn download(q: &Quality) -> Vec<String> {
+        download_args(&full(), q, "x", &PathBuf::from("/o/x"), &PathBuf::from("/p"))
+    }
+
+    fn has_flag(a: &[String], flag: &str) -> bool {
+        a.iter().any(|x| x == flag)
+    }
+
+    fn with_subs(f: fn(&mut Quality)) -> Quality {
+        let mut q = Quality { subtitles: true, ..Quality::default() };
+        f(&mut q);
+        q
+    }
+
+    fn audio_with_subs(f: &str) -> Quality {
+        Quality { mode: "audio".into(), audio_format: f.into(), subtitles: true,
+                  ..Quality::default() }
+    }
+
+    #[test]
+    fn chapters_are_embedded_by_default_and_subtitles_are_not() {
+        let a = download(&Quality::default());
+        assert!(has_flag(&a, "--embed-chapters"), "{a:?}");
+        for flag in SUBTITLE_FLAGS {
+            assert!(!has_flag(&a, flag), "{flag} in {a:?}");
+        }
+    }
+
+    #[test]
+    fn chapters_off_passes_no_chapter_flag() {
+        let a = download(&Quality { chapters: false, ..Quality::default() });
+        assert!(!has_flag(&a, "--embed-chapters"), "{a:?}");
+    }
+
+    #[test]
+    fn chapters_go_into_every_container_even_webm() {
+        let raw = |f: &str| Quality { format: f.into(), ..Quality::default() };
+        let audio = |f: &str| Quality { mode: "audio".into(), audio_format: f.into(),
+                                        ..Quality::default() };
+        for q in [Quality { container: "mp4".into(), ..Quality::default() },
+                  audio("original"), audio("m4a"), audio("mp3"), audio("opus"),
+                  raw("18"), raw("251")] {
+            assert!(has_flag(&download(&q), "--embed-chapters"), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn subtitles_are_embedded_into_a_merged_mkv_or_mp4() {
+        for q in [with_subs(|_| {}),
+                  with_subs(|q| q.container = "mp4".into()),
+                  with_subs(|q| q.format = "399+251".into())] {
+            let a = download(&q);
+            assert!(has_flag(&a, "--embed-subs"), "{a:?}");
+            assert_eq!(value_of(&a, "--sub-langs").as_deref(), Some("all,-live_chat"));
+            assert_eq!(value_of(&a, "--sub-format").as_deref(), Some("srt/best"));
+            assert_eq!(a.iter().filter(|x| SUBTITLE_FLAGS.contains(&x.as_str())).count(), 3,
+                       "each flag once: {a:?}");
+            assert!(has_flag(&a, "--embed-chapters"), "chapters too: {a:?}");
+        }
+    }
+
+    /// A live replay lists its chat as a subtitle "language", and fetching it
+    /// downloads the whole chat. yt-dlp walks `--sub-langs` left to right, a
+    /// `-` entry removing what the entries before it added -- so the exclusion
+    /// has to come after `all`, or `all` would put the chat straight back.
+    #[test]
+    fn live_chat_is_never_a_subtitle() {
+        for q in [with_subs(|_| {}), with_subs(|q| q.container = "mp4".into())] {
+            let a = download(&q);
+            let langs = value_of(&a, "--sub-langs").unwrap();
+            let langs: Vec<&str> = langs.split(',').collect();
+            let all = langs.iter().position(|l| *l == "all").expect("all");
+            let chat = langs.iter().position(|l| *l == "-live_chat").expect("-live_chat");
+            assert!(chat > all, "{langs:?}");
+            assert!(!langs.contains(&"live_chat"), "{langs:?}");
+        }
+    }
+
+    /// `--embed-subs` alone deletes the fetched `.srt` files once they are in
+    /// the video; adding `--write-subs` keeps them beside it, and any of the
+    /// automatic-caption flags brings YouTube's machine captions in.
+    #[test]
+    fn no_subtitle_file_is_ever_written_and_no_automatic_caption_fetched() {
+        let qs = [Quality::default(), with_subs(|_| {}), with_subs(|q| q.container = "mp4".into()),
+                  audio_with_subs("mp3"), with_subs(|q| q.format = "251".into())];
+        for q in &qs {
+            let argvs = [download(q), probe_args(&full(), q, "u", "/out", "t"),
+                         formats_args(&full(), q, "x")];
+            for a in &argvs {
+                for flag in ["--write-subs", "--write-srt", "--write-auto-subs",
+                             "--write-automatic-subs", "--write-auto-sub", "--all-subs"] {
+                    assert!(!has_flag(a, flag), "{flag} in {a:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_audio_download_asks_for_no_subtitles_but_keeps_its_chapters() {
+        for f in ["original", "m4a", "mp3", "opus"] {
+            let a = download(&audio_with_subs(f));
+            for flag in SUBTITLE_FLAGS {
+                assert!(!has_flag(&a, flag), "{f}: {flag} in {a:?}");
+            }
+            assert!(has_flag(&a, "--embed-chapters"), "{f}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn a_raw_single_stream_asks_for_no_subtitles() {
+        for one in [with_subs(|q| q.format = "18".into()), with_subs(|q| q.format = "251".into())] {
+            let a = download(&one);
+            for flag in SUBTITLE_FLAGS {
+                assert!(!has_flag(&a, flag), "{flag} in {a:?}");
+            }
+        }
+    }
+
+    /// The probe's stdout is read positionally, and choosing subtitles prints
+    /// `[info] …: Downloading subtitles: …` there; the format listing is a
+    /// JSON document. Neither has anything to embed into anyway.
+    #[test]
+    fn the_probe_and_the_format_listing_carry_no_subtitle_or_chapter_flag() {
+        for q in [with_subs(|_| {}), with_subs(|q| q.container = "mp4".into()),
+                  audio_with_subs("mp3")] {
+            for a in [probe_args(&full(), &q, "u", "/out", "t"), formats_args(&full(), &q, "x")] {
+                for flag in SUBTITLE_FLAGS.iter().chain(&["--embed-chapters"]) {
+                    assert!(!has_flag(&a, flag), "{flag} in {a:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_subtitle_fetch_is_recognised_and_nothing_else_is() {
+        assert!(is_subtitle_failure(
+            "ERROR: Unable to download video subtitles for 'de-DE': HTTP Error 429: Too Many \
+             Requests"));
+        assert!(!is_subtitle_failure("ERROR: [youtube] xyz: Video unavailable"));
+        assert!(!is_subtitle_failure(""));
     }
 
     #[test]

@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import type { Quality, VideoFormats } from "./types";
 import { MB, a, rickroll, v } from "./quality.fixture";
 import {
-  DEFAULT_QUALITY, HEIGHT_OPTIONS, audioChoices, codecChoices, fpsChoices, formatSize,
-  hdrChoices, heightChoices, initialPick, languageChoices, overriddenByFormat, pickSize,
-  pickVideo, resolveExact, sanitizeQuality, withAudioLanguage, withVideo,
+  DEFAULT_QUALITY, HEIGHT_OPTIONS, audioChoices, canEmbedSubtitles, codecChoices, fpsChoices,
+  formatSize, hdrChoices, heightChoices, initialPick, languageChoices, overriddenByFormat,
+  pickSize, pickVideo, resolveExact, sanitizeQuality, withAudioLanguage, withVideo,
 } from "./quality";
 
 describe("formatSize", () => {
@@ -19,6 +19,13 @@ describe("formatSize", () => {
   });
 });
 
+describe("DEFAULT_QUALITY", () => {
+  it("leaves subtitles out and puts chapters in, as Quality::default() does", () => {
+    expect(DEFAULT_QUALITY.subtitles).toBe(false);
+    expect(DEFAULT_QUALITY.chapters).toBe(true);
+  });
+});
+
 describe("sanitizeQuality", () => {
   it("fills a missing block with the defaults", () => {
     expect(sanitizeQuality(undefined)).toEqual(DEFAULT_QUALITY);
@@ -26,6 +33,25 @@ describe("sanitizeQuality", () => {
   it("repairs unknown values field by field", () => {
     const q = sanitizeQuality({ mode: "audio", vcodec: "h265" as never, max_height: 1080 });
     expect(q).toEqual({ ...DEFAULT_QUALITY, mode: "audio", max_height: 1080 });
+  });
+  it("keeps both switches when they are booleans", () => {
+    const q = sanitizeQuality({ ...DEFAULT_QUALITY, subtitles: true, chapters: false });
+    expect(q).toEqual({ ...DEFAULT_QUALITY, subtitles: true, chapters: false });
+  });
+  it("reads a block from before the switches as their defaults", () => {
+    const { subtitles: _s, chapters: _c, ...older } = DEFAULT_QUALITY;
+    expect(sanitizeQuality(older)).toEqual(DEFAULT_QUALITY);
+  });
+  it("repairs a switch that is not a boolean to its own default, and nothing else", () => {
+    for (const bad of ["yes", 1, 0, null, "true"]) {
+      const q = sanitizeQuality({ ...DEFAULT_QUALITY, mode: "audio", subtitles: bad as never, chapters: bad as never });
+      expect(q).toEqual({ ...DEFAULT_QUALITY, mode: "audio" });
+    }
+    // Each on its own: a broken one never resets the other.
+    expect(sanitizeQuality({ ...DEFAULT_QUALITY, subtitles: true, chapters: "no" as never }))
+      .toEqual({ ...DEFAULT_QUALITY, subtitles: true });
+    expect(sanitizeQuality({ ...DEFAULT_QUALITY, subtitles: 1 as never, chapters: false }))
+      .toEqual({ ...DEFAULT_QUALITY, chapters: false });
   });
   it("offers the heights the backend accepts, best first", () => {
     expect(HEIGHT_OPTIONS.map((o) => o.value)).toEqual([0, 2160, 1440, 1080, 720, 480, 360]);
@@ -39,6 +65,36 @@ describe("overriddenByFormat", () => {
   });
   it("is the stream selects once a raw -f is typed", () => {
     expect(overriddenByFormat({ ...DEFAULT_QUALITY, format: "137+140" })).toBe(true);
+  });
+});
+
+describe("canEmbedSubtitles", () => {
+  const can = (q: Partial<Quality>) => canEmbedSubtitles({ ...DEFAULT_QUALITY, ...q });
+
+  it("is the merged video, in either container", () => {
+    expect(can({})).toBe(true);
+    expect(can({ container: "mp4" })).toBe(true);
+  });
+  it("is never an audio file, whatever it is converted to or picked by", () => {
+    for (const audio_format of ["original", "m4a", "mp3", "opus"] as const) {
+      expect(can({ mode: "audio", audio_format })).toBe(false);
+    }
+    expect(can({ mode: "audio", format: "251" })).toBe(false);
+    expect(can({ mode: "audio", format: "bv+ba" })).toBe(false);
+  });
+  it("follows a raw -f: a merge can, a single stream cannot", () => {
+    expect(can({ format: "399+251" })).toBe(true);
+    expect(can({ format: "bv*+ba/b" })).toBe(true);
+    expect(can({ format: "18" })).toBe(false);
+    expect(can({ format: "bv*/b" })).toBe(false);
+  });
+  it("reads a raw -f of only spaces as none, as Rust's sanitize does", () => {
+    expect(can({ format: "   " })).toBe(true);
+    expect(can({ format: " 18 " })).toBe(false);
+  });
+  it("asks only whether the file could hold them, not whether they are wanted", () => {
+    expect(can({ subtitles: false })).toBe(true);
+    expect(can({ subtitles: true, mode: "audio" })).toBe(false);
   });
 });
 
@@ -61,7 +117,7 @@ describe("initialPick", () => {
     const pick = initialPick(rickroll(), DEFAULT_QUALITY);
     expect(pick).toEqual({
       mode: "video", videoId: "401", audioId: "251", container: "mkv",
-      audio_format: "original", format: "",
+      audio_format: "original", format: "", subtitles: false, chapters: true,
     });
   });
 
@@ -80,6 +136,13 @@ describe("initialPick", () => {
     expect(pick.audio_format).toBe("mp3");
     // A raw -f in settings is not carried: the preselection already is its answer.
     expect(initialPick(rickroll(), { ...DEFAULT_QUALITY, format: "bv+ba" }).format).toBe("");
+  });
+
+  it("takes what goes into the file from the settings", () => {
+    const base: Quality = { ...DEFAULT_QUALITY, subtitles: true, chapters: false };
+    const pick = initialPick(rickroll(), base);
+    expect(pick.subtitles).toBe(true);
+    expect(pick.chapters).toBe(false);
   });
 
   it("is audio-only for a video with no video tracks", () => {
@@ -178,6 +241,17 @@ describe("resolveExact", () => {
   it("carries the container", () => {
     const pick = { ...initialPick(f, DEFAULT_QUALITY), container: "mp4" as const };
     expect(resolveExact(f, pick)?.container).toBe("mp4");
+  });
+
+  it("carries the Settings' subtitles and chapters into the override", () => {
+    const base: Quality = { ...DEFAULT_QUALITY, subtitles: true, chapters: false };
+    const pick = { ...initialPick(f, base), videoId: "399" };
+    expect(resolveExact(f, pick)).toEqual({
+      ...DEFAULT_QUALITY, format: "399+251", subtitles: true, chapters: false,
+    });
+    // Audio mode and a raw -f build their override from the same base.
+    expect(resolveExact(f, { ...pick, mode: "audio" })).toMatchObject({ subtitles: true, chapters: false });
+    expect(resolveExact(f, { ...pick, format: "18" })).toMatchObject({ subtitles: true, chapters: false });
   });
 
   it("lets a raw -f win over the tracks", () => {

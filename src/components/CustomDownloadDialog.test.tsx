@@ -74,6 +74,17 @@ describe("CustomDownloadDialog", () => {
     expect(onQueued).toHaveBeenCalledWith(VIDEO);
   });
 
+  it("keeps the Settings' subtitles and chapters in the exact override", async () => {
+    quality = { ...DEFAULT_QUALITY, subtitles: true, chapters: false };
+    const { onClose } = renderDialog();
+    await screen.findByLabelText("Resolution");
+    fireEvent.click(downloadButton());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(enqueueDownload).toHaveBeenCalledWith(
+      "dQw4w9WgXcQ", { ...DEFAULT_QUALITY, format: "401+251", subtitles: true, chapters: false },
+    );
+  });
+
   it("falls back to the Settings preferences when the probe fails", async () => {
     quality = { ...DEFAULT_QUALITY, mode: "audio", audio_format: "mp3" };
     probeFormats.mockImplementation(() => Promise.reject("Sign in to confirm you're not a bot"));

@@ -17,7 +17,7 @@ import type {
  *  argv MyTube used before quality was a setting. */
 export const DEFAULT_QUALITY: Quality = {
   mode: "video", max_height: 0, vcodec: "any", fps: "any", container: "mkv",
-  audio_format: "original", format: "",
+  audio_format: "original", format: "", subtitles: false, chapters: true,
 };
 
 export interface Option<T> { value: T; label: string }
@@ -60,6 +60,11 @@ export const AUDIO_FORMAT_OPTIONS: Option<QualityAudioFormat>[] = [
 const oneOf = <T>(options: Option<T>[], value: unknown, fallback: T): T =>
   options.some((o) => o.value === value) ? (value as T) : fallback;
 
+/** Rust's `or_false` / `or_true`: a switch that is not a boolean costs that
+ *  switch, and nothing else in the block. */
+const flag = (value: unknown, fallback: boolean): boolean =>
+  typeof value === "boolean" ? value : fallback;
+
 /**
  * The frontend's half of `Quality::sanitize`. Rust already repairs the block on
  * every read; this is for a Settings built without one — a backend a step
@@ -76,6 +81,8 @@ export function sanitizeQuality(q: Partial<Quality> | null | undefined): Quality
     container: oneOf(CONTAINER_OPTIONS, q.container, d.container),
     audio_format: oneOf(AUDIO_FORMAT_OPTIONS, q.audio_format, d.audio_format),
     format: typeof q.format === "string" ? q.format : d.format,
+    subtitles: flag(q.subtitles, d.subtitles),
+    chapters: flag(q.chapters, d.chapters),
   };
 }
 
@@ -83,6 +90,17 @@ export function sanitizeQuality(q: Partial<Quality> | null | undefined): Quality
  *  them stop meaning anything; the form disables them to say so. */
 export function overriddenByFormat(q: { format: string }): boolean {
   return q.format.trim() !== "";
+}
+
+/**
+ * Whether the finished file could hold subtitles at all — `embeds_subtitles` in
+ * quality.rs without its `subtitles` half, so the switch can say when it would
+ * do nothing. Only a merged MKV or MP4 takes them: an audio file cannot, and a
+ * raw `-f` with no `+` picks one stream that is never remuxed and may be webm.
+ */
+export function canEmbedSubtitles(q: Quality): boolean {
+  if (q.mode === "audio") return false;
+  return !overriddenByFormat(q) || q.format.includes("+");
 }
 
 /** "~30 MB". Every size here is YouTube's estimate, and one it may not give. */
@@ -119,6 +137,10 @@ export interface ExactPick {
   audio_format: QualityAudioFormat;
   /** The Advanced raw `-f` field, empty unless typed in. */
   format: string;
+  /** Carried from Settings rather than offered here: they decide what goes
+   *  into the file, not which streams, and the override must not drop them. */
+  subtitles: boolean;
+  chapters: boolean;
 }
 
 interface VideoWant {
@@ -169,7 +191,7 @@ export function initialPick(f: VideoFormats, base: Quality): ExactPick {
   else if (audioId === null) mode = "video";
   return {
     mode, videoId, audioId, container: base.container, audio_format: base.audio_format,
-    format: "",
+    format: "", subtitles: base.subtitles, chapters: base.chapters,
   };
 }
 
@@ -281,7 +303,7 @@ export const audioLanguage = (t: AudioTrack) => langKey(t);
 export function resolveExact(f: VideoFormats, pick: ExactPick): Quality | null {
   const base: Quality = {
     ...DEFAULT_QUALITY, mode: pick.mode, container: pick.container,
-    audio_format: pick.audio_format,
+    audio_format: pick.audio_format, subtitles: pick.subtitles, chapters: pick.chapters,
   };
   if (overriddenByFormat(pick)) return { ...base, format: pick.format.trim() };
   const video = selectedVideo(f, pick);

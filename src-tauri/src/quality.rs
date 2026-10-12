@@ -30,6 +30,15 @@ pub struct Quality {
     /// A raw yt-dlp `-f` string. Non-empty replaces the selects above for the
     /// choice of streams; `container` and `audio_format` still apply.
     pub format: String,
+    /// Embed every subtitle track the uploader provided -- never YouTube's
+    /// automatic captions, never a live replay's chat. Only a merged MKV or
+    /// MP4 can hold them: see [`embeds_subtitles`].
+    #[serde(deserialize_with = "or_false")]
+    pub subtitles: bool,
+    /// Embed the video's chapter markers. Every container MyTube produces
+    /// takes them.
+    #[serde(deserialize_with = "or_true")]
+    pub chapters: bool,
 }
 
 pub const HEIGHTS: [u32; 6] = [2160, 1440, 1080, 720, 480, 360];
@@ -49,8 +58,20 @@ impl Default for Quality {
             container: "mkv".into(),
             audio_format: "original".into(),
             format: String::new(),
+            subtitles: false,
+            chapters: true,
         }
     }
+}
+
+/// A switch that is not a bool -- a hand edit of settings.json -- costs that
+/// switch, read as its default, and nothing else in the block.
+fn or_false<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_bool().unwrap_or(false))
+}
+
+fn or_true<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_bool().unwrap_or(true))
 }
 
 fn repair(value: &mut String, allowed: &[&str]) {
@@ -214,6 +235,13 @@ pub fn final_ext(q: &Quality) -> Option<&'static str> {
     }
 }
 
+/// Whether a download with `q` embeds subtitles: asked for, and the finished
+/// file is a merged MKV or MP4. An audio file cannot hold them, and a raw
+/// single-stream pick may be webm, which takes WebVTT alone.
+pub fn embeds_subtitles(q: &Quality) -> bool {
+    q.subtitles && matches!(final_ext(q), Some("mkv" | "mp4"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +369,8 @@ mod tests {
             container: "avi".into(),
             audio_format: "flac".into(),
             format: "  137+140  ".into(),
+            subtitles: false,
+            chapters: true,
         };
         bad.sanitize();
         assert_eq!(bad, Quality { format: "137+140".into(), ..Quality::default() });
@@ -352,6 +382,8 @@ mod tests {
             q.fps = "prefer60".into();
             q.container = "mp4".into();
             q.audio_format = "opus".into();
+            q.subtitles = true;
+            q.chapters = false;
         });
         let before = good.clone();
         good.sanitize();
@@ -372,5 +404,79 @@ mod tests {
     fn missing_keys_take_their_defaults() {
         let x: Quality = serde_json::from_str(r#"{"mode":"audio"}"#).unwrap();
         assert_eq!(x, Quality { mode: "audio".into(), ..Quality::default() });
+    }
+
+    #[test]
+    fn chapters_are_on_and_subtitles_off_by_default() {
+        let d = Quality::default();
+        assert!(d.chapters);
+        assert!(!d.subtitles);
+    }
+
+    #[test]
+    fn a_block_saved_before_the_switches_existed_takes_their_defaults() {
+        // Every key a 4.1 settings.json carries, and neither switch.
+        let x: Quality = serde_json::from_str(
+            r#"{"mode":"video","max_height":1080,"vcodec":"any","fps":"any",
+                "container":"mp4","audio_format":"original","format":""}"#).unwrap();
+        assert!(x.chapters, "chapters come on for an existing user");
+        assert!(!x.subtitles);
+    }
+
+    #[test]
+    fn a_wrong_typed_switch_costs_only_itself() {
+        let raw = r#"{"mode":"audio","subtitles":"yes","chapters":0}"#;
+        let want = Quality { mode: "audio".into(), ..Quality::default() };
+        let x: Quality = serde_json::from_str(raw).unwrap();
+        assert_eq!(x, want);
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(lenient(v).unwrap(), want, "and the block is not thrown away for it");
+
+        let null: Quality = serde_json::from_str(r#"{"subtitles":null,"chapters":null}"#).unwrap();
+        assert_eq!(null, Quality::default());
+    }
+
+    #[test]
+    fn both_switches_survive_a_round_trip_through_json() {
+        let x = q(|q| {
+            q.subtitles = true;
+            q.chapters = false;
+        });
+        let back: Quality = serde_json::from_value(serde_json::to_value(&x).unwrap()).unwrap();
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn subtitles_are_embedded_only_into_a_merged_mkv_or_mp4() {
+        let subs = |f: fn(&mut Quality)| q(|q| {
+            q.subtitles = true;
+            f(q);
+        });
+        assert!(embeds_subtitles(&subs(|_| {})), "mkv");
+        assert!(embeds_subtitles(&subs(|q| q.container = "mp4".into())), "mp4");
+        assert!(embeds_subtitles(&subs(|q| q.format = "399+251".into())), "a raw merge");
+        assert!(embeds_subtitles(&subs(|q| {
+            q.format = "399+251".into();
+            q.container = "mp4".into();
+        })), "a raw merge into mp4");
+
+        for f in ["original", "m4a", "mp3", "opus"] {
+            let audio = q(|q| {
+                q.subtitles = true;
+                q.mode = "audio".into();
+                q.audio_format = f.into();
+            });
+            assert!(!embeds_subtitles(&audio), "an audio file holds no subtitles: {f}");
+        }
+        for one in ["18", "251"] {
+            let raw = q(|q| {
+                q.subtitles = true;
+                q.format = one.into();
+            });
+            assert!(!embeds_subtitles(&raw), "one raw stream may be webm: {one}");
+        }
+
+        assert!(!embeds_subtitles(&Quality::default()), "off is off");
+        assert!(!embeds_subtitles(&q(|q| q.container = "mp4".into())), "off is off in mp4");
     }
 }

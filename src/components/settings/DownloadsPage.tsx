@@ -4,7 +4,7 @@ import {
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, errText } from "../../api";
 import { TEMPLATE_PRESETS, TOKEN_CHIPS, insertToken } from "../../format";
-import { overriddenByFormat, sanitizeQuality } from "../../quality";
+import { canEmbedSubtitles, overriddenByFormat, sanitizeQuality } from "../../quality";
 import type {
   Quality, QualityAudioFormat, QualityCodec, QualityContainer, QualityFps, QualityMode,
   VideoFilter,
@@ -20,7 +20,7 @@ import {
   SAMPLE_VIDEO, folderName, folderSegments, renderTemplate, splitRendered, templateFields,
   type PreviewVideo,
 } from "./filenamePreview";
-import { Block, Cap, Segmented, SettingsPage, Stepper, type SegOption } from "./parts";
+import { Block, Cap, Segmented, SettingsPage, Stepper, Switch, type SegOption } from "./parts";
 
 const CODEC_SHORT = { any: "", av1: "AV1", vp9: "VP9", h264: "H.264" } as const;
 const AUDIO_SHORT = { original: "Original", m4a: "M4A", mp3: "MP3", opus: "Opus" } as const;
@@ -48,6 +48,7 @@ export default function DownloadsPage() {
         <SavedAs />
       </Block>
       <QualityBlock />
+      <AlsoInFile />
       <AtOnce />
     </SettingsPage>
   );
@@ -549,6 +550,48 @@ function RawFormat({ id, value, onChange, onBlur }: {
       />
       <p className="st-dl-raw-hint" id={`${inputId}-hint`}>{hint}</p>
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Also in the file
+ * ------------------------------------------------------------------ */
+
+/**
+ * What is embedded beside the streams. Part of the same `Quality` as the block
+ * above, so each switch saves the whole block at once, the way its picks do.
+ *
+ * Subtitles only fit a merged MKV or MP4. Where the quality above rules that
+ * out, the switch is drawn off and disabled but the stored choice is left
+ * alone: switching back to video, or to a raw `-f` that merges, finds it as it
+ * was. The hint says which of the two is in the way.
+ */
+function AlsoInFile() {
+  const { settings, save } = useSettingsCtx();
+  const q = sanitizeQuality(settings.quality);
+  const fits = canEmbedSubtitles(q);
+  const subtitlesHint = fits
+    ? "Every language the uploader provided — YouTube's automatic captions are never added."
+    : q.mode === "audio"
+      ? "Audio files can't hold subtitles."
+      : "Needs a merged MKV or MP4 — the raw -f picks a single stream.";
+
+  return (
+    <Block title="Also in the file">
+      <Switch
+        label="Include subtitles"
+        hint={subtitlesHint}
+        checked={q.subtitles && fits}
+        disabled={!fits}
+        onChange={(on) => save("quality", { ...q, subtitles: on })}
+      />
+      <Switch
+        label="Include chapters"
+        hint="Chapter markers from the video's description, so your player can skip between them."
+        checked={q.chapters}
+        onChange={(on) => save("quality", { ...q, chapters: on })}
+      />
+    </Block>
   );
 }
 

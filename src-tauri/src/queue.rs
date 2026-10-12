@@ -115,7 +115,10 @@ impl<K> Default for Job<K> {
 
 struct JobInner<K> {
     cancelled: bool,
-    /// The tree yt-dlp is running in, for as long as it is running.
+    /// The tree yt-dlp is running in, for as long as it is running. A job can
+    /// run yt-dlp twice -- again without subtitles, when a track would not
+    /// download (`run_one`) -- but one after the other, never side by side:
+    /// the second is only `started` once the first is `reaped`.
     tree: Option<K>,
     /// Set when yt-dlp is spawned and never cleared. `tree` answers "is there
     /// something to kill?"; this answers "might there be a part file on disk?",
@@ -149,7 +152,8 @@ impl<K> Job<K> {
 
     /// Adopts the tree yt-dlp was spawned into. Returns false if a cancel got
     /// in first, in which case the caller must kill what it has just spawned
-    /// itself -- nobody else now holds a handle to it.
+    /// itself -- nobody else now holds a handle to it. That includes a cancel
+    /// landing between a job's two runs, while nothing was running to kill.
     fn started(&self, tree: K) -> bool {
         let mut g = self.inner.lock().unwrap();
         g.spawned = true;
@@ -241,24 +245,32 @@ impl Gone {
 /// a video they had downloaded. Only the shapes yt-dlp actually produces count:
 /// the merged file itself, the separate streams (`.f137.mp4`) with their
 /// in-progress and fragment files (`.part`, `.part-FragN`) and resume state
-/// (`.ytdl`), ffmpeg's merge target (`.temp.mkv`), and the thumbnail fetched
-/// for embedding. Format ids are matched as digits, which is what YouTube uses.
+/// (`.ytdl`), ffmpeg's merge target (`.temp.mkv`), and the thumbnail and
+/// subtitle tracks (`.en.srt`) fetched for embedding, and the chapter list
+/// written for ffmpeg to embed (`.meta` -- FFmpegMetadataPP's
+/// `replace_extension(filename, 'meta')`). Format ids are matched as digits,
+/// which is what YouTube uses.
 fn is_leftover(out_path: &Path, name: &str) -> bool {
     if out_path.file_name().and_then(|n| n.to_str()) == Some(name) {
         return true;
     }
-    let Some(stem) = out_path.file_stem().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let Some(rest) = name.strip_prefix(stem).and_then(|r| r.strip_prefix('.')) else {
+    let Some(rest) = after_stem(out_path, name) else {
         return false;
     };
     rest.ends_with(".part")
         || rest.ends_with(".ytdl")
         || rest.contains(".part-Frag")
         || rest.starts_with("temp.")
-        || matches!(rest, "jpg" | "png" | "webp")
+        || matches!(rest, "jpg" | "png" | "webp" | "meta")
         || is_format_stream(rest)
+        || is_subtitle_track(rest)
+}
+
+/// What follows `<stem>.` in `name`, if `name` begins with `out_path`'s stem
+/// and a dot: the part of a sidecar's name that says what it is.
+fn after_stem<'a>(out_path: &Path, name: &'a str) -> Option<&'a str> {
+    let stem = out_path.file_stem().and_then(|n| n.to_str())?;
+    name.strip_prefix(stem)?.strip_prefix('.')
 }
 
 /// `f137.mp4`, `f251.webm` -- one of the streams yt-dlp downloads to merge.
@@ -269,15 +281,47 @@ fn is_format_stream(rest: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) && !ext.is_empty()
 }
 
-/// Deletes everything a cancelled download left in the output directory, in
-/// one pass. Returns what it could not delete.
-fn remove_leftovers(out_path: &Path) -> Vec<PathBuf> {
+/// The formats a subtitle track can arrive in. `--sub-format srt/best` asks
+/// for srt, and a track YouTube offers no srt of falls back to its best.
+const SUBTITLE_EXTS: [&str; 9] =
+    ["srt", "vtt", "ass", "ssa", "ttml", "srv1", "srv2", "srv3", "json3"];
+
+/// `en.srt`, `de-DE.srt`, `es-419.vtt` -- one subtitle track fetched to embed,
+/// written as `<stem>.<lang>.<format>`. yt-dlp makes the language out of
+/// YouTube's track id with every dot turned into a hyphen (`get_lang_code`,
+/// checked in yt-dlp 2026.08.19: the named track `.en.nP7-2PuUl7o` becomes
+/// `en-nP7-2PuUl7o`), so it never holds one; that id is shaped like a video
+/// id, so `_` is allowed beside letters, digits and `-`. A language begins
+/// with a letter, which is what keeps `Part 1.5.srt` -- the subtitles of the
+/// video `Part 1.5` -- from passing for a track of `Part 1`.
+fn is_subtitle_track(rest: &str) -> bool {
+    let Some((lang, ext)) = rest.split_once('.') else {
+        return false;
+    };
+    lang.starts_with(|c: char| c.is_ascii_alphabetic())
+        && lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && SUBTITLE_EXTS.contains(&ext)
+}
+
+/// A subtitle track of `out_path`'s, finished or in progress (`.en.srt.part`):
+/// what a run that failed over one of them can have left, and all that is
+/// cleared away before the run without them (`run_one`). Nothing else -- the
+/// video's own part files are not that run's to touch.
+fn is_subtitle_leftover(out_path: &Path, name: &str) -> bool {
+    after_stem(out_path, name)
+        .is_some_and(|rest| is_subtitle_track(rest.strip_suffix(".part").unwrap_or(rest)))
+}
+
+/// Deletes everything in `out_path`'s directory that `wanted` says a download
+/// of it left behind -- `is_leftover` after a cancel -- in one pass. Returns
+/// what it could not delete.
+fn remove_leftovers(out_path: &Path, wanted: fn(&Path, &str) -> bool) -> Vec<PathBuf> {
     let Some(dir) = out_path.parent() else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut stuck = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name();
-        if name.to_str().is_some_and(|n| is_leftover(out_path, n)) {
+        if name.to_str().is_some_and(|n| wanted(out_path, n)) {
             if let Err(err) = std::fs::remove_file(e.path()) {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     stuck.push(e.path());
@@ -304,9 +348,10 @@ const SWEEP_ATTEMPTS: u32 = 10;
 /// thread, never a runtime worker: the download directory is as often as not a
 /// spun-down HDD or a network mount, and one `read_dir` there can take
 /// seconds, which on a worker stalls every other task scheduled on it.
-fn sweep_blocking(out_paths: &[PathBuf]) {
+fn sweep_blocking(out_paths: &[PathBuf], wanted: fn(&Path, &str) -> bool) {
     #[allow(unused_mut, unused_variables)]
-    let mut stuck: Vec<PathBuf> = out_paths.iter().flat_map(|p| remove_leftovers(p)).collect();
+    let mut stuck: Vec<PathBuf> =
+        out_paths.iter().flat_map(|p| remove_leftovers(p, wanted)).collect();
     #[cfg(windows)]
     for _ in 0..SWEEP_ATTEMPTS {
         if stuck.is_empty() {
@@ -317,9 +362,18 @@ fn sweep_blocking(out_paths: &[PathBuf]) {
     }
 }
 
-/// `sweep_blocking`, awaited from a blocking thread.
+/// `sweep_blocking` of everything a cancel clears, awaited from a blocking
+/// thread.
 async fn sweep_leftovers(out_paths: Vec<PathBuf>) {
-    let _ = tokio::task::spawn_blocking(move || sweep_blocking(&out_paths)).await;
+    let _ = tokio::task::spawn_blocking(move || sweep_blocking(&out_paths, is_leftover)).await;
+}
+
+/// `sweep_blocking` of the subtitle tracks alone, awaited from a blocking
+/// thread: the run without subtitles would leave them where they are, and
+/// nothing would ever clear them away after a download that ends `Done`.
+async fn sweep_subtitles(out_paths: Vec<PathBuf>) {
+    let _ = tokio::task::spawn_blocking(move || sweep_blocking(&out_paths, is_subtitle_leftover))
+        .await;
 }
 
 /// Runs blocking filesystem work off the runtime's workers; see
@@ -393,7 +447,7 @@ impl Drop for CleanupGuard {
         let alive = self.alive.clone();
         let work = move || {
             let _alive = alive;
-            sweep_blocking(&out_paths);
+            sweep_blocking(&out_paths, is_leftover);
             drop(claim);
         };
         match tokio::runtime::Handle::try_current() {
@@ -855,9 +909,12 @@ async fn run_one(
         .await?
     };
 
-    // The cleanup guard is declared before the child so that it drops *after*
-    // it: yt-dlp is dead before a cancelled job unlinks anything. It owns the
-    // claim, so the names stay reserved until its sweep is done.
+    // The cleanup guard is declared before the children so that it drops
+    // *after* them: yt-dlp is dead before a cancelled job unlinks anything.
+    // Each child is owned by the `run_ytdlp` future awaited below, a temporary
+    // of a later statement, so an aborted task drops -- and kills -- whichever
+    // run is live first. The guard owns the claim, so the names stay reserved
+    // until its sweep is done.
     let _cleanup = CleanupGuard {
         job: cancel.clone(),
         out_paths: out_paths.clone(),
@@ -869,8 +926,116 @@ async fn run_one(
         blocking(move || std::fs::create_dir_all(parent)).await??;
     }
 
-    let mut cmd = proc::command(&inv.runner.program);
-    cmd.args(ytdlp::download_args(&inv.runner, &quality, video_id, &out_path, &print_file))
+    let mut ran =
+        run_ytdlp(app, &inv.runner, &quality, video_id, &out_path, &print_file, cancel).await?;
+
+    // Subtitles are a preference and never a reason to fail a download, but
+    // yt-dlp fetches them before the video and one track it cannot fetch fails
+    // the whole run: `_write_subtitles` raises unless `--ignore-errors`. Seen
+    // 2026-10-12 (yt-dlp 2026.10.10): `ERROR: Unable to download video
+    // subtitles for 'de-DE': HTTP Error 429: Too Many Requests`. So the
+    // download runs once more without them, and that run's outcome is final.
+    // The tracks that did arrive go first: no run will embed them now. A
+    // cancel in the meantime is caught by `Job::started` refusing the second
+    // yt-dlp, which `run_ytdlp` then kills.
+    if retry_without_subtitles(&quality, cancel.is_cancelled(), ran.status.success(), &ran.stderr) {
+        let why = ran.stderr.lines().find(|l| ytdlp::is_subtitle_failure(l)).unwrap_or_default();
+        eprintln!("[mytube] {video_id}: {why}; downloading again without subtitles");
+        sweep_subtitles(out_paths.clone()).await;
+        let plain = Quality { subtitles: false, ..quality.clone() };
+        ran = run_ytdlp(app, &inv.runner, &plain, video_id, &out_path, &print_file, cancel).await?;
+    }
+    let Ran { status, stderr: stderr_text, tree } = ran;
+
+    // The part files are deleted here, before the task ends, because that is
+    // what a new download of the same video is waiting for (`Book::cleaning`);
+    // the row is left alone because `Registry::cancel` owns it. On Windows the
+    // leader being reaped does not mean the tree is: the kill has only been
+    // *started* for the real yt-dlp and its ffmpeg, and their open handles make
+    // a part file undeletable until they are gone -- so wait for the job to
+    // empty first (bounded, well inside `CLEANUP_GRACE`), then sweep with
+    // retries. `_cleanup` makes one more pass on the way out, which finds
+    // nothing. On unix both steps are what they always were: no wait, one pass.
+    if cancel.is_cancelled() {
+        if !tree.wait_empty(TREE_EXIT_GRACE).await {
+            eprintln!("[mytube] {video_id}: yt-dlp's processes outlived the cancel's grace; sweeping anyway");
+        }
+        sweep_leftovers(out_paths.clone()).await;
+        return Ok(());
+    }
+
+    if !status.success() {
+        let msg = stderr_text
+            .lines()
+            .rev()
+            .find(|l| l.contains("ERROR"))
+            .map(str::to_string)
+            .unwrap_or_else(|| tail(stderr_text.trim(), 2000));
+        return Err(anyhow!(
+            "{}",
+            if msg.is_empty() {
+                format!("yt-dlp exited with {status}")
+            } else {
+                msg
+            }
+        ));
+    }
+
+    // yt-dlp appends to this file with `open(..., 'a', encoding='utf-8',
+    // newline='')` and ends each value with `os.linesep` (checked in
+    // `YoutubeDL._forceprint`, yt-dlp 2026.08.19) -- UTF-8 on every OS,
+    // whatever `--encoding` says, and `\r\n` on Windows. So: read as UTF-8,
+    // take the last line, trim the `\r`.
+    let pf = print_file.clone();
+    let path = blocking(move || -> Result<String> {
+        let path = std::fs::read_to_string(&pf)
+            .map_err(|_| anyhow!("yt-dlp finished but reported no output file"))?
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if path.is_empty() || !Path::new(&path).exists() {
+            return Err(anyhow!("yt-dlp finished but the output file is missing"));
+        }
+        Ok(path)
+    })
+    .await??;
+
+    // Under the job's lock: a cancel that got in first means the row is not
+    // ours to write, and `_cleanup` is about to delete the file; one that
+    // comes after finds `Done` written and overwrites it with `None`.
+    let recorded = cancel.unless_cancelled(|| -> Result<()> {
+        db.set_download_state(video_id, DownloadState::Done, Some(&path), None)?;
+        emit_state(app, video_id, DownloadState::Done, Some(path.clone()), None);
+        Ok(())
+    });
+    recorded.unwrap_or(Ok(()))
+}
+
+/// Whether a run of yt-dlp that has just ended is to be run again without
+/// subtitles: it failed, over a subtitle track, with subtitles asked of it,
+/// and not because it was cancelled. False for the run without them, so there
+/// is never a third.
+fn retry_without_subtitles(q: &Quality, cancelled: bool, success: bool, stderr: &str) -> bool {
+    !cancelled && !success && quality::embeds_subtitles(q) && ytdlp::is_subtitle_failure(stderr)
+}
+
+/// What one run of yt-dlp came to.
+struct Ran {
+    status: std::process::ExitStatus,
+    stderr: String,
+    /// The tree it ran in, for a cancel to wait on before it sweeps.
+    tree: proc::KillTree,
+}
+
+/// One run of yt-dlp for `run_one`: spawned into a tree of its own, handed to
+/// the job, its progress relayed to the views, and waited for. Its stderr comes
+/// back whole, for `run_one` to judge.
+async fn run_ytdlp(app: &AppHandle, runner: &ytdlp::Runner, quality: &Quality, video_id: &str,
+                   out_path: &Path, print_file: &Path, cancel: &Arc<Job>) -> Result<Ran> {
+    let mut cmd = proc::command(&runner.program);
+    cmd.args(ytdlp::download_args(runner, quality, video_id, out_path, print_file))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -943,72 +1108,8 @@ async fn run_one(
     let status = child.wait().await?;
     cancel.reaped();
     let _ = pump.await;
-    let stderr_text = err_collect.await.unwrap_or_default();
-
-    // The part files are deleted here, before the task ends, because that is
-    // what a new download of the same video is waiting for (`Book::cleaning`);
-    // the row is left alone because `Registry::cancel` owns it. On Windows the
-    // leader being reaped does not mean the tree is: the kill has only been
-    // *started* for the real yt-dlp and its ffmpeg, and their open handles make
-    // a part file undeletable until they are gone -- so wait for the job to
-    // empty first (bounded, well inside `CLEANUP_GRACE`), then sweep with
-    // retries. `_cleanup` makes one more pass on the way out, which finds
-    // nothing. On unix both steps are what they always were: no wait, one pass.
-    if cancel.is_cancelled() {
-        if !tree.wait_empty(TREE_EXIT_GRACE).await {
-            eprintln!("[mytube] {video_id}: yt-dlp's processes outlived the cancel's grace; sweeping anyway");
-        }
-        sweep_leftovers(out_paths.clone()).await;
-        return Ok(());
-    }
-
-    if !status.success() {
-        let msg = stderr_text
-            .lines()
-            .rev()
-            .find(|l| l.contains("ERROR"))
-            .map(str::to_string)
-            .unwrap_or_else(|| tail(stderr_text.trim(), 2000));
-        return Err(anyhow!(
-            "{}",
-            if msg.is_empty() {
-                format!("yt-dlp exited with {status}")
-            } else {
-                msg
-            }
-        ));
-    }
-
-    // yt-dlp appends to this file with `open(..., 'a', encoding='utf-8',
-    // newline='')` and ends each value with `os.linesep` (checked in
-    // `YoutubeDL._forceprint`, yt-dlp 2026.08.19) -- UTF-8 on every OS,
-    // whatever `--encoding` says, and `\r\n` on Windows. So: read as UTF-8,
-    // take the last line, trim the `\r`.
-    let pf = print_file.clone();
-    let path = blocking(move || -> Result<String> {
-        let path = std::fs::read_to_string(&pf)
-            .map_err(|_| anyhow!("yt-dlp finished but reported no output file"))?
-            .lines()
-            .last()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if path.is_empty() || !Path::new(&path).exists() {
-            return Err(anyhow!("yt-dlp finished but the output file is missing"));
-        }
-        Ok(path)
-    })
-    .await??;
-
-    // Under the job's lock: a cancel that got in first means the row is not
-    // ours to write, and `_cleanup` is about to delete the file; one that
-    // comes after finds `Done` written and overwrites it with `None`.
-    let recorded = cancel.unless_cancelled(|| -> Result<()> {
-        db.set_download_state(video_id, DownloadState::Done, Some(&path), None)?;
-        emit_state(app, video_id, DownloadState::Done, Some(path.clone()), None);
-        Ok(())
-    });
-    recorded.unwrap_or(Ok(()))
+    let stderr = err_collect.await.unwrap_or_default();
+    Ok(Ran { status, stderr, tree })
 }
 
 #[cfg(test)]
@@ -1082,8 +1183,32 @@ mod tests {
             "Some Video [2026-01-02].temp.mkv",            // ffmpeg's merge target
             "Some Video [2026-01-02].jpg",                 // thumbnail fetched to embed
             "Some Video [2026-01-02].webp",
+            "Some Video [2026-01-02].en.srt",              // a subtitle track fetched to embed
+            "Some Video [2026-01-02].de-DE.srt",
+            "Some Video [2026-01-02].es-419.srt",
+            "Some Video [2026-01-02].pt-BR.vtt",           // a track with no srt to offer
+            "Some Video [2026-01-02].en-nP7-2PuUl7o.srt",  // a named track, its dot made a hyphen
+            "Some Video [2026-01-02].en.srt.part",         // a track in progress
+            "Some Video [2026-01-02].meta",                // the chapter list handed to ffmpeg
         ] {
             assert!(is_leftover(out, name), "{name} should be swept up");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_is_a_subtitle_track_only_with_a_language_and_a_subtitle_format() {
+        let out = Path::new("/d/Name.mkv");
+        for name in [
+            "Name.en.mkv",         // a video, whatever its name says
+            "Name.en.mp4",
+            "Name.en.txt",
+            "Name.live_chat.json", // a live replay's chat, never asked for
+            "Name..srt",           // no language at all
+            "Name.5.srt",          // no language begins with a digit
+            "Name.en.us.srt",      // nor holds a dot
+            "Name.en.srt.mkv",
+        ] {
+            assert!(!is_leftover(out, name), "{name} is nothing a download leaves");
         }
     }
 
@@ -1100,9 +1225,83 @@ mod tests {
             "Part 1 (2).mkv",
             "Part 1.mkv.jpg.mkv",
             "Some other video.mkv",
+            "Part 1.5.en.srt",
+            "Part 1.5.srt", // `Part 1.5`'s own subtitles; `5` is no language
+            "Part 1.5.meta",
         ] {
             assert!(!is_leftover(out, name), "{name} must survive");
         }
+    }
+
+    #[test]
+    fn before_the_run_without_subtitles_only_the_subtitle_tracks_are_cleared() {
+        let out = Path::new("/d/Name.mkv");
+        for name in ["Name.en.srt", "Name.de-DE.srt.part", "Name.pt-BR.vtt", "Name.es-419.srt"] {
+            assert!(is_subtitle_leftover(out, name), "{name} should go");
+        }
+        for name in [
+            "Name.mkv",
+            "Name.mkv.part",
+            "Name.f137.mp4.part",
+            "Name.temp.mkv",
+            "Name.jpg",
+            "Name.meta",
+            "Name.5.en.srt",
+            "Other.en.srt",
+        ] {
+            assert!(!is_subtitle_leftover(out, name), "{name} must stay");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_subtitle_sweep_clears_the_tracks_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("mytube-subtitle-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("V.mkv");
+        for n in ["V.en.srt", "V.de-DE.srt.part", "V.f137.mp4.part", "V.jpg", "W.en.srt"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        sweep_subtitles(vec![out.clone()]).await;
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["V.f137.mp4.part", "V.jpg", "W.en.srt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const SUBTITLE_429: &str = "[info] Writing video subtitles to: /d/Name.de-DE.srt\n\
+        ERROR: Unable to download video subtitles for 'de-DE': HTTP Error 429: Too Many Requests\n";
+
+    #[test]
+    fn a_subtitle_track_that_will_not_download_costs_the_subtitles_not_the_video() {
+        let subs = Quality { subtitles: true, ..Quality::default() };
+        assert!(retry_without_subtitles(&subs, false, false, SUBTITLE_429));
+        let mp4 = Quality { container: "mp4".into(), ..subs.clone() };
+        assert!(retry_without_subtitles(&mp4, false, false, SUBTITLE_429));
+
+        assert!(!retry_without_subtitles(&subs, true, false, SUBTITLE_429),
+                "a cancelled run is the cancel's, not a failure to work around");
+        assert!(!retry_without_subtitles(&subs, false, true, SUBTITLE_429),
+                "a run that succeeded has nothing to do again");
+        assert!(!retry_without_subtitles(&subs, false, false,
+                                         "ERROR: [youtube] dQw4w9WgXcQ: Video unavailable\n"),
+                "any other failure is the download's own");
+    }
+
+    #[test]
+    fn the_run_without_subtitles_is_the_last() {
+        // Its own failure -- whatever it says -- is final: there is no third run.
+        let plain = Quality { subtitles: false, ..Quality::default() };
+        assert!(!retry_without_subtitles(&plain, false, false, SUBTITLE_429));
+        // Nor is a run that never asked for them retried: an audio file
+        // cannot hold subtitles, so yt-dlp was not told to fetch any.
+        let audio = Quality { subtitles: true, mode: "audio".into(), audio_format: "mp3".into(),
+                              ..Quality::default() };
+        assert!(!retry_without_subtitles(&audio, false, false, SUBTITLE_429));
     }
 
     #[test]
@@ -1118,7 +1317,7 @@ mod tests {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
 
-        assert!(remove_leftovers(&out).is_empty(), "nothing is held open here");
+        assert!(remove_leftovers(&out, is_leftover).is_empty(), "nothing is held open here");
 
         let mut left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -1165,7 +1364,8 @@ mod tests {
         std::fs::write(&part, b"x").unwrap();
         let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&part).unwrap();
 
-        assert_eq!(remove_leftovers(&out), vec![part.clone()], "held open, so it cannot go yet");
+        assert_eq!(remove_leftovers(&out, is_leftover), vec![part.clone()],
+                   "held open, so it cannot go yet");
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             drop(held);
@@ -1351,6 +1551,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_aborted_job_drops_the_live_run_before_its_cleanup_guard() {
+        // The shape `run_one` relies on: `CleanupGuard` is a local, and the
+        // child lives inside the `run_ytdlp` future awaited after it. Aborted
+        // mid-run, that future must go first -- killing yt-dlp's tree -- and
+        // only then the guard, whose sweep would otherwise race a live yt-dlp.
+        type Log = Arc<std::sync::Mutex<Vec<&'static str>>>;
+        struct Mark(&'static str, Log);
+        impl Drop for Mark {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+        async fn run(log: Log) {
+            let _child = Mark("child", log);
+            std::future::pending::<()>().await;
+        }
+        let log: Log = Default::default();
+        let l = log.clone();
+        let task = tokio::spawn(async move {
+            let _cleanup = Mark("cleanup", l.clone());
+            run(l).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(*log.lock().unwrap(), vec!["child", "cleanup"]);
+    }
+
+    #[tokio::test]
     async fn enqueueing_a_download_already_in_flight_does_nothing() {
         let reg = Registry::<i32>::new();
         let rows = Arc::new(FakeRows::default());
@@ -1429,6 +1658,34 @@ mod tests {
         let stop = job.cancel();
         assert_eq!(stop.tree, None);
         assert!(stop.spawned);
+    }
+
+    #[test]
+    fn the_run_without_subtitles_is_adopted_once_the_first_is_reaped() {
+        // One job, two yt-dlps one after the other: a cancel must reach the
+        // one that is running, never the pid of the one already reaped.
+        let job = Job::<i32>::default();
+        assert!(job.started(1));
+        job.reaped();
+        assert!(job.started(2), "the second run is the job's as much as the first");
+        let stop = job.cancel();
+        assert_eq!(stop.tree, Some(2));
+        assert!(stop.spawned);
+    }
+
+    #[test]
+    fn a_cancel_between_the_two_runs_stops_the_second_before_it_starts() {
+        // It lands while the first run's subtitle tracks are being deleted.
+        // Nothing is running to kill, but files are on disk, so the cancel
+        // waits for the job's sweep -- and the job must not adopt the yt-dlp
+        // it spawns next, which leaves the kill to `run_ytdlp`.
+        let job = Job::<i32>::default();
+        assert!(job.started(1));
+        job.reaped();
+        let stop = job.cancel();
+        assert_eq!(stop.tree, None);
+        assert!(stop.spawned);
+        assert!(!job.started(2));
     }
 
     #[test]
@@ -1541,6 +1798,95 @@ mod tests {
             .collect();
         left.sort();
         println!("directory: {left:?}");
+    }
+
+    /// Downloads with subtitles and with chapters through the same steps as
+    /// `real_download_in_each_mode`, asks ffprobe what landed, and checks that
+    /// nothing was left beside it -- every subtitle track and chapter list
+    /// yt-dlp wrote on the way embedded and deleted:
+    ///
+    ///     cargo test --manifest-path src-tauri/Cargo.toml real_download_embeds_subtitles_and_chapters -- --ignored --nocapture
+    ///
+    /// It does not go through `run_one`, so a subtitle track YouTube refuses
+    /// (HTTP 429) fails it rather than falling back: run it again later.
+    #[tokio::test]
+    #[ignore = "requires network, yt-dlp, ffmpeg and deno"]
+    async fn real_download_embeds_subtitles_and_chapters() {
+        const SUBTITLED: &str = "dQw4w9WgXcQ"; // 5 uploader tracks, no chapters
+        const CHAPTERED: &str = "cko1HzN9OA4"; // 7 chapters, no uploader tracks
+        let settings = config::load().unwrap_or_default();
+        let tools = Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
+        let inv = tools.ytdlp(&settings).await.expect("a yt-dlp");
+        let ffprobe_exe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+        let ffprobe = match &inv.runner.ffmpeg_location {
+            Some(loc) if loc.is_dir() => loc.join(ffprobe_exe),
+            _ => PathBuf::from(ffprobe_exe),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().into_owned();
+        let claims = PathClaims::default();
+
+        // What ffprobe says of `file` when asked `args`: a line per stream or
+        // chapter it picks out.
+        let probe = |file: PathBuf, args: &'static [&'static str]| {
+            let ffprobe = ffprobe.clone();
+            async move {
+                let out = proc::command(&ffprobe).args(["-v", "error"]).args(args)
+                    .args(["-of", "csv=p=0"]).arg(&file)
+                    .output().await.expect("ffprobe runs");
+                assert!(out.status.success(), "ffprobe: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8_lossy(&out.stdout).lines()
+                    .filter(|l| !l.trim().is_empty()).map(str::to_string).collect::<Vec<_>>()
+            }
+        };
+
+        let small = Quality { max_height: 144, ..Quality::default() };
+        let cases = [
+            ("subtitles mkv", SUBTITLED, Quality { subtitles: true, ..small.clone() }),
+            ("subtitles mp4", SUBTITLED,
+             Quality { subtitles: true, container: "mp4".into(), ..small.clone() }),
+            ("chapters", CHAPTERED, small.clone()),
+        ];
+        let mut landed_names = Vec::new();
+        for (name, video, q) in cases {
+            let probed = ytdlp::probe(&inv, &q, &ytdlp::watch_url(video), &dir,
+                                      &format!("{name} [%(id)s].%(ext)s"))
+                .await.unwrap_or_else(|e| panic!("{name}: probe failed: {e}"));
+            let probed = PathBuf::from(&probed.intended_path);
+            let (intended, via) = intended_path(&probed, quality::final_ext(&q));
+            let (out, _) = claims.claim_unique_with(&intended, via.as_deref(), |c| c.exists());
+            let print_file = tmp.path().join(format!("{name}.path"));
+
+            let args = ytdlp::download_args(&inv.runner, &q, video, &out, &print_file);
+            let out_status = proc::command(&inv.runner.program).args(&args)
+                .output().await.expect("yt-dlp runs");
+            let stderr = String::from_utf8_lossy(&out_status.stderr);
+            assert!(out_status.status.success(), "{name}: yt-dlp failed: {stderr}");
+
+            let landed = PathBuf::from(std::fs::read_to_string(&print_file).unwrap().trim());
+            assert_eq!(landed, out, "{name}: the file did not land where it was claimed");
+            const SUBTITLE_STREAMS: &[&str] =
+                &["-select_streams", "s", "-show_entries", "stream=codec_name:stream_tags=language"];
+            let subs = probe(landed.clone(), SUBTITLE_STREAMS).await;
+            let chapters = probe(landed.clone(), &["-show_entries", "chapter=start_time"]).await;
+            println!("{name}: {} -- {} subtitle streams {subs:?}, {} chapters",
+                     landed.file_name().unwrap().to_string_lossy(), subs.len(), chapters.len());
+            if q.subtitles {
+                assert!(!subs.is_empty(), "{name}: no subtitle stream was embedded");
+            }
+            if video == CHAPTERED {
+                assert!(!chapters.is_empty(), "{name}: no chapter was embedded");
+            }
+            landed_names.push(landed.file_name().unwrap().to_string_lossy().into_owned());
+        }
+
+        let mut left: Vec<String> = std::fs::read_dir(tmp.path()).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".path"))
+            .collect();
+        left.sort();
+        landed_names.sort();
+        assert_eq!(left, landed_names, "a sidecar was left beside the finished files");
     }
 
     #[test]
