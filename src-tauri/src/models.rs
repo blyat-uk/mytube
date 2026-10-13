@@ -119,6 +119,10 @@ pub struct Video {
     /// but a handful of rows -- leaves the title matcher to work alone. The
     /// frontend reads it to know whether "Unlink from siblings" applies.
     pub sibling_group: Option<String>,
+    /// Hidden with its whole series: a part that joins this video's card later
+    /// arrives hidden and marked too. Implies nothing about `hidden` on its
+    /// own -- un-hiding one part keeps the mark. See the v11 migration step.
+    pub series_hidden: bool,
 }
 
 /// A row to insert. Separate from `Video` because inserts have no joined

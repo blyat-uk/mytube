@@ -32,6 +32,7 @@ const VIDEO: Video = {
   status: "ready", hidden: false, watched: false, watched_at: null, download_state: "none",
   download_error: null, file_path: null, downloaded_at: null, first_seen_at: 0,
   sibling_group: null,
+  series_hidden: false,
 };
 
 describe("the page", () => {

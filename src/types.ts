@@ -40,6 +40,9 @@ export interface Video {
   /** Key shared with every video marked its sibling by hand. Null — all but a
    *  handful of rows — leaves the title matcher to work alone. */
   sibling_group: string | null;
+  /** Hidden with its whole series: a part that joins this video's card later
+   *  arrives hidden and marked too. Un-hiding one part keeps the mark. */
+  series_hidden: boolean;
 }
 
 /**

@@ -343,6 +343,7 @@ impl ArchiveVideo {
             downloaded_at: None,
             first_seen_at: self.first_seen_at,
             sibling_group: self.sibling_group,
+            series_hidden: false,
         }
     }
 }
@@ -832,6 +833,7 @@ mod tests {
             downloaded_at: None,
             first_seen_at: 1_756_000_000,
             sibling_group: Some("grp-1".into()),
+            series_hidden: false,
         }
     }
 

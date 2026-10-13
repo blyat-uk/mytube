@@ -13,7 +13,7 @@ function video(over: Partial<Video> = {}): Video {
     added_manually: false, duration_secs: 754, view_count: 1500,
     status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "none", download_error: null,
-    file_path: null, downloaded_at: null, first_seen_at: 0, sibling_group: null,
+    file_path: null, downloaded_at: null, first_seen_at: 0, sibling_group: null, series_hidden: false,
     ...over,
   };
 }

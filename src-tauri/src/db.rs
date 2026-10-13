@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -189,6 +189,25 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         seed_sync_stamps(conn)?;
         conn.execute_batch(SYNC_TRIGGERS)?;
+    }
+
+    // A series hidden as a whole. `hidden` says "this video is out of the
+    // feed"; `series_hidden` says "and so is every part that joins its card
+    // later" -- the one bit that tells hiding a bad episode from hiding the
+    // show. A series has no row of its own (a card is recomputed on every
+    // fetch, led by whichever part comes first), so the mark lives on its
+    // parts, and a new part that joins the card of a marked one is hidden and
+    // marked in turn, which is what lets it follow a series whose titles
+    // drift. Stamped by trigger like the v10 columns, so it syncs. Nothing to
+    // seed: every existing row is 0.
+    if version < 11 {
+        for column in ["series_hidden INTEGER NOT NULL DEFAULT 0", "series_hidden_changed_at INTEGER"] {
+            let name = column.split_whitespace().next().unwrap();
+            if !column_exists(conn, "videos", name)? {
+                conn.execute(&format!("ALTER TABLE videos ADD COLUMN {column}"), [])?;
+            }
+        }
+        conn.execute_batch(SERIES_HIDDEN_TRIGGERS)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -356,6 +375,26 @@ BEGIN
   ON CONFLICT (kind, id) DO UPDATE
      SET removed_at = MAX(tombstones.removed_at, excluded.removed_at)
    WHERE tombstones.removed_at < OLD.first_seen_at;
+END;
+";
+
+/// The v11 stamp, kept exactly like the v10 ones in `SYNC_TRIGGERS`: a changed
+/// value is stamped now unless the same write moved the stamp (an apply), and
+/// an insert carrying a set value is stamped. Its own constant because the v10
+/// step runs before the column exists.
+const SERIES_HIDDEN_TRIGGERS: &str = "
+CREATE TRIGGER IF NOT EXISTS sync_series_hidden_changed AFTER UPDATE OF series_hidden ON videos
+WHEN NEW.series_hidden IS NOT OLD.series_hidden
+ AND NEW.series_hidden_changed_at IS OLD.series_hidden_changed_at
+BEGIN
+  UPDATE videos SET series_hidden_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_series_hidden_inserted AFTER INSERT ON videos
+WHEN NEW.series_hidden <> 0 AND NEW.series_hidden_changed_at IS NULL
+BEGIN
+  UPDATE videos SET series_hidden_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
 END;
 ";
 
@@ -1421,7 +1460,7 @@ SELECT v.id, v.channel_id, c.title, v.title, v.description, v.thumb_url, v.thumb
        v.published_at, v.sort_at, v.feed_rank, v.added_manually,
        v.duration_secs, v.view_count, v.status, v.hidden,
        v.watched, v.watched_at, v.download_state, v.download_error, v.file_path,
-       v.downloaded_at, v.first_seen_at, v.sibling_group
+       v.downloaded_at, v.first_seen_at, v.sibling_group, v.series_hidden
 FROM videos v JOIN channels c ON c.id = v.channel_id";
 
 /// The same shape as `SELECT_VIDEO` -- the join stays, since `By channel`
@@ -1443,6 +1482,7 @@ fn map_video(r: &Row) -> rusqlite::Result<Video> {
         download_error: r.get(18)?, file_path: r.get(19)?,
         downloaded_at: r.get(20)?, first_seen_at: r.get(21)?,
         sibling_group: r.get(22)?,
+        series_hidden: r.get::<_, i64>(23)? != 0,
     })
 }
 
@@ -3502,7 +3542,7 @@ mod import_tests {
                 view_count: Some(1), status: VideoStatus::Ready, hidden: false,
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
-                first_seen_at: 500, sibling_group: None }
+                first_seen_at: 500, sibling_group: None, series_hidden: false }
     }
 
     /// Every user-owned column set to something distinguishable, so a round
@@ -4099,7 +4139,7 @@ mod auto_download_tests {
                 view_count: Some(1), status: VideoStatus::Ready, hidden: false,
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
-                first_seen_at: SINCE + 60, sibling_group: None }
+                first_seen_at: SINCE + 60, sibling_group: None, series_hidden: false }
     }
 
     #[test]
@@ -4575,7 +4615,7 @@ mod sync_tests {
                 view_count: Some(1), status: VideoStatus::Ready, hidden: false,
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
-                first_seen_at: 500, sibling_group: None }
+                first_seen_at: 500, sibling_group: None, series_hidden: false }
     }
 
     /// Raw SQL, for what only a migration, the clock or another machine
@@ -4624,6 +4664,45 @@ mod sync_tests {
 
     fn stamped_now(at: &RangeInclusive<i64>, stamp: Option<i64>) -> bool {
         stamp.is_some_and(|s| at.contains(&s))
+    }
+
+    // ---- the v11 migration ----
+
+    fn series_stamp(d: &Db, id: &str) -> (bool, Option<i64>) {
+        d.conn.lock().unwrap().query_row(
+            "SELECT series_hidden, series_hidden_changed_at FROM videos WHERE id=?1",
+            params![id], |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn upgrading_adds_series_hidden_unset_and_unstamped() {
+        let conn = v9();
+        conn.execute_batch(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7);
+             INSERT INTO videos (id,channel_id,title,status,first_seen_at,hidden)
+               VALUES ('a','UC1','t','ready',1,1);",
+        ).unwrap();
+        let d = Db::init(conn).unwrap();
+        assert_eq!(series_stamp(&d, "a"), (false, None), "a hidden video is not a hidden series");
+        let names = trigger_names(&d);
+        assert!(names.contains(&"sync_series_hidden_changed".to_string()));
+        assert!(names.contains(&"sync_series_hidden_inserted".to_string()));
+    }
+
+    #[test]
+    fn marking_a_series_hidden_is_stamped_but_an_apply_keeps_its_own_stamp() {
+        let d = db();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        d.insert_video_if_new(&polled("a", "UC1")).unwrap();
+        d.insert_video_if_new(&polled("b", "UC1")).unwrap();
+
+        let ((), at) = around(|| sql(&d, "UPDATE videos SET series_hidden=1 WHERE id='a'"));
+        let (on, stamp) = series_stamp(&d, "a");
+        assert!(on && stamped_now(&at, stamp), "a local change is stamped now");
+
+        // How `apply_sync` writes: the value and another machine's stamp together.
+        sql(&d, "UPDATE videos SET series_hidden=1, series_hidden_changed_at=42 WHERE id='b'");
+        assert_eq!(series_stamp(&d, "b"), (true, Some(42)));
     }
 
     // ---- the v10 migration ----

@@ -52,6 +52,7 @@ fn video(id: &str, channel_id: &str, channel_title: &str, title: &str) -> Video 
         downloaded_at: None,
         first_seen_at: 1_000,
         sibling_group: None,
+        series_hidden: false,
     }
 }
 
