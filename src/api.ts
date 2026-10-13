@@ -22,6 +22,12 @@ export const api = {
     invoke<ImportResult>("import_takeout_csv", { path, channelIds }),
   setVideoHidden: (videoId: string, hidden: boolean) =>
     invoke<void>("set_video_hidden", { videoId, hidden }),
+  /** Hides a series as a whole, named by the part leading its card, and marks
+   *  every part so one that joins the series later is hidden on arrival.
+   *  Un-hiding clears both. Resolves with the ids of every part it changed,
+   *  which can include parts not on screen yet, such as a coming premiere. */
+  setSeriesHidden: (leaderId: string, hidden: boolean) =>
+    invoke<string[]>("set_series_hidden", { leaderId, hidden }),
   deleteVideo: (videoId: string) => invoke<void>("delete_video", { videoId }),
   pollAll: () => invoke<PollSummary>("poll_all"),
   pollChannel: (channelId: string) => invoke<PollSummary>("poll_channel", { channelId }),
@@ -57,6 +63,11 @@ export const api = {
    *  download exactly. */
   enqueueDownload: (videoId: string, quality?: Quality | null) =>
     invoke<void>("enqueue_download", { videoId, quality: quality ?? null }),
+  /** Queues several videos, oldest upload first, so a series starts at its
+   *  first part. The backend skips any already downloaded or on its way and
+   *  resolves with how many it queued. Stored overrides are left alone, as
+   *  `enqueueDownload` with no quality leaves them. */
+  enqueueDownloads: (videoIds: string[]) => invoke<number>("enqueue_downloads", { videoIds }),
   /** Everything one video offers, and what the Settings default would pick
    *  from it. Runs yt-dlp, so it takes a few seconds. */
   probeFormats: (videoId: string) => invoke<VideoFormats>("probe_formats", { videoId }),

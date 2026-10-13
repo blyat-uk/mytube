@@ -58,6 +58,11 @@ function fileOf(v: Video): Pick<Video, "download_state" | "download_error" | "fi
   return { download_state: v.download_state, download_error: v.download_error, file_path: v.file_path };
 }
 
+/** What Download would take: never fetched, or fetched and failed. */
+function downloadable(v: Video): boolean {
+  return v.download_state === "none" || v.download_state === "failed";
+}
+
 /**
  * Marking and unlinking both end in a refetch that regroups the feed, and the
  * grid that is up stays up -- dimmed once any of them is slow -- until the new
@@ -154,10 +159,13 @@ export default function SubscriptionsView(p: Props) {
   const [pageEpoch, setPageEpoch] = useState(0);
   const [menu, setMenu] = useState<{ video: Video; x: number; y: number } | null>(null);
   /**
-   * Two dialogs share this slot: "remove" asks how to hide or delete a video,
-   * "file" asks only whether to delete a watched video's download.
+   * Three dialogs share this slot: "remove" asks how to hide or delete a video,
+   * "file" asks only whether to delete a watched video's download, and
+   * "series" asks how to hide a series with a part downloaded.
    */
-  const [confirm, setConfirm] = useState<{ kind: "remove" | "file"; video: Video } | null>(null);
+  const [confirm, setConfirm] = useState<
+    { kind: "remove" | "file"; video: Video } | { kind: "series"; group: VideoGroup } | null
+  >(null);
   /** The video Download (custom)… is choosing formats for. */
   const [custom, setCustom] = useState<Video | null>(null);
 
@@ -378,6 +386,26 @@ export default function SubscriptionsView(p: Props) {
     });
   }, []);
 
+  /**
+   * `drop` for a whole card at once, which is how a series hidden as one
+   * leaves. The undo puts the card back where it stood, unless any of its parts
+   * is on screen again by then: a refetch has landed in between, and it knows
+   * better than the copy kept here.
+   */
+  const dropCard = useCallback((leaderId: string): (() => void) => {
+    const at = groupsRef.current.findIndex((g) => g.videos[0].id === leaderId);
+    if (at < 0) return () => {};
+    const card = groupsRef.current[at];
+    const ids = new Set(card.videos.map((v) => v.id));
+    setGroups((prev) => prev.filter((g) => g.videos[0].id !== leaderId));
+    return () => setGroups((prev) => {
+      if (prev.some((g) => g.videos.some((v) => ids.has(v.id)))) return prev;
+      const next = [...prev];
+      next.splice(Math.min(at, next.length), 0, card);
+      return next;
+    });
+  }, []);
+
   const onToggleWatched = useCallback((video: Video) => {
     const next = !video.watched;
     const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
@@ -491,6 +519,109 @@ export default function SubscriptionsView(p: Props) {
     else removeVideo(video, false);
   }, [removeVideo]);
 
+  /**
+   * Queues every part of a series that is not down or on its way. The whole
+   * card goes to the backend, which picks those parts out again and queues
+   * them oldest first -- so episode 1 starts first, whatever order the card
+   * holds them in -- and each one shows queued at once.
+   */
+  const downloadSeries = useCallback((group: VideoGroup) => {
+    const leader = group.videos[0];
+    const name = group.stem ?? leader.title;
+    const due = new Map(group.videos.filter(downloadable).map((v) => [v.id, v]));
+    // A key apart from the hide's: neither bears on the other, so one being out
+    // is no reason to refuse the other.
+    void run(`series-download:${leader.id}`, async () => {
+      const n = await api.enqueueDownloads(group.videos.map((v) => v.id));
+      if (n > 0) toast.success(`Queued ${n} ${n === 1 ? "part" : "parts"} of “${name}”.`);
+      else toast.info(`Every part of “${name}” is already downloaded or on its way.`);
+    }, {
+      optimistic: () => {
+        mapVideos((v) => (due.has(v.id) ? { ...v, download_state: "queued", download_error: null } : v));
+        // Only a part still showing that mark goes back: one a state event has
+        // moved on since says what really happened to it.
+        return () => mapVideos((v) => {
+          const was = due.get(v.id);
+          return was && v.download_state === "queued"
+            ? { ...v, download_state: was.download_state, download_error: was.download_error }
+            : v;
+        });
+      },
+    });
+  }, [mapVideos, run, toast]);
+
+  /**
+   * Hides a series as a whole -- every part, and any part that joins it later
+   * -- removing its downloaded files first when asked. As with `removeVideo`,
+   * the card leaves at once (or turns hidden, with hidden videos on show) and
+   * comes back as it was if anything fails, less any file already gone.
+   */
+  const hideSeries = useCallback((group: VideoGroup, alsoDeleteFiles: boolean) => {
+    const leader = group.videos[0];
+    const name = group.stem ?? leader.title;
+    const files = new Set(alsoDeleteFiles ? group.videos.filter(hasDownloadedFile).map((v) => v.id) : []);
+    // The parts whose file is gone, which no undo can bring back.
+    const gone = new Set<string>();
+    // Shared with Un-hide series: two of them out at once could land in either
+    // order and leave the card saying the opposite of the database.
+    void run(`series-hidden:${leader.id}`, async () => {
+      // One at a time, so a failure part way through knows which files went.
+      for (const id of files) {
+        await api.deleteDownload(id);
+        gone.add(id);
+      }
+      await api.setSeriesHidden(leader.id, true);
+      toast.success(`Hidden “${name}”. Parts that join it later stay hidden too.`);
+    }, {
+      optimistic: () => {
+        // Never in a series view in practice -- grouping stands down there, so
+        // no series card is up -- but it is the rule `removeVideo` keeps.
+        if (!showHidden && !siblingOf) {
+          const undo = dropCard(leader.id);
+          return () => {
+            undo();
+            if (gone.size > 0) mapVideos((v) => (gone.has(v.id) ? { ...v, ...NO_FILE } : v));
+          };
+        }
+        const was = new Map(group.videos.map((v) => [v.id, v]));
+        mapVideos((v) => (was.has(v.id)
+          ? { ...v, hidden: true, series_hidden: true, ...(files.has(v.id) ? NO_FILE : {}) }
+          : v));
+        return () => mapVideos((v) => {
+          const before = was.get(v.id);
+          if (!before) return v;
+          return {
+            ...v,
+            hidden: before.hidden,
+            series_hidden: before.series_hidden,
+            ...(files.has(v.id) && !gone.has(v.id) ? fileOf(before) : {}),
+          };
+        });
+      },
+    });
+  }, [dropCard, mapVideos, run, showHidden, siblingOf, toast]);
+
+  const requestHideSeries = useCallback((group: VideoGroup) => {
+    if (group.videos.some(hasDownloadedFile)) setConfirm({ kind: "series", group });
+    else hideSeries(group, false);
+  }, [hideSeries]);
+
+  /** Brings every part of a series back and clears the mark, so a part that
+   *  joins it later stays in the feed too. */
+  const unhideSeries = useCallback((group: VideoGroup) => {
+    const leader = group.videos[0];
+    const was = new Map(group.videos.map((v) => [v.id, v]));
+    void run(`series-hidden:${leader.id}`, () => api.setSeriesHidden(leader.id, false), {
+      optimistic: () => {
+        mapVideos((v) => (was.has(v.id) ? { ...v, hidden: false, series_hidden: false } : v));
+        return () => mapVideos((v) => {
+          const before = was.get(v.id);
+          return before ? { ...v, hidden: before.hidden, series_hidden: before.series_hidden } : v;
+        });
+      },
+    });
+  }, [mapVideos, run]);
+
   const menuItems = useCallback((video: Video): MenuItem[] => {
     const picked = marking.selected.size;
     const markItem: MenuItem[] =
@@ -498,12 +629,35 @@ export default function SubscriptionsView(p: Props) {
         ? [{ label: `Mark ${picked} videos as siblings`, onSelect: marking.markSelected }]
         : [];
 
-    // A series card stands for every one of its parts, so the items below --
-    // which all act on a single video -- would silently act on one part out of
-    // seven. Marking is the exception, because it is the card being marked.
-    // With nothing to mark the caller opens no menu at all.
+    // A series card stands for every one of its parts, so it gets a menu of its
+    // own: the items further down all act on a single video, and from here
+    // would silently act on one part out of seven. Everything in this one acts
+    // on the whole series -- marking too, since it is the card being marked.
     const card = groups.find((g) => g.videos[0].id === video.id);
-    if ((card?.videos.length ?? 1) > 1) return markItem;
+    if (card && card.videos.length > 1) {
+      const series = [...markItem];
+      // Watched and hidden parts count: downloading a series is asking for all
+      // of it. The backend repeats the pick, so this is only the label's count.
+      const due = card.videos.filter(downloadable).length;
+      if (due > 0) {
+        series.push({
+          label: `Download ${due} ${due === 1 ? "part" : "parts"}`,
+          onSelect: () => void downloadSeries(card),
+        });
+      }
+      // Offered wherever the mark is, even on a part brought back by hand: the
+      // mark is what hides the parts still to come, and this is how it goes.
+      if (card.videos.some((v) => v.series_hidden)) {
+        series.push({ label: "Un-hide series", onSelect: () => void unhideSeries(card) });
+      } else {
+        series.push({
+          label: "Hide from feed",
+          danger: true,
+          onSelect: () => requestHideSeries(card),
+        });
+      }
+      return series;
+    }
 
     const items: MenuItem[] = [
       ...markItem,
@@ -514,7 +668,7 @@ export default function SubscriptionsView(p: Props) {
     ];
     if (hasDownloadedFile(video)) {
       items.push({ label: "Play", onSelect: () => void onAction("play", video) });
-    } else if (video.download_state === "none" || video.download_state === "failed") {
+    } else if (downloadable(video)) {
       items.push({ label: "Download", onSelect: () => void onAction("download", video) });
       items.push({ label: "Download (custom)…", onSelect: () => setCustom(video) });
     }
@@ -549,11 +703,12 @@ export default function SubscriptionsView(p: Props) {
     }
     return items;
   }, [onToggleWatched, onAction, unhideVideo, requestRemove, unlinkSiblings, groups,
+      downloadSeries, unhideSeries, requestHideSeries,
       marking.selected, marking.markSelected, p.onFindSiblings]);
 
   const openMenu = useCallback((video: Video, x: number, y: number) => {
-    // An empty menu is worse than none: a series card with nothing selected
-    // has nothing to offer that would not act on one part out of seven.
+    // Every card has something to offer -- a series at least its Hide or
+    // Un-hide -- but an empty menu is worse than none, so one never opens.
     if (menuItems(video).length === 0) return;
     setMenu({ video, x, y });
   }, [menuItems]);
@@ -572,6 +727,10 @@ export default function SubscriptionsView(p: Props) {
     inProgress;
   /** Any mark or unlink slow enough to show; see `SIBLINGS`. */
   const refreshing = useMemo(() => [...slow].some((k) => k.startsWith(SIBLINGS)), [slow]);
+  /** How many parts of the series being asked about have a file, which the
+   *  dialog's words follow: one file reads as a lone video's dialog does. */
+  const seriesFiles =
+    confirm?.kind === "series" ? confirm.group.videos.filter(hasDownloadedFile).length : 0;
 
   return (
     <>
@@ -702,6 +861,36 @@ export default function SubscriptionsView(p: Props) {
           const target = confirm.video;
           setConfirm(null);
           void removeVideo(target, choice === "delete");
+        }}
+      />
+    )}
+
+    {confirm?.kind === "series" && (
+      <ConfirmDialog
+        title="Hide this series?"
+        body={
+          (confirm.group.videos.length === 2 ? "Both parts" : `All ${confirm.group.videos.length} parts`) +
+          ` of “${confirm.group.stem ?? confirm.group.videos[0].title}”, and any part that joins` +
+          " it later, will stay out of your feed. " +
+          (seriesFiles === 1 ? "The downloaded file is" : `The ${seriesFiles} downloaded files are`) +
+          " kept unless you choose otherwise."
+        }
+        choices={[
+          { label: seriesFiles === 1 ? "Hide, keep file" : "Hide, keep files", value: "keep", primary: true },
+          {
+            label: seriesFiles === 1 ? "Hide and remove file" : "Hide and remove files",
+            value: "delete",
+            danger: true,
+          },
+        ]}
+        onCancel={() => setConfirm(null)}
+        onChoose={(choice) => {
+          // The card as it is now rather than when the dialog opened: a part
+          // that finished downloading meanwhile has a file to remove as well.
+          const leader = confirm.group.videos[0].id;
+          const target = groupsRef.current.find((g) => g.videos[0].id === leader) ?? confirm.group;
+          setConfirm(null);
+          void hideSeries(target, choice === "delete");
         }}
       />
     )}

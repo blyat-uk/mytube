@@ -10,9 +10,10 @@ interface Props {
   /** Opens the series: the sibling view, anchored on the leader and carrying
    *  the shared stem, which is the name the breadcrumb then wears. */
   onOpen: (leader: Video, stem: string | null) => void;
-  /** Right-click. The view answers with a menu holding nothing but the marking
-   *  item, and with no menu at all when there is nothing to mark — a full one
-   *  would act on the leader alone, which is what this card exists not to do. */
+  /** Right-click. The view answers with a menu of its own for a series, every
+   *  item acting on the whole of it -- marking, downloading its parts, hiding
+   *  it -- and never the lone-video menu, which would act on the leader alone,
+   *  which is what this card exists not to do. */
   onContextMenu: (leader: Video, e: React.MouseEvent) => void;
   /** Selection and drag, when the view offers sibling marking. */
   mark?: CardMark;
@@ -24,7 +25,8 @@ interface Props {
  *
  * Deliberately no download or play button. The card is one click target that
  * opens the series, and the parts are acted on inside it — a button here would
- * silently act on one part out of seven.
+ * silently act on one part out of seven. Its right-click menu can download the
+ * series, but that takes every part, oldest first.
  *
  * Memoised like VideoCard: the view keeps a group's object as it was unless one
  * of its parts changed, so a state event elsewhere in the grid passes it by.
@@ -41,6 +43,10 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
   // spot among the rest, since they have parts left you meant to get to. The
   // look is all CSS, under `.series-card.is-resumable` in App.css.
   const resumable = watched > 0 && unwatched > 0;
+  // On screen only with Include hidden on, wearing a hidden video's look
+  // (`.card.is-hidden-video`). Every part again: a series with one part back
+  // in the feed is not out of it.
+  const hidden = group.videos.every((v) => v.hidden);
 
   // The series' runtime, not the leading part's. A part whose duration has not
   // resolved yet contributes nothing, which would silently understate the
@@ -68,14 +74,15 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
 
   return (
     <article
-      className={`card series-card${done ? " is-watched" : ""}${resumable ? " is-resumable" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}`}
+      className={`card series-card${done ? " is-watched" : ""}${resumable ? " is-resumable" : ""}${hidden ? " is-hidden-video" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}`}
       role="button"
       tabIndex={0}
       aria-label={
         `${title} — ${parts} parts, ` +
         (runtime ? `${runtime} total, ` : "") +
         `${watched} watched, ${unwatched} unwatched` +
-        (resumable ? ", in progress" : "")
+        (resumable ? ", in progress" : "") +
+        (hidden ? ", hidden" : "")
       }
       onClick={(e) => {
         if (mark?.onClick(e)) return;

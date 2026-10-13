@@ -200,3 +200,32 @@ describe("SeriesCard total runtime", () => {
       .toContain("1h total");
   });
 });
+
+/**
+ * A hidden series is seen only with Include hidden on, and it should look the
+ * way a hidden video does there -- which, like the watched dimming, takes
+ * every part, since the card stands for all of them.
+ */
+describe("SeriesCard hidden", () => {
+  /** The three-part series, with `count` of its parts hidden. */
+  function withHidden(count: number): VideoGroup {
+    const g = group();
+    return {
+      ...g,
+      videos: g.videos.map((v, i) => ({ ...v, hidden: i >= g.videos.length - count })),
+    };
+  }
+  const label = () => screen.getByRole("button").getAttribute("aria-label");
+
+  it("dims as a hidden video does once every part is hidden, and says so", () => {
+    render(<SeriesCard group={withHidden(3)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+    expect(document.querySelector(".series-card")!.className).toContain("is-hidden-video");
+    expect(label()).toMatch(/, hidden$/);
+  });
+
+  it("stays as it is while any one part is still in the feed", () => {
+    render(<SeriesCard group={withHidden(2)} onOpen={vi.fn()} onContextMenu={vi.fn()} />);
+    expect(document.querySelector(".series-card")!.className).not.toContain("is-hidden-video");
+    expect(label()).not.toContain("hidden");
+  });
+});

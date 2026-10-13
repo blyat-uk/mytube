@@ -30,6 +30,8 @@ const enqueueDownload = vi.fn((_id: string, _q?: unknown) => Promise.resolve());
 const probeFormats = vi.fn((_id: string) => Promise.resolve(rickroll()));
 const cancelDownload = vi.fn((_id: string) => Promise.resolve());
 const setVideoHidden = vi.fn((_id: string, _hidden: boolean) => Promise.resolve());
+const setSeriesHidden = vi.fn((_leader: string, _hidden: boolean) => Promise.resolve<string[]>([]));
+const enqueueDownloads = vi.fn((_ids: string[]) => Promise.resolve(0));
 // Typed with the filter so a test can page through a library with it.
 const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn<(f: VideoFilter) => Promise<VideoGroup[]>>(() => Promise.resolve(groups));
@@ -46,6 +48,8 @@ vi.mock("../api", () => ({
     probeFormats: (id: string) => probeFormats(id),
     cancelDownload: (id: string) => cancelDownload(id),
     setVideoHidden: (id: string, hidden: boolean) => setVideoHidden(id, hidden),
+    setSeriesHidden: (leader: string, hidden: boolean) => setSeriesHidden(leader, hidden),
+    enqueueDownloads: (ids: string[]) => enqueueDownloads(ids),
     getSettings: () => Promise.resolve({ quality: DEFAULT_QUALITY }),
   },
   thumbSrc: () => "",
@@ -120,6 +124,9 @@ beforeEach(() => {
   probeFormats.mockImplementation(() => Promise.resolve(rickroll()));
   cancelDownload.mockImplementation(() => Promise.resolve());
   setVideoHidden.mockImplementation(() => Promise.resolve());
+  setSeriesHidden.mockImplementation(() => Promise.resolve([]));
+  enqueueDownloads.mockImplementation((ids) => Promise.resolve(ids.length));
+  deleteDownload.mockImplementation(() => Promise.resolve());
   enqueueDownload.mockImplementation(() => Promise.resolve());
   markSiblings.mockImplementation(() => Promise.resolve(2));
 });
@@ -704,23 +711,221 @@ describe("marking siblings by hand", () => {
   });
 });
 
+/**
+ * A series card stands for every one of its parts, so its menu acts on all of
+ * them or on none: never on the leader alone, which is what a lone video's
+ * items would do from here.
+ */
 describe("a series card's right-click menu", () => {
-  it("offers nothing but marking, and no menu at all with nothing picked", async () => {
-    groups = [
-      { videos: [video({ id: "p2" }), video({ id: "p1" })], stem: "The Blackwood Tapes" },
-      { videos: [video({ id: "solo" })], stem: null },
-    ];
+  /** A series, newest part leading as the backend hands it over, one part per
+   *  argument. Nothing downloaded unless a part says so. */
+  function series(...parts: Partial<Video>[]): VideoGroup {
+    return {
+      videos: parts.map((over, i) => video({
+        id: `p${parts.length - i}`,
+        title: `The Blackwood Tapes - Part ${parts.length - i}`,
+        download_state: "none",
+        file_path: null,
+        ...over,
+      })),
+      stem: "The Blackwood Tapes",
+    };
+  }
+  const fresh = () => series({}, {}, {});
+  const solo = (): VideoGroup => ({ videos: [video({ id: "solo" })], stem: null });
+  const seriesCard = () => document.querySelector<HTMLElement>(".series-card");
+
+  /** Right-click the series card once it is up, and read back the menu. A
+   *  series card is one button rather than an article, so `openMenu` misses it. */
+  async function openSeriesMenu() {
+    await waitFor(() => expect(seriesCard()).not.toBeNull());
+    fireEvent.contextMenu(seriesCard()!);
+    return screen.getByRole("menu");
+  }
+
+  // jsdom has no Web Animations, and a card put back after a failed hide is an
+  // insertion, which the grid animates in.
+  beforeEach(() => {
+    Element.prototype.animate = vi.fn() as unknown as Element["animate"];
+  });
+  afterEach(() => {
+    delete (Element.prototype as Partial<Element>).animate;
+  });
+
+  it("offers to download the parts not yet down, and to hide the series", async () => {
+    groups = [series(
+      { download_state: "failed", download_error: "HTTP Error 403" },
+      { download_state: "done", file_path: "/videos/p2.mkv" },
+      {},
+    )];
     renderView({ grouped: true });
-    const [series, solo] = await cardsReady(2);
+    // A failed part is retried; the downloaded one is left alone.
+    expect(menuLabels(await openSeriesMenu())).toEqual(["Download 2 parts", "Hide from feed"]);
+  });
 
-    // A full menu here would act on the leader alone -- one part out of two.
-    fireEvent.contextMenu(series);
-    expect(screen.queryByRole("menu")).toBeNull();
+  it("counts a single part left to download as one part", async () => {
+    groups = [series({ download_state: "done", file_path: "/videos/p2.mkv" }, {})];
+    renderView({ grouped: true });
+    expect(menuLabels(await openSeriesMenu())).toContain("Download 1 part");
+  });
 
-    fireEvent.click(series, { ctrlKey: true });
-    fireEvent.click(solo, { ctrlKey: true });
-    fireEvent.contextMenu(series);
-    expect(menuLabels(screen.getByRole("menu"))).toEqual(["Mark 2 videos as siblings"]);
+  it("offers no download once every part is downloaded or on its way", async () => {
+    groups = [series(
+      { download_state: "done", file_path: "/videos/p3.mkv" },
+      { download_state: "downloading" },
+      { download_state: "queued" },
+    )];
+    renderView({ grouped: true });
+    expect(menuLabels(await openSeriesMenu())).toEqual(["Hide from feed"]);
+  });
+
+  it("queues every part and shows the ones it could take as queued", async () => {
+    groups = [series({}, { download_state: "done", file_path: "/videos/p2.mkv" }, {})];
+    enqueueDownloads.mockImplementation(() => Promise.resolve(2));
+    renderView({ grouped: true });
+    fireEvent.click(within(await openSeriesMenu(), "Download 2 parts"));
+
+    // Every part goes, in the card's order: the backend picks out what it can
+    // queue and puts it oldest first, so neither is the menu's job.
+    await waitFor(() => expect(enqueueDownloads).toHaveBeenCalledWith(["p3", "p2", "p1"]));
+    expect(await screen.findByText("Queued 2 parts of “The Blackwood Tapes”.")).toBeTruthy();
+    // Shown queued before any state event arrives, so there is nothing left
+    // for a second Download to take.
+    fireEvent.contextMenu(seriesCard()!);
+    expect(menuLabels(screen.getByRole("menu"))).toEqual(["Hide from feed"]);
+  });
+
+  it("puts the parts back when the download cannot be queued", async () => {
+    groups = [fresh()];
+    enqueueDownloads.mockImplementation(() => Promise.reject("database is locked"));
+    renderView({ grouped: true });
+    fireEvent.click(within(await openSeriesMenu(), "Download 3 parts"));
+
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    fireEvent.contextMenu(seriesCard()!);
+    expect(menuLabels(screen.getByRole("menu"))).toContain("Download 3 parts");
+  });
+
+  it("hides a series with no files at once, taking the whole card", async () => {
+    groups = [fresh(), solo()];
+    renderView({ grouped: true });
+    await cardsReady(2);
+    fireEvent.contextMenu(seriesCard()!);
+    fireEvent.click(within(screen.getByRole("menu"), "Hide from feed"));
+
+    // Hidden by its leader: the backend works the rest of the series out.
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p3", true));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(deleteDownload).not.toHaveBeenCalled();
+    await waitFor(() => expect(seriesCard()).toBeNull());
+    expect(cards()).toHaveLength(1);
+    expect(await screen.findByText(/^Hidden “The Blackwood Tapes”\./)).toBeTruthy();
+  });
+
+  it("brings the card back, where it was, when the hide fails", async () => {
+    groups = [solo(), fresh()];
+    setSeriesHidden.mockImplementation(() => Promise.reject("database is locked"));
+    renderView({ grouped: true });
+    await cardsReady(2);
+    fireEvent.contextMenu(seriesCard()!);
+    fireEvent.click(within(screen.getByRole("menu"), "Hide from feed"));
+
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(cards().map((c) => c.dataset.videoId)).toEqual(["solo", "p3"]);
+  });
+
+  it("asks first when a part has a file, and keeps it unless told otherwise", async () => {
+    groups = [series({}, { download_state: "done", file_path: "/videos/p2.mkv" }, {})];
+    renderView({ grouped: true });
+    fireEvent.click(within(await openSeriesMenu(), "Hide from feed"));
+
+    const dialog = await screen.findByRole("dialog", { name: "Hide this series?" });
+    // Asking is not doing.
+    expect(setSeriesHidden).not.toHaveBeenCalled();
+    // It says what is being hidden -- the series by name, and what is to come.
+    expect(dialog.textContent)
+      .toContain("All 3 parts of “The Blackwood Tapes”, and any part that joins it later");
+    expect(dialog.textContent).toContain("The downloaded file is kept");
+    // One file, so the choices say so, as a lone video's dialog does.
+    fireEvent.click(getByRole(dialog, "button", { name: "Hide, keep file" }));
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p3", true));
+    expect(deleteDownload).not.toHaveBeenCalled();
+    await waitFor(() => expect(seriesCard()).toBeNull());
+  });
+
+  it("removes every downloaded part's file first when asked to", async () => {
+    groups = [series(
+      { download_state: "done", file_path: "/videos/p3.mkv" },
+      {},
+      { download_state: "done", file_path: "/videos/p1.mkv" },
+    )];
+    renderView({ grouped: true });
+    fireEvent.click(within(await openSeriesMenu(), "Hide from feed"));
+    const dialog = await screen.findByRole("dialog", { name: "Hide this series?" });
+    fireEvent.click(getByRole(dialog, "button", { name: "Hide and remove files" }));
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p3", true));
+    expect(deleteDownload.mock.calls).toEqual([["p3"], ["p1"]]);
+    // The files go before the hide, as a lone video's does.
+    expect(Math.max(...deleteDownload.mock.invocationCallOrder))
+      .toBeLessThan(setSeriesHidden.mock.invocationCallOrder[0]);
+  });
+
+  it("keeps a hidden series on screen, dimmed, while Include hidden is on", async () => {
+    groups = [fresh()];
+    renderView({ grouped: true, showHidden: true });
+    fireEvent.click(within(await openSeriesMenu(), "Hide from feed"));
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p3", true));
+    expect(seriesCard()!.className).toContain("is-hidden-video");
+    fireEvent.contextMenu(seriesCard()!);
+    expect(menuLabels(screen.getByRole("menu"))).toContain("Un-hide series");
+  });
+
+  it("offers to un-hide a series carrying the mark, and clears it", async () => {
+    groups = [series(
+      { hidden: true, series_hidden: true },
+      { hidden: true, series_hidden: true },
+      // Un-hidden by hand inside the series: the part keeps its mark.
+      { hidden: false, series_hidden: true },
+    )];
+    renderView({ grouped: true, showHidden: true });
+    const labels = menuLabels(await openSeriesMenu());
+    expect(labels).toContain("Un-hide series");
+    expect(labels).not.toContain("Hide from feed");
+    fireEvent.click(within(screen.getByRole("menu"), "Un-hide series"));
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p3", false));
+    fireEvent.contextMenu(seriesCard()!);
+    expect(menuLabels(screen.getByRole("menu"))).toContain("Hide from feed");
+  });
+
+  it("puts the mark back when the un-hide fails", async () => {
+    groups = [series(
+      { hidden: true, series_hidden: true },
+      { hidden: true, series_hidden: true },
+    )];
+    setSeriesHidden.mockImplementation(() => Promise.reject("database is locked"));
+    renderView({ grouped: true, showHidden: true });
+    fireEvent.click(within(await openSeriesMenu(), "Un-hide series"));
+
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(seriesCard()!.className).toContain("is-hidden-video");
+    fireEvent.contextMenu(seriesCard()!);
+    expect(menuLabels(screen.getByRole("menu"))).toContain("Un-hide series");
+  });
+
+  it("still leads with the marking item when cards are picked", async () => {
+    groups = [fresh(), solo()];
+    renderView({ grouped: true });
+    const [card, lone] = await cardsReady(2);
+
+    fireEvent.click(card, { ctrlKey: true });
+    fireEvent.click(lone, { ctrlKey: true });
+    fireEvent.contextMenu(card);
+    expect(menuLabels(screen.getByRole("menu")))
+      .toEqual(["Mark 2 videos as siblings", "Download 3 parts", "Hide from feed"]);
   });
 });
 
