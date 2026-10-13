@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::db::Db;
 use crate::models::{DownloadProgress, DownloadState, DownloadStateEvent};
@@ -341,6 +341,92 @@ impl Place {
 impl Drop for Place {
     fn drop(&mut self) {
         self.line.leave(self.n);
+    }
+}
+
+/// How many downloads may run at once: the semaphore the line admits to, and
+/// the setting it stands for.
+///
+/// Raising the limit is `add_permits`. Lowering it is the half a semaphore
+/// does not do for you, and `set_concurrency` used to just write the new
+/// number down -- so a limit lowered from 3 to 1 went on running three at a
+/// time until a restart, and raising it back to 3 then added two more on top
+/// of those: five. Now a permit nobody holds is forgotten on the spot, and one
+/// a running download holds, which cannot be taken back mid-flight, is owed:
+/// retired when that download gives it back (`Seat`) instead of going to the
+/// next in line.
+struct Slots {
+    sem: Arc<Semaphore>,
+    size: std::sync::Mutex<Size>,
+}
+
+struct Size {
+    /// The limit as last set.
+    limit: usize,
+    /// Permits out with running downloads that the limit no longer has room
+    /// for. Never more than are out, so the downloads running pay it off.
+    owed: usize,
+}
+
+impl Slots {
+    fn new(n: usize) -> Arc<Slots> {
+        Arc::new(Slots {
+            sem: Arc::new(Semaphore::new(n)),
+            size: std::sync::Mutex::new(Size { limit: n, owed: 0 }),
+        })
+    }
+
+    /// Every change under this lock is whole before it is let go, and a
+    /// `Seat` dropped while unwinding must still be able to give its slot back.
+    fn size(&self) -> std::sync::MutexGuard<'_, Size> {
+        self.size.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Makes the limit `n`. A raise pays off what is still owed before it adds
+    /// a permit, which is what brings 3 -> 1 -> 3 back to three.
+    ///
+    /// `forget_permits` reports how many it found free, so a permit the front
+    /// of the line takes in the same instant is simply not among them: it is
+    /// counted as owed instead, and retired when that download is done.
+    fn resize(&self, n: usize) {
+        let mut s = self.size();
+        if n < s.limit {
+            let cut = s.limit - n;
+            s.owed += cut - self.sem.forget_permits(cut);
+        } else {
+            let more = n - s.limit;
+            let repaid = more.min(s.owed);
+            s.owed -= repaid;
+            self.sem.add_permits(more - repaid);
+        }
+        s.limit = n;
+    }
+
+    /// `place`'s turn, then a slot: `Place::admit`, with the permit kept in a
+    /// `Seat` so that giving it back settles what is owed first.
+    async fn take(self: &Arc<Self>, place: Place) -> Option<Seat> {
+        let permit = place.admit(&self.sem).await?;
+        Some(Seat { permit: Some(permit), slots: self.clone() })
+    }
+}
+
+/// One running download's slot. Dropping it gives the slot back -- or, while
+/// the limit has been lowered below the downloads already running, retires it.
+struct Seat {
+    permit: Option<OwnedSemaphorePermit>,
+    slots: Arc<Slots>,
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        // Under the lock, so a `resize` in the same instant cannot count this
+        // permit both as free and as owed.
+        let mut s = self.slots.size();
+        let Some(permit) = self.permit.take() else { return };
+        if s.owed > 0 {
+            s.owed -= 1;
+            permit.forget();
+        }
     }
 }
 
@@ -697,13 +783,12 @@ struct Registry<K = proc::KillTree> {
     book: std::sync::Mutex<Book<K>>,
     /// The order the downloads take their slots in -- see `Line`.
     line: Arc<Line>,
-    /// One permit per download allowed to run at once. `Queue` holds the same
-    /// semaphore, to grow it when the setting is raised.
-    slots: Arc<Semaphore>,
+    /// How many downloads may run at once -- see `Slots`.
+    slots: Arc<Slots>,
 }
 
 impl<K: Kill> Registry<K> {
-    fn new(slots: Arc<Semaphore>) -> Arc<Self> {
+    fn new(slots: Arc<Slots>) -> Arc<Self> {
         Arc::new(Registry {
             book: std::sync::Mutex::new(Book { jobs: HashMap::new(), cleaning: HashMap::new() }),
             line: Line::new(),
@@ -769,7 +854,7 @@ impl<K: Kill> Registry<K> {
             // panic in the download included -- and given back before
             // `Finish` runs. Until it is in hand the task holds its place
             // instead, so an abort while it waits leaves the line.
-            let Some(_slot) = place.admit(&slots).await else { return };
+            let Some(_slot) = slots.take(place).await else { return };
             if let Some(p) = pending {
                 p.wait().await;
             }
@@ -897,8 +982,6 @@ impl<K: Kill> Drop for Finish<K> {
 pub struct Queue {
     db: Arc<Db>,
     app: AppHandle,
-    sem: Arc<Semaphore>,
-    permits: Arc<Mutex<usize>>,
     reg: Arc<Registry>,
     rows: Arc<Ledger>,
     claims: Arc<PathClaims>,
@@ -907,31 +990,23 @@ pub struct Queue {
 
 impl Queue {
     pub fn new(db: Arc<Db>, app: AppHandle, concurrency: usize, tools: Arc<Tools>) -> Self {
-        let sem = Arc::new(Semaphore::new(concurrency.max(1)));
         Self {
             rows: Arc::new(Ledger { db: db.clone(), app: app.clone() }),
             db,
             app,
             tools,
-            reg: Registry::new(sem.clone()),
-            sem,
-            permits: Arc::new(Mutex::new(concurrency.max(1))),
+            reg: Registry::new(Slots::new(concurrency.max(1))),
             claims: Arc::new(PathClaims::default()),
         }
     }
 
     /// Grows the semaphore when the user raises concurrency. Lowering it takes
-    /// effect as running jobs finish, since permits cannot be revoked mid-flight.
-    /// The new slots go to the downloads waiting longest: only the front of
-    /// the line ever waits on the semaphore (`Line`), and each one through it
-    /// lets the next one at it.
+    /// effect as running jobs finish, since permits cannot be revoked mid-flight
+    /// (`Slots`). The new slots go to the downloads waiting longest: only the
+    /// front of the line ever waits on the semaphore (`Line`), and each one
+    /// through it lets the next one at it.
     pub async fn set_concurrency(&self, n: usize) {
-        let n = n.clamp(1, 16);
-        let mut cur = self.permits.lock().await;
-        if n > *cur {
-            self.sem.add_permits(n - *cur);
-        }
-        *cur = n;
+        self.reg.slots.resize(n.clamp(1, 16));
     }
 
     /// Whether the video is queued or downloading right now.
@@ -1546,7 +1621,7 @@ mod tests {
 
     /// A registry letting `slots` downloads run at once.
     fn registry(slots: usize) -> Arc<Registry<i32>> {
-        Registry::new(Arc::new(Semaphore::new(slots)))
+        Registry::new(Slots::new(slots))
     }
 
     /// Waits for the cancelled download of `id` to finish clearing up.
@@ -1932,7 +2007,7 @@ mod tests {
             reg.enqueue(id.into(), &rows, held(&starts, id, rx)).unwrap();
         }
         assert!(eventually(|| starts.lock().unwrap().len() == 1).await);
-        reg.slots.add_permits(2); // what `Queue::set_concurrency` does
+        reg.slots.resize(3); // what `Queue::set_concurrency` does
         assert!(eventually(|| starts.lock().unwrap().len() == 3).await);
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut started = starts.lock().unwrap().clone();
@@ -1967,6 +2042,83 @@ mod tests {
         }
         assert!(eventually(|| log.lock().unwrap().len() == 3).await);
         assert_eq!(*log.lock().unwrap(), ["y started", "old x swept", "new x started"]);
+    }
+
+    /// `n` slots taken from `slots`, one after the other.
+    async fn seats(slots: &Arc<Slots>, n: usize) -> Vec<Seat> {
+        let line = Line::new();
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(slots.take(line.join()).await.expect("a slot"));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_lowered_limit_retires_slots_as_the_running_downloads_give_them_back() {
+        let slots = Slots::new(3);
+        let mut running = seats(&slots, 3).await;
+        slots.resize(1);
+        assert_eq!(slots.sem.available_permits(), 0);
+        running.pop();
+        running.pop();
+        assert_eq!(slots.sem.available_permits(), 0, "both retired on the way back");
+        running.pop();
+        assert_eq!(slots.sem.available_permits(), 1, "the one left goes round again");
+    }
+
+    #[tokio::test]
+    async fn lowering_and_raising_the_limit_again_comes_back_to_where_it_was() {
+        // 3 -> 1 -> 3 with three downloads running used to end at five.
+        let slots = Slots::new(3);
+        let running = seats(&slots, 3).await;
+        slots.resize(1);
+        slots.resize(3);
+        drop(running);
+        assert_eq!(slots.sem.available_permits(), 3);
+        // With nothing running, a lowered limit is there at once; an unchanged
+        // one -- every Settings save sends it -- moves nothing.
+        slots.resize(2);
+        assert_eq!(slots.sem.available_permits(), 2);
+        slots.resize(2);
+        assert_eq!(slots.sem.available_permits(), 2);
+        // Partly free, partly running: the free one goes now, one more is owed.
+        slots.resize(3);
+        let mut running = seats(&slots, 2).await;
+        slots.resize(1);
+        assert_eq!(slots.sem.available_permits(), 0);
+        running.pop();
+        assert_eq!(slots.sem.available_permits(), 0, "retired, not handed on");
+        running.pop();
+        assert_eq!(slots.sem.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lowered_limit_lets_the_running_downloads_finish_and_then_holds() {
+        // Three running when the limit drops to one: nothing is stopped, and
+        // d starts only once a single download is left -- none, then -- and
+        // the queue is back to one at a time.
+        let reg = registry(3);
+        let rows = Arc::new(FakeRows::default());
+        let starts: Starts = Default::default();
+        let mut go = Vec::new();
+        for id in ["a", "b", "c", "d", "e"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            go.push(Some(tx));
+            reg.enqueue(id.into(), &rows, held(&starts, id, rx)).unwrap();
+        }
+        assert!(eventually(|| starts.lock().unwrap().len() == 3).await);
+        reg.slots.resize(1); // what `Queue::set_concurrency` does
+        go[0].take().unwrap().send(()).unwrap();
+        go[1].take().unwrap().send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(starts.lock().unwrap().len(), 3, "d started past the lowered limit");
+        go[2].take().unwrap().send(()).unwrap();
+        assert!(eventually(|| starts.lock().unwrap().len() == 4).await, "d never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*starts.lock().unwrap(), ["a", "b", "c", "d"], "e waits for d: one at a time");
+        drop(go);
+        assert!(eventually(|| starts.lock().unwrap().len() == 5).await);
     }
 
     #[test]
