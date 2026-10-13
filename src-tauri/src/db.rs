@@ -1303,6 +1303,18 @@ impl Db {
         );
         conn.execute(&sql, rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())))?;
 
+        // Linking a video to a series hidden as a whole puts it on that card,
+        // so it goes the way of the series, as an undecided part would at the
+        // next sweep (see `hide_series_arrivals`) -- and here even one that
+        // was decided before, since the user has just put it there by hand.
+        // Only unmarked rows are touched: a part brought back on its own keeps
+        // its mark and stays back.
+        conn.execute(
+            "UPDATE videos SET hidden=1, series_hidden=1
+             WHERE sibling_group=?1 AND series_hidden=0
+               AND EXISTS (SELECT 1 FROM videos WHERE sibling_group=?1 AND series_hidden=1)",
+            params![key])?;
+
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM videos WHERE sibling_group=?1", params![key], |r| r.get(0))?;
         Ok(n as usize)
@@ -1330,6 +1342,193 @@ impl Db {
                          params![key])?;
         }
         Ok(())
+    }
+
+    /// Every row on a channel as the grouping rule sees it, whatever its
+    /// `status` -- unlike [`channel_rows`], which reads only what the feed can
+    /// show. Hiding a series has to reach the parts not on screen yet too: an
+    /// upcoming premiere is the next part, and the day it goes live it must
+    /// not walk back into the feed. Extra entries can only add members to a
+    /// card, never take one away, so the visible card is always inside what
+    /// this groups.
+    fn series_entries(conn: &Connection, channel_id: &str) -> Result<Vec<siblings::Entry>> {
+        let mut st = conn.prepare_cached(
+            "SELECT id, title, sibling_group FROM videos WHERE channel_id=?1")?;
+        let rows = st.query_map(params![channel_id], |r| {
+            Ok(siblings::Entry { id: r.get(0)?, title: r.get(1)?, group: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Hides (or brings back) the series `leader_id` leads, as a whole, and
+    /// returns the ids of the parts whose flags changed.
+    ///
+    /// A series has no row of its own -- a card is recomputed on every fetch --
+    /// so the decision is written onto its parts: `hidden` takes each out of
+    /// the feed, and `series_hidden` records that the *show* was hidden rather
+    /// than one bad episode, which is what [`Db::hide_series_arrivals`] follows
+    /// to the parts that join the card later.
+    ///
+    /// Bringing it back clears both, and stamps `series_hidden_changed_at` on
+    /// every part -- even one whose mark was already clear, which the trigger
+    /// alone would leave unstamped. The stamp is what makes a row *decided*:
+    /// the sweep only ever marks rows nobody has decided about, so a part on
+    /// the card brought back can never be swept back out by a mark elsewhere
+    /// on the channel. It also lets this choice win a sync against an older
+    /// mark another machine still holds.
+    ///
+    /// The lock is released for the matching, as in [`Db::sibling_ids`]. An
+    /// unknown leader changes nothing.
+    pub fn set_series_hidden(&self, leader_id: &str, hidden: bool) -> Result<Vec<String>> {
+        let entries = {
+            let conn = self.conn.lock().unwrap();
+            let channel_id: Option<String> = conn
+                .query_row("SELECT channel_id FROM videos WHERE id=?1", params![leader_id],
+                           |r| r.get(0))
+                .optional()?;
+            let Some(channel_id) = channel_id else { return Ok(Vec::new()) };
+            Self::series_entries(&conn, &channel_id)?
+        };
+        let parts: Vec<String> = siblings::Atoms::new(entries)
+            .group_led_by(leader_id)
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = Vec::new();
+        {
+            // Hiding writes only rows not already there, so a part already
+            // hidden and marked keeps its stamps and is not reported.
+            let mut flags = tx.prepare(if hidden {
+                "UPDATE videos SET hidden=1, series_hidden=1
+                 WHERE id=?1 AND (hidden=0 OR series_hidden=0)"
+            } else {
+                "UPDATE videos SET hidden=0, series_hidden=0
+                 WHERE id=?1 AND (hidden<>0 OR series_hidden<>0)"
+            })?;
+            // A stamp-only write, so the v11 trigger -- which fires on writes
+            // naming `series_hidden` -- stays out of it.
+            let mut decided = tx.prepare(
+                "UPDATE videos SET series_hidden_changed_at=?2 WHERE id=?1")?;
+            let at = now();
+            for id in parts {
+                if flags.execute(params![id])? > 0 { changed.push(id.clone()); }
+                if !hidden { decided.execute(params![id, at])?; }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Hides every part of a series hidden as a whole that nobody has decided
+    /// about yet, marks it so the part after it follows in turn, and returns
+    /// the ids.
+    ///
+    /// Run after everything that can bring such a part in: a poll (before its
+    /// auto-download sweep, which must never take a part of a series the user
+    /// hid, and before its toast, which must not announce one), a membership
+    /// join, hiding a series, and -- where a mark itself arrives -- a sync or
+    /// an import.
+    ///
+    /// A row is a candidate while its `series_hidden_changed_at` is NULL: the
+    /// mark was never set or cleared on it, by anyone, here or on a machine it
+    /// synced from. That one rule covers every way a part turns up -- polled
+    /// new, deepened from the back catalogue, a premiere going live under its
+    /// real title, an old upload retitled into the series, or a part this
+    /// machine already held when a mark arrived from elsewhere -- and it is
+    /// what keeps the sweep from ever overruling a person: Un-hide series
+    /// stamps every part it brings back, and un-hiding one part keeps that
+    /// part's mark, so neither can be swept back out. A video added by hand is
+    /// never a candidate either -- pasting it into the Add box was asking to
+    /// see it.
+    ///
+    /// A candidate is hidden when the card it would lead holds a marked part.
+    /// Each one hidden counts as marked for the rest, repeated until nothing
+    /// changes: two new parts in one poll, where the second matches only the
+    /// first, must not depend on which the loop reached first. That chaining
+    /// is also what follows a series whose titles drift -- p7 that matches
+    /// only p6, which matches only what was hidden by hand.
+    ///
+    /// Only channels holding a mark are read, and each candidate's card is
+    /// worked out once, with the lock released as in [`Db::sibling_ids`]. A
+    /// decision landing in that gap is respected by the write, which takes
+    /// only rows still undecided; that is also why only the rows this call
+    /// actually marked are returned, so two callers racing over one part never
+    /// both report it.
+    pub fn hide_series_arrivals(&self) -> Result<Vec<String>> {
+        // Per channel holding a mark: every row on it, which are marked, and
+        // which are still undecided.
+        let channels: Vec<(Vec<siblings::Entry>, HashSet<String>, Vec<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let ids: Vec<String> = {
+                let mut st = conn.prepare(
+                    "SELECT DISTINCT channel_id FROM videos WHERE series_hidden=1")?;
+                let rows = st.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut out = Vec::new();
+            for channel_id in ids {
+                let mut st = conn.prepare_cached(
+                    "SELECT id, series_hidden FROM videos
+                     WHERE channel_id=?1
+                       AND (series_hidden=1
+                            OR (series_hidden_changed_at IS NULL AND added_manually=0))")?;
+                let rows = st.query_map(params![channel_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+                })?;
+                let (mut marked, mut undecided) = (HashSet::new(), Vec::new());
+                for row in rows {
+                    let (id, is_marked) = row?;
+                    if is_marked { marked.insert(id); } else { undecided.push(id); }
+                }
+                if undecided.is_empty() { continue; }
+                out.push((Self::series_entries(&conn, &channel_id)?, marked, undecided));
+            }
+            out
+        };
+
+        let mut hide: Vec<String> = Vec::new();
+        for (entries, already, undecided) in channels {
+            let atoms = siblings::Atoms::new(entries);
+            let mut marked: HashSet<&str> = already.iter().map(String::as_str).collect();
+            // Each candidate's card once, up front: which rows are marked
+            // changes from pass to pass, but the cards themselves do not. A
+            // card of one holds nothing but the candidate, which is unmarked.
+            let mut pending: Vec<(&str, Vec<&str>)> = undecided
+                .iter()
+                .map(|id| (id.as_str(), atoms.group_led_by(id)))
+                .filter(|(_, card)| card.len() > 1)
+                .collect();
+            loop {
+                let before = pending.len();
+                pending.retain(|(id, card)| {
+                    if !card.iter().any(|m| marked.contains(m)) {
+                        return true;
+                    }
+                    marked.insert(id);
+                    hide.push(id.to_string());
+                    false
+                });
+                if pending.len() == before { break; }
+            }
+        }
+        if hide.is_empty() { return Ok(hide); }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = Vec::new();
+        {
+            let mut st = tx.prepare(
+                "UPDATE videos SET hidden=1, series_hidden=1
+                 WHERE id=?1 AND series_hidden=0 AND series_hidden_changed_at IS NULL")?;
+            for id in hide {
+                if st.execute(params![id])? > 0 { changed.push(id); }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn set_watched(&self, id: &str, watched: bool) -> Result<()> {
@@ -4735,6 +4934,425 @@ impl Db {
         tx.commit()?;
         report.changed = writes > 0;
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+    use std::ops::RangeInclusive;
+
+    const CH: &str = "UC1";
+
+    fn chan(id: &str) -> Channel {
+        Channel { id: id.into(), title: format!("T-{id}"), handle: None,
+                  url: format!("https://www.youtube.com/channel/{id}"),
+                  thumb_path: None, subscribed: true, member: false, added_at: 0,
+                  last_polled_at: None, terminated: false, auto_download: false }
+    }
+
+    fn row(id: &str, title: &str) -> NewVideo {
+        NewVideo { id: id.into(), channel_id: CH.into(), title: title.into(),
+                   description: None, thumb_url: None, published_at: Some(1_000),
+                   sort_at: Some(1_000), feed_rank: 0, added_manually: false,
+                   duration_secs: Some(600), view_count: Some(1), status: VideoStatus::Ready }
+    }
+
+    fn db() -> Db {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&chan(CH)).unwrap();
+        d
+    }
+
+    fn add(d: &Db, v: NewVideo) { assert!(d.insert_video_if_new(&v).unwrap()); }
+
+    /// The Blackwood Tapes, parts 1 and 2, and an unrelated upload beside them.
+    fn tapes(d: &Db) {
+        add(d, row("p1", "The Blackwood Tapes Pt 1"));
+        add(d, row("p2", "The Blackwood Tapes Pt 2"));
+        add(d, row("other", "Cooking With Gas"));
+    }
+
+    fn sql(d: &Db, s: &str) { d.conn.lock().unwrap().execute_batch(s).unwrap(); }
+
+    /// `(hidden, series_hidden)`.
+    fn flags(d: &Db, id: &str) -> (bool, bool) {
+        let v = d.get_video(id).unwrap().unwrap();
+        (v.hidden, v.series_hidden)
+    }
+
+    /// `(hidden_changed_at, series_hidden_changed_at)`.
+    fn stamps(d: &Db, id: &str) -> (Option<i64>, Option<i64>) {
+        d.conn.lock().unwrap().query_row(
+            "SELECT hidden_changed_at, series_hidden_changed_at FROM videos WHERE id=?1",
+            params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> { ids.sort(); ids }
+
+    fn around<T>(f: impl FnOnce() -> T) -> (T, RangeInclusive<i64>) {
+        let before = now();
+        let out = f();
+        (out, before..=now())
+    }
+
+    /// The premise of the drift tests, checked rather than assumed: "The Long
+    /// Road Home" reads as a part of "The Long Road Part 6", but not of "The
+    /// Long Road" -- neither of those two carries a part marker, and without
+    /// one only an identical stem matches. So p6 sits on both cards, p5's and
+    /// p7's, and p5 and p7 never share one.
+    fn the_long_road_drifts() {
+        use crate::siblings::{is_sibling, normalize};
+        let (p5, p6, p7) = (normalize("The Long Road"), normalize("The Long Road Part 6"),
+                            normalize("The Long Road Home"));
+        assert!(is_sibling(&p5, &p6) && is_sibling(&p6, &p7));
+        assert!(!is_sibling(&p5, &p7));
+    }
+
+    // ---- hiding and un-hiding a series ----
+
+    #[test]
+    fn hiding_a_series_marks_every_part_including_one_not_ready_yet() {
+        let d = db();
+        tapes(&d);
+        // An upcoming premiere: never on screen, but it is the next part, and
+        // the day it goes live it must not walk back into the feed.
+        add(&d, NewVideo { status: VideoStatus::Upcoming, ..row("p3", "The Blackwood Tapes Pt 3") });
+
+        let changed = d.set_series_hidden("p1", true).unwrap();
+        assert_eq!(sorted(changed), vec!["p1", "p2", "p3"]);
+        for id in ["p1", "p2", "p3"] {
+            assert_eq!(flags(&d, id), (true, true), "{id}");
+        }
+        assert_eq!(flags(&d, "other"), (false, false), "not a part, not touched");
+    }
+
+    #[test]
+    fn hiding_again_changes_nothing_and_says_so() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+        assert!(d.set_series_hidden("p2", true).unwrap().is_empty(),
+                "led from another part, the same series is already hidden");
+    }
+
+    #[test]
+    fn a_part_hidden_on_its_own_is_marked_when_its_series_is_hidden() {
+        let d = db();
+        tapes(&d);
+        d.set_hidden("p2", true).unwrap();
+        let changed = d.set_series_hidden("p1", true).unwrap();
+        assert_eq!(sorted(changed), vec!["p1", "p2"], "p2 was hidden but not yet marked");
+        assert_eq!(flags(&d, "p2"), (true, true));
+    }
+
+    #[test]
+    fn unhiding_a_series_clears_both_flags_on_every_part() {
+        let d = db();
+        tapes(&d);
+        add(&d, NewVideo { status: VideoStatus::Upcoming, ..row("p3", "The Blackwood Tapes Pt 3") });
+        d.set_series_hidden("p1", true).unwrap();
+
+        let changed = d.set_series_hidden("p2", false).unwrap();
+        assert_eq!(sorted(changed), vec!["p1", "p2", "p3"]);
+        for id in ["p1", "p2", "p3"] {
+            assert_eq!(flags(&d, id), (false, false), "{id}");
+        }
+
+        // And with the mark gone, a new part is just a new part.
+        add(&d, row("p4", "The Blackwood Tapes Pt 4"));
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(flags(&d, "p4"), (false, false));
+    }
+
+    #[test]
+    fn an_unknown_leader_changes_nothing() {
+        let d = db();
+        tapes(&d);
+        assert!(d.set_series_hidden("no such video", true).unwrap().is_empty());
+        assert_eq!(flags(&d, "p1"), (false, false));
+    }
+
+    #[test]
+    fn hiding_and_unhiding_a_series_stamp_both_columns() {
+        let d = db();
+        tapes(&d);
+        let (_, at) = around(|| d.set_series_hidden("p1", true).unwrap());
+        for id in ["p1", "p2"] {
+            let (hidden, series) = stamps(&d, id);
+            assert!(hidden.is_some_and(|s| at.contains(&s)), "{id} hidden stamp");
+            assert!(series.is_some_and(|s| at.contains(&s)), "{id} series stamp");
+        }
+
+        // Pinned into the past, so the un-hide can be seen to move them on.
+        sql(&d, "UPDATE videos SET hidden_changed_at=5, series_hidden_changed_at=5
+                 WHERE id IN ('p1','p2')");
+        let (_, at) = around(|| d.set_series_hidden("p1", false).unwrap());
+        let (hidden, series) = stamps(&d, "p2");
+        assert!(hidden.is_some_and(|s| at.contains(&s)));
+        assert!(series.is_some_and(|s| at.contains(&s)));
+        assert_eq!(stamps(&d, "other"), (None, None), "an untouched row stays unstamped");
+    }
+
+    #[test]
+    fn unhiding_a_series_decides_even_a_part_that_was_never_marked() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+        // On the card but never marked: added by hand, so the sweep let it be.
+        add(&d, NewVideo { added_manually: true, ..row("p3", "The Blackwood Tapes Pt 3") });
+        assert_eq!(stamps(&d, "p3"), (None, None));
+
+        let (changed, at) = around(|| d.set_series_hidden("p1", false).unwrap());
+        assert_eq!(sorted(changed), vec!["p1", "p2"], "p3's flags did not change");
+        assert!(stamps(&d, "p3").1.is_some_and(|s| at.contains(&s)),
+                "but bringing the series back was a decision about it too");
+        assert_eq!(flags(&d, "p3"), (false, false));
+    }
+
+    // ---- the sweep ----
+
+    #[test]
+    fn a_part_arriving_after_the_hide_is_hidden_and_marked() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        add(&d, row("stranger", "A Quiet Walk"));
+        let (hid, at) = around(|| d.hide_series_arrivals().unwrap());
+        assert_eq!(hid, vec!["p3"]);
+        assert_eq!(flags(&d, "p3"), (true, true), "marked too, so the part after it follows");
+        assert_eq!(flags(&d, "stranger"), (false, false));
+        let (hidden, series) = stamps(&d, "p3");
+        assert!(hidden.is_some_and(|s| at.contains(&s)), "a hide like any other: it syncs");
+        assert!(series.is_some_and(|s| at.contains(&s)));
+        assert_eq!(stamps(&d, "stranger"), (None, None), "still undecided, still unstamped");
+
+        assert!(d.hide_series_arrivals().unwrap().is_empty(), "nothing left to do twice");
+    }
+
+    #[test]
+    fn a_part_outside_the_hidden_card_whose_own_card_holds_a_marked_part_is_swept() {
+        the_long_road_drifts();
+        let d = db();
+        add(&d, row("p5", "The Long Road"));
+        add(&d, row("p6", "The Long Road Part 6"));
+        add(&d, row("p7", "The Long Road Home"));
+
+        // p5's card is p5 and p6; p7 is not on it, and the hide leaves it be.
+        assert_eq!(sorted(d.set_series_hidden("p5", true).unwrap()), vec!["p5", "p6"]);
+        assert_eq!(flags(&d, "p7"), (false, false));
+
+        // But p7's own card is p7 and p6, and p6 is marked now.
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p7"]);
+        assert_eq!(flags(&d, "p7"), (true, true));
+    }
+
+    #[test]
+    fn a_drifting_series_is_followed_one_part_at_a_time() {
+        the_long_road_drifts();
+        let d = db();
+        add(&d, row("p5", "The Long Road"));
+        d.set_series_hidden("p5", true).unwrap();
+
+        add(&d, row("p6", "The Long Road Part 6"));
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p6"]);
+
+        // p7 shares nothing with what was hidden by hand. It is hidden because
+        // p6 arrived marked, which is the whole reason an arrival is marked
+        // rather than only hidden.
+        add(&d, row("p7", "The Long Road Home"));
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p7"]);
+        assert_eq!(flags(&d, "p7"), (true, true));
+    }
+
+    #[test]
+    fn two_arrivals_in_one_sweep_where_the_second_matches_only_the_first() {
+        the_long_road_drifts();
+        let d = db();
+        add(&d, row("p5", "The Long Road"));
+        d.set_series_hidden("p5", true).unwrap();
+
+        // p7 first, so a single pass in insertion order would reach it before
+        // p6 was marked and leave it out.
+        add(&d, row("p7", "The Long Road Home"));
+        add(&d, row("p6", "The Long Road Part 6"));
+        assert_eq!(sorted(d.hide_series_arrivals().unwrap()), vec!["p6", "p7"]);
+    }
+
+    #[test]
+    fn a_part_brought_back_with_its_series_is_never_swept_back_out() {
+        the_long_road_drifts();
+        let d = db();
+        add(&d, row("p5", "The Long Road"));
+        add(&d, row("p6", "The Long Road Part 6"));
+        add(&d, row("p7", "The Long Road Home"));
+        d.set_series_hidden("p5", true).unwrap();
+
+        // Brought back from p7's card, which holds p7 and p6 but not p5: p5
+        // stays hidden and marked, on a card of its own.
+        assert_eq!(d.set_series_hidden("p7", false).unwrap(), vec!["p6"]);
+        assert_eq!(flags(&d, "p5"), (true, true));
+
+        // p6 still matches the marked p5, and p7 matches p6. Neither may come
+        // back out: the user has just said so.
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(flags(&d, "p6"), (false, false));
+        assert_eq!(flags(&d, "p7"), (false, false));
+
+        // A new part reads as p5's (the same stem) and as p7's (a numbered
+        // title sharing p7's opening), so it is swept -- and lands on p7's
+        // card marked. p7's mark was never set, only its stamp: that is all
+        // that keeps it from following p8 out.
+        add(&d, row("p8", "The Long Road Part 8"));
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p8"]);
+        assert_eq!(flags(&d, "p7"), (false, false));
+        assert_eq!(flags(&d, "p6"), (false, false));
+    }
+
+    #[test]
+    fn a_part_already_here_when_a_mark_arrives_from_elsewhere_is_swept() {
+        let d = db();
+        tapes(&d);
+        // Another machine hid the series and only its p1 travelled -- the way
+        // a sync apply writes it, stamp and all, so the trigger stays out.
+        sql(&d, "UPDATE videos SET hidden=1, hidden_changed_at=50,
+                                   series_hidden=1, series_hidden_changed_at=50
+                 WHERE id='p1'");
+
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p2"]);
+        assert_eq!(flags(&d, "p2"), (true, true));
+        assert_eq!(flags(&d, "other"), (false, false));
+    }
+
+    #[test]
+    fn an_old_upload_retitled_into_a_hidden_series_is_swept() {
+        let d = db();
+        tapes(&d);
+        // A premiere listed under a placeholder when the series was hidden, so
+        // it matched nothing and was left unmarked.
+        add(&d, NewVideo { status: VideoStatus::Upcoming, ..row("p3", "Coming Soon") });
+        d.set_series_hidden("p1", true).unwrap();
+        assert_eq!(flags(&d, "p3"), (false, false));
+
+        d.set_titles(&[("p3".into(), "The Blackwood Tapes Pt 3".into())]).unwrap();
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p3"]);
+        assert_eq!(flags(&d, "p3"), (true, true));
+    }
+
+    #[test]
+    fn a_video_added_by_hand_is_never_swept() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+
+        add(&d, NewVideo { added_manually: true, ..row("p3", "The Blackwood Tapes Pt 3") });
+        assert!(d.hide_series_arrivals().unwrap().is_empty(),
+                "pasting it into the Add box was asking to see it");
+        assert_eq!(flags(&d, "p3"), (false, false));
+    }
+
+    #[test]
+    fn hiding_one_part_on_its_own_leaves_nothing_for_the_sweep_to_follow() {
+        let d = db();
+        tapes(&d);
+        // A bad episode, not the show.
+        d.set_hidden("p1", true).unwrap();
+
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(flags(&d, "p2"), (false, false));
+        assert_eq!(flags(&d, "p3"), (false, false));
+    }
+
+    #[test]
+    fn unhiding_one_part_keeps_its_mark_and_arrivals_still_hide() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+        d.set_hidden("p1", false).unwrap();
+        assert_eq!(flags(&d, "p1"), (false, true), "one episode back, the show still hidden");
+
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p3"]);
+        assert_eq!(flags(&d, "p1"), (false, true), "and the episode brought back stays back");
+    }
+
+    #[test]
+    fn a_part_is_matched_only_against_its_own_channel() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+        d.upsert_channel(&chan("UC2")).unwrap();
+
+        // The very same title, uploaded by someone else.
+        add(&d, NewVideo { channel_id: "UC2".into(), ..row("copy", "The Blackwood Tapes Pt 3") });
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(flags(&d, "copy"), (false, false));
+    }
+
+    #[test]
+    fn nothing_is_swept_on_a_channel_with_no_hidden_series() {
+        let d = db();
+        tapes(&d);
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(flags(&d, "p3"), (false, false));
+    }
+
+    // ---- marking by hand ----
+
+    #[test]
+    fn marking_a_video_into_a_hidden_series_hides_it() {
+        let d = db();
+        tapes(&d);
+        add(&d, row("ec", "EVERYTHING CHANGED"));
+        d.set_series_hidden("p1", true).unwrap();
+
+        // The renamed follow-up, linked by hand.
+        assert_eq!(d.mark_siblings(&["p2".into(), "ec".into()]).unwrap(), 2,
+                   "the group's size, as before");
+        assert_eq!(flags(&d, "ec"), (true, true));
+        assert_eq!(flags(&d, "other"), (false, false));
+    }
+
+    #[test]
+    fn marking_hides_even_a_video_decided_before_since_the_user_just_linked_it() {
+        let d = db();
+        tapes(&d);
+        add(&d, row("ec", "EVERYTHING CHANGED"));
+        // Its own one-part "series" brought back once: decided, so no sweep
+        // would ever touch it.
+        d.set_series_hidden("ec", true).unwrap();
+        d.set_series_hidden("ec", false).unwrap();
+        d.set_series_hidden("p1", true).unwrap();
+
+        d.mark_siblings(&["p2".into(), "ec".into()]).unwrap();
+        assert_eq!(flags(&d, "ec"), (true, true));
+    }
+
+    #[test]
+    fn marking_visible_videos_together_hides_nothing() {
+        let d = db();
+        tapes(&d);
+        add(&d, row("ec", "EVERYTHING CHANGED"));
+        d.mark_siblings(&["p2".into(), "ec".into()]).unwrap();
+        assert_eq!(flags(&d, "ec"), (false, false));
+        assert_eq!(flags(&d, "p2"), (false, false));
+    }
+
+    #[test]
+    fn marking_never_re_hides_a_part_brought_back_on_its_own() {
+        let d = db();
+        tapes(&d);
+        add(&d, row("ec", "EVERYTHING CHANGED"));
+        d.set_series_hidden("p1", true).unwrap();
+        d.set_hidden("p2", false).unwrap();
+
+        d.mark_siblings(&["p2".into(), "ec".into()]).unwrap();
+        assert_eq!(flags(&d, "ec"), (true, true), "the newcomer joins a hidden series");
+        assert_eq!(flags(&d, "p2"), (false, true), "the episode brought back stays back");
     }
 }
 

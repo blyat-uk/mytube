@@ -425,6 +425,35 @@ pub async fn set_video_hidden(
     db_blocking(&state, move |db| db.set_hidden(&video_id, hidden)).await
 }
 
+/// Hides (or brings back) the series a card leads, as a whole: every part on
+/// it, and -- through the mark this leaves on them -- every part that joins it
+/// later. Returns the ids of every video whose flags changed.
+///
+/// Hiding sweeps at once rather than leaving it to the next poll: a part off
+/// this card whose own card holds one of these parts -- a series whose titles
+/// drift -- would otherwise stay on screen until then, wearing the parts just
+/// hidden.
+#[tauri::command]
+pub async fn set_series_hidden(
+    leader_id: String,
+    hidden: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<Vec<String>> {
+    db_blocking(&state, move |db| {
+        let mut changed = db.set_series_hidden(&leader_id, hidden)?;
+        if hidden {
+            match db.hide_series_arrivals() {
+                Ok(more) => changed.extend(more),
+                // The hide itself is in; what the sweep missed stays undecided,
+                // and the next poll's sweep takes it.
+                Err(err) => eprintln!("mytube: sweeping after a series hide failed: {err}"),
+            }
+        }
+        Ok(changed)
+    })
+    .await
+}
+
 /// Removes a manually added video outright. Refuses subscription videos, which
 /// would simply reappear on the next poll — those must be hidden instead.
 #[tauri::command]

@@ -227,18 +227,40 @@ fn insert_from_listing(db: &Db, channel_id: &str, entries: &[FlatEntry],
     db.insert_videos_if_new(&rows)
 }
 
+/// What one write of fresh rows added: the database's own count of rows that
+/// were new, and the ids that were handed to it as new.
+///
+/// The ids are what lets an ingest take a row the series sweep just hid back
+/// out of the count it reports ([`still_new`]). They match the count unless
+/// another writer -- a sync, a membership join -- slipped one of them in
+/// between the existence check and the insert. Such an id is in `ids` without
+/// being counted, so taking it out again can leave the toast one short, but
+/// can never let it announce a video the sweep hid.
+#[derive(Default)]
+struct Added {
+    count: usize,
+    ids: Vec<String>,
+}
+
+impl Added {
+    fn extend(&mut self, more: Added) {
+        self.count += more.count;
+        self.ids.extend(more.ids);
+    }
+}
+
 /// Adds what a listing carries and RSS structurally cannot: a joined channel's
 /// members-only uploads.
 ///
 /// Shared by the poll, which already holds a listing, and by joining a channel,
 /// which fetches its own and deeper one.
 async fn ingest_listing(state: &AppState, channel_id: &str, entries: &[FlatEntry],
-                        member: bool, mode: Ingest) -> Result<usize> {
+                        member: bool, mode: Ingest) -> Result<Added> {
     let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
     let known = state.db.existing_video_ids(&ids)?;
     let fresh = ingestable(entries, &known, member, mode);
     if fresh.is_empty() {
-        return Ok(0);
+        return Ok(Added::default());
     }
 
     // The same reasoning as `backfill_channel`: a listing only ever carries an
@@ -247,11 +269,11 @@ async fn ingest_listing(state: &AppState, channel_id: &str, entries: &[FlatEntry
     // ld+json to a signed-out request, so no cookies are needed here -- only
     // the download itself needs them.
     let fresh_ids: Vec<String> = fresh.iter().map(|e| e.id.clone()).collect();
-    let real = upload_date::fetch_many(&state.http, fresh_ids).await;
+    let real = upload_date::fetch_many(&state.http, fresh_ids.clone()).await;
 
-    let added = insert_from_listing(&state.db, channel_id, &fresh, &real)?;
+    let count = insert_from_listing(&state.db, channel_id, &fresh, &real)?;
     cache_thumbs(state, fresh.iter().map(|e| (e.id.clone(), ytdlp::thumb_url_for(&e.id)))).await;
-    Ok(added)
+    Ok(Added { count, ids: fresh_ids })
 }
 
 /// One listing, read as deep as a backfill, purely to pick up the members-only
@@ -260,10 +282,45 @@ async fn ingest_listing(state: &AppState, channel_id: &str, entries: &[FlatEntry
 /// The poll's own window is [`TITLE_REFRESH_LIMIT`] and a membership backlog
 /// routinely reaches past it, so joining reads `depth` entries once rather than
 /// leaving the older parts permanently out of sight.
+///
+/// The count it returns is what the join's toast announces, so it follows the
+/// poll's rule: a part of a series hidden as a whole is hidden at once, before
+/// the next poll could, and left out of it.
 pub async fn ingest_members_only(state: &AppState, channel_id: &str, depth: u32)
     -> Result<usize> {
     let entries = listing(&state.tools, channel_id, depth).await?;
-    ingest_listing(state, channel_id, &entries, true, Ingest::MembersOnly).await
+    let added = ingest_listing(state, channel_id, &entries, true, Ingest::MembersOnly).await?;
+    let hidden = hide_series_arrivals(state);
+    Ok(still_new(added.count, &added.ids.into_iter().collect(), &hidden))
+}
+
+/// [`Db::hide_series_arrivals`], for a caller outside a poll -- joining a
+/// membership, a sync that brought marks -- which has no summary line of its
+/// own to carry the count, so the journal is told here.
+pub fn hide_series_arrivals(state: &AppState) -> Vec<String> {
+    let hidden = arrivals_hidden(&state.db);
+    if !hidden.is_empty() {
+        eprintln!("mytube: {} hidden with their series", hidden.len());
+    }
+    hidden
+}
+
+/// [`Db::hide_series_arrivals`] with its error logged and swallowed: a sweep
+/// that fails must not fail the ingest that wrote the rows. What it missed
+/// stays undecided, so the next sweep tries again.
+fn arrivals_hidden(db: &Db) -> Vec<String> {
+    db.hide_series_arrivals().unwrap_or_else(|err| {
+        eprintln!("mytube: hiding the new parts of hidden series failed: {err}");
+        Vec::new()
+    })
+}
+
+/// How many of an ingest's `counted` new videos are still in the feed once the
+/// series sweep has run. Only rows the ingest itself counted are taken back
+/// out: the sweep also reaches deepened rows and parts that were already here,
+/// and those were never in the count to begin with.
+fn still_new(counted: usize, new_ids: &HashSet<String>, hidden: &[String]) -> usize {
+    counted.saturating_sub(hidden.iter().filter(|id| new_ids.contains(*id)).count())
 }
 
 /// How many dates one startup repairs. A flat listing costs nothing per video,
@@ -292,11 +349,11 @@ pub async fn repair_dates(state: &AppState) -> usize {
     state.db.set_published_at_many(&real).unwrap_or(0)
 }
 
-/// Writes a feed's entries as new rows, returning how many were actually new.
+/// Writes a feed's entries as new rows, returning what was actually new.
 ///
 /// The counterpart of [`insert_from_listing`], and the only path that ever sees
 /// an exact publish instant: RSS is the one source that carries one.
-fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<usize> {
+fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
     let ids: Vec<String> = feed.entries.iter().map(|e| e.video_id.clone()).collect();
     let existing = db.existing_video_ids(&ids)?;
     let mut dates: Vec<(String, i64)> = Vec::new();
@@ -337,12 +394,16 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<usize> {
     }
     // One lock and one commit for the whole feed. A date that fails to write is
     // skipped, as it always was; only an insert failing fails the poll.
-    db.apply_feed(&dates, &fresh)
+    let count = db.apply_feed(&dates, &fresh)?;
+    Ok(Added { count, ids: fresh.into_iter().map(|v| v.id).collect() })
 }
 
 /// What one channel's poll produced.
 pub struct ChannelPoll {
     pub new_videos: usize,
+    /// The ids behind `new_videos`, so that once every channel is in, the
+    /// series sweep's hides can be taken back out of the poll's count.
+    pub new_ids: Vec<String>,
     pub shorts_rejected: usize,
     /// True when RSS failed and the channel listing stood in for it. Carried
     /// only so [`summary_line`] can record the outage in the journal.
@@ -374,7 +435,7 @@ pub async fn poll_one(
     let feed = feed.ok();
     let mode = if feed.is_some() { Ingest::MembersOnly } else { Ingest::Everything };
 
-    let mut new_count = 0;
+    let mut added = Added::default();
     if let Some(feed) = &feed {
         // Only the feed carries the channel's current name; a listing entry
         // does not, so a rename waits for the feed to come back.
@@ -383,7 +444,7 @@ pub async fn poll_one(
             c.title = feed.channel_title.clone();
             state.db.upsert_channel(&c)?;
         }
-        new_count += insert_from_feed(&state.db, channel, feed)?;
+        added.extend(insert_from_feed(&state.db, channel, feed)?);
     }
 
     let entries = match refresh_from_listing(&state.db, &state.tools, &channel.id, backfill, mode)
@@ -411,7 +472,7 @@ pub async fn poll_one(
     };
     // Counted as new videos like any other: these are uploads you had not seen,
     // and the toast and the tray badge would be wrong without them.
-    new_count += ingest_listing(state, &channel.id, &entries, channel.member, mode).await?;
+    added.extend(ingest_listing(state, &channel.id, &entries, channel.member, mode).await?);
 
     // Only the feed carries a thumbnail URL. Rows ingested from the listing get
     // theirs inside `ingest_listing`, from `ytdlp::thumb_url_for`.
@@ -429,7 +490,8 @@ pub async fn poll_one(
     }
     state.db.set_channel_polled(&channel.id)?;
     Ok(ChannelPoll {
-        new_videos: new_count,
+        new_videos: added.count,
+        new_ids: added.ids,
         // A listing carries no Shorts to reject: it reads the /videos tab,
         // which does not serve them -- so during a fallback the Shorts guard
         // is the tab rather than `rss::is_short`. Verified 2026-09-22 against
@@ -454,8 +516,12 @@ pub async fn poll_one(
 /// because their feed failed. It is deliberately not a [`PollSummary`] field:
 /// a fallback shows nothing on screen, and this line is the whole record of it.
 /// `auto_queued` is the same kind of number: what the post-poll auto-download
-/// sweep queued, visible on screen only as rows turning "queued".
-fn summary_line(s: &PollSummary, via_listing: usize, auto_queued: usize) -> String {
+/// sweep queued, visible on screen only as rows turning "queued". So is
+/// `series_hidden`: parts the series sweep hid with a series hidden as a whole,
+/// which show on screen as nothing at all -- `s.new_videos` has already left
+/// out the ones it counted.
+fn summary_line(s: &PollSummary, via_listing: usize, series_hidden: usize,
+                auto_queued: usize) -> String {
     let mut line = format!("polled {} {}", s.channels_polled, plural(s.channels_polled, "channel"));
     match s.new_videos {
         0 => line.push_str(", nothing new"),
@@ -467,6 +533,9 @@ fn summary_line(s: &PollSummary, via_listing: usize, auto_queued: usize) -> Stri
     }
     if via_listing > 0 {
         line.push_str(&format!(", {via_listing} via yt-dlp (RSS down)"));
+    }
+    if series_hidden > 0 {
+        line.push_str(&format!(", {series_hidden} hidden with their series"));
     }
     if auto_queued > 0 {
         line.push_str(&format!(", {auto_queued} auto-queued"));
@@ -494,7 +563,7 @@ pub async fn poll_channels(
             errors: vec!["A refresh is already running".into()],
             ..Default::default()
         };
-        eprintln!("mytube: {}", summary_line(&refused, 0, 0));
+        eprintln!("mytube: {}", summary_line(&refused, 0, 0, 0));
         return refused;
     };
     // A terminated channel's feed 404s and its listing refuses, every time, so
@@ -522,10 +591,12 @@ pub async fn poll_channels(
         ..Default::default()
     };
     let mut via_listing = 0;
+    let mut new_ids: HashSet<String> = HashSet::new();
     for (title, r) in results {
         match r {
             Ok(p) => {
                 summary.new_videos += p.new_videos;
+                new_ids.extend(p.new_ids);
                 summary.shorts_rejected += p.shorts_rejected;
                 via_listing += usize::from(p.via_listing);
             }
@@ -535,12 +606,21 @@ pub async fn poll_channels(
     // Before `poll://finished`, so the refetch it drives shows the deeper
     // catalogue on the same poll.
     deepen(state, &ids, backfill).await;
+    // After `deepen`, so a deepened part of a hidden series is caught too, and
+    // before the auto-download sweep, so it never takes a part of a series the
+    // user hid. It also catches what a new subscription's or a Takeout
+    // import's backfill wrote just before this poll was called. The toast and
+    // the tray badge are for videos you will find in the feed, which these
+    // are not; only the ones this poll counted are taken back out, since
+    // deepened and backfilled rows were never in the count.
+    let hidden = arrivals_hidden(&state.db);
+    summary.new_videos = still_new(summary.new_videos, &new_ids, &hidden);
     // After `deepen`, though what it inserts is never a candidate (it aired
     // before the switch-on): the order just means the sweep sees the library
     // as this poll leaves it. Before `poll://finished`, so the refetch shows
     // the rows already queued.
     let auto_queued = auto_download(state).await;
-    eprintln!("mytube: {}", summary_line(&summary, via_listing, auto_queued));
+    eprintln!("mytube: {}", summary_line(&summary, via_listing, hidden.len(), auto_queued));
     let _ = app.emit("poll://finished", summary.clone());
     // Polls only. A backfill or a manually added video is something you asked
     // for with the window in front of you, so it is read the moment it lands.
@@ -930,25 +1010,25 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
     fn a_quiet_poll_still_reports_that_it_ran() {
         // The whole point of the line: proving the loop is alive on a night
         // where nothing was published.
-        assert_eq!(summary_line(&summary(27, 0, 0), 0, 0), "polled 27 channels, nothing new");
+        assert_eq!(summary_line(&summary(27, 0, 0), 0, 0, 0), "polled 27 channels, nothing new");
     }
 
     #[test]
     fn a_haul_is_counted() {
-        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0), "polled 27 channels, 2 new");
+        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0, 0), "polled 27 channels, 2 new");
     }
 
     #[test]
     fn rejected_shorts_are_only_mentioned_when_there_were_some() {
         assert_eq!(
-            summary_line(&summary(27, 2, 3), 0, 0),
+            summary_line(&summary(27, 2, 3), 0, 0, 0),
             "polled 27 channels, 2 new, 3 shorts rejected"
         );
     }
 
     #[test]
     fn one_channel_is_not_pluralised() {
-        assert_eq!(summary_line(&summary(1, 1, 1), 0, 0), "polled 1 channel, 1 new, 1 short rejected");
+        assert_eq!(summary_line(&summary(1, 1, 1), 0, 0, 0), "polled 1 channel, 1 new, 1 short rejected");
     }
 
     /// A fallback is invisible on screen by design -- no error toast, and the
@@ -958,11 +1038,11 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
     #[test]
     fn channels_that_fell_back_to_the_listing_are_named_in_the_journal() {
         assert_eq!(
-            summary_line(&summary(36, 3, 0), 36, 0),
+            summary_line(&summary(36, 3, 0), 36, 0, 0),
             "polled 36 channels, 3 new, 36 via yt-dlp (RSS down)"
         );
         // A healthy poll says nothing about a fallback that did not happen.
-        assert_eq!(summary_line(&summary(36, 3, 0), 0, 0), "polled 36 channels, 3 new");
+        assert_eq!(summary_line(&summary(36, 3, 0), 0, 0, 0), "polled 36 channels, 3 new");
         // Both halves of a partial outage are on the line: 1 channel had no
         // feed *and* no listing, the other 35 were served by the listing.
         let partial = PollSummary {
@@ -970,7 +1050,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             ..summary(36, 0, 0)
         };
         assert_eq!(
-            summary_line(&partial, 35, 0),
+            summary_line(&partial, 35, 0, 0),
             "polled 36 channels, nothing new, 35 via yt-dlp (RSS down), \
 1 error: Gone: feed 404; and the listing failed too: no such channel"
         );
@@ -981,10 +1061,85 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
     #[test]
     fn auto_queued_downloads_are_counted_only_when_there_were_some() {
         assert_eq!(
-            summary_line(&summary(27, 2, 0), 0, 2),
+            summary_line(&summary(27, 2, 0), 0, 0, 2),
             "polled 27 channels, 2 new, 2 auto-queued"
         );
-        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0), "polled 27 channels, 2 new");
+        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0, 0), "polled 27 channels, 2 new");
+    }
+
+    /// A part hidden with its series shows on screen as nothing at all, and is
+    /// already out of the "new" count, so the journal is the only place it is
+    /// recorded.
+    #[test]
+    fn parts_hidden_with_their_series_are_named_only_when_there_were_some() {
+        assert_eq!(
+            summary_line(&summary(27, 2, 0), 0, 1, 2),
+            "polled 27 channels, 2 new, 1 hidden with their series, 2 auto-queued"
+        );
+        assert_eq!(
+            summary_line(&summary(27, 0, 0), 0, 3, 0),
+            "polled 27 channels, nothing new, 3 hidden with their series"
+        );
+        assert_eq!(summary_line(&summary(27, 2, 0), 0, 0, 0), "polled 27 channels, 2 new");
+    }
+
+    fn ids(list: &[&str]) -> HashSet<String> { list.iter().map(|s| s.to_string()).collect() }
+    fn owned(list: &[&str]) -> Vec<String> { list.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn a_hidden_part_is_taken_out_of_the_count_only_if_the_poll_counted_it() {
+        // The poll's only new video went with its series: nothing to announce.
+        assert_eq!(still_new(1, &ids(&["p3"]), &owned(&["p3"])), 0);
+        // A deepened row, or a part already in the library, was never in the
+        // count, so hiding it takes nothing away from the videos that were.
+        assert_eq!(still_new(2, &ids(&["a", "b"]), &owned(&["deep", "old"])), 2);
+        assert_eq!(still_new(2, &ids(&["a", "b"]), &owned(&["b", "deep"])), 1);
+        // An id handed to the insert that another writer got in first is in
+        // `new_ids` uncounted; taking it out must not wrap below zero.
+        assert_eq!(still_new(0, &ids(&["raced"]), &owned(&["raced"])), 0);
+    }
+
+    fn feed(entries: &[(&str, &str)]) -> Feed {
+        Feed {
+            channel_id: CH.into(),
+            channel_title: "One".into(),
+            entries: entries.iter().map(|(id, title)| FeedEntry {
+                video_id: id.to_string(),
+                title: title.to_string(),
+                description: None,
+                thumb_url: None,
+                published_at: 1_789_887_789,
+                view_count: None,
+            }).collect(),
+            shorts_rejected: 0,
+        }
+    }
+
+    /// The poll's arithmetic against a real database: a feed brings a new part
+    /// of a series hidden as a whole alongside an ordinary upload, the sweep
+    /// takes the part, and only the upload is announced.
+    #[test]
+    fn a_poll_announces_only_the_new_videos_the_series_sweep_left_in_the_feed() {
+        let db = Db::open_in_memory().unwrap();
+        member_channel(&db);
+        let channel = db.get_channel(CH).unwrap().unwrap();
+        insert_from_feed(&db, &channel, &feed(&[("p1", "The Blackwood Tapes Pt 1")])).unwrap();
+        db.set_series_hidden("p1", true).unwrap();
+
+        let added = insert_from_feed(&db, &channel, &feed(&[
+            ("p1", "The Blackwood Tapes Pt 1"),
+            ("p2", "The Blackwood Tapes Pt 2"),
+            ("cook", "Cooking With Gas"),
+        ])).unwrap();
+        assert_eq!(added.count, 2, "p1 was already in");
+        assert_eq!(added.ids, owned(&["p2", "cook"]));
+
+        let hidden = arrivals_hidden(&db);
+        assert_eq!(hidden, owned(&["p2"]));
+        let new_ids: HashSet<String> = added.ids.into_iter().collect();
+        assert_eq!(still_new(added.count, &new_ids, &hidden), 1);
+        assert!(db.get_video("p2").unwrap().unwrap().hidden);
+        assert!(!db.get_video("cook").unwrap().unwrap().hidden);
     }
 
     #[test]
@@ -996,7 +1151,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             ..summary(0, 0, 0)
         };
         assert_eq!(
-            summary_line(&refused, 0, 0),
+            summary_line(&refused, 0, 0, 0),
             "polled 0 channels, nothing new, 1 error: A refresh is already running"
         );
     }
@@ -1008,7 +1163,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             ..summary(27, 0, 0)
         };
         assert_eq!(
-            summary_line(&s, 0, 0),
+            summary_line(&s, 0, 0, 0),
             "polled 27 channels, nothing new, 2 errors: Alpha: boom; Beta: bang"
         );
     }

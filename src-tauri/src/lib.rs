@@ -181,6 +181,7 @@ pub fn run() {
             commands::import_takeout_csv,
             commands::preview_takeout_csv,
             commands::set_video_hidden,
+            commands::set_series_hidden,
             commands::delete_video,
             commands::poll_all,
             commands::poll_channel,
