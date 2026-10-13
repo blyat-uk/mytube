@@ -535,6 +535,11 @@ export default function SubscriptionsView(p: Props) {
       const n = await api.enqueueDownloads(group.videos.map((v) => v.id));
       if (n > 0) toast.success(`Queued ${n} ${n === 1 ? "part" : "parts"} of “${name}”.`);
       else toast.info(`Every part of “${name}” is already downloaded or on its way.`);
+      // Fewer queued than marked: the card was behind the database, or a part
+      // failed to queue (the backend logs it and carries on). Either way no
+      // state event will come for the rest, so the card is read again rather
+      // than left saying "queued" for parts that are not.
+      if (n < due.size) await fetchPage(0);
     }, {
       optimistic: () => {
         mapVideos((v) => (due.has(v.id) ? { ...v, download_state: "queued", download_error: null } : v));
@@ -548,7 +553,7 @@ export default function SubscriptionsView(p: Props) {
         });
       },
     });
-  }, [mapVideos, run, toast]);
+  }, [fetchPage, mapVideos, run, toast]);
 
   /**
    * Hides a series as a whole -- every part, and any part that joins it later
@@ -570,8 +575,13 @@ export default function SubscriptionsView(p: Props) {
         await api.deleteDownload(id);
         gone.add(id);
       }
-      await api.setSeriesHidden(leader.id, true);
+      const changed = await api.setSeriesHidden(leader.id, true);
       toast.success(`Hidden “${name}”. Parts that join it later stay hidden too.`);
+      // The hide sweeps the channel too, and can reach parts on another card --
+      // one led by a part whose title drifted from this one's. Only a refetch
+      // takes that card away.
+      const shown = new Set(group.videos.map((v) => v.id));
+      if (changed.some((id) => !shown.has(id))) await fetchPage(0);
     }, {
       optimistic: () => {
         // Never in a series view in practice -- grouping stands down there, so
@@ -599,7 +609,7 @@ export default function SubscriptionsView(p: Props) {
         });
       },
     });
-  }, [dropCard, mapVideos, run, showHidden, siblingOf, toast]);
+  }, [dropCard, fetchPage, mapVideos, run, showHidden, siblingOf, toast]);
 
   const requestHideSeries = useCallback((group: VideoGroup) => {
     if (group.videos.some(hasDownloadedFile)) setConfirm({ kind: "series", group });

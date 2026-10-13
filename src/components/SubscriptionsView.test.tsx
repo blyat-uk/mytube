@@ -806,6 +806,38 @@ describe("a series card's right-click menu", () => {
     expect(menuLabels(screen.getByRole("menu"))).toContain("Download 3 parts");
   });
 
+  it("reads the card again when the backend queued fewer parts than it showed", async () => {
+    groups = [fresh()];
+    // One part was already on its way as far as the database knew.
+    enqueueDownloads.mockImplementation(() => Promise.resolve(2));
+    renderView({ grouped: true });
+    await cardsReady(1);
+    const fetched = listVideoGroups.mock.calls.length;
+    fireEvent.click(within(await openSeriesMenu(), "Download 3 parts"));
+    await waitFor(() => expect(listVideoGroups.mock.calls.length).toBe(fetched + 1));
+  });
+
+  it("does not read the card again when every part it showed was queued", async () => {
+    groups = [fresh()];
+    renderView({ grouped: true });
+    await cardsReady(1);
+    const fetched = listVideoGroups.mock.calls.length;
+    fireEvent.click(within(await openSeriesMenu(), "Download 3 parts"));
+    expect(await screen.findByText("Queued 3 parts of “The Blackwood Tapes”.")).toBeTruthy();
+    expect(listVideoGroups.mock.calls.length).toBe(fetched);
+  });
+
+  it("reads the feed again when the hide reached a part on another card", async () => {
+    groups = [fresh(), solo()];
+    // The sweep after the hide caught a drifted part leading a card of its own.
+    setSeriesHidden.mockImplementation(() => Promise.resolve(["p3", "p2", "p1", "drifted"]));
+    renderView({ grouped: true });
+    await cardsReady(2);
+    const fetched = listVideoGroups.mock.calls.length;
+    fireEvent.click(within(await openSeriesMenu(), "Hide from feed"));
+    await waitFor(() => expect(listVideoGroups.mock.calls.length).toBe(fetched + 1));
+  });
+
   it("hides a series with no files at once, taking the whole card", async () => {
     groups = [fresh(), solo()];
     renderView({ grouped: true });

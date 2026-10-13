@@ -822,7 +822,7 @@ fn follow_up(app: &AppHandle, app_state: &Arc<AppState>, report: &ApplyReport) {
         // for the interval a poll would take to catch up.
         let (st, app) = (app_state.clone(), app.clone());
         tauri::async_runtime::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || poll::hide_series_arrivals(&st)).await;
+            poll::sweep_hidden_series(&st.db, true).await;
             let _ = app.emit(FINISHED_EVENT, ());
         });
     }

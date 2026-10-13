@@ -290,16 +290,23 @@ pub async fn ingest_members_only(state: &AppState, channel_id: &str, depth: u32)
     -> Result<usize> {
     let entries = listing(&state.tools, channel_id, depth).await?;
     let added = ingest_listing(state, channel_id, &entries, true, Ingest::MembersOnly).await?;
-    let hidden = hide_series_arrivals(state);
+    let hidden = sweep_hidden_series(&state.db, true).await;
     Ok(still_new(added.count, &added.ids.into_iter().collect(), &hidden))
 }
 
-/// [`Db::hide_series_arrivals`], for a caller outside a poll -- joining a
-/// membership, a sync that brought marks -- which has no summary line of its
-/// own to carry the count, so the journal is told here.
-pub fn hide_series_arrivals(state: &AppState) -> Vec<String> {
-    let hidden = arrivals_hidden(&state.db);
-    if !hidden.is_empty() {
+/// [`Db::hide_series_arrivals`] on the blocking pool, its error logged and
+/// swallowed (`arrivals_hidden`). The sweep matches every undecided title on a
+/// channel holding a mark against the rest -- tens of milliseconds on a big
+/// channel, per channel -- which is not work for a runtime worker. `log` is
+/// for a caller outside a poll -- joining a membership, a sync that brought
+/// marks -- which has no summary line of its own to carry the count, so the
+/// journal is told here.
+pub async fn sweep_hidden_series(db: &Arc<Db>, log: bool) -> Vec<String> {
+    let db = db.clone();
+    let hidden = tokio::task::spawn_blocking(move || arrivals_hidden(&db))
+        .await
+        .unwrap_or_default();
+    if log && !hidden.is_empty() {
         eprintln!("mytube: {} hidden with their series", hidden.len());
     }
     hidden
@@ -613,7 +620,7 @@ pub async fn poll_channels(
     // the tray badge are for videos you will find in the feed, which these
     // are not; only the ones this poll counted are taken back out, since
     // deepened and backfilled rows were never in the count.
-    let hidden = arrivals_hidden(&state.db);
+    let hidden = sweep_hidden_series(&state.db, false).await;
     summary.new_videos = still_new(summary.new_videos, &new_ids, &hidden);
     // After `deepen`, though what it inserts is never a candidate (it aired
     // before the switch-on): the order just means the sweep sees the library
