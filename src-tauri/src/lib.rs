@@ -193,6 +193,7 @@ pub fn run() {
             commands::unlink_siblings,
             commands::set_watched,
             commands::enqueue_download,
+            commands::enqueue_downloads,
             commands::probe_formats,
             commands::cancel_download,
             commands::open_in_player,

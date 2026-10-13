@@ -1370,6 +1370,30 @@ impl Db {
         Ok(())
     }
 
+    /// Which of `ids` a "Download all" queues, in the order to queue them:
+    /// oldest upload first, so a series downloads from part 1, and the queue
+    /// (`queue::Line`) starts them in exactly that order.
+    ///
+    /// Only what a Download button would offer: ready, and with nothing
+    /// downloaded, queued or running -- a failure is retried, as its own Retry
+    /// would. Watched and hidden rows are not filtered out: the ids are the
+    /// parts the caller chose. An undated row goes after the dated ones;
+    /// `sort_at` and then the id settle ties, so the order is the same every
+    /// time. Unknown ids, and the same id twice, cost nothing.
+    pub fn download_order(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id FROM videos
+             WHERE id IN ({placeholders})
+               AND status='ready' AND download_state IN ('none','failed')
+             ORDER BY published_at ASC NULLS LAST, sort_at ASC NULLS LAST, id ASC");
+        let mut st = conn.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(ids), |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn clear_file_path(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET file_path=NULL, download_state='none', download_error=NULL,
@@ -1611,6 +1635,78 @@ mod tests {
             }
             assert_eq!(db.download_quality("a").unwrap(), None);
             assert_eq!(db.get_video("a").unwrap().unwrap().file_path.as_deref(), Some("/x.mkv"));
+        }
+    }
+
+    mod download_order {
+        use super::*;
+
+        /// A ready row on UC1 with these two dates.
+        fn at(d: &Db, id: &str, published: Option<i64>, sort: Option<i64>) {
+            d.insert_video_if_new(&NewVideo { published_at: published, sort_at: sort,
+                                              ..vid(id, "UC1", None) })
+                .unwrap();
+        }
+
+        fn ids(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        fn one_channel() -> Db {
+            let d = db();
+            d.upsert_channel(&chan("UC1", "One")).unwrap();
+            d
+        }
+
+        #[test]
+        fn oldest_upload_first_then_sort_at_then_id_and_undated_last() {
+            let d = one_channel();
+            at(&d, "p3", Some(300), Some(300));
+            at(&d, "undated", None, Some(50));
+            at(&d, "p1", Some(100), Some(100));
+            // One upload instant -- a midnight bucket -- the earlier sort_at first,
+            at(&d, "p2b", Some(200), Some(260));
+            at(&d, "p2a", Some(200), Some(250));
+            // and with both the same, the id.
+            at(&d, "p4y", Some(400), Some(400));
+            at(&d, "p4x", Some(400), Some(400));
+            at(&d, "nothing", None, None);
+            let asked = ids(&["nothing", "p4y", "p3", "undated", "p2b", "p1", "p4x", "p2a"]);
+            assert_eq!(d.download_order(&asked).unwrap(),
+                       ids(&["p1", "p2a", "p2b", "p3", "p4x", "p4y", "undated", "nothing"]));
+        }
+
+        #[test]
+        fn only_what_a_download_button_would_offer_and_a_failure_is_retried() {
+            let d = one_channel();
+            for (i, id) in ["none", "failed", "queued", "downloading", "done", "watched", "hidden"]
+                .into_iter().enumerate() {
+                at(&d, id, Some(i as i64 * 10), Some(i as i64 * 10));
+            }
+            d.insert_video_if_new(&NewVideo { status: VideoStatus::Upcoming,
+                                              ..vid("upcoming", "UC1", Some(5)) })
+                .unwrap();
+            d.set_download_state("failed", DownloadState::Failed, None, Some("boom")).unwrap();
+            d.set_download_state("queued", DownloadState::Queued, None, None).unwrap();
+            d.set_download_state("downloading", DownloadState::Downloading, None, None).unwrap();
+            d.set_download_state("done", DownloadState::Done, Some("/x.mkv"), None).unwrap();
+            d.set_watched("watched", true).unwrap();
+            d.set_hidden("hidden", true).unwrap();
+
+            let asked = ids(&["hidden", "upcoming", "done", "downloading", "queued", "failed",
+                              "none", "watched", "no such row", "none"]);
+            assert_eq!(d.download_order(&asked).unwrap(),
+                       ids(&["none", "failed", "watched", "hidden"]),
+                       "the same id twice is queued once; an unknown one is no error");
+        }
+
+        #[test]
+        fn only_the_ids_asked_for_and_none_for_none() {
+            let d = one_channel();
+            at(&d, "a", Some(1), Some(1));
+            at(&d, "b", Some(2), Some(2));
+            assert_eq!(d.download_order(&ids(&["b"])).unwrap(), ids(&["b"]));
+            assert!(d.download_order(&[]).unwrap().is_empty());
         }
     }
 

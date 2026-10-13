@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::db::Db;
 use crate::models::{DownloadProgress, DownloadState, DownloadStateEvent};
@@ -234,6 +234,113 @@ impl Gone {
 
     fn same(&self, other: &Gone) -> bool {
         self.0.same_channel(&other.0)
+    }
+}
+
+/// The order downloads take their slots in: exactly the order they were
+/// queued.
+///
+/// The semaphore never promised that on its own. It is fair to whoever is
+/// already waiting on it, but every download is a task of its own, and which
+/// of two tasks spawned a moment apart gets to `acquire` first is the
+/// runtime's business -- on a multi-threaded one, either. So "Download all" on
+/// a series could start part 3 before part 1, and a video queued last could
+/// overtake a whole backlog. The line decides who waits on the semaphore: one
+/// download at a time, the one at the front.
+///
+/// A place is a number, handed out under the registry's lock in the same
+/// breath as the row's `Queued` (`Registry::enqueue`), so the order of places
+/// is the order the rows say. Being served means waiting for a slot, taking
+/// it, and stepping out of the way: the next place is served while this
+/// download runs.
+///
+/// Leaving is dropping the [`Place`] -- served, or not. That is how a download
+/// that never gets its turn gets out of the way: cancelled where it stands
+/// (`Registry::cancel` aborts a queued job), or torn down by a panic. A place
+/// left before its number comes up cannot simply wave the next one through,
+/// because places ahead of it may still be waiting and the next must not
+/// overtake those; it is noted instead, and skipped when its number comes up.
+struct Line {
+    turns: std::sync::Mutex<Turns>,
+    /// The number being served, for the places waiting on it.
+    serving: watch::Sender<u64>,
+}
+
+struct Turns {
+    /// The next number to hand out.
+    issued: u64,
+    /// The number being served. Only that place's own leaving moves it on,
+    /// so it never passes a place still in the line.
+    serving: u64,
+    /// Places left before their number came up.
+    left: BTreeSet<u64>,
+}
+
+impl Line {
+    fn new() -> Arc<Line> {
+        Arc::new(Line {
+            turns: std::sync::Mutex::new(Turns { issued: 0, serving: 0, left: BTreeSet::new() }),
+            serving: watch::channel(0).0,
+        })
+    }
+
+    /// Nothing panics under this lock, and every change is whole before it is
+    /// let go, so a poisoned one is still good -- and a `Place` dropped while
+    /// unwinding must still be able to leave.
+    fn turns(&self) -> std::sync::MutexGuard<'_, Turns> {
+        self.turns.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A place at the back of the line.
+    fn join(self: &Arc<Self>) -> Place {
+        let mut t = self.turns();
+        let n = t.issued;
+        t.issued += 1;
+        Place { line: self.clone(), n }
+    }
+
+    /// Place `n` is done with the line, served or not.
+    fn leave(&self, n: u64) {
+        let mut t = self.turns();
+        if t.serving != n {
+            t.left.insert(n);
+            return;
+        }
+        let mut next = n + 1;
+        while t.left.remove(&next) {
+            next += 1;
+        }
+        t.serving = next;
+        // Sent under the lock, so the number only ever goes up.
+        self.serving.send_replace(next);
+    }
+}
+
+/// One download's place in the [`Line`]. Dropping it leaves the line.
+struct Place {
+    line: Arc<Line>,
+    n: u64,
+}
+
+impl Place {
+    /// Waits until every download queued before this one has its slot, takes
+    /// one from `slots`, and gives the place up -- in that order, so the next
+    /// download is only let at the semaphore once this one is through it.
+    /// `None` only for a closed semaphore, which nothing closes.
+    async fn admit(self, slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+        // `>=` and `==` are the same here -- only this place's own leaving can
+        // move the number past it -- but `>=` could not hang if that ever
+        // changed. The sender lives in the line this place holds, so the wait
+        // cannot fail; the `Ref` it returns is let go at once, because a leave
+        // elsewhere needs to write the value it borrows.
+        let _ = self.line.serving.subscribe().wait_for(|&s| s >= self.n).await;
+        slots.clone().acquire_owned().await.ok()
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.line.leave(self.n);
     }
 }
 
@@ -581,14 +688,26 @@ struct Book<K> {
 /// for the job, whose own last act was to lock `running` -- so every cancel of
 /// a running download hung for the full 15 s grace, and every enqueue, every
 /// `is_active` and every other finishing job hung behind it.
+///
+/// The line has a lock of its own, taken *inside* the book's (a place is
+/// joined under it, in `enqueue`) and never the other way round: leaving the
+/// line takes the line's lock alone, so a place dropped by an abort or mid-
+/// panic, wherever that happens, can never wait on a book somebody holds.
 struct Registry<K = proc::KillTree> {
     book: std::sync::Mutex<Book<K>>,
+    /// The order the downloads take their slots in -- see `Line`.
+    line: Arc<Line>,
+    /// One permit per download allowed to run at once. `Queue` holds the same
+    /// semaphore, to grow it when the setting is raised.
+    slots: Arc<Semaphore>,
 }
 
 impl<K: Kill> Registry<K> {
-    fn new() -> Arc<Self> {
+    fn new(slots: Arc<Semaphore>) -> Arc<Self> {
         Arc::new(Registry {
             book: std::sync::Mutex::new(Book { jobs: HashMap::new(), cleaning: HashMap::new() }),
+            line: Line::new(),
+            slots,
         })
     }
 
@@ -608,9 +727,20 @@ impl<K: Kill> Registry<K> {
     /// The row is written, the task spawned and the slot filed under the one
     /// lock, so a cancel can never find the row queued but no slot to cancel,
     /// and the task's `Downloading` can never be overwritten by a late
-    /// `Queued`. The task first waits out any cancelled download of the same
-    /// video that is still clearing up (`Book::cleaning`) -- before the
-    /// semaphore, before a single file is touched.
+    /// `Queued`. The download's place in the line is taken under it too, so
+    /// downloads get their slots in the order their rows read `Queued`.
+    ///
+    /// The task takes its slot, in line, and only then waits out any
+    /// cancelled download of the same video still clearing up
+    /// (`Book::cleaning`) -- before a single file is touched, which is what
+    /// that wait is for. The other way round, a download waiting on a slow
+    /// sweep (a spun-down disk, a tree Windows is slow to empty) would stand
+    /// at the front of the line with every slot free, and nothing behind it
+    /// could start; this way it costs one slot for as long as the sweep
+    /// takes, and the line moves on. It cannot deadlock: the job it waits on
+    /// had either spawned yt-dlp, and so already holds a slot and waits on
+    /// neither the line nor the semaphore, or it had not, and `cancel`
+    /// aborted it where it stood.
     fn enqueue<R, F, Fut>(self: &Arc<Self>, video_id: String, rows: &Arc<R>, body: F) -> Result<()>
     where
         R: Rows,
@@ -626,6 +756,8 @@ impl<K: Kill> Registry<K> {
         let job = Arc::new(Job::default());
         let (alive, gone) = lifeline();
         let pending = book.cleaning.get(&video_id).cloned();
+        let place = self.line.join();
+        let slots = self.slots.clone();
         let work = body(job.clone(), alive.clone());
         let finish = Finish { reg: self.clone(), video_id: video_id.clone(), job: job.clone() };
         let handle = tokio::spawn(async move {
@@ -633,6 +765,11 @@ impl<K: Kill> Registry<K> {
             // everything else in here has been torn down.
             let _alive = alive;
             let _finish = finish;
+            // The slot is held to the end, whichever way the task ends -- a
+            // panic in the download included -- and given back before
+            // `Finish` runs. Until it is in hand the task holds its place
+            // instead, so an abort while it waits leaves the line.
+            let Some(_slot) = place.admit(&slots).await else { return };
             if let Some(p) = pending {
                 p.wait().await;
             }
@@ -672,8 +809,10 @@ impl<K: Kill> Registry<K> {
         }
         if !stop.spawned {
             // Nothing has been spawned, so there is nothing on disk to wait
-            // for -- and a queued job is parked on the semaphore behind other
-            // downloads, which could be minutes.
+            // for -- and a queued job is waiting its turn behind other
+            // downloads, which could be minutes. Dropping it leaves the line
+            // (`Place`), so the downloads behind it move up rather than wait
+            // for a turn nobody will take.
             slot.abort.abort();
         }
 
@@ -768,20 +907,24 @@ pub struct Queue {
 
 impl Queue {
     pub fn new(db: Arc<Db>, app: AppHandle, concurrency: usize, tools: Arc<Tools>) -> Self {
+        let sem = Arc::new(Semaphore::new(concurrency.max(1)));
         Self {
             rows: Arc::new(Ledger { db: db.clone(), app: app.clone() }),
             db,
             app,
             tools,
-            sem: Arc::new(Semaphore::new(concurrency.max(1))),
+            reg: Registry::new(sem.clone()),
+            sem,
             permits: Arc::new(Mutex::new(concurrency.max(1))),
-            reg: Registry::new(),
             claims: Arc::new(PathClaims::default()),
         }
     }
 
     /// Grows the semaphore when the user raises concurrency. Lowering it takes
     /// effect as running jobs finish, since permits cannot be revoked mid-flight.
+    /// The new slots go to the downloads waiting longest: only the front of
+    /// the line ever waits on the semaphore (`Line`), and each one through it
+    /// lets the next one at it.
     pub async fn set_concurrency(&self, n: usize) {
         let n = n.clamp(1, 16);
         let mut cur = self.permits.lock().await;
@@ -810,17 +953,14 @@ impl Queue {
     }
 
     pub async fn enqueue(&self, video_id: String, dir: String, template: String) -> Result<()> {
-        let (db, app, sem) = (self.db.clone(), self.app.clone(), self.sem.clone());
+        let (db, app) = (self.db.clone(), self.app.clone());
         let claims = self.claims.clone();
         let tools = self.tools.clone();
         let vid = video_id.clone();
         let (reg, rows) = (self.reg.clone(), self.rows.clone());
 
+        // Runs once the job holds its slot, taken in line by `Registry::enqueue`.
         blocking(move || reg.enqueue(video_id, &rows, move |job, alive| async move {
-            let _permit = match sem.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
             if job.is_cancelled() {
                 return;
             }
@@ -1404,6 +1544,11 @@ mod tests {
         f()
     }
 
+    /// A registry letting `slots` downloads run at once.
+    fn registry(slots: usize) -> Arc<Registry<i32>> {
+        Registry::new(Arc::new(Semaphore::new(slots)))
+    }
+
     /// Waits for the cancelled download of `id` to finish clearing up.
     async fn cleared(reg: &Registry<i32>, id: &str) {
         let pending = reg.book().cleaning.get(id).cloned();
@@ -1439,7 +1584,7 @@ mod tests {
         // while it waited for the job, and the job's last act was to take that
         // lock -- so the cancel button hung for the full 15 s grace. Now it
         // must not wait for the job at all, not even for a sweep that works.
-        let reg = Registry::<i32>::new();
+        let reg = registry(4);
         let rows = Arc::new(FakeRows::default());
         let swept = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1471,7 +1616,7 @@ mod tests {
         // the same claimed path, the same `.part` files -- so the new download
         // must not start until it is over. And the old job's exit must not
         // take the new job's entry with it.
-        let reg = Registry::<i32>::new();
+        let reg = registry(4);
         let rows = Arc::new(FakeRows::default());
         let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1507,7 +1652,7 @@ mod tests {
     async fn a_write_landing_after_the_cancel_is_put_back_to_none() {
         // A `Done` that slips in after the cancel's `None`, while the file it
         // names is being deleted, must not be where the row ends up.
-        let reg = Registry::<i32>::new();
+        let reg = registry(4);
         let rows = Arc::new(FakeRows::default());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let r = rows.clone();
@@ -1533,7 +1678,7 @@ mod tests {
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        let reg = Registry::<i32>::new();
+        let reg = registry(4);
         let rows = Arc::new(FakeRows::default());
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d = Dropped(dropped.clone());
@@ -1581,7 +1726,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueueing_a_download_already_in_flight_does_nothing() {
-        let reg = Registry::<i32>::new();
+        let reg = registry(4);
         let rows = Arc::new(FakeRows::default());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         reg.enqueue("v".into(), &rows, move |_j, _a| async move { let _ = rx.await; }).unwrap();
@@ -1590,6 +1735,238 @@ mod tests {
         assert_eq!(*rows.sent.lock().unwrap(), vec![DownloadState::Queued]);
         tx.send(()).unwrap();
         assert!(eventually(|| !reg.is_active("v")).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn places_are_served_in_the_order_handed_out_not_the_order_they_arrive() {
+        // The race the line exists for, made certain rather than likely: each
+        // later place dawdles *less* before asking, so without the line they
+        // would reach the semaphore last-queued first. One slot, held a moment
+        // by each, so the log is the order the slot was handed out in.
+        let line = Line::new();
+        let slots = Arc::new(Semaphore::new(1));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let n = 24u64;
+        let mut tasks = Vec::new();
+        for i in 0..n {
+            let place = line.join();
+            let (slots, log) = (slots.clone(), log.clone());
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(n - i)).await;
+                let _slot = place.admit(&slots).await.expect("a slot");
+                log.lock().unwrap().push(i);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(*log.lock().unwrap(), (0..n).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_place_left_before_its_turn_is_skipped_and_forgotten() {
+        let line = Line::new();
+        let slots = Arc::new(Semaphore::new(1));
+        let (a, b, c) = (line.join(), line.join(), line.join());
+        drop(b); // a cancel, while a still had the front
+        drop(a.admit(&slots).await.expect("a slot"));
+        let c = tokio::time::timeout(Duration::from_secs(1), c.admit(&slots)).await
+            .expect("c waited for a turn nobody was going to take");
+        drop(c.expect("a slot"));
+        assert!(line.turns().left.is_empty(), "b's number was skipped, not kept forever");
+        // And the line, empty now, serves whoever comes next at once.
+        let next = tokio::time::timeout(Duration::from_secs(1), line.join().admit(&slots)).await
+            .expect("an empty line kept a newcomer waiting");
+        assert!(next.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leaving_out_of_turn_never_lets_the_next_place_overtake() {
+        // b gives up while a, ahead of it, has not been served. c is behind
+        // b, but it must not take that as its cue: a is still waiting. Slots
+        // to spare, so only the line can be holding c back.
+        let line = Line::new();
+        let slots = Arc::new(Semaphore::new(8));
+        let (a, b, c) = (line.join(), line.join(), line.join());
+        let s = slots.clone();
+        let c = tokio::spawn(async move { c.admit(&s).await.map(drop) });
+        drop(b);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!c.is_finished(), "c overtook a");
+        let _a = a.admit(&slots).await.expect("a slot");
+        tokio::time::timeout(Duration::from_secs(1), c).await
+            .expect("c was not served once a had been")
+            .unwrap()
+            .expect("a slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_front_of_the_line_given_up_while_waiting_for_a_slot_hands_its_turn_on() {
+        // a is at the front and parked on the semaphore, every slot taken,
+        // when its task is aborted -- a cancel of the next download due.
+        let line = Line::new();
+        let slots = Arc::new(Semaphore::new(1));
+        let busy = slots.clone().acquire_owned().await.unwrap();
+        let (a, b) = (line.join(), line.join());
+        let s = slots.clone();
+        let a = tokio::spawn(async move { a.admit(&s).await.map(drop) });
+        let s = slots.clone();
+        let b = tokio::spawn(async move { b.admit(&s).await.map(drop) });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.abort();
+        let _ = a.await;
+        drop(busy);
+        tokio::time::timeout(Duration::from_secs(1), b).await
+            .expect("b waited on a download that is gone")
+            .unwrap()
+            .expect("a slot");
+    }
+
+    /// Ids in the order their fake downloads began.
+    type Starts = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A fake download that notes its start in `starts` and ends at once.
+    fn quick(starts: &Starts, id: &str)
+             -> impl FnOnce(Arc<Job<i32>>, Alive) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        let (starts, id) = (starts.clone(), id.to_string());
+        move |_job, _alive| Box::pin(async move { starts.lock().unwrap().push(id) })
+    }
+
+    /// A fake download that notes its start and holds its slot until `go`
+    /// fires or is dropped.
+    fn held(starts: &Starts, id: &str, go: tokio::sync::oneshot::Receiver<()>)
+            -> impl FnOnce(Arc<Job<i32>>, Alive) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        let (starts, id) = (starts.clone(), id.to_string());
+        move |_job, _alive| Box::pin(async move {
+            starts.lock().unwrap().push(id);
+            let _ = go.await;
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn downloads_start_in_the_order_they_were_queued() {
+        // "Download all" on a series: part 1 first. One slot, each part
+        // holding it a different while, through the real `enqueue`.
+        let reg = registry(1);
+        let rows = Arc::new(FakeRows::default());
+        let starts: Starts = Default::default();
+        let ids: Vec<String> = (0..16).map(|i| format!("part {i:02}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let (s, me) = (starts.clone(), id.clone());
+            reg.enqueue(id.clone(), &rows, move |_job, _alive| async move {
+                s.lock().unwrap().push(me);
+                tokio::time::sleep(Duration::from_millis(i as u64 % 3)).await;
+            })
+            .unwrap();
+        }
+        assert!(eventually(|| starts.lock().unwrap().len() == ids.len()).await);
+        assert_eq!(*starts.lock().unwrap(), ids);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_cancelled_mid_line_holds_up_nobody_and_lets_nobody_jump() {
+        // b is at the front, parked on the one slot a is using; c behind it,
+        // d behind that. Cancelling c must neither stall d for good nor let it
+        // overtake b.
+        let reg = registry(1);
+        let rows = Arc::new(FakeRows::default());
+        let starts: Starts = Default::default();
+        let (go, wait) = tokio::sync::oneshot::channel();
+        reg.enqueue("a".into(), &rows, held(&starts, "a", wait)).unwrap();
+        for id in ["b", "c", "d"] {
+            reg.enqueue(id.into(), &rows, quick(&starts, id)).unwrap();
+        }
+        assert!(eventually(|| starts.lock().unwrap().len() == 1).await);
+        reg.cancel("c", &rows).unwrap();
+        cleared(&reg, "c").await;
+        go.send(()).unwrap();
+        assert!(eventually(|| starts.lock().unwrap().len() == 3).await, "d never started");
+        assert_eq!(*starts.lock().unwrap(), ["a", "b", "d"]);
+        assert_eq!(rows.state("c"), Some(DownloadState::None));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_cancelled_at_the_front_hands_its_turn_on() {
+        // b is the one download waiting on the semaphore itself.
+        let reg = registry(1);
+        let rows = Arc::new(FakeRows::default());
+        let starts: Starts = Default::default();
+        let (go, wait) = tokio::sync::oneshot::channel();
+        reg.enqueue("a".into(), &rows, held(&starts, "a", wait)).unwrap();
+        for id in ["b", "c"] {
+            reg.enqueue(id.into(), &rows, quick(&starts, id)).unwrap();
+        }
+        assert!(eventually(|| starts.lock().unwrap().len() == 1).await);
+        reg.cancel("b", &rows).unwrap();
+        cleared(&reg, "b").await;
+        go.send(()).unwrap();
+        assert!(eventually(|| starts.lock().unwrap().len() == 2).await, "c never started");
+        assert_eq!(*starts.lock().unwrap(), ["a", "c"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_that_panics_gives_up_its_slot() {
+        // A panic unwinds through the task, slot and all; the next download
+        // must not wait on a permit the panic took with it.
+        let reg = registry(1);
+        let rows = Arc::new(FakeRows::default());
+        let starts: Starts = Default::default();
+        reg.enqueue("a".into(), &rows, |_j, _a| async { panic!("a download blew up") }).unwrap();
+        reg.enqueue("b".into(), &rows, quick(&starts, "b")).unwrap();
+        assert!(eventually(|| starts.lock().unwrap().len() == 1).await, "b never started");
+        assert!(eventually(|| !reg.is_active("a")).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn new_slots_go_to_the_downloads_queued_first() {
+        // Raising the limit mid-queue: the two new slots go to b and c, the
+        // two waiting longest, and d still waits.
+        let reg = registry(1);
+        let rows = Arc::new(FakeRows::default());
+        let starts: Starts = Default::default();
+        let mut go = Vec::new();
+        for id in ["a", "b", "c", "d"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            go.push(tx);
+            reg.enqueue(id.into(), &rows, held(&starts, id, rx)).unwrap();
+        }
+        assert!(eventually(|| starts.lock().unwrap().len() == 1).await);
+        reg.slots.add_permits(2); // what `Queue::set_concurrency` does
+        assert!(eventually(|| starts.lock().unwrap().len() == 3).await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut started = starts.lock().unwrap().clone();
+        started.sort(); // b and c start side by side, in either order
+        assert_eq!(started, ["a", "b", "c"]);
+        drop(go);
+        assert!(eventually(|| starts.lock().unwrap().len() == 4).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_download_waits_for_its_clean_up_without_holding_up_the_line() {
+        // x is cancelled mid-download and queued again at once, y behind it.
+        // The new x must wait for the old one's sweep; y, with a slot free,
+        // must not wait for it too.
+        let reg = registry(3);
+        let rows = Arc::new(FakeRows::default());
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let l = log.clone();
+        reg.enqueue("x".into(), &rows,
+                    running_download(tx, Duration::from_millis(500),
+                                     move || l.lock().unwrap().push("old x swept")))
+            .unwrap();
+        rx.await.unwrap();
+        reg.cancel("x", &rows).unwrap();
+        for (id, mark) in [("x", "new x started"), ("y", "y started")] {
+            let l = log.clone();
+            reg.enqueue(id.into(), &rows, move |_j, _a| async move {
+                l.lock().unwrap().push(mark);
+            })
+            .unwrap();
+        }
+        assert!(eventually(|| log.lock().unwrap().len() == 3).await);
+        assert_eq!(*log.lock().unwrap(), ["y started", "old x swept", "new x started"]);
     }
 
     #[test]

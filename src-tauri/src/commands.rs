@@ -619,6 +619,39 @@ pub async fn enqueue_download(
         .map_err(e)
 }
 
+/// Queues every part of a series at once -- its card's "Download N parts" --
+/// oldest upload first, and returns how many went in.
+///
+/// The ids are the card's parts as the view has them; the database picks the
+/// ones to queue and their order (`Db::download_order`), so a part that has
+/// since finished or been queued elsewhere is skipped, not queued twice.
+/// They go in one after the other, each enqueue awaited before the next, so
+/// their places in the queue's line are that order exactly -- enqueued side by
+/// side, they would take them in whatever order the blocking pool ran them.
+/// A part that will not queue is logged and passed over, as the auto-download
+/// sweep does: the rest of the series is still worth having. Like a plain
+/// Download, it leaves a stored quality alone, so a failed custom download is
+/// retried as it was.
+#[tauri::command]
+pub async fn enqueue_downloads(
+    video_ids: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> R<usize> {
+    let s = blocking(config::load).await?;
+    let ids = db_blocking(&state, move |db| db.download_order(&video_ids)).await?;
+    let mut queued = 0;
+    // Owned ids, moved one at a time: nothing borrowed from an iterator lives
+    // across the await (see "Async gotchas" in CLAUDE.md).
+    for id in ids {
+        let (dir, template) = (s.download_dir.clone(), s.filename_template.clone());
+        match state.queue.enqueue(id.clone(), dir, template).await {
+            Ok(()) => queued += 1,
+            Err(err) => eprintln!("mytube: could not queue {id}: {err}"),
+        }
+    }
+    Ok(queued)
+}
+
 /// Every format one video offers, for the "Download (custom)…" dialog, and
 /// which of them the Settings default would pick. Runs with the same cookies,
 /// deno and ffmpeg a download would, under a tools lease.
