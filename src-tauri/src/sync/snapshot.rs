@@ -58,6 +58,20 @@ pub struct SyncVideo {
     pub hidden_changed_at: Option<i64>,
     pub sibling_group: Option<String>,
     pub sibling_changed_at: Option<i64>,
+    /// Hidden with its whole series (DB v11), a pair of its own beside
+    /// `hidden`'s. A 4.3.0 machine's snapshot has neither key, and reads as a
+    /// mark nobody ever set -- which loses to any stamp, so an older machine
+    /// can fail to carry a mark but never clear one. That is why this is no
+    /// new `SNAPSHOT_FORMAT`: a bump would have the older machines skip this
+    /// one's slot whole, while unknown keys are simply ignored by them.
+    ///
+    /// Left out while unset, so a library that never hid a series serialises
+    /// -- and hashes -- to exactly the bytes it did before: the upgrade alone
+    /// moves no machine's `pushed_hash` and spends no request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub series_hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_hidden_changed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -178,13 +192,15 @@ pub(crate) fn merge_channel(copies: &[&SyncChannel]) -> SyncChannel {
 /// names the row.
 pub(crate) fn merge_video(copies: &[&SyncVideo]) -> SyncVideo {
     let meta = winner(copies, |v| {
-        (newest(&[v.watched_changed_at, v.hidden_changed_at, v.sibling_changed_at]),
+        (newest(&[v.watched_changed_at, v.hidden_changed_at, v.sibling_changed_at,
+                  v.series_hidden_changed_at]),
          v.added_at, v.title.clone(), v.channel_id.clone(),
          v.published_at, v.sort_at, v.duration_secs)
     });
     let watched = winner(copies, |v| (v.watched_changed_at, v.watched, v.watched_at));
     let hidden = winner(copies, |v| (v.hidden_changed_at, v.hidden));
     let sibling = winner(copies, |v| (v.sibling_changed_at, v.sibling_group.clone()));
+    let series = winner(copies, |v| (v.series_hidden_changed_at, v.series_hidden));
     SyncVideo {
         id: meta.id.clone(),
         channel_id: meta.channel_id.clone(),
@@ -201,6 +217,8 @@ pub(crate) fn merge_video(copies: &[&SyncVideo]) -> SyncVideo {
         hidden_changed_at: hidden.hidden_changed_at,
         sibling_group: sibling.sibling_group.clone(),
         sibling_changed_at: sibling.sibling_changed_at,
+        series_hidden: series.series_hidden,
+        series_hidden_changed_at: series.series_hidden_changed_at,
     }
 }
 
@@ -221,7 +239,8 @@ mod tests {
                     added_manually: false, added_at: 60,
                     watched: false, watched_at: None, watched_changed_at: None,
                     hidden: false, hidden_changed_at: None,
-                    sibling_group: None, sibling_changed_at: None }
+                    sibling_group: None, sibling_changed_at: None,
+                    series_hidden: false, series_hidden_changed_at: None }
     }
 
     fn snap(name: &str, channels: Vec<SyncChannel>, videos: Vec<SyncVideo>,
@@ -314,6 +333,83 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_series_is_settled_by_its_own_stamp() {
+        let marked = |at| SyncVideo { series_hidden: true, series_hidden_changed_at: Some(at),
+                                      ..vid("a") };
+        let unmarked = |at| SyncVideo { series_hidden_changed_at: Some(at), ..vid("a") };
+        let pair = |v: SyncVideo| (v.series_hidden, v.series_hidden_changed_at);
+
+        // Whichever way round, and whichever side holds the later stamp.
+        for (x, y, want) in [
+            (marked(10), unmarked(20), (false, Some(20))),
+            (unmarked(10), marked(20), (true, Some(20))),
+            (marked(10), vid("a"), (true, Some(10))),
+            (SyncVideo { series_hidden: true, ..vid("a") }, unmarked(1), (false, Some(1))),
+            (marked(7), unmarked(7), (true, Some(7))),
+        ] {
+            assert_eq!(pair(one(x.clone(), y.clone())), want, "{x:?} / {y:?}");
+            assert_eq!(pair(one(y, x)), want);
+        }
+
+        // Its own pair: neither the hide nor the watch is moved by it.
+        let both = SyncVideo { hidden: true, hidden_changed_at: Some(5), ..marked(9) };
+        let unhid = SyncVideo { hidden_changed_at: Some(8), ..vid("a") };
+        let m = one(both, unhid);
+        assert!(!m.hidden && m.series_hidden, "{m:?}");
+    }
+
+    #[test]
+    fn a_series_stamp_counts_towards_the_newest_on_the_row() {
+        let stale = SyncVideo { title: "old name".into(), hidden_changed_at: Some(10), ..vid("a") };
+        let fresh = SyncVideo { title: "new name".into(), series_hidden_changed_at: Some(20),
+                                ..vid("a") };
+        assert_eq!(one(stale.clone(), fresh.clone()).title, "new name");
+        assert_eq!(one(fresh, stale).title, "new name");
+    }
+
+    #[test]
+    fn a_snapshot_from_before_series_hiding_reads_as_never_set() {
+        // A video entry exactly as 4.3.0 wrote it: no series keys at all.
+        let old = r#"{"format":1,"machine_name":"old","channels":[],"tombstones":[],
+            "videos":[{"id":"a","channel_id":"UC1","title":"t-a","published_at":50,
+                       "sort_at":50,"duration_secs":600,"added_manually":false,"added_at":60,
+                       "watched":false,"watched_at":null,"watched_changed_at":null,
+                       "hidden":true,"hidden_changed_at":5,
+                       "sibling_group":null,"sibling_changed_at":null}]}"#;
+        let s: Snapshot = serde_json::from_str(old).unwrap();
+        let v = &s.videos[0];
+        assert!(v.hidden);
+        assert_eq!((v.series_hidden, v.series_hidden_changed_at), (false, None));
+
+        // Which can never clear a mark made since: NULL loses to any stamp.
+        let here = SyncVideo { hidden: true, hidden_changed_at: Some(5), series_hidden: true,
+                               series_hidden_changed_at: Some(3), ..vid("a") };
+        let m = merge(&[s.clone(), videos(vec![here])]);
+        assert!(m.videos[0].series_hidden);
+    }
+
+    #[test]
+    fn an_unset_series_mark_is_left_out_of_the_json() {
+        // So a library that never hid a series serialises -- and hashes --
+        // exactly as it did before the field existed, and a 4.3.0 machine
+        // reading one that did simply ignores two keys it cannot name.
+        let plain = serde_json::to_string(&vid("a")).unwrap();
+        assert!(!plain.contains("series_hidden"), "{plain}");
+
+        let marked = SyncVideo { series_hidden: true, series_hidden_changed_at: Some(9),
+                                 ..vid("a") };
+        let raw = serde_json::to_string(&marked).unwrap();
+        assert!(raw.contains(r#""series_hidden":true"#) && raw.contains(r#""series_hidden_changed_at":9"#));
+        assert_eq!(serde_json::from_str::<SyncVideo>(&raw).unwrap(), marked);
+
+        // An un-hide keeps its stamp, which is what carries it.
+        let unhidden = SyncVideo { series_hidden_changed_at: Some(10), ..vid("a") };
+        let raw = serde_json::to_string(&unhidden).unwrap();
+        assert!(!raw.contains(r#""series_hidden":"#) && raw.contains(r#""series_hidden_changed_at":10"#));
+        assert_eq!(serde_json::from_str::<SyncVideo>(&raw).unwrap(), unhidden);
+    }
+
+    #[test]
     fn added_manually_is_ored_and_added_at_is_the_latest() {
         let manual = SyncVideo { added_manually: true, added_at: 10, ..vid("a") };
         let polled = SyncVideo { added_at: 30, ..vid("a") };
@@ -384,6 +480,7 @@ mod tests {
                                ..chan("UC1") }],
             vec![SyncVideo { watched: true, watched_at: Some(4), watched_changed_at: Some(9),
                              sibling_group: Some("k-a".into()), sibling_changed_at: Some(3),
+                             series_hidden: true, series_hidden_changed_at: Some(8),
                              title: "from a".into(), ..vid("v") },
                  SyncVideo { added_manually: true, added_at: 70, ..vid("m") }],
             vec![tomb(TombstoneKind::Video, "gone", 3)],
@@ -400,7 +497,8 @@ mod tests {
         let c = snap(
             "c",
             vec![SyncChannel { title: "C".into(), subscribed: false, ..chan("UC1") }],
-            vec![SyncVideo { hidden_changed_at: Some(9), title: "from c".into(), ..vid("v") },
+            vec![SyncVideo { hidden_changed_at: Some(9), series_hidden_changed_at: Some(8),
+                             title: "from c".into(), ..vid("v") },
                  SyncVideo { title: "polled".into(), added_at: 40, ..vid("m") }],
             vec![tomb(TombstoneKind::Channel, "gone", 1)],
         );
@@ -428,6 +526,8 @@ mod tests {
         assert!(v.watched && v.hidden);
         assert_eq!(v.watched_at, Some(6), "the tie on stamp and flag goes to the later instant");
         assert_eq!(v.sibling_group.as_deref(), Some("k-b"));
+        assert_eq!((v.series_hidden, v.series_hidden_changed_at), (true, Some(8)),
+                   "a's mark ties c's unmarking, and true takes the tie");
         assert_eq!(v.title, "from b", "b holds the newest stamp on the row");
         let manual = m.videos.iter().find(|v| v.id == "m").unwrap();
         assert!(manual.added_manually);

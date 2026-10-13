@@ -201,6 +201,8 @@ mod tests {
                 hidden_changed_at: None,
                 sibling_group: None,
                 sibling_changed_at: None,
+                series_hidden: true,
+                series_hidden_changed_at: Some(80),
             }],
             tombstones: vec![Tombstone { kind: TombstoneKind::Video, id: "gone".into(), removed_at: 9 }],
         }

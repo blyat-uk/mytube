@@ -80,15 +80,19 @@ fn video(id: &str, channel_id: &str) -> Video {
 }
 
 /// The machine at home: two channels, three videos, one of them watched and
-/// with a cached thumbnail, and a setting worth carrying.
+/// with a cached thumbnail, one hidden with its series, and a setting worth
+/// carrying.
 fn home_library(home: &Path) {
     let db = Db::open(&home.join("mytube.db")).unwrap();
     let mut watched = video("v1", "UC1");
     watched.watched = true;
     watched.watched_at = Some(1_700_000_500);
+    let mut series = video("v2", "UC1");
+    series.hidden = true;
+    series.series_hidden = true;
     db.apply_import(
         &[chan("UC1", "One"), chan("UC2", "Two")],
-        &[watched, video("v2", "UC1"), video("v3", "UC2")],
+        &[watched, series, video("v3", "UC2")],
         ImportMode::Merge,
         &[],
     )
@@ -146,6 +150,8 @@ fn a_library_goes_from_home_to_the_laptop_with_nobody_at_a_terminal() {
     let db = Db::open(&laptop.join("mytube.db")).unwrap();
     let v1 = db.get_video("v1").unwrap().expect("crossed");
     assert!(v1.watched, "watched state crossed");
+    let v2 = db.get_video("v2").unwrap().expect("crossed");
+    assert!(v2.hidden && v2.series_hidden, "the hidden series crossed");
     assert!(laptop.join("thumbs").join("v1.jpg").is_file(), "and its thumbnail");
     let applied = config::load_from(&laptop.join("settings.json")).unwrap();
     assert_eq!(applied.backfill_count, 77);

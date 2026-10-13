@@ -3347,8 +3347,9 @@ const PUT_VIDEO: &str = "
 INSERT INTO videos
   (id,channel_id,title,description,thumb_url,thumb_path,published_at,sort_at,feed_rank,
    added_manually,duration_secs,view_count,status,hidden,watched,watched_at,
-   download_state,download_error,file_path,downloaded_at,first_seen_at,sibling_group)
-VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+   download_state,download_error,file_path,downloaded_at,first_seen_at,sibling_group,
+   series_hidden)
+VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
 ON CONFLICT(id) DO UPDATE SET
   channel_id=excluded.channel_id, title=excluded.title, description=excluded.description,
   thumb_url=excluded.thumb_url, thumb_path=excluded.thumb_path,
@@ -3359,7 +3360,7 @@ ON CONFLICT(id) DO UPDATE SET
   watched_at=excluded.watched_at, download_state=excluded.download_state,
   download_error=excluded.download_error, file_path=excluded.file_path,
   downloaded_at=excluded.downloaded_at, first_seen_at=excluded.first_seen_at,
-  sibling_group=excluded.sibling_group,
+  sibling_group=excluded.sibling_group, series_hidden=excluded.series_hidden,
   download_quality=CASE excluded.download_state WHEN 'none' THEN NULL
                         ELSE download_quality END";
 
@@ -3382,6 +3383,10 @@ ON CONFLICT(id) DO UPDATE SET
 /// `watched_at` takes the earliest of the two, since the question it answers is
 /// when you first watched the thing, and that is not a per-machine fact.
 ///
+/// `series_hidden` is lifted like `hidden` and apart from it: an archive part
+/// un-hidden on its own still carries its series' mark, and a part hidden on
+/// its own carries none, so neither flag can stand in for the other.
+///
 /// The WHERE guard repeats every rule above as a predicate so that `changes()`
 /// counts rows that actually moved. It is what makes a second run of the same
 /// archive report zero updates instead of rewriting the whole library.
@@ -3397,10 +3402,12 @@ UPDATE videos SET
   thumb_path     = COALESCE(thumb_path, ?7),
   download_state = CASE WHEN ?8 = 'done' THEN ?8  ELSE download_state END,
   file_path      = CASE WHEN ?8 = 'done' THEN ?9  ELSE file_path      END,
-  downloaded_at  = CASE WHEN ?8 = 'done' THEN ?10 ELSE downloaded_at  END
+  downloaded_at  = CASE WHEN ?8 = 'done' THEN ?10 ELSE downloaded_at  END,
+  series_hidden  = MAX(series_hidden, ?11)
 WHERE id = ?1
   AND ( watched < ?2
      OR hidden < ?3
+     OR series_hidden < ?11
      OR added_manually < ?4
      OR (?5 IS NOT NULL AND (watched_at IS NULL OR watched_at > ?5))
      OR (sibling_group IS NULL AND ?6 IS NOT NULL)
@@ -3595,7 +3602,8 @@ impl Db {
                     MERGE_VIDEO,
                     params![v.id, v.watched as i64, v.hidden as i64, v.added_manually as i64,
                             v.watched_at, v.sibling_group, v.thumb_path,
-                            v.download_state.as_str(), v.file_path, v.downloaded_at],
+                            v.download_state.as_str(), v.file_path, v.downloaded_at,
+                            v.series_hidden as i64],
                 )?;
             } else {
                 tx.execute(
@@ -3605,7 +3613,8 @@ impl Db {
                             v.added_manually as i64, v.duration_secs, v.view_count,
                             v.status.as_str(), v.hidden as i64, v.watched as i64,
                             v.watched_at, v.download_state.as_str(), v.download_error,
-                            v.file_path, v.downloaded_at, v.first_seen_at, v.sibling_group],
+                            v.file_path, v.downloaded_at, v.first_seen_at, v.sibling_group,
+                            v.series_hidden as i64],
                 )?;
                 if existed { report.videos_updated += 1 } else { report.videos_added += 1 }
             }
@@ -3648,6 +3657,7 @@ mod import_tests {
         v.watched = true;
         v.watched_at = Some(9_999);
         v.hidden = true;
+        v.series_hidden = true;
         v.added_manually = true;
         v.sibling_group = Some("k-1".into());
         v.thumb_path = Some(format!("/thumbs/{id}.jpg"));
@@ -3714,7 +3724,7 @@ mod import_tests {
         let ch = dst.get_channel("UC1").unwrap().unwrap();
         assert!(ch.subscribed && ch.member);
         let v = dst.get_video("a").unwrap().unwrap();
-        assert!(v.watched && v.hidden && v.added_manually);
+        assert!(v.watched && v.hidden && v.series_hidden && v.added_manually);
         assert_eq!(v.watched_at, Some(9_999));
         assert_eq!(v.sibling_group.as_deref(), Some("k-1"));
         assert_eq!(v.download_state, DownloadState::Done);
@@ -4017,6 +4027,47 @@ mod import_tests {
         assert!(d.get_video("b").unwrap().is_none(), "half an import is no import");
         assert_eq!(d.transfer_estimate().unwrap(), (1, 1));
     }
+
+    #[test]
+    fn merging_lifts_a_series_mark_and_never_lowers_one() {
+        let d = db();
+        let marked = Video { series_hidden: true, ..video("b", "UC1", "One") };
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One"), marked]);
+
+        // The archive has it the other way round.
+        let report = d
+            .apply_import(
+                &[chan("UC1", "One")],
+                &[Video { series_hidden: true, ..video("a", "UC1", "One") }, video("b", "UC1", "One")],
+                ImportMode::Merge,
+                &[],
+            )
+            .unwrap();
+
+        let (a, b) = (d.get_video("a").unwrap().unwrap(), d.get_video("b").unwrap().unwrap());
+        assert!(a.series_hidden, "false -> true");
+        assert!(b.series_hidden, "true survives an incoming false");
+        assert!(!a.hidden, "the mark is lifted on its own, never the hide with it");
+        assert_eq!(report.videos_updated, 1, "only 'a' actually moved");
+    }
+
+    #[test]
+    fn replacing_applies_a_series_mark_verbatim_either_way() {
+        let d = db();
+        let marked = Video { series_hidden: true, ..video("a", "UC1", "One") };
+        seed(&d, &[chan("UC1", "One")], &[marked, video("b", "UC1", "One")]);
+
+        d.apply_import(
+            &[chan("UC1", "One")],
+            &[video("a", "UC1", "One"), Video { series_hidden: true, ..video("b", "UC1", "One") }],
+            ImportMode::Replace,
+            &archive(&["UC1"]),
+        )
+        .unwrap();
+
+        assert!(!d.get_video("a").unwrap().unwrap().series_hidden, "incoming wins outright");
+        assert!(d.get_video("b").unwrap().unwrap().series_hidden);
+    }
 }
 
 #[cfg(test)]
@@ -4279,15 +4330,17 @@ use crate::sync::snapshot::{
 };
 
 /// The rows a snapshot carries: every manual add, and every row whose watched,
-/// hidden or sibling state anyone ever changed. A stamp outlives the change it
-/// records -- a watch taken back keeps its stamp -- which is how an un-watch
-/// travels at all.
+/// hidden, sibling or hidden-series state anyone ever changed. A stamp outlives
+/// the change it records -- a watch taken back keeps its stamp -- which is how
+/// an un-watch travels at all.
 const SYNC_TOUCHED: &str = "(added_manually <> 0 OR watched_changed_at IS NOT NULL
-     OR hidden_changed_at IS NOT NULL OR sibling_changed_at IS NOT NULL)";
+     OR hidden_changed_at IS NOT NULL OR sibling_changed_at IS NOT NULL
+     OR series_hidden_changed_at IS NOT NULL)";
 
 const SYNC_VIDEO_COLUMNS: &str = "id, channel_id, title, published_at, sort_at, duration_secs,
      added_manually, first_seen_at, watched, watched_at, watched_changed_at,
-     hidden, hidden_changed_at, sibling_group, sibling_changed_at";
+     hidden, hidden_changed_at, sibling_group, sibling_changed_at,
+     series_hidden, series_hidden_changed_at";
 
 const SYNC_CHANNEL_COLUMNS: &str =
     "id, title, handle, url, subscribed, subscribed_changed_at, member, member_changed_at";
@@ -4300,6 +4353,7 @@ fn map_sync_video(r: &Row) -> rusqlite::Result<SyncVideo> {
         watched: r.get(8)?, watched_at: r.get(9)?, watched_changed_at: r.get(10)?,
         hidden: r.get(11)?, hidden_changed_at: r.get(12)?,
         sibling_group: r.get(13)?, sibling_changed_at: r.get(14)?,
+        series_hidden: r.get(15)?, series_hidden_changed_at: r.get(16)?,
     })
 }
 
@@ -4347,9 +4401,11 @@ fn channel_state(c: &SyncChannel) -> (bool, Option<i64>, bool, Option<i64>) {
 /// Everything about a video that sync owns. `added_at` is `first_seen_at`.
 #[allow(clippy::type_complexity)]
 fn video_state(v: &SyncVideo)
-    -> (bool, Option<i64>, Option<i64>, bool, Option<i64>, Option<&str>, Option<i64>, bool, i64) {
+    -> (bool, Option<i64>, Option<i64>, bool, Option<i64>, Option<&str>, Option<i64>, bool, i64,
+        bool, Option<i64>) {
     (v.watched, v.watched_at, v.watched_changed_at, v.hidden, v.hidden_changed_at,
-     v.sibling_group.as_deref(), v.sibling_changed_at, v.added_manually, v.added_at)
+     v.sibling_group.as_deref(), v.sibling_changed_at, v.added_manually, v.added_at,
+     v.series_hidden, v.series_hidden_changed_at)
 }
 
 /// `removed_at` only ever moves forward, so a second apply of the same
@@ -4397,21 +4453,24 @@ const INSERT_SYNC_VIDEO: &str = "
 INSERT INTO videos (id, channel_id, title, thumb_url, published_at, sort_at, feed_rank,
                     added_manually, duration_secs, status, first_seen_at,
                     watched, watched_at, watched_changed_at, hidden, hidden_changed_at,
-                    sibling_group, sibling_changed_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 'ready', ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+                    sibling_group, sibling_changed_at, series_hidden, series_hidden_changed_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 'ready', ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+        ?17, ?18)";
 
 const SET_SYNC_VIDEO: &str = "
 UPDATE videos SET watched = ?2, watched_at = ?3, watched_changed_at = ?4,
                   hidden = ?5, hidden_changed_at = ?6,
                   sibling_group = ?7, sibling_changed_at = ?8,
-                  added_manually = ?9, first_seen_at = ?10
+                  added_manually = ?9, first_seen_at = ?10,
+                  series_hidden = ?11, series_hidden_changed_at = ?12
  WHERE id = ?1";
 
 /// [`RESTAMP_SYNC_CHANNEL`], for a video.
 const RESTAMP_SYNC_VIDEO: &str = "
 UPDATE videos SET watched_changed_at = COALESCE(?2, watched_changed_at),
                   hidden_changed_at  = COALESCE(?3, hidden_changed_at),
-                  sibling_changed_at = COALESCE(?4, sibling_changed_at)
+                  sibling_changed_at = COALESCE(?4, sibling_changed_at),
+                  series_hidden_changed_at = COALESCE(?5, series_hidden_changed_at)
  WHERE id = ?1";
 
 fn insert_sync_channel(conn: &Connection, c: &SyncChannel) -> Result<()> {
@@ -4430,7 +4489,8 @@ fn insert_sync_video(conn: &Connection, v: &SyncVideo) -> Result<()> {
                 v.published_at, v.sort_at.or(v.published_at), v.added_manually as i64,
                 v.duration_secs, v.added_at, v.watched as i64, v.watched_at,
                 v.watched_changed_at, v.hidden as i64, v.hidden_changed_at,
-                v.sibling_group, v.sibling_changed_at],
+                v.sibling_group, v.sibling_changed_at, v.series_hidden as i64,
+                v.series_hidden_changed_at],
     )?;
     Ok(())
 }
@@ -4612,10 +4672,11 @@ impl Db {
                             joined.watched_changed_at, joined.hidden as i64,
                             joined.hidden_changed_at, joined.sibling_group,
                             joined.sibling_changed_at, joined.added_manually as i64,
-                            joined.added_at])?;
+                            joined.added_at, joined.series_hidden as i64,
+                            joined.series_hidden_changed_at])?;
                         tx.execute(RESTAMP_SYNC_VIDEO, params![
                             joined.id, joined.watched_changed_at, joined.hidden_changed_at,
-                            joined.sibling_changed_at])?;
+                            joined.sibling_changed_at, joined.series_hidden_changed_at])?;
                         writes += 1;
                     }
                     continue;
@@ -5620,6 +5681,215 @@ mod sync_tests {
         assert!(!first.channels_added.is_empty() && !first.videos_added.is_empty());
         let after_first = anon(&b);
 
+        assert_eq!(b.apply_sync(&snaps).unwrap(), ApplyReport::default());
+        assert_eq!(anon(&b), after_first);
+    }
+
+    // ---- a hidden series ----
+
+    /// Hides or un-hides one part with its series the way
+    /// `Db::set_series_hidden` writes it -- both flags together -- with both
+    /// stamps pinned at `at`, in one write so the triggers keep them.
+    fn hide_series(d: &Db, id: &str, on: bool, at: i64) {
+        let v = on as i64;
+        pin(d, "videos", id, &format!(
+            "hidden={v}, hidden_changed_at={at}, series_hidden={v}, series_hidden_changed_at={at}"));
+    }
+
+    #[test]
+    fn the_snapshot_carries_a_hidden_series_and_one_taken_back() {
+        let d = library();
+        hide_series(&d, "a", true, 150);
+        // The series stamp alone is enough to carry a row.
+        pin(&d, "videos", "b", "series_hidden_changed_at=160");
+        d.upsert_channel(&adhoc("UC2")).unwrap();
+        d.insert_video_if_new(&polled("z", "UC2")).unwrap();
+        pin(&d, "videos", "z", "series_hidden=1, series_hidden_changed_at=170");
+
+        let s = d.sync_snapshot("desk").unwrap();
+        let ids: Vec<&str> = s.videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "z"], "never the untouched 'c'");
+        let pair = |id: &str| {
+            let v = s.videos.iter().find(|v| v.id == id).unwrap();
+            (v.series_hidden, v.series_hidden_changed_at)
+        };
+        assert_eq!(pair("a"), (true, Some(150)));
+        assert_eq!(pair("b"), (false, Some(160)), "taken back, and still carried by its stamp");
+        assert!(s.channels.iter().any(|c| c.id == "UC2"), "the parent of a carried row rides along");
+    }
+
+    #[test]
+    fn a_hidden_series_travels_and_so_does_taking_it_back() {
+        let (a, b) = (library(), library());
+        for id in ["a", "b"] { hide_series(&a, id, true, 150); }
+        assert!(sync(&a, &b).changed);
+        for id in ["a", "b"] {
+            assert!(b.get_video(id).unwrap().unwrap().hidden, "{id}");
+            assert_eq!(series_stamp(&b, id), (true, Some(150)), "copied, never restamped here");
+        }
+        assert_eq!(series_stamp(&b, "c"), (false, None));
+
+        for id in ["a", "b"] { hide_series(&b, id, false, 200); }
+        assert!(sync(&b, &a).changed);
+        for id in ["a", "b"] {
+            assert!(!a.get_video(id).unwrap().unwrap().hidden, "{id}");
+            assert_eq!(series_stamp(&a, id), (false, Some(200)));
+        }
+        assert!(!sync(&a, &b).changed);
+        assert_eq!(anon(&a), anon(&b));
+    }
+
+    #[test]
+    fn un_hiding_one_part_travels_and_leaves_its_mark_alone() {
+        let (a, b) = (library(), library());
+        hide_series(&a, "a", true, 150);
+        sync(&a, &b);
+        a.set_hidden("a", false).unwrap();
+        pin(&a, "videos", "a", "hidden_changed_at=200");
+        assert!(sync(&a, &b).changed);
+        assert!(!b.get_video("a").unwrap().unwrap().hidden);
+        assert_eq!(series_stamp(&b, "a"), (true, Some(150)));
+    }
+
+    #[test]
+    fn the_later_series_stamp_wins_on_either_side() {
+        // The local copy is newer: the remote one writes nothing.
+        let (a, b) = (library(), library());
+        hide_series(&a, "a", true, 150);
+        hide_series(&b, "a", false, 200);
+        assert!(!sync(&a, &b).changed, "b's word at 200 is the later one");
+        assert_eq!(series_stamp(&b, "a"), (false, Some(200)));
+        // The remote copy is newer: it lands, stamp and all.
+        assert!(sync(&b, &a).changed);
+        assert_eq!(series_stamp(&a, "a"), (false, Some(200)));
+
+        // A copy that never carried a mark loses to one that did, however it
+        // reaches the row -- here riding along with a watch.
+        let (a, b) = (library(), library());
+        hide_series(&a, "b", true, 150);
+        sync(&a, &b);
+        let c = library();
+        c.set_watched("b", true).unwrap();
+        pin(&c, "videos", "b", "watched_at=120, watched_changed_at=120");
+        assert!(sync(&c, &b).changed, "the watch lands");
+        assert_eq!(series_stamp(&b, "b"), (true, Some(150)), "the mark stays");
+        assert!(b.get_video("b").unwrap().unwrap().hidden);
+    }
+
+    #[test]
+    fn a_tie_on_the_series_stamp_goes_to_the_mark_without_restamping() {
+        let (a, b) = (library(), library());
+        hide_series(&a, "a", true, 500);
+        // B marked it too and took it back within the same second.
+        hide_series(&b, "a", true, 400);
+        hide_series(&b, "a", false, 500);
+        assert!(sync(&a, &b).changed);
+        assert_eq!(series_stamp(&b, "a"), (true, Some(500)), "with the stamp it tied on");
+        assert!(b.get_video("a").unwrap().unwrap().hidden);
+        assert!(!sync(&b, &a).changed);
+        assert_eq!(anon(&a), anon(&b));
+    }
+
+    #[test]
+    fn a_video_arriving_whole_brings_its_series_mark_and_stamp() {
+        // A's poll found a new part of a hidden series before B's did.
+        let (a, b) = (library(), library());
+        a.insert_video_if_new(&polled("x", "UC1")).unwrap();
+        pin(&a, "videos", "x", "first_seen_at=120");
+        hide_series(&a, "x", true, 130);
+        assert_eq!(sync(&a, &b).videos_added, ["x"]);
+        let v = b.get_video("x").unwrap().unwrap();
+        assert!(v.hidden && v.series_hidden);
+        assert_eq!(series_stamp(&b, "x"), (true, Some(130)), "the insert trigger kept the sender's");
+        assert!(!sync(&a, &b).changed);
+    }
+
+    #[test]
+    fn a_snapshot_from_a_build_without_series_hiding_never_clears_a_mark() {
+        let (old, new) = (library(), library());
+        hide_series(&new, "a", true, 150);
+        // The older machine hid the same part on its own, later: the most it
+        // can say about it.
+        old.set_hidden("a", true).unwrap();
+        pin(&old, "videos", "a", "hidden_changed_at=170");
+        let mut json = serde_json::to_value(old.sync_snapshot("old").unwrap()).unwrap();
+        for v in json["videos"].as_array_mut().unwrap() {
+            let v = v.as_object_mut().unwrap();
+            v.remove("series_hidden");
+            v.remove("series_hidden_changed_at");
+        }
+        let s: Snapshot = serde_json::from_value(json).unwrap();
+
+        assert!(new.apply_sync(&[s]).unwrap().changed, "its hide still lands");
+        assert_eq!(video_stamps(&new, "a")[1], Some(170));
+        assert_eq!(series_stamp(&new, "a"), (true, Some(150)));
+    }
+
+    #[test]
+    fn an_import_that_lifts_or_brings_a_series_mark_is_stamped() {
+        let d = one_video("a");
+        let a = Video { series_hidden: true, ..archived("a", "UC1") };
+        let b = Video { series_hidden: true, hidden: true, ..archived("b", "UC1") };
+        let (_, at) = around(|| {
+            d.apply_import(&[chan("UC1")], &[a, b], ImportMode::Merge, &[]).unwrap()
+        });
+        for id in ["a", "b"] {
+            let (on, stamp) = series_stamp(&d, id);
+            assert!(on && stamped_now(&at, stamp), "{id}: a merge lifting it, a row arriving with it");
+        }
+    }
+
+    /// [`apart`], with hidden series on top. A hides 'a' with its series. B
+    /// hides 'b' with its series and takes it back, later than A's hide of
+    /// 'b'. And both mark 'c' in the same second, B taking it back at once.
+    fn apart_with_series() -> (Db, Db) {
+        let (a, b) = apart();
+        hide_series(&a, "a", true, 300);
+        hide_series(&b, "b", true, 305);
+        hide_series(&b, "b", false, 310);
+        pin(&a, "videos", "c", "series_hidden=1, series_hidden_changed_at=320");
+        pin(&b, "videos", "c", "series_hidden=1, series_hidden_changed_at=315");
+        pin(&b, "videos", "c", "series_hidden=0, series_hidden_changed_at=320");
+        (a, b)
+    }
+
+    fn assert_series_settled_as_expected(d: &Db) {
+        let v = |id: &str| d.get_video(id).unwrap().unwrap();
+        assert!(v("a").hidden && v("a").series_hidden);
+        assert_eq!(series_stamp(d, "a"), (true, Some(300)));
+        assert!(!v("b").hidden, "B's un-hide at 310 is later than A's hide at 210");
+        assert_eq!(series_stamp(d, "b"), (false, Some(310)));
+        assert!(v("c").hidden, "B's hide at 215 is untouched by either mark");
+        assert_eq!(series_stamp(d, "c"), (true, Some(320)), "the mark takes the tie");
+    }
+
+    #[test]
+    fn two_libraries_converge_on_their_hidden_series() {
+        let (a, b) = apart_with_series();
+        assert!(settle(&a, &b) <= 3);
+        assert_eq!(anon(&a), anon(&b));
+        assert_series_settled_as_expected(&a);
+
+        let (a2, b2) = apart_with_series();
+        assert!(settle(&b2, &a2) <= 3);
+        assert_eq!(anon(&a2), anon(&b2));
+        assert_eq!(anon(&a2), anon(&a), "whichever pulls first");
+
+        let (a3, b3) = apart_with_series();
+        assert!(settle_at_once(&a3, &b3) <= 3);
+        assert_eq!(anon(&a3), anon(&a), "or both at the same moment");
+
+        let c = library();
+        c.apply_sync(&[a3.sync_snapshot("a").unwrap(), b3.sync_snapshot("b").unwrap()]).unwrap();
+        assert_eq!(anon(&c), anon(&a), "and a third machine pulling both lands there too");
+    }
+
+    #[test]
+    fn applying_the_same_series_marks_twice_changes_nothing_the_second_time() {
+        let (a, b) = apart_with_series();
+        let snaps = [a.sync_snapshot("a").unwrap()];
+        assert!(b.apply_sync(&snaps).unwrap().changed);
+        let after_first = anon(&b);
         assert_eq!(b.apply_sync(&snaps).unwrap(), ApplyReport::default());
         assert_eq!(anon(&b), after_first);
     }

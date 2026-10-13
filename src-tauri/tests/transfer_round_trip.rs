@@ -106,6 +106,11 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     let mut p2 = video("vid_p2", "UCmember", "Members channel", "The Blackwood Tapes Pt 3");
     p1.sibling_group = Some("1757000000000-vid_p1".into());
     p2.sibling_group = Some("1757000000000-vid_p1".into());
+    // ...hidden as a series, with one part since un-hidden on its own: the
+    // mark stays on both, which is what hides the part that joins them next.
+    p1.hidden = true;
+    p1.series_hidden = true;
+    p2.series_hidden = true;
 
     src.apply_import(
         &[chan("UC1", "One"), adhoc, member],
@@ -190,6 +195,9 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     assert!(got("vid_manual").added_manually);
     assert_eq!(got("vid_p1").sibling_group, got("vid_p2").sibling_group);
     assert!(got("vid_p1").sibling_group.is_some(), "hand-marked siblings survived");
+    assert!(got("vid_p1").hidden && got("vid_p1").series_hidden, "the hidden series crossed");
+    assert!(!got("vid_p2").hidden && got("vid_p2").series_hidden, "and so did a part un-hidden on its own");
+    assert!(!got("vid_hidden").series_hidden, "a hidden video is not a hidden series");
 
     let d = got("vid_dl");
     assert_eq!(d.download_state, DownloadState::Done);

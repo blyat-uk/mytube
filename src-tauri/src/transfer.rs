@@ -146,6 +146,11 @@ struct ArchiveVideo {
     downloaded_at: Option<i64>,
     first_seen_at: i64,
     sibling_group: Option<String>,
+    /// Hidden with its whole series (DB v11). Absent from an archive written
+    /// before that, which hid no series; no new `FORMAT` for it, since an
+    /// older build reading a newer archive just leaves the key unread.
+    #[serde(default)]
+    series_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +318,7 @@ impl ArchiveVideo {
             downloaded_at: if done { v.downloaded_at } else { None },
             first_seen_at: v.first_seen_at,
             sibling_group: v.sibling_group.clone(),
+            series_hidden: v.series_hidden,
         }
     }
 
@@ -343,7 +349,7 @@ impl ArchiveVideo {
             downloaded_at: None,
             first_seen_at: self.first_seen_at,
             sibling_group: self.sibling_group,
-            series_hidden: false,
+            series_hidden: self.series_hidden,
         }
     }
 }
@@ -833,7 +839,7 @@ mod tests {
             downloaded_at: None,
             first_seen_at: 1_756_000_000,
             sibling_group: Some("grp-1".into()),
-            series_hidden: false,
+            series_hidden: true,
         }
     }
 
@@ -1119,6 +1125,7 @@ mod tests {
         assert_eq!(a.downloaded_at, v.downloaded_at);
         assert_eq!(a.first_seen_at, v.first_seen_at);
         assert_eq!(a.sibling_group, v.sibling_group);
+        assert_eq!(a.series_hidden, v.series_hidden);
 
         // The three machine-specific columns are absent from the video rows
         // entirely, not merely null. (`channels` does carry its own
@@ -1143,6 +1150,7 @@ mod tests {
         assert_eq!(got.title, v.title);
         assert_eq!(got.sibling_group, v.sibling_group);
         assert_eq!(got.hidden, v.hidden);
+        assert_eq!(got.series_hidden, v.series_hidden);
         assert_eq!(got.watched_at, v.watched_at);
         assert_eq!(got.first_seen_at, v.first_seen_at);
         assert!(p.report.settings_applied);
@@ -1193,6 +1201,39 @@ mod tests {
         prepare_import_in(&old, &["UC1".into()], true, &dirs_in(&cfg), &noop).unwrap();
         let after = config::load_from(&cfg.join("settings.json")).unwrap();
         assert_eq!(after.quality.mode, "audio", "an archive silent on quality reset it");
+    }
+
+    #[test]
+    fn an_archive_from_before_series_hiding_reads_as_no_series_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        let written = tmp.path().join("a.zip");
+        write_archive(&written, &[channel("UC1", "Chan")], &[video("v1", "UC1")],
+                      &settings_with_download_dir(&dl), false, &noop).unwrap();
+
+        // The same manifest as 4.3.0 wrote it: no `series_hidden` on any video.
+        let mut m: serde_json::Value = {
+            let mut z = open(&written).unwrap();
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut z.by_name(MANIFEST).unwrap(), &mut raw).unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        let row = m["videos"][0].as_object_mut().unwrap();
+        assert_eq!(row.remove("series_hidden"), Some(serde_json::Value::Bool(true)), "export wrote it");
+        let old = tmp.path().join("old.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&old).unwrap());
+            z.start_file(MANIFEST, SimpleFileOptions::default()).unwrap();
+            z.write_all(m.to_string().as_bytes()).unwrap();
+            z.finish().unwrap();
+        }
+
+        let p = prepare_import_in(&old, &["UC1".into()], false, &dirs_in(&tmp.path().join("cfg")), &noop)
+            .unwrap();
+        let v = &p.videos[0];
+        assert!(!v.series_hidden, "an archive silent on it hides no series");
+        assert!(v.hidden, "and the rest of the row is read as before");
     }
 
     // ------------------------------------------------------------- versioning
