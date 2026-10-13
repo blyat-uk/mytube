@@ -97,6 +97,17 @@ fn import_in(
         &prepared.archive_channel_ids,
     )?;
 
+    // An archive can bring a series' hidden mark to parts this library already
+    // held, but it cannot know about the parts only this library has -- one
+    // polled here after the export. Left to the next poll, those would stay in
+    // the feed for up to an interval, leading a card full of hidden parts; the
+    // sweep only ever marks rows nobody has decided about, so it is safe to run
+    // after any import. Its failure is logged rather than failing an import
+    // whose rows have already landed.
+    if let Err(err) = db.hide_series_arrivals() {
+        eprintln!("mytube: hiding the parts of imported hidden series failed: {err}");
+    }
+
     // `db` knows the row counts; `transfer` knows everything that happened
     // outside SQL. Neither can fill the other's half.
     report.downloads_relinked = prepared.report.downloads_relinked;
@@ -261,6 +272,29 @@ mod tests {
         assert!(report.settings_applied);
         assert!(ours.join("thumbs/a1.jpg").is_file());
         assert!(db.get_channel("B").unwrap().is_none(), "an unpicked channel is skipped");
+    }
+
+    #[test]
+    fn an_imported_series_mark_hides_the_parts_only_this_library_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("a.zip");
+        let mut p1 = video("p1", "A");
+        p1.title = "The Blackwood Tapes Part 1".into();
+        p1.hidden = true;
+        p1.series_hidden = true;
+        transfer::write_archive(&archive, &[channel("A")], &[p1], &settings_in(tmp.path()),
+                                false, &noop)
+            .unwrap();
+        // Polled here after the export: the archive has never heard of it.
+        let mut p2 = video("p2", "A");
+        p2.title = "The Blackwood Tapes Part 2".into();
+        let db = library(&[channel("A")], &[p2]);
+
+        import_in(&db, &archive, &["A".to_string()], ImportMode::Merge, false,
+                  &dirs_in(&tmp.path().join("ours")), &noop)
+            .unwrap();
+        let p2 = db.get_video("p2").unwrap().unwrap();
+        assert!(p2.hidden && p2.series_hidden, "{p2:?}");
     }
 
     #[test]

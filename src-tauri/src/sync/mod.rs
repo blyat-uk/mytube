@@ -784,7 +784,8 @@ pub async fn run_clock(app: AppHandle, app_state: Arc<AppState>, syncer: Arc<Syn
 }
 
 /// What an apply leaves to do: thumbnails for the new rows, a poll for the new
-/// subscriptions, and a refetch if anything moved.
+/// subscriptions, and -- if anything moved -- a sweep for hidden series, then a
+/// refetch.
 fn follow_up(app: &AppHandle, app_state: &Arc<AppState>, report: &ApplyReport) {
     if !report.videos_added.is_empty() {
         let st = app_state.clone();
@@ -815,7 +816,15 @@ fn follow_up(app: &AppHandle, app_state: &Arc<AppState>, report: &ApplyReport) {
         });
     }
     if report.changed {
-        let _ = app.emit(FINISHED_EVENT, ());
+        // Another computer's hidden series reaches the parts it holds, never
+        // one only this machine has polled so far; the sweep hides those too.
+        // Before the refetch the event drives, so the feed never shows them
+        // for the interval a poll would take to catch up.
+        let (st, app) = (app_state.clone(), app.clone());
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || poll::hide_series_arrivals(&st)).await;
+            let _ = app.emit(FINISHED_EVENT, ());
+        });
     }
 }
 
