@@ -486,6 +486,7 @@ fn channel_rows(
     conn: &Connection,
     channel_id: &str,
 ) -> Result<(Vec<siblings::Entry>, HashMap<String, PartFacts>)> {
+    let mut former = former_titles(conn, channel_id)?;
     let mut st = conn.prepare_cached(
         "SELECT id, title, duration_secs, sibling_group, watched FROM videos
          WHERE channel_id=?1 AND status='ready'",
@@ -507,9 +508,40 @@ fn channel_rows(
         // A row whose duration has not resolved yet contributes nothing to its
         // series rather than dropping the series out of the ordering.
         facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched });
-        entries.push(siblings::Entry { id, title, former_titles: Vec::new(), group });
+        let former_titles = former.remove(&id).unwrap_or_default();
+        entries.push(siblings::Entry { id, title, former_titles, group });
     }
     Ok((entries, facts))
+}
+
+/// Every name each video on a channel carried before its current title
+/// (`video_titles`), by video id. Both readers of a channel for the grouping
+/// rule -- [`channel_rows`] and [`Db::series_entries`] -- take their names from
+/// here, so a card and a series hide can never disagree about what a video was
+/// once called.
+///
+/// One query per channel rather than one per video: nearly every video has no
+/// former name at all, and is simply absent from the map. A channel's rows
+/// that the caller does not read (one not `ready`, for [`channel_rows`]) cost
+/// nothing but a map entry nobody asks for. Each video's names come back in
+/// title order -- the table keeps no other -- so the same rows always make the
+/// same entries.
+fn former_titles(conn: &Connection, channel_id: &str) -> Result<HashMap<String, Vec<String>>> {
+    let mut st = conn.prepare_cached(
+        "SELECT t.video_id, t.title FROM video_titles t
+           JOIN videos v ON v.id = t.video_id
+          WHERE v.channel_id = ?1
+          ORDER BY t.video_id, t.title",
+    )?;
+    let rows = st.query_map(params![channel_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (id, title) = row?;
+        out.entry(id).or_default().push(title);
+    }
+    Ok(out)
 }
 
 /// What the grouped walk needs to know about one part once its card is built,
@@ -979,13 +1011,41 @@ impl Db {
 
     /// Everything one RSS feed writes, in one transaction: the exact instant
     /// for each row already stored (`dates`, via [`Db::set_published_at`] and
-    /// its per-row error tolerance), then the new rows (via
+    /// its per-row error tolerance), the title each of those rows was published
+    /// under (`titles`, see below), then the new rows (via
     /// [`Db::insert_videos_if_new`]). Returns how many rows were new.
-    pub fn apply_feed(&self, dates: &[(String, i64)], fresh: &[NewVideo]) -> Result<usize> {
-        if dates.is_empty() && fresh.is_empty() { return Ok(0); }
+    ///
+    /// A feed's title is never written to `videos.title`: it is frozen at
+    /// publish time (see [`Db::set_titles`]), so it is the one source that
+    /// cannot know a rename. That same freezing is what makes it worth
+    /// keeping. Where it differs from the stored title it is a name the video
+    /// carried and no longer does, and it goes into `video_titles` beside the
+    /// ones the rename trigger records. The guards live in the SQL, as in
+    /// `set_titles`, so a poll can hand over every entry: an empty title, the
+    /// title the row carries now, and an id belonging to no row all record
+    /// nothing. A name that fails to write is skipped like a date -- the feed
+    /// carries it again next poll, and it is not worth the new rows.
+    pub fn apply_feed(
+        &self,
+        dates: &[(String, i64)],
+        titles: &[(String, String)],
+        fresh: &[NewVideo],
+    ) -> Result<usize> {
+        if dates.is_empty() && titles.is_empty() && fresh.is_empty() { return Ok(0); }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         set_published_all(&tx, dates)?;
+        {
+            let mut keep = tx.prepare_cached(
+                "INSERT OR IGNORE INTO video_titles (video_id, title)
+                 SELECT id, ?2 FROM videos WHERE id=?1 AND ?2<>'' AND title<>?2")?;
+            for (id, title) in titles {
+                // Per row, like `set_published_all`: an ordinary statement
+                // error rolls back that statement alone, and one that takes
+                // the transaction with it fails the commit below.
+                let _ = keep.execute(params![id, title]);
+            }
+        }
         let added = insert_all(&tx, fresh)?;
         tx.commit()?;
         Ok(added)
@@ -1161,11 +1221,19 @@ impl Db {
             (seeds, rows_by_channel)
         };
 
-        // Bucketed with the lock released.
+        // Bucketed with the lock released. The atoms take the entries whole,
+        // so the former names -- which name a card as well as match it -- are
+        // set aside first, for the few rows that have any.
         let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
         let mut parts: HashMap<String, PartFacts> = HashMap::new();
+        let mut former: HashMap<String, Vec<String>> = HashMap::new();
         for (channel, (entries, facts)) in rows_by_channel {
             parts.extend(facts);
+            former.extend(
+                entries.iter()
+                    .filter(|e| !e.former_titles.is_empty())
+                    .map(|e| (e.id.clone(), e.former_titles.clone())),
+            );
             index.insert(channel, siblings::Atoms::new(entries));
         }
 
@@ -1263,8 +1331,19 @@ impl Db {
             }
             if videos.is_empty() { continue; }
             let stem = if videos.len() > 1 {
-                let names: Vec<Vec<&str>> =
-                    videos.iter().map(|v| vec![v.title.as_str()]).collect();
+                // Each part's names, its current title first. That one comes
+                // from the hydrated row, which is fresher than the walk's read
+                // when a rename lands in between -- so a name it now carries
+                // again is kept out of the former ones rather than counted twice.
+                let names: Vec<Vec<&str>> = videos
+                    .iter()
+                    .map(|v| {
+                        let was = former.get(&v.id).into_iter().flatten().map(String::as_str);
+                        std::iter::once(v.title.as_str())
+                            .chain(was.filter(|t| *t != v.title))
+                            .collect()
+                    })
+                    .collect();
                 siblings::series_stem(&names)
             } else {
                 None
@@ -1390,12 +1469,13 @@ impl Db {
     /// card, never take one away, so the visible card is always inside what
     /// this groups.
     fn series_entries(conn: &Connection, channel_id: &str) -> Result<Vec<siblings::Entry>> {
+        let mut former = former_titles(conn, channel_id)?;
         let mut st = conn.prepare_cached(
             "SELECT id, title, sibling_group FROM videos WHERE channel_id=?1")?;
         let rows = st.query_map(params![channel_id], |r| {
-            Ok(siblings::Entry {
-                id: r.get(0)?, title: r.get(1)?, former_titles: Vec::new(), group: r.get(2)?,
-            })
+            let id: String = r.get(0)?;
+            let former_titles = former.remove(&id).unwrap_or_default();
+            Ok(siblings::Entry { id, title: r.get(1)?, former_titles, group: r.get(2)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -3099,7 +3179,7 @@ mod tests {
 
         let dates = vec![("known".to_string(), 1234), ("manual".to_string(), 42),
                          ("gone".to_string(), 7)];
-        let added = d.apply_feed(&dates, &[vid("new", "UC1", Some(99))]).unwrap();
+        let added = d.apply_feed(&dates, &[], &[vid("new", "UC1", Some(99))]).unwrap();
         assert_eq!(added, 1);
 
         let known = d.get_video("known").unwrap().unwrap();
@@ -3152,21 +3232,23 @@ mod tests {
     fn a_retitle_regroups_on_the_very_next_fetch() {
         // Normalised titles are remembered between walks; the memo is keyed on
         // the title itself, so a rename must read as a different title at once.
+        // A rename no longer splits a card -- the old name is kept and still
+        // matches (see `former_titles_tests`) -- so the new name shows it was
+        // read by the card it brings in.
         let d = db();
         titled(&d, "UC1", &[
             ("p1", "Retitle Regroup Saga Part 1"),
             ("p2", "Retitle Regroup Saga Part 2"),
+            ("q1", "Something Else Entirely Part 1"),
         ]);
         let f = VideoFilter::default();
-        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
+        assert_eq!(grouped(&d, &f), vec![("q1".to_string(), 1), ("p2".to_string(), 2)]);
         assert_eq!(siblings_of(&d, "p1").len(), 2);
 
-        d.set_titles(&[("p1".into(), "Something Else Entirely".into())]).unwrap();
-        assert_eq!(grouped(&d, &f).len(), 2, "the rename splits the card");
-        assert_eq!(siblings_of(&d, "p1"), vec!["p1".to_string()]);
-
-        d.set_titles(&[("p1".into(), "Retitle Regroup Saga Part 1".into())]).unwrap();
-        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)], "and renaming back rejoins it");
+        d.set_titles(&[("p1".into(), "Something Else Entirely Part 2".into())]).unwrap();
+        assert_eq!(grouped(&d, &f), vec![("q1".to_string(), 3)],
+                   "the new name joins q1, the old one keeps p2");
+        assert_eq!(siblings_of(&d, "q1").len(), 3);
     }
 
     #[test]
@@ -6550,5 +6632,410 @@ mod sync_tests {
         let after_first = anon(&b);
         assert_eq!(b.apply_sync(&snaps).unwrap(), ApplyReport::default());
         assert_eq!(anon(&b), after_first);
+    }
+}
+
+#[cfg(test)]
+mod former_titles_tests {
+    use super::*;
+
+    const CH: &str = "UC1";
+
+    fn chan(id: &str) -> Channel {
+        Channel { id: id.into(), title: format!("T-{id}"), handle: None,
+                  url: format!("https://www.youtube.com/channel/{id}"),
+                  thumb_path: None, subscribed: true, member: false, added_at: 0,
+                  last_polled_at: None, terminated: false, auto_download: false }
+    }
+
+    /// A ready row, dated `at` so the two ends of the feed lead with different
+    /// parts.
+    fn row(id: &str, title: &str, at: i64) -> NewVideo {
+        NewVideo { id: id.into(), channel_id: CH.into(), title: title.into(),
+                   description: None, thumb_url: None, published_at: Some(at),
+                   sort_at: Some(at), feed_rank: 0, added_manually: false,
+                   duration_secs: Some(600), view_count: Some(1), status: VideoStatus::Ready }
+    }
+
+    fn db() -> Db {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&chan(CH)).unwrap();
+        d
+    }
+
+    fn add(d: &Db, v: NewVideo) { assert!(d.insert_video_if_new(&v).unwrap()); }
+
+    /// One video, `a`, under `title`.
+    fn one(title: &str) -> Db {
+        let d = db();
+        add(&d, row("a", title, 1_000));
+        d
+    }
+
+    fn sql(d: &Db, s: &str) { d.conn.lock().unwrap().execute_batch(s).unwrap(); }
+
+    /// The names `id` carried before its current one.
+    fn former(d: &Db, id: &str) -> Vec<String> {
+        let c = d.conn.lock().unwrap();
+        let mut st = c
+            .prepare("SELECT title FROM video_titles WHERE video_id=?1 ORDER BY title")
+            .unwrap();
+        let rows = st.query_map(params![id], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<String>>>().unwrap()
+    }
+
+    fn names_kept(d: &Db) -> i64 {
+        d.conn.lock().unwrap()
+            .query_row("SELECT COUNT(*) FROM video_titles", [], |r| r.get(0)).unwrap()
+    }
+
+    fn title(d: &Db, id: &str) -> String { d.get_video(id).unwrap().unwrap().title }
+
+    /// A rename the way a poll writes one, from the channel listing.
+    fn retitle(d: &Db, id: &str, to: &str) { d.set_titles(&[(id.into(), to.into())]).unwrap(); }
+
+    fn owned(ids: &[&str]) -> Vec<String> { ids.iter().map(|s| s.to_string()).collect() }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> { ids.sort(); ids }
+
+    /// What "Find siblings" on `anchor` shows.
+    fn series(d: &Db, anchor: &str) -> Vec<String> {
+        let f = VideoFilter { sibling_of: Some(anchor.into()), ..VideoFilter::default() };
+        sorted(d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect())
+    }
+
+    /// The grouped feed, card by card, each leader first.
+    fn cards(d: &Db, sort: SortOrder) -> Vec<Vec<String>> {
+        let f = VideoFilter { sort, ..VideoFilter::default() };
+        d.list_video_groups(&f).unwrap()
+            .into_iter()
+            .map(|g| g.videos.into_iter().map(|v| v.id).collect())
+            .collect()
+    }
+
+    // ---- the v12 migration ----
+
+    /// A database exactly as v11 left it, built step by step the way
+    /// `sync_tests` builds v9 -- not by migrating to the top and taking v12
+    /// back off, which would quietly stop being v11 the day a v13 lands.
+    fn v11() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE videos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+             CREATE INDEX idx_videos_hidden ON videos(hidden, sort_at DESC);
+             ALTER TABLE videos ADD COLUMN downloaded_at INTEGER;
+             CREATE INDEX idx_videos_downloaded ON videos(downloaded_at DESC);
+             ALTER TABLE videos ADD COLUMN sibling_group TEXT;
+             CREATE INDEX idx_videos_sibling_group ON videos(sibling_group);
+             ALTER TABLE channels ADD COLUMN member INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE channels ADD COLUMN backfill_depth INTEGER;
+             ALTER TABLE channels ADD COLUMN terminated_at INTEGER;
+             ALTER TABLE channels ADD COLUMN auto_download_since INTEGER;
+             ALTER TABLE videos ADD COLUMN auto_queued INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN download_quality TEXT;
+             ALTER TABLE videos ADD COLUMN watched_changed_at INTEGER;
+             ALTER TABLE videos ADD COLUMN hidden_changed_at INTEGER;
+             ALTER TABLE videos ADD COLUMN sibling_changed_at INTEGER;
+             ALTER TABLE channels ADD COLUMN subscribed_changed_at INTEGER;
+             ALTER TABLE channels ADD COLUMN member_changed_at INTEGER;
+             CREATE TABLE tombstones (
+               kind       TEXT NOT NULL,
+               id         TEXT NOT NULL,
+               removed_at INTEGER NOT NULL,
+               PRIMARY KEY (kind, id)
+             );
+             ALTER TABLE videos ADD COLUMN series_hidden INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN series_hidden_changed_at INTEGER;",
+        ).unwrap();
+        conn.execute_batch(SYNC_TRIGGERS).unwrap();
+        conn.execute_batch(SERIES_HIDDEN_TRIGGERS).unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn
+    }
+
+    /// Every object in the schema with its SQL, whitespace squeezed: the same
+    /// statement indented differently is the same schema.
+    fn schema(d: &Db) -> Vec<(String, String, Option<String>)> {
+        let c = d.conn.lock().unwrap();
+        let mut st = c
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)))
+            .unwrap();
+        rows.map(|r| {
+            let (kind, name, sql) = r.unwrap();
+            (kind, name, sql.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")))
+        })
+        .collect()
+    }
+
+    #[test]
+    fn upgrading_a_v11_database_keeps_every_row_and_starts_with_no_former_names() {
+        let conn = v11();
+        conn.execute_batch(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7);
+             INSERT INTO videos (id,channel_id,title,status,first_seen_at,watched,sibling_group)
+               VALUES ('a','UC1','The Blackwood Tapes','ready',1,1,'k'),
+                      ('b','UC1','The Blackwood Tapes Part 2','ready',1,0,'k');",
+        ).unwrap();
+        let d = Db::init(conn).unwrap();
+
+        let version: i64 = d.conn.lock().unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let a = d.get_video("a").unwrap().unwrap();
+        assert_eq!((a.title.as_str(), a.watched, a.sibling_group.as_deref()),
+                   ("The Blackwood Tapes", true, Some("k")));
+        assert_eq!(title(&d, "b"), "The Blackwood Tapes Part 2");
+        assert_eq!(names_kept(&d), 0, "no name was ever kept before v12; nothing to seed");
+
+        // A row from before the upgrade is renamed like any other.
+        retitle(&d, "b", "EVERYTHING CHANGED");
+        assert_eq!(former(&d, "b"), owned(&["The Blackwood Tapes Part 2"]));
+    }
+
+    #[test]
+    fn an_upgraded_database_has_exactly_the_schema_of_a_fresh_one() {
+        let upgraded = schema(&Db::init(v11()).unwrap());
+        assert_eq!(upgraded, schema(&Db::open_in_memory().unwrap()));
+        assert!(upgraded.iter().any(|(k, n, _)| k == "table" && n == "video_titles"));
+        assert!(upgraded.iter().any(|(k, n, _)| k == "trigger" && n == "video_title_kept"));
+    }
+
+    // ---- the trigger ----
+
+    #[test]
+    fn a_rename_keeps_the_name_it_replaced() {
+        let d = one("The Blackwood Tapes Part 2");
+        retitle(&d, "a", "EVERYTHING CHANGED");
+        assert_eq!(title(&d, "a"), "EVERYTHING CHANGED");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes Part 2"]));
+
+        retitle(&d, "a", "YOU WON'T BELIEVE WHAT HAPPENED");
+        assert_eq!(former(&d, "a"), owned(&["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"]),
+                   "a second rename forgets nothing");
+    }
+
+    #[test]
+    fn a_title_that_did_not_change_records_nothing() {
+        let d = one("The Blackwood Tapes");
+        retitle(&d, "a", "The Blackwood Tapes");
+        // Past `set_titles`' own guard: a write naming the column that leaves
+        // it as it was, as a transfer Replace's upsert does on every row.
+        sql(&d, "UPDATE videos SET title=title WHERE id='a'");
+        d.set_watched("a", true).unwrap();
+        assert_eq!(names_kept(&d), 0);
+    }
+
+    #[test]
+    fn an_empty_title_is_never_kept_as_a_name() {
+        let d = one("The Blackwood Tapes");
+        // `set_titles` refuses a blank outright...
+        retitle(&d, "a", "");
+        assert_eq!(title(&d, "a"), "The Blackwood Tapes");
+        assert_eq!(names_kept(&d), 0);
+
+        // ...but `scripts/` write the column directly. Blanking it keeps the
+        // real name it replaced, and the blank is not kept when a name returns.
+        sql(&d, "UPDATE videos SET title='' WHERE id='a'");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes"]));
+        sql(&d, "UPDATE videos SET title='EVERYTHING CHANGED' WHERE id='a'");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes"]));
+    }
+
+    #[test]
+    fn a_title_flipping_back_moves_between_current_and_former() {
+        // YouTube's title A/B test serves different variants to different
+        // reads, so a poll can see a title go and come back.
+        let d = one("The Blackwood Tapes Part 2");
+        retitle(&d, "a", "EVERYTHING CHANGED");
+        retitle(&d, "a", "The Blackwood Tapes Part 2");
+        assert_eq!(former(&d, "a"), owned(&["EVERYTHING CHANGED"]),
+                   "the current title is never a former one as well");
+
+        retitle(&d, "a", "EVERYTHING CHANGED");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes Part 2"]));
+        retitle(&d, "a", "YOU WON'T BELIEVE WHAT HAPPENED");
+        assert_eq!(former(&d, "a"), owned(&["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"]),
+                   "and nothing is kept twice");
+    }
+
+    #[test]
+    fn former_names_go_with_their_video() {
+        let d = one("The Blackwood Tapes Part 2");
+        add(&d, row("b", "Cooking With Gas", 2_000));
+        retitle(&d, "a", "EVERYTHING CHANGED");
+        retitle(&d, "b", "Cooking With Gas, Again");
+
+        d.delete_video("a").unwrap();
+        assert!(former(&d, "a").is_empty());
+        assert_eq!(former(&d, "b"), owned(&["Cooking With Gas"]), "only its own");
+
+        // A channel removed takes its videos' names with the videos.
+        d.remove_channel(CH).unwrap();
+        assert_eq!(names_kept(&d), 0);
+    }
+
+    // ---- the feed ----
+
+    fn feed_title(d: &Db, id: &str, title: &str) {
+        d.apply_feed(&[], &[(id.into(), title.into())], &[]).unwrap();
+    }
+
+    #[test]
+    fn a_feed_title_the_row_no_longer_carries_is_kept_but_never_written_back() {
+        // Stored under its new name: ingested from the listing during an RSS
+        // outage, or renamed before v12 kept anything.
+        let d = one("EVERYTHING CHANGED");
+        feed_title(&d, "a", "The Blackwood Tapes Part 2");
+        assert_eq!(title(&d, "a"), "EVERYTHING CHANGED", "the feed is no authority on a title");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes Part 2"]));
+
+        // Every poll hands it over again; it stays one name.
+        feed_title(&d, "a", "The Blackwood Tapes Part 2");
+        assert_eq!(names_kept(&d), 1);
+
+        // Renamed back by the uploader, it is current again and not former.
+        retitle(&d, "a", "The Blackwood Tapes Part 2");
+        assert_eq!(former(&d, "a"), owned(&["EVERYTHING CHANGED"]));
+        feed_title(&d, "a", "The Blackwood Tapes Part 2");
+        assert_eq!(former(&d, "a"), owned(&["EVERYTHING CHANGED"]));
+    }
+
+    #[test]
+    fn a_feed_title_that_is_blank_current_or_for_no_row_records_nothing() {
+        let d = one("The Blackwood Tapes");
+        let titles = [
+            // Unchanged: nearly every entry of every poll.
+            ("a".to_string(), "The Blackwood Tapes".to_string()),
+            // A mangled entry.
+            ("a".to_string(), String::new()),
+            // No such row: the foreign key would refuse it, and must not have to.
+            ("gone".to_string(), "Deleted Since".to_string()),
+        ];
+        assert_eq!(d.apply_feed(&[], &titles, &[]).unwrap(), 0);
+        assert_eq!(names_kept(&d), 0);
+        assert_eq!(title(&d, "a"), "The Blackwood Tapes");
+    }
+
+    #[test]
+    fn a_new_row_in_the_same_feed_has_no_former_names() {
+        let d = one("EVERYTHING CHANGED");
+        let added = d.apply_feed(
+            &[("a".into(), 1_234)],
+            &[("a".into(), "The Blackwood Tapes Part 2".into())],
+            &[row("b", "The Blackwood Tapes Part 3", 2_000)],
+        ).unwrap();
+        assert_eq!(added, 1);
+        assert!(former(&d, "b").is_empty(), "the feed's title is the only one it has had");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes Part 2"]));
+        assert_eq!(d.get_video("a").unwrap().unwrap().published_at, Some(1_234),
+                   "and the date lands beside it");
+    }
+
+    // ---- the grouping rule sees every name ----
+
+    /// The premise of the tests below, checked rather than assumed: the new
+    /// name shares nothing with the series, and the part uploaded after it
+    /// reads as a sequel to the new name alone.
+    fn the_rename_breaks_the_titles_apart() {
+        use crate::siblings::{is_sibling, normalize};
+        let sib = |a: &str, b: &str| is_sibling(&normalize(a), &normalize(b));
+        assert!(sib("The Blackwood Tapes", "The Blackwood Tapes Part 2"));
+        assert!(sib("The Blackwood Tapes Part 2", "The Blackwood Tapes Part 3"));
+        for old in ["The Blackwood Tapes", "The Blackwood Tapes Part 2", "The Blackwood Tapes Part 3"] {
+            assert!(!sib(old, "EVERYTHING CHANGED Part 2"), "{old}");
+        }
+        for old in ["The Blackwood Tapes", "The Blackwood Tapes Part 3"] {
+            assert!(!sib(old, "EVERYTHING CHANGED"), "{old}");
+        }
+        assert!(sib("EVERYTHING CHANGED", "EVERYTHING CHANGED Part 2"));
+        assert!(sib("EVERYTHING CHANGED Part 2", "EVERYTHING CHANGED Part 3"));
+    }
+
+    /// The Blackwood Tapes in three parts, and an unrelated upload among them.
+    fn tapes(d: &Db) {
+        add(d, row("p1", "The Blackwood Tapes", 1_000));
+        add(d, row("p2", "The Blackwood Tapes Part 2", 2_000));
+        add(d, row("other", "Cooking With Gas", 2_500));
+        add(d, row("p3", "The Blackwood Tapes Part 3", 3_000));
+    }
+
+    const FOUR: [&str; 4] = ["p1", "p2", "p3", "p4"];
+
+    #[test]
+    fn a_renamed_part_stays_on_its_series_card_and_brings_the_next_one() {
+        the_rename_breaks_the_titles_apart();
+        let d = db();
+        tapes(&d);
+        retitle(&d, "p2", "EVERYTHING CHANGED");
+
+        // One card of three whichever end of the feed leads it, "other" alone.
+        for sort in [SortOrder::Newest, SortOrder::Oldest] {
+            let c = cards(&d, sort);
+            assert_eq!(c.len(), 2, "{sort:?}: {c:?}");
+            let parts = c.iter().find(|m| m.len() > 1).expect("a series card");
+            assert_eq!(sorted(parts.clone()), owned(&["p1", "p2", "p3"]), "{sort:?}");
+        }
+        // And "Find siblings" from any part, the renamed one too.
+        for id in ["p1", "p2", "p3"] {
+            assert_eq!(series(&d, id), owned(&["p1", "p2", "p3"]), "{id}");
+        }
+
+        // The next part is uploaded under the new name and matches nothing the
+        // others were ever called. The renamed part carries both names, so it
+        // is still one card -- led by the newcomer or by the first part.
+        add(&d, row("p4", "EVERYTHING CHANGED Part 2", 4_000));
+        let newest = cards(&d, SortOrder::Newest);
+        assert_eq!(newest[0][0], "p4");
+        assert_eq!(sorted(newest[0].clone()), owned(&FOUR));
+        let oldest = cards(&d, SortOrder::Oldest);
+        assert_eq!(oldest[0][0], "p1");
+        assert_eq!(sorted(oldest[0].clone()), owned(&FOUR));
+        for id in FOUR {
+            assert_eq!(series(&d, id), owned(&FOUR), "{id}");
+        }
+
+        // Hidden from the card, the series goes whole...
+        assert_eq!(sorted(d.set_series_hidden("p4", true).unwrap()), owned(&FOUR));
+        for id in FOUR {
+            assert!(d.get_video(id).unwrap().unwrap().hidden, "{id}");
+        }
+        assert!(!d.get_video("other").unwrap().unwrap().hidden);
+        // ...and so does the part after it.
+        add(&d, row("p5", "EVERYTHING CHANGED Part 3", 5_000));
+        assert_eq!(d.hide_series_arrivals().unwrap(), owned(&["p5"]));
+    }
+
+    #[test]
+    fn hiding_a_series_takes_a_part_only_its_old_name_matches() {
+        the_rename_breaks_the_titles_apart();
+        let d = db();
+        tapes(&d);
+        retitle(&d, "p2", "EVERYTHING CHANGED");
+
+        // Led from the first part, which only p2's old name reaches.
+        assert_eq!(sorted(d.set_series_hidden("p1", true).unwrap()), owned(&["p1", "p2", "p3"]));
+        assert!(d.get_video("p2").unwrap().unwrap().series_hidden);
+
+        // A part under the new name matches no marked part but p2, by the
+        // name it carries now.
+        add(&d, row("p4", "EVERYTHING CHANGED Part 2", 4_000));
+        assert_eq!(d.hide_series_arrivals().unwrap(), owned(&["p4"]));
+    }
+
+    #[test]
+    fn the_sweep_follows_a_hidden_part_by_the_name_it_was_hidden_under() {
+        let d = db();
+        add(&d, row("p1", "The Blackwood Tapes", 1_000));
+        d.set_series_hidden("p1", true).unwrap();
+        // Retitled after it was hidden, as YouTubers do in the days after an
+        // upload. Nothing marked is called anything like the series now.
+        retitle(&d, "p1", "EVERYTHING CHANGED");
+
+        add(&d, row("p2", "The Blackwood Tapes Part 2", 2_000));
+        assert_eq!(d.hide_series_arrivals().unwrap(), owned(&["p2"]));
     }
 }

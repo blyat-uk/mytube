@@ -364,6 +364,7 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
     let ids: Vec<String> = feed.entries.iter().map(|e| e.video_id.clone()).collect();
     let existing = db.existing_video_ids(&ids)?;
     let mut dates: Vec<(String, i64)> = Vec::new();
+    let mut titles: Vec<(String, String)> = Vec::new();
     let mut fresh: Vec<NewVideo> = Vec::new();
 
     for e in &feed.entries {
@@ -379,6 +380,23 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
             // publish time (see `Db::set_titles`), so writing it back would
             // undo the rename `refresh_from_listing` just picked up whenever
             // the listing is unavailable.
+            //
+            // Frozen is exactly what makes it worth keeping, though. Where it
+            // differs from the stored title it is the name the video was
+            // published under and no longer carries, so `apply_feed` records
+            // it as a former name -- the one that keeps a renamed part on its
+            // series' card. That recovers renames made before former names
+            // were kept at all, for as much of each channel as its feed holds,
+            // and gives a row the listing ingested during an outage, already
+            // under its new name, the name it was published under the moment
+            // RSS comes back. Every entry goes in: the guards (empty,
+            // unchanged) are in the SQL.
+            //
+            // A new row needs none of this. It is inserted below under the
+            // feed's title, and if the listing read later in this same poll
+            // has it renamed, `set_titles` retitles it and the database's
+            // trigger keeps the old name on its own.
+            titles.push((e.video_id.clone(), e.title.clone()));
             continue;
         }
         fresh.push(NewVideo {
@@ -399,9 +417,10 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
             status: VideoStatus::Pending,
         });
     }
-    // One lock and one commit for the whole feed. A date that fails to write is
-    // skipped, as it always was; only an insert failing fails the poll.
-    let count = db.apply_feed(&dates, &fresh)?;
+    // One lock and one commit for the whole feed. A date or a former name that
+    // fails to write is skipped, as a date always was; only an insert failing
+    // fails the poll.
+    let count = db.apply_feed(&dates, &titles, &fresh)?;
     Ok(Added { count, ids: fresh.into_iter().map(|v| v.id).collect() })
 }
 
@@ -1147,6 +1166,69 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         assert_eq!(still_new(added.count, &new_ids, &hidden), 1);
         assert!(db.get_video("p2").unwrap().unwrap().hidden);
         assert!(!db.get_video("cook").unwrap().unwrap().hidden);
+    }
+
+    /// What "Find siblings" on `anchor` shows.
+    fn series(db: &Db, anchor: &str) -> Vec<String> {
+        let f = VideoFilter { sibling_of: Some(anchor.into()), ..VideoFilter::default() };
+        let mut ids: Vec<String> = db.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// A row the listing ingested while RSS was down already carries its new
+    /// name, which shares nothing with its series. The feed, back up, still
+    /// carries the name it was published under: that one must reach the
+    /// series' card, and must never replace the title.
+    #[test]
+    fn a_feed_hands_back_the_name_a_renamed_video_was_published_under() {
+        let db = Db::open_in_memory().unwrap();
+        member_channel(&db);
+        let channel = db.get_channel(CH).unwrap().unwrap();
+        let listed = |id: &str, title: &str| FlatEntry { title: title.into(), ..entry(id, None) };
+        insert_from_listing(&db, CH, &[
+            listed("p1", "The Blackwood Tapes Pt 1"),
+            listed("p2", "EVERYTHING CHANGED"),
+            listed("p3", "The Blackwood Tapes Pt 3"),
+        ], &HashMap::new()).unwrap();
+        assert_eq!(series(&db, "p1"), owned(&["p1", "p3"]), "the premise: p2 is off the card");
+
+        let added = insert_from_feed(&db, &channel, &feed(&[
+            ("p1", "The Blackwood Tapes Pt 1"),
+            ("p2", "The Blackwood Tapes Pt 2"),
+            ("p3", "The Blackwood Tapes Pt 3"),
+        ])).unwrap();
+        assert_eq!(added.count, 0);
+        assert_eq!(db.get_video("p2").unwrap().unwrap().title, "EVERYTHING CHANGED",
+                   "the feed's frozen title is never written back");
+        assert_eq!(series(&db, "p1"), owned(&["p1", "p2", "p3"]));
+        assert_eq!(series(&db, "p2"), owned(&["p1", "p2", "p3"]));
+    }
+
+    /// The poll's order, checked: the feed inserts a new video under the name
+    /// it was published under, and when the listing read after it in the same
+    /// poll has it renamed, the rename keeps that name on its own -- nothing in
+    /// `insert_from_feed` has to.
+    #[test]
+    fn a_video_renamed_before_its_first_poll_keeps_the_name_the_feed_inserted() {
+        let db = Db::open_in_memory().unwrap();
+        member_channel(&db);
+        let channel = db.get_channel(CH).unwrap().unwrap();
+        let listed = |id: &str, title: &str| FlatEntry { title: title.into(), ..entry(id, None) };
+        insert_from_listing(&db, CH, &[
+            listed("p1", "The Blackwood Tapes Pt 1"),
+            listed("p3", "The Blackwood Tapes Pt 3"),
+        ], &HashMap::new()).unwrap();
+
+        let added = insert_from_feed(&db, &channel, &feed(&[("p2", "The Blackwood Tapes Pt 2")]))
+            .unwrap();
+        assert_eq!(added.ids, owned(&["p2"]));
+        // What `refresh_from_listing` then writes for it.
+        db.set_titles(&[("p2".into(), "EVERYTHING CHANGED".into())]).unwrap();
+        db.update_video_meta("p2", Some(600), None, VideoStatus::Ready).unwrap();
+
+        assert_eq!(db.get_video("p2").unwrap().unwrap().title, "EVERYTHING CHANGED");
+        assert_eq!(series(&db, "p1"), owned(&["p1", "p2", "p3"]));
     }
 
     #[test]
