@@ -275,14 +275,30 @@ fn strip_markers_for_display(title: &str) -> String {
 /// choosing.
 pub fn display_stem(titles: &[&str]) -> Option<String> {
     let stripped: Vec<String> = titles.iter().map(|t| strip_markers_for_display(t)).collect();
-    let words: Vec<&str> = stripped.first()?.split(' ').filter(|w| !w.is_empty()).collect();
+    let words: Vec<Vec<&str>> = stripped.iter().map(|s| display_words(s)).collect();
+    let titles: Vec<&[&str]> = words.iter().map(Vec::as_slice).collect();
+    stem_of(&titles)
+}
+
+/// A title's words once [`strip_markers_for_display`] has squeezed it.
+fn display_words(stripped: &str) -> Vec<&str> {
+    stripped.split(' ').filter(|w| !w.is_empty()).collect()
+}
+
+/// How many words two stripped titles share from the start, compared by
+/// [`word_key`].
+fn shared_words(a: &[&str], b: &[&str]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| word_key(x) == word_key(y)).count()
+}
+
+/// [`display_stem`]'s rule over titles already stripped and split into words,
+/// so [`series_stem`] can weigh many names while stripping each only once.
+fn stem_of(titles: &[&[&str]]) -> Option<String> {
+    let words = *titles.first()?;
 
     let mut shared = words.len();
-    for other in stripped.iter().skip(1) {
-        let theirs: Vec<&str> = other.split(' ').filter(|w| !w.is_empty()).collect();
-        shared = shared.min(
-            words.iter().zip(&theirs).take_while(|(a, b)| word_key(a) == word_key(b)).count(),
-        );
+    for theirs in &titles[1..] {
+        shared = shared.min(shared_words(words, theirs));
     }
     if shared == 0 {
         return None;
@@ -294,10 +310,7 @@ pub fn display_stem(titles: &[&str]) -> Option<String> {
     // separator: that is where the removed marker stood, so everything past it
     // -- `The Blackwood Tapes : The` out of two differing subtitles -- belongs
     // to one part rather than to the series.
-    let identical = shared == words.len()
-        && stripped
-            .iter()
-            .all(|o| o.split(' ').filter(|w| !w.is_empty()).count() == words.len());
+    let identical = shared == words.len() && titles.iter().all(|o| o.len() == words.len());
     if !identical {
         if let Some(cut) = words[..shared].iter().position(|w| word_key(w).is_empty()) {
             shared = cut;
@@ -322,11 +335,81 @@ pub fn display_stem(titles: &[&str]) -> Option<String> {
 /// `parts[0]` is the card's leader, and each part lists its names with its
 /// current title first.
 ///
-/// STUB: uses current titles only. To be replaced with the best stem over one
-/// name per part.
+/// A part renamed to chase the algorithm stays on its card through its old
+/// name, but `EVERYTHING CHANGED` shares nothing with the parts beside it, so
+/// the current titles alone name nothing and the card would fall back to its
+/// leader's title. The series still has a name -- `The Blackwood Tapes Pt 2`
+/// carries it -- and finding it means picking one name per part: the pick that
+/// leaves the longest stem, counted in words.
+///
+/// Trying every combination would be exponential in the parts, and the stem
+/// never needs it. [`display_stem`] reads only three things: the first title's
+/// words, how far the run each other title shares with them reaches, and
+/// whether every title is that run exactly. So once the leader's name is
+/// fixed, every other part is chosen on its own -- the name sharing the
+/// longest run with the leader's, and between equals one that *is* the
+/// leader's, since only a card whose parts all strip to one title keeps a
+/// separator inside its name (`Hardcore | The Blackwood Tapes`). That pick is
+/// the best there is for that leader name, not an approximation of it, which
+/// leaves only the leader's own few names to try: one pass over every other
+/// part's names for each.
+///
+/// Every tie goes to the earlier name, current titles first. Another part's
+/// former name is picked only when it fits the leader's name better than the
+/// current one does, and the leader's only when it gives a longer stem -- so
+/// with one name per part this is exactly [`display_stem`] over the current
+/// titles, and a rename that changes nothing about the stem changes nothing
+/// about the card. The words, and so the casing, are the leader's chosen name's.
+///
+/// A part with no names is skipped, as though the card did not hold it: it has
+/// nothing to say about what the others share, and refusing the whole card
+/// over it would throw away a name they agree on. Every row has a current
+/// title, so this only guards a caller's slip.
 pub fn series_stem(parts: &[Vec<&str>]) -> Option<String> {
-    let current: Vec<&str> = parts.iter().filter_map(|names| names.first().copied()).collect();
-    display_stem(&current)
+    let stripped: Vec<Vec<String>> = parts
+        .iter()
+        .filter(|names| !names.is_empty())
+        .map(|names| names.iter().map(|t| strip_markers_for_display(t)).collect())
+        .collect();
+    let words: Vec<Vec<Vec<&str>>> = stripped
+        .iter()
+        .map(|names| names.iter().map(|s| display_words(s)).collect())
+        .collect();
+    let (leader, rest) = words.split_first()?;
+
+    let mut best: Option<(usize, String)> = None;
+    for lead in leader {
+        let mut chosen: Vec<&[&str]> = Vec::with_capacity(words.len());
+        chosen.push(lead);
+        chosen.extend(rest.iter().map(|names| closest_name(lead, names)));
+        let Some(stem) = stem_of(&chosen) else { continue };
+        // Words, not tokens: a standalone `|` names nothing.
+        let len = stem.split(' ').filter(|w| !word_key(w).is_empty()).count();
+        if best.as_ref().map_or(true, |(most, _)| len > *most) {
+            best = Some((len, stem));
+        }
+    }
+    best.map(|(_, stem)| stem)
+}
+
+/// The one of a part's names that leaves the most of `lead` standing as the
+/// series name: the longest shared run first, then a name that is `lead`
+/// exactly, then the earliest. `names` is never empty -- [`series_stem`] has
+/// already dropped a part with none.
+fn closest_name<'n, 'w>(lead: &[&str], names: &'n [Vec<&'w str>]) -> &'n [&'w str] {
+    let fit = |name: &[&str]| {
+        let shared = shared_words(lead, name);
+        (shared, shared == lead.len() && name.len() == lead.len())
+    };
+    let mut best = names[0].as_slice();
+    let mut best_fit = fit(best);
+    for name in &names[1..] {
+        let f = fit(name);
+        if f > best_fit {
+            (best, best_fit) = (name, f);
+        }
+    }
+    best
 }
 
 /// One video as the grouping rule sees it.
@@ -372,13 +455,19 @@ pub struct Entry {
 /// part uploaded later under the *new* name still brings the whole series.
 /// YouTube vouches for those names belonging together -- it is one video --
 /// which is a stronger promise than any fuzzy match. A video with one name
-/// still seeds nothing when it joins; the ceiling is unchanged.
+/// still seeds nothing when it joins; the ceiling is unchanged. Nor does a
+/// rename that leaves the stem as it was -- `Part 1` added once part two came
+/// out, a title re-cased -- or one to a name that matches nothing: a second
+/// name has to be able to reach titles the first cannot before it vouches
+/// for anything.
 pub struct Atoms {
     ids: Vec<String>,
-    /// Each entry's distinct names, its current title first. Two names that
-    /// normalise alike (a rename that only changed case or punctuation) are
-    /// one stem, so a cosmetic rename neither costs a comparison nor counts
-    /// as a second name for seeding.
+    /// Each entry's distinct names, its current title first unless that is
+    /// one of the inert ones dropped in [`Atoms::new`]. Two names with one
+    /// core (a rename that only changed case, punctuation or the part marker)
+    /// are one stem, and a name that can match nothing is none, so neither
+    /// costs a comparison nor counts as a second name for seeding. An
+    /// untitled video has no stem at all.
     stems: Vec<Vec<Stem>>,
     /// Which atom each entry landed in.
     atom_of: Vec<usize>,
@@ -418,13 +507,26 @@ impl Atoms {
                 atom_of[i] = atoms.len();
                 atoms.push(vec![i]);
             }
+            // Folded on the core alone, keeping a marker if either name had one:
+            // `Stem::matches` reads the marker only to let a *different* core
+            // in, so a marked stem matches everything its unmarked twin does,
+            // and the pair is one name. Keyed on the whole `Normalized`, the
+            // `Part 1` a first part so often gains once part two is up would
+            // make it two names, and a seed that reaches nothing new.
             let mut names: Vec<Stem> = Vec::with_capacity(1 + e.former_titles.len());
             for title in std::iter::once(&e.title).chain(&e.former_titles) {
                 let norm = normalize_memo(title);
-                if !names.iter().any(|s| s.norm == norm) {
-                    names.push(Stem::new(norm));
+                match names.iter_mut().find(|s| s.norm.core == norm.core) {
+                    Some(same) => same.norm.had_marker |= norm.had_marker,
+                    None => names.push(Stem::new(norm)),
                 }
             }
+            // An empty stem with no marker matches no title at all (see
+            // `Stem::matches`), so a rename to nothing but emoji is not a
+            // second name either. Before former titles this was never more
+            // than one inert stem per untitled video; dropping it changes no
+            // match.
+            names.retain(|s| !s.norm.core.is_empty() || s.norm.had_marker);
             stems.push(names);
             by_id.insert(e.id.clone(), i);
             ids.push(e.id);
@@ -813,12 +915,22 @@ mod tests {
     type Row<'a> = (&'a str, &'a str, Option<&'a str>);
 
     fn led_by(rows: &[Row], anchor: &str) -> Vec<String> {
+        let named: Vec<Named> =
+            rows.iter().map(|(id, title, group)| (*id, vec![*title], *group)).collect();
+        renamed_led_by(&named, anchor)
+    }
+
+    /// `(id, every name it carried with the current title first, manual group key)`.
+    type Named<'a> = (&'a str, Vec<&'a str>, Option<&'a str>);
+
+    /// [`led_by`] for rows that may have been renamed.
+    fn renamed_led_by(rows: &[Named], anchor: &str) -> Vec<String> {
         let entries = rows
             .iter()
-            .map(|(id, title, group)| Entry {
+            .map(|(id, names, group)| Entry {
                 id: (*id).into(),
-                title: (*title).into(),
-                former_titles: Vec::new(),
+                title: names[0].into(),
+                former_titles: names[1..].iter().map(|t| t.to_string()).collect(),
                 group: group.map(str::to_string),
             })
             .collect();
@@ -928,5 +1040,299 @@ mod tests {
     #[test]
     fn an_anchor_that_is_not_here_has_no_group() {
         assert!(led_by(&[("a", "The Blackwood Tapes", None)], "nope").is_empty());
+    }
+
+    /* ---------------- former titles: a rename keeps its bonds ---------------- */
+
+    #[test]
+    fn a_part_renamed_to_clickbait_stays_on_its_card() {
+        // The rename that used to drop a part off its series: nothing in
+        // `EVERYTHING CHANGED` reaches the other parts, and nothing has to,
+        // because the name it was uploaded under still does. Whichever part
+        // leads, the card is the same three.
+        assert!(!sib("EVERYTHING CHANGED", "The Blackwood Tapes"));
+        let rows: &[Named] = &[
+            ("p1", vec!["The Blackwood Tapes"], None),
+            ("p2", vec!["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"], None),
+            ("p3", vec!["The Blackwood Tapes Part 3"], None),
+            ("x", vec!["Something Else Entirely"], None),
+        ];
+        assert_eq!(renamed_led_by(rows, "p1"), ["p1", "p2", "p3"]);
+        assert_eq!(renamed_led_by(rows, "p2"), ["p2", "p1", "p3"]);
+        assert_eq!(renamed_led_by(rows, "p3"), ["p3", "p1", "p2"]);
+    }
+
+    #[test]
+    fn a_part_uploaded_under_the_new_name_brings_the_whole_series() {
+        // `a_marked_atom_drawn_in_keeps_seeding` without the mark: YouTube
+        // vouches that both names are one video, so the renamed part seeds
+        // with both and the follow-up under the new name finds its way to part
+        // one -- from either end of the chain.
+        let rows: &[Named] = &[
+            ("p1", vec!["The Blackwood Tapes"], None),
+            ("p2", vec!["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"], None),
+            ("ec2", vec!["EVERYTHING CHANGED Part 2"], None),
+        ];
+        assert!(!sib("EVERYTHING CHANGED Part 2", "The Blackwood Tapes"));
+        assert_eq!(renamed_led_by(rows, "ec2"), ["ec2", "p1", "p2"]);
+        assert_eq!(renamed_led_by(rows, "p1"), ["p1", "ec2", "p2"]);
+    }
+
+    #[test]
+    fn every_name_the_leader_carried_seeds() {
+        // Renamed twice. Its current title reaches nothing, its first name
+        // reaches the parts it was uploaded beside, and the name it wore in
+        // between reaches a follow-up uploaded while it wore it.
+        let rows: &[Named] = &[
+            ("p3", vec!["SHOCKING", "EVERYTHING CHANGED", "The Blackwood Tapes Pt 3"], None),
+            ("p1", vec!["The Blackwood Tapes"], None),
+            ("p2", vec!["The Blackwood Tapes Part 2"], None),
+            ("ec2", vec!["EVERYTHING CHANGED Part 2"], None),
+            ("x", vec!["Something Else Entirely"], None),
+        ];
+        assert_eq!(renamed_led_by(rows, "p3"), ["p3", "ec2", "p1", "p2"]);
+    }
+
+    #[test]
+    fn a_cosmetic_rename_does_not_seed_further_matches() {
+        // `an_auto_joined_title_does_not_seed_further_matches` with `b`
+        // re-cased and re-punctuated since upload. Both names normalise alike,
+        // so `b` still has one name, and one name that joins seeds nothing.
+        let rows: &[Named] = &[
+            ("a", vec!["Nightfall Ashen Court Chronicle Reborn Again"], Some("g1")),
+            ("z", vec!["An Unrelated Title"], Some("g1")),
+            ("b", vec!["NIGHTFALL ASHEN COURT, PART 2!", "Nightfall Ashen Court Part 2"], None),
+            ("c", vec!["Nightfall Ashen Court Of Dawn And Dusk Part 4"], None),
+        ];
+        assert_eq!(renamed_led_by(rows, "a"), ["a", "b", "z"]);
+    }
+
+    #[test]
+    fn numbering_a_part_after_the_fact_is_not_a_second_name() {
+        // Part one gets its `Part 1` once part two exists. Same stem, one with
+        // a marker and one without -- and a marked stem already matches
+        // everything its unmarked twin does, so the old name adds nothing to
+        // match on. Counted as a second name it would make `b` a seed all the
+        // same, and `c`, which matches only `b`, would cascade in past the
+        // ceiling.
+        let rows: &[Named] = &[
+            ("a", vec!["Nightfall Ashen Court Chronicle Reborn Again"], Some("g1")),
+            ("z", vec!["An Unrelated Title"], Some("g1")),
+            ("b", vec!["Nightfall Ashen Court Part 1", "Nightfall Ashen Court"], None),
+            ("c", vec!["Nightfall Ashen Court Of Dawn And Dusk Part 4"], None),
+        ];
+        assert!(sib(
+            "Nightfall Ashen Court Part 1",
+            "Nightfall Ashen Court Of Dawn And Dusk Part 4",
+        ));
+        assert!(!sib(
+            "Nightfall Ashen Court Chronicle Reborn Again",
+            "Nightfall Ashen Court Of Dawn And Dusk Part 4",
+        ));
+        assert_eq!(renamed_led_by(rows, "a"), ["a", "b", "z"]);
+        // ...and the other way round, the marker dropped by the rename.
+        let rows: &[Named] = &[
+            ("a", vec!["Nightfall Ashen Court Chronicle Reborn Again"], Some("g1")),
+            ("z", vec!["An Unrelated Title"], Some("g1")),
+            ("b", vec!["Nightfall Ashen Court", "Nightfall Ashen Court Part 1"], None),
+            ("c", vec!["Nightfall Ashen Court Of Dawn And Dusk Part 4"], None),
+        ];
+        assert_eq!(renamed_led_by(rows, "a"), ["a", "b", "z"]);
+    }
+
+    #[test]
+    fn a_name_with_nothing_to_match_on_is_not_a_second_name() {
+        // Renamed to nothing but emoji, which normalise to an empty, unmarked
+        // stem that matches no title at all. `b` keeps its old name to match
+        // on -- it still joins -- but it has one name that can match anything,
+        // so like any one-name joiner it seeds nothing.
+        let rows: &[Named] = &[
+            ("a", vec!["Nightfall Ashen Court Chronicle Reborn Again"], Some("g1")),
+            ("z", vec!["An Unrelated Title"], Some("g1")),
+            ("b", vec!["\u{1f631}\u{1f631}\u{1f631}", "Nightfall Ashen Court Part 2"], None),
+            ("c", vec!["Nightfall Ashen Court Of Dawn And Dusk Part 4"], None),
+        ];
+        assert_eq!(renamed_led_by(rows, "a"), ["a", "b", "z"]);
+        assert_eq!(renamed_led_by(rows, "b"), ["b", "a", "c", "z"]);
+    }
+
+    #[test]
+    fn a_one_name_joiner_still_seeds_nothing_past_a_renamed_part() {
+        // `r` is renamed, so it seeds, and `b` joins through its new name. `c`
+        // matches `b` -- `b` carries a marker, `r`'s new name does not -- and
+        // nothing else; `b` has one name, so `c` stays out. A renamed part
+        // widens the net by its own names and not one step further.
+        let rows: &[Named] = &[
+            ("a", vec!["The Blackwood Tapes"], None),
+            ("r", vec!["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"], None),
+            ("b", vec!["Everything Changed Part 2"], None),
+            ("c", vec!["Everything Changed Forever"], None),
+        ];
+        assert!(sib("Everything Changed Part 2", "Everything Changed Forever"));
+        assert!(!sib("EVERYTHING CHANGED", "Everything Changed Forever"));
+        assert_eq!(renamed_led_by(rows, "a"), ["a", "b", "r"]);
+    }
+
+    #[test]
+    fn a_renamed_part_in_a_marked_atom_seeds_with_every_name() {
+        // `p1` reaches the atom only through `p2`'s old name; the atom still
+        // arrives whole, and then seeds with every name of every member: `p2`'s
+        // new one brings `ec2`, `x`'s brings `w2`.
+        let rows: &[Named] = &[
+            ("p1", vec!["The Blackwood Tapes"], None),
+            ("p2", vec!["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"], Some("g1")),
+            ("x", vec!["Nothing Like The Others"], Some("g1")),
+            ("ec2", vec!["EVERYTHING CHANGED Part 2"], None),
+            ("w2", vec!["Nothing Like The Others Part 2"], None),
+            ("y", vec!["Something Else Entirely"], None),
+        ];
+        assert_eq!(renamed_led_by(rows, "p1"), ["p1", "ec2", "p2", "w2", "x"]);
+        assert_eq!(renamed_led_by(rows, "ec2"), ["ec2", "p1", "p2", "w2", "x"]);
+    }
+
+    /* ---------------- series_stem: naming a card of renamed parts ---------------- */
+
+    fn stem_of_parts(parts: &[&[&str]]) -> Option<String> {
+        let parts: Vec<Vec<&str>> = parts.iter().map(|p| p.to_vec()).collect();
+        series_stem(&parts)
+    }
+
+    #[test]
+    fn with_one_name_a_part_a_series_name_is_display_stem() {
+        // Byte for byte: the card of a series nobody renamed must not change.
+        let cases: &[&[&str]] = &[
+            &["The Blackwood Tapes", "The Blackwood Tapes - Part 7"],
+            &["(2) The Blackwood Tapes", "(7) The Blackwood Tapes"],
+            &["The Blackwood Tapes Part 1: The Arrival", "The Blackwood Tapes Part 2: The Cellar"],
+            &["Hardcore | The Blackwood Tapes 1", "Hardcore | The Blackwood Tapes 2"],
+            &["Hardcore | The Blackwood Tapes 1", "Hardcore | The Blackwood Tapes: Finale"],
+            &["THE BLACKWOOD TAPES Part 2", "The Blackwood Tapes"],
+            &["The Blackwood Tapes", "EVERYTHING CHANGED", "The Blackwood Tapes Part 3"],
+            &["(1)", "(2)"],
+            &["The Blackwood Tapes Part 2"],
+            &[],
+        ];
+        for titles in cases {
+            let one_each: Vec<&[&str]> = titles.iter().map(std::slice::from_ref).collect();
+            assert_eq!(stem_of_parts(&one_each), display_stem(titles), "{titles:?}");
+        }
+    }
+
+    #[test]
+    fn a_renamed_part_is_named_by_the_name_it_was_uploaded_under() {
+        assert_eq!(
+            display_stem(&[
+                "The Blackwood Tapes",
+                "EVERYTHING CHANGED",
+                "The Blackwood Tapes Part 3",
+            ]),
+            None,
+        );
+        assert_eq!(
+            stem_of_parts(&[
+                &["The Blackwood Tapes"],
+                &["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"],
+                &["The Blackwood Tapes Part 3"],
+            ])
+            .as_deref(),
+            Some("The Blackwood Tapes"),
+        );
+        // A renamed leader too, whose words -- and casing -- name the card.
+        assert_eq!(
+            stem_of_parts(&[
+                &["EVERYTHING CHANGED", "THE BLACKWOOD TAPES Pt 3"],
+                &["The Blackwood Tapes"],
+                &["The Blackwood Tapes Part 2"],
+            ])
+            .as_deref(),
+            Some("THE BLACKWOOD TAPES"),
+        );
+    }
+
+    #[test]
+    fn a_rename_that_changes_nothing_about_the_stem_keeps_the_current_name() {
+        // Both of the leader's names give three words. The current one wins,
+        // so a re-cased title moves nothing on its card.
+        assert_eq!(
+            stem_of_parts(&[
+                &["The Blackwood Tapes Part 2", "THE BLACKWOOD TAPES PART 2"],
+                &["the blackwood tapes"],
+            ])
+            .as_deref(),
+            Some("The Blackwood Tapes"),
+        );
+        assert_eq!(
+            stem_of_parts(&[
+                &["THE BLACKWOOD TAPES Part 2", "The Blackwood Tapes Part 2"],
+                &["the blackwood tapes"],
+            ])
+            .as_deref(),
+            Some("THE BLACKWOOD TAPES"),
+        );
+        // A former name that shares less than the current one is never picked.
+        assert_eq!(
+            stem_of_parts(&[
+                &["The Blackwood Tapes: The Arrival"],
+                &["The Blackwood Tapes Part 2: The Cellar", "Blackwood 2"],
+            ])
+            .as_deref(),
+            Some("The Blackwood Tapes"),
+        );
+    }
+
+    #[test]
+    fn a_former_name_that_matches_the_leader_exactly_keeps_its_separator() {
+        // Both of part two's names share all five of the leader's words, but
+        // only the old one *is* the leader's title, and only a card whose
+        // parts strip to one title keeps the `|` inside its name. A pick on the
+        // shared run alone would settle for the current name and `Hardcore`.
+        assert_eq!(
+            display_stem(&[
+                "Hardcore | The Blackwood Tapes 1",
+                "Hardcore | The Blackwood Tapes: Finale",
+            ])
+            .as_deref(),
+            Some("Hardcore"),
+        );
+        assert_eq!(
+            stem_of_parts(&[
+                &["Hardcore | The Blackwood Tapes 1"],
+                &["Hardcore | The Blackwood Tapes: Finale", "Hardcore | The Blackwood Tapes 2"],
+            ])
+            .as_deref(),
+            Some("Hardcore | The Blackwood Tapes"),
+        );
+    }
+
+    #[test]
+    fn a_part_with_no_names_is_skipped() {
+        assert_eq!(
+            stem_of_parts(&[&[], &["The Blackwood Tapes"], &["The Blackwood Tapes Part 2"]])
+                .as_deref(),
+            Some("The Blackwood Tapes"),
+        );
+        assert_eq!(stem_of_parts(&[&[], &[]]), None);
+        assert_eq!(stem_of_parts(&[]), None);
+    }
+
+    #[test]
+    fn naming_a_long_renamed_series_is_not_a_search_over_every_combination() {
+        // Forty parts of four names each is 4^40 combinations; this would never
+        // finish if they were tried. The clickbait opens with the part's own
+        // number, so no two parts share a word of it, and the one name that
+        // fits is last every time.
+        let names: Vec<[String; 4]> = (1..=40)
+            .map(|n| {
+                [
+                    format!("{n} SHOCKING"),
+                    format!("{n} Reasons Why"),
+                    format!("{n}x Gone Wrong"),
+                    format!("The Blackwood Tapes Part {n}"),
+                ]
+            })
+            .collect();
+        let parts: Vec<Vec<&str>> =
+            names.iter().map(|n| n.iter().map(String::as_str).collect()).collect();
+        assert_eq!(series_stem(&parts).as_deref(), Some("The Blackwood Tapes"));
     }
 }
