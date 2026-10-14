@@ -420,6 +420,12 @@ END;
 /// A/B test serves different variants to different reads) moves between the
 /// two rather than piling up. An empty title is a mangled entry, not a name.
 /// The rows go with their video (`ON DELETE CASCADE`; `foreign_keys` is ON).
+///
+/// The duplicate guard is a `NOT EXISTS`, not `INSERT OR IGNORE`: a trigger's
+/// own conflict clause is overridden by the statement that fired it, and the
+/// transfer Replace's `PUT_VIDEO` is an upsert, whose `DO UPDATE` runs this
+/// trigger under ABORT -- so with `OR IGNORE`, one stray copy of a current
+/// title in this table would fail the whole import. Reproduced in `sqlite3`.
 const VIDEO_TITLES: &str = "
 CREATE TABLE IF NOT EXISTS video_titles (
   video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
@@ -429,8 +435,11 @@ CREATE TABLE IF NOT EXISTS video_titles (
 CREATE TRIGGER IF NOT EXISTS video_title_kept AFTER UPDATE OF title ON videos
 WHEN NEW.title IS NOT OLD.title
 BEGIN
-  INSERT OR IGNORE INTO video_titles (video_id, title)
-    SELECT OLD.id, OLD.title WHERE OLD.title <> '';
+  INSERT INTO video_titles (video_id, title)
+    SELECT OLD.id, OLD.title
+     WHERE OLD.title <> ''
+       AND NOT EXISTS (SELECT 1 FROM video_titles
+                        WHERE video_id = OLD.id AND title = OLD.title);
   DELETE FROM video_titles WHERE video_id = NEW.id AND title = NEW.title;
 END;
 ";
@@ -7075,6 +7084,27 @@ mod former_titles_tests {
         retitle(&d, "a", "YOU WON'T BELIEVE WHAT HAPPENED");
         assert_eq!(former(&d, "a"), owned(&["EVERYTHING CHANGED", "The Blackwood Tapes Part 2"]),
                    "and nothing is kept twice");
+    }
+
+    #[test]
+    fn a_retitling_upsert_survives_a_stray_copy_of_the_current_title() {
+        // The table never holds a current title through any path the app
+        // writes, but `scripts/` can put one there. An upsert's `DO UPDATE`
+        // runs the trigger under the outer statement's ABORT, which overrides
+        // any `OR IGNORE` inside it -- so the trigger's own guard is all that
+        // stands between that stray row and a transfer Replace (`PUT_VIDEO`)
+        // failing whole.
+        let d = one("The Blackwood Tapes Part 2");
+        sql(&d, "INSERT INTO video_titles (video_id, title)
+                 VALUES ('a', 'The Blackwood Tapes Part 2')");
+        d.conn.lock().unwrap().execute(
+            "INSERT INTO videos (id, channel_id, title, status, first_seen_at)
+             VALUES ('a', ?1, 'EVERYTHING CHANGED', 'ready', 1)
+             ON CONFLICT(id) DO UPDATE SET title=excluded.title",
+            params![CH],
+        ).expect("the upsert retitles despite the stray row");
+        assert_eq!(title(&d, "a"), "EVERYTHING CHANGED");
+        assert_eq!(former(&d, "a"), owned(&["The Blackwood Tapes Part 2"]));
     }
 
     #[test]
