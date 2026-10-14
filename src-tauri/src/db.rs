@@ -3737,6 +3737,15 @@ WHERE id = ?1
                           OR file_path IS NOT ?9
                           OR downloaded_at IS NOT ?10)) )";
 
+/// Keeps `?2` as a former name of video `?1`, under the rules the v12 trigger
+/// keeps (see `VIDEO_TITLES`): never the row's current title, never `''`.
+/// Reading the title off the row judges the first rule against whatever the
+/// import has just written there, whichever mode wrote it; `OR IGNORE` is what
+/// makes a second import of the same names write nothing.
+const KEEP_FORMER_TITLE: &str = "
+INSERT OR IGNORE INTO video_titles (video_id, title)
+SELECT id, ?2 FROM videos WHERE id = ?1 AND ?2 <> '' AND title <> ?2";
+
 impl Db {
     /// Every channel, subscribed or not.
     ///
@@ -3759,6 +3768,26 @@ impl Db {
             &format!("{SELECT_VIDEO} ORDER BY v.first_seen_at ASC, v.id ASC"))?;
         let rows = st.query_map([], map_video)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every former name (`video_titles`), keyed by video id, for the archive.
+    ///
+    /// Read apart from [`Db::export_videos`] because [`Video`] crosses the IPC
+    /// boundary and mirrors `src/types.ts`, and nothing on screen shows these.
+    /// Each list is sorted, so two libraries holding the same rows still write
+    /// byte-identical manifests. A video with no former name, which is nearly
+    /// every one, has no entry at all.
+    pub fn export_former_titles(&self) -> Result<HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT video_id, title FROM video_titles ORDER BY video_id, title")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut names: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (id, title) = row?;
+            names.entry(id).or_default().push(title);
+        }
+        Ok(names)
     }
 
     /// `(channel_count, video_count)`, for the export dialog's size estimate.
@@ -3810,6 +3839,12 @@ impl Db {
     /// caller. Nothing here second-guesses them, and nothing here touches the
     /// filesystem at all.
     ///
+    /// `former_titles` is the archive's names per video id (see
+    /// [`Db::export_former_titles`]). Only the ones belonging to a row in
+    /// `videos` are written, so a name can never reach into a channel the user
+    /// left unticked; they are not counted in the report, the same way a poll's
+    /// retitle is not.
+    ///
     /// The report's `downloads_relinked`, `thumbs_written`, `settings_applied`
     /// and `download_dir_kept` are left at their defaults: they are the
     /// caller's to fill in and merge.
@@ -3817,6 +3852,7 @@ impl Db {
         &self,
         channels: &[Channel],
         videos: &[Video],
+        former_titles: &HashMap<String, Vec<String>>,
         mode: ImportMode,
         archive_channel_ids: &[String],
     ) -> Result<ImportReport> {
@@ -3942,6 +3978,27 @@ impl Db {
             local_videos.insert(v.id.clone(), v.channel_id.clone());
         }
 
+        // Former names last, once every row they hang from is in place. Both
+        // modes take the union: a name is a fact about a video, never wrong,
+        // so whatever either machine saw it carry survives.
+        {
+            let mut keep = tx.prepare_cached(KEEP_FORMER_TITLE)?;
+            for v in videos {
+                // The archive's own title too. A Merge never retitles a row
+                // already here, so an archive title that differs is a name
+                // this machine never saw the video wear -- an old one, or a
+                // rename the other machine polled first, which the trigger
+                // moves back out once a poll here catches up. A row the import
+                // inserted or replaced wears it as its title, and the guard
+                // skips it; a Replace's upsert has already had the v12 trigger
+                // keep the local title it replaced.
+                keep.execute(params![v.id, v.title])?;
+                for name in former_titles.get(&v.id).into_iter().flatten() {
+                    keep.execute(params![v.id, name])?;
+                }
+            }
+        }
+
         tx.commit()?;
         Ok(report)
     }
@@ -3990,7 +4047,7 @@ mod import_tests {
     }
 
     fn seed(d: &Db, channels: &[Channel], videos: &[Video]) -> ImportReport {
-        d.apply_import(channels, videos, ImportMode::Merge, &[]).unwrap()
+        d.apply_import(channels, videos, &HashMap::new(), ImportMode::Merge, &[]).unwrap()
     }
 
     /// Every channel id an archive carries, which is what a Replace measures
@@ -4033,6 +4090,7 @@ mod import_tests {
             .apply_import(
                 &src.export_channels().unwrap(),
                 &src.export_videos().unwrap(),
+                &HashMap::new(),
                 ImportMode::Merge,
                 &[],
             )
@@ -4068,7 +4126,7 @@ mod import_tests {
         incoming.watched_at = Some(77);
         incoming.hidden = true;
         let report = d
-            .apply_import(&[chan("UC1", "One")], &[incoming], ImportMode::Merge, &[])
+            .apply_import(&[chan("UC1", "One")], &[incoming], &HashMap::new(), ImportMode::Merge, &[])
             .unwrap();
 
         assert_eq!(report.videos_added, 0);
@@ -4093,6 +4151,7 @@ mod import_tests {
             .apply_import(
                 &[chan("UC1", "One")],
                 &[video("a", "UC1", "One")],
+                &HashMap::new(),
                 ImportMode::Merge,
                 &[],
             )
@@ -4121,6 +4180,7 @@ mod import_tests {
         d.apply_import(
             &[chan("UC1", "One")],
             &[video("a", "UC1", "One"), incoming_b],
+            &HashMap::new(),
             ImportMode::Merge,
             &[],
         )
@@ -4147,6 +4207,7 @@ mod import_tests {
             .apply_import(
                 &[Channel { member: true, ..chan("UC1", "One") }, chan("UC2", "Two")],
                 &[],
+                &HashMap::new(),
                 ImportMode::Merge,
                 &[],
             )
@@ -4166,12 +4227,13 @@ mod import_tests {
         let archive_v = src.export_videos().unwrap();
 
         let dst = db();
-        let first = dst.apply_import(&archive_c, &archive_v, ImportMode::Merge, &[]).unwrap();
+        let none = HashMap::new();
+        let first = dst.apply_import(&archive_c, &archive_v, &none, ImportMode::Merge, &[]).unwrap();
         assert_eq!((first.channels_added, first.videos_added), (1, 2));
         let channels = dst.export_channels().unwrap();
         let videos = dst.export_videos().unwrap();
 
-        let second = dst.apply_import(&archive_c, &archive_v, ImportMode::Merge, &[]).unwrap();
+        let second = dst.apply_import(&archive_c, &archive_v, &none, ImportMode::Merge, &[]).unwrap();
         assert_eq!(second, ImportReport::default(), "every count zero");
         assert_eq!(dst.export_channels().unwrap(), channels);
         assert_eq!(dst.export_videos().unwrap(), videos);
@@ -4193,6 +4255,7 @@ mod import_tests {
             .apply_import(
                 &[chan("UC1", "One")],
                 &[video("a", "UC1", "One"), video("b", "UC1", "One")],
+                &HashMap::new(),
                 ImportMode::Replace,
                 &archive_ids,
             )
@@ -4216,6 +4279,7 @@ mod import_tests {
             .apply_import(
                 &[chan("UC1", "One")],
                 &[video("a", "UC1", "One")],
+                &HashMap::new(),
                 ImportMode::Replace,
                 &archive_ids,
             )
@@ -4244,6 +4308,7 @@ mod import_tests {
             .apply_import(
                 &[chan("UC1", "One")],
                 &[video("a", "UC1", "One")],
+                &HashMap::new(),
                 ImportMode::Replace,
                 &archive_ids,
             )
@@ -4301,7 +4366,8 @@ mod import_tests {
         incoming.duration_secs = Some(3);
         let archive_ids = archive(&["UC1"]);
         let report = d
-            .apply_import(&[chan("UC1", "Renamed")], &[incoming], ImportMode::Replace, &archive_ids)
+            .apply_import(&[chan("UC1", "Renamed")], &[incoming], &HashMap::new(), ImportMode::Replace,
+                          &archive_ids)
             .unwrap();
 
         assert_eq!((report.channels_updated, report.videos_updated), (1, 1));
@@ -4321,6 +4387,7 @@ mod import_tests {
             .apply_import(
                 &[chan("UC9", "Nine")],
                 &[video("x", "UC9", "Nine")],
+                &HashMap::new(),
                 ImportMode::Merge,
                 &[],
             )
@@ -4341,6 +4408,7 @@ mod import_tests {
         let err = d.apply_import(
             &[chan("UC1", "One")],
             &[video("b", "UC1", "One"), video("c", "UC404", "Gone")],
+            &HashMap::new(),
             ImportMode::Merge,
             &[],
         );
@@ -4360,6 +4428,7 @@ mod import_tests {
             .apply_import(
                 &[chan("UC1", "One")],
                 &[Video { series_hidden: true, ..video("a", "UC1", "One") }, video("b", "UC1", "One")],
+                &HashMap::new(),
                 ImportMode::Merge,
                 &[],
             )
@@ -4381,6 +4450,7 @@ mod import_tests {
         d.apply_import(
             &[chan("UC1", "One")],
             &[video("a", "UC1", "One"), Video { series_hidden: true, ..video("b", "UC1", "One") }],
+            &HashMap::new(),
             ImportMode::Replace,
             &archive(&["UC1"]),
         )
@@ -4388,6 +4458,150 @@ mod import_tests {
 
         assert!(!d.get_video("a").unwrap().unwrap().series_hidden, "incoming wins outright");
         assert!(d.get_video("b").unwrap().unwrap().series_hidden);
+    }
+
+    // ------------------------------------------------------- former names
+
+    /// `id`'s former names, as an export would read them.
+    fn former(d: &Db, id: &str) -> Vec<String> {
+        d.export_former_titles().unwrap().remove(id).unwrap_or_default()
+    }
+
+    /// A poll retitling `id`, which is what records a former name for real.
+    fn retitle(d: &Db, id: &str, title: &str) {
+        d.set_titles(&[(id.to_string(), title.to_string())]).unwrap();
+    }
+
+    /// An archive's names, by video id.
+    fn names(of: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        of.iter()
+            .map(|(id, ts)| (id.to_string(), ts.iter().map(|t| t.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn export_former_titles_sorts_each_videos_names_and_lists_no_video_without_one() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One"), video("b", "UC1", "One")]);
+        retitle(&d, "a", "zeta");
+        retitle(&d, "a", "alpha");
+        retitle(&d, "a", "mid");
+
+        let all = d.export_former_titles().unwrap();
+        assert_eq!(all.get("a"), Some(&vec!["alpha".to_string(), "t-a".into(), "zeta".into()]));
+        assert!(!all.contains_key("b"), "a video never renamed has no entry");
+    }
+
+    #[test]
+    fn an_archive_into_an_empty_library_brings_its_former_names() {
+        let src = db();
+        seed(&src, &[chan("UC1", "One")], &[video("a", "UC1", "One"), video("b", "UC1", "One")]);
+        retitle(&src, "a", "Part 3 (SHOCKING)");
+        retitle(&src, "a", "EVERYTHING CHANGED");
+
+        let dst = db();
+        dst.apply_import(&src.export_channels().unwrap(), &src.export_videos().unwrap(),
+                         &src.export_former_titles().unwrap(), ImportMode::Merge, &[])
+            .unwrap();
+
+        assert_eq!(dst.export_former_titles().unwrap(), src.export_former_titles().unwrap());
+        assert_eq!(former(&dst, "a"), vec!["Part 3 (SHOCKING)".to_string(), "t-a".into()]);
+        assert_eq!(dst.get_video("a").unwrap().unwrap().title, "EVERYTHING CHANGED");
+    }
+
+    #[test]
+    fn merging_unions_former_names_and_keeps_a_differing_archive_title_as_one() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+        retitle(&d, "a", "Local now"); // "t-a" is a local former name
+
+        // The other machine polled a rename this one never saw, kept a name of
+        // its own, and also lists the title this machine has now.
+        let incoming = Video { title: "Archive now".into(), ..video("a", "UC1", "One") };
+        d.apply_import(&[chan("UC1", "One")], &[incoming],
+                       &names(&[("a", &["Archive old", "Local now", ""])]),
+                       ImportMode::Merge, &[])
+            .unwrap();
+
+        assert_eq!(d.get_video("a").unwrap().unwrap().title, "Local now", "a merge never retitles");
+        assert_eq!(former(&d, "a"), vec!["Archive now".to_string(), "Archive old".into(), "t-a".into()],
+                   "both machines' names, never the current title, never ''");
+    }
+
+    #[test]
+    fn replacing_keeps_local_former_names_and_the_title_it_overwrites() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+        retitle(&d, "a", "Local now");
+
+        let incoming = Video { title: "Archive now".into(), ..video("a", "UC1", "One") };
+        d.apply_import(&[chan("UC1", "One")], &[incoming], &names(&[("a", &["Archive old"])]),
+                       ImportMode::Replace, &archive(&["UC1"]))
+            .unwrap();
+
+        assert_eq!(d.get_video("a").unwrap().unwrap().title, "Archive now", "incoming wins outright");
+        // "Local now" is the trigger's doing: the upsert retitled the row.
+        assert_eq!(former(&d, "a"), vec!["Archive old".to_string(), "Local now".into(), "t-a".into()]);
+    }
+
+    #[test]
+    fn replacing_back_to_a_former_name_moves_it_out_of_the_former_names() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+        retitle(&d, "a", "Part three");
+        retitle(&d, "a", "SHOCKING");
+
+        // An archive written before the renames: it still calls the video "t-a".
+        d.apply_import(&[chan("UC1", "One")], &[video("a", "UC1", "One")], &HashMap::new(),
+                       ImportMode::Replace, &archive(&["UC1"]))
+            .unwrap();
+
+        assert_eq!(d.get_video("a").unwrap().unwrap().title, "t-a");
+        assert_eq!(former(&d, "a"), vec!["Part three".to_string(), "SHOCKING".into()],
+                   "the current title is never also a former one");
+    }
+
+    #[test]
+    fn a_former_name_rides_only_with_a_row_the_import_writes() {
+        let d = db();
+        seed(&d, &[chan("UC1", "One"), chan("UC2", "Two")],
+             &[video("a", "UC1", "One"), video("b", "UC2", "Two")]);
+
+        // UC2 left unticked: its video is not in the payload, so neither are
+        // its names -- even handed over by mistake -- nor is a name for a row
+        // that is nowhere at all an error.
+        d.apply_import(&[chan("UC1", "One")], &[video("a", "UC1", "One")],
+                       &names(&[("a", &["kept"]), ("b", &["withheld"]), ("zz", &["nowhere"])]),
+                       ImportMode::Merge, &[])
+            .unwrap();
+
+        assert_eq!(former(&d, "a"), vec!["kept".to_string()]);
+        assert!(former(&d, "b").is_empty(), "an unticked channel's video gained a name");
+        assert!(!d.export_former_titles().unwrap().contains_key("zz"));
+    }
+
+    #[test]
+    fn importing_the_same_names_twice_writes_nothing_the_second_time() {
+        for mode in [ImportMode::Merge, ImportMode::Replace] {
+            let d = db();
+            seed(&d, &[chan("UC1", "One")], &[video("a", "UC1", "One")]);
+            retitle(&d, "a", "Local now");
+            let incoming = Video { title: "Archive now".into(), ..video("a", "UC1", "One") };
+            let theirs = names(&[("a", &["Archive old"])]);
+            let import = || {
+                d.apply_import(&[chan("UC1", "One")], &[incoming.clone()], &theirs, mode,
+                               &archive(&["UC1"]))
+                    .unwrap()
+            };
+
+            import();
+            let after_first = d.export_former_titles().unwrap();
+            let second = import();
+            assert_eq!(d.export_former_titles().unwrap(), after_first, "{mode:?}");
+            if mode == ImportMode::Merge {
+                assert_eq!(second, ImportReport::default(), "every count zero");
+            }
+        }
     }
 }
 
@@ -4624,7 +4838,7 @@ mod auto_download_tests {
             // switched anything on.
             let incoming = Channel { member: true, ..chan("UC1") };
             d.apply_import(&[incoming], &[archived_video("a", "UC1"), archived_video("b", "UC1")],
-                           mode, &["UC1".to_string()]).unwrap();
+                           &HashMap::new(), mode, &["UC1".to_string()]).unwrap();
 
             assert!(d.get_channel("UC1").unwrap().unwrap().auto_download, "{mode:?}");
             assert_eq!(d.auto_download_candidates().unwrap(), vec!["b".to_string()],
@@ -4636,7 +4850,7 @@ mod auto_download_tests {
     fn an_imported_channel_new_here_arrives_switched_off() {
         let d = db();
         let incoming = Channel { auto_download: true, ..chan("UC1") };
-        d.apply_import(&[incoming], &[], ImportMode::Merge, &[]).unwrap();
+        d.apply_import(&[incoming], &[], &HashMap::new(), ImportMode::Merge, &[]).unwrap();
         assert!(!d.get_channel("UC1").unwrap().unwrap().auto_download);
     }
 }
@@ -5845,7 +6059,8 @@ mod sync_tests {
                         sibling_group: Some("k".into()), ..archived("b", "UC9") };
         let joined = Channel { member: true, ..chan("UC9") };
         let (_, at) = around(|| {
-            d.apply_import(&[chan("UC1"), joined], &[a, b], ImportMode::Merge, &[]).unwrap()
+            d.apply_import(&[chan("UC1"), joined], &[a, b], &HashMap::new(), ImportMode::Merge, &[])
+                .unwrap()
         });
 
         let [w, h, s] = video_stamps(&d, "a");
@@ -6571,7 +6786,7 @@ mod sync_tests {
         let a = Video { series_hidden: true, ..archived("a", "UC1") };
         let b = Video { series_hidden: true, hidden: true, ..archived("b", "UC1") };
         let (_, at) = around(|| {
-            d.apply_import(&[chan("UC1")], &[a, b], ImportMode::Merge, &[]).unwrap()
+            d.apply_import(&[chan("UC1")], &[a, b], &HashMap::new(), ImportMode::Merge, &[]).unwrap()
         });
         for id in ["a", "b"] {
             let (on, stamp) = series_stamp(&d, id);

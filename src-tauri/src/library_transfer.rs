@@ -41,7 +41,10 @@ pub fn export(
 ) -> Result<()> {
     let channels = db.export_channels()?;
     let videos = db.export_videos()?;
-    transfer::write_archive(dest, &channels, &videos, settings, include_thumbs, progress)
+    let former_titles = db.export_former_titles()?;
+    transfer::write_archive(
+        dest, &channels, &videos, &former_titles, settings, include_thumbs, progress,
+    )
 }
 
 /// What an archive holds, measured against this library. Writes nothing.
@@ -93,6 +96,7 @@ fn import_in(
     let mut report = db.apply_import(
         &prepared.channels,
         &prepared.videos,
+        &prepared.former_titles,
         mode,
         &prepared.archive_channel_ids,
     )?;
@@ -121,6 +125,7 @@ fn import_in(
 mod tests {
     use super::*;
     use crate::models::{Channel, DownloadState, Video, VideoStatus};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn noop(_: usize, _: usize, _: &str) {}
@@ -172,7 +177,7 @@ mod tests {
 
     fn library(channels: &[Channel], videos: &[Video]) -> Db {
         let db = Db::open_in_memory().unwrap();
-        db.apply_import(channels, videos, ImportMode::Merge, &[]).unwrap();
+        db.apply_import(channels, videos, &HashMap::new(), ImportMode::Merge, &[]).unwrap();
         db
     }
 
@@ -214,6 +219,7 @@ mod tests {
             &archive,
             &[channel("Shared"), channel("New")],
             &[video("s1", "Shared"), video("n1", "New")],
+            &HashMap::new(),
             &settings_in(tmp.path()),
             false,
             &noop,
@@ -246,6 +252,7 @@ mod tests {
             &archive,
             &[channel("A"), channel("B")],
             &[a1, video("a2", "A"), video("b1", "B")],
+            &HashMap::new(),
             &settings_in(tmp.path()),
             true,
             &noop,
@@ -282,8 +289,8 @@ mod tests {
         p1.title = "The Blackwood Tapes Part 1".into();
         p1.hidden = true;
         p1.series_hidden = true;
-        transfer::write_archive(&archive, &[channel("A")], &[p1], &settings_in(tmp.path()),
-                                false, &noop)
+        transfer::write_archive(&archive, &[channel("A")], &[p1], &HashMap::new(),
+                                &settings_in(tmp.path()), false, &noop)
             .unwrap();
         // Polled here after the export: the archive has never heard of it.
         let mut p2 = video("p2", "A");
@@ -305,6 +312,7 @@ mod tests {
             &archive,
             &[channel("A"), channel("B")],
             &[video("a1", "A"), video("b1", "B")],
+            &HashMap::new(),
             &settings_in(tmp.path()),
             false,
             &noop,
@@ -329,5 +337,67 @@ mod tests {
         assert_eq!((report.channels_removed, report.videos_removed), (1, 1));
         assert!(db.get_channel("B").unwrap().is_some());
         assert!(db.get_channel("Gone").unwrap().is_none());
+    }
+
+    fn retitle(db: &Db, id: &str, title: &str) {
+        db.set_titles(&[(id.to_string(), title.to_string())]).unwrap();
+    }
+
+    #[test]
+    fn a_renamed_videos_former_name_reaches_a_fresh_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = library(&[channel("A")], &[video("a1", "A"), video("a2", "A")]);
+        retitle(&src, "a1", "EVERYTHING CHANGED");
+        let archive = tmp.path().join("a.zip");
+        export(&src, &settings_in(tmp.path()), &archive, false, &noop).unwrap();
+
+        let dst = Db::open_in_memory().unwrap();
+        import_in(&dst, &archive, &["A".to_string()], ImportMode::Merge, false,
+                  &dirs_in(&tmp.path().join("ours")), &noop)
+            .unwrap();
+        assert_eq!(dst.get_video("a1").unwrap().unwrap().title, "EVERYTHING CHANGED");
+        assert_eq!(
+            dst.export_former_titles().unwrap(),
+            HashMap::from([("a1".to_string(), vec!["Title of a1".to_string()])])
+        );
+    }
+
+    #[test]
+    fn an_archive_with_no_names_imports_and_writes_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("a.zip");
+        // Exactly the manifest an older build writes: no key on any row.
+        transfer::write_archive(&archive, &[channel("A")], &[video("a1", "A")], &HashMap::new(),
+                                &settings_in(tmp.path()), false, &noop)
+            .unwrap();
+
+        let dst = Db::open_in_memory().unwrap();
+        let report = import_in(&dst, &archive, &["A".to_string()], ImportMode::Merge, false,
+                               &dirs_in(&tmp.path().join("ours")), &noop)
+            .unwrap();
+        assert_eq!(report.videos_added, 1);
+        assert!(dst.export_former_titles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_video_of_an_unticked_channel_gains_no_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = library(&[channel("A"), channel("B")], &[video("a1", "A"), video("b1", "B")]);
+        retitle(&src, "a1", "A, renamed");
+        retitle(&src, "b1", "There");
+        let archive = tmp.path().join("a.zip");
+        export(&src, &settings_in(tmp.path()), &archive, false, &noop).unwrap();
+
+        // This machine calls b1 something else again, which a ticked B would
+        // record as a name it never saw.
+        let here = Video { title: "Here".into(), ..video("b1", "B") };
+        let dst = library(&[channel("B")], &[here]);
+        import_in(&dst, &archive, &["A".to_string()], ImportMode::Merge, false,
+                  &dirs_in(&tmp.path().join("ours")), &noop)
+            .unwrap();
+
+        let names = dst.export_former_titles().unwrap();
+        assert_eq!(names.get("a1"), Some(&vec!["Title of a1".to_string()]));
+        assert!(!names.contains_key("b1"), "B was left unticked: {names:?}");
     }
 }

@@ -10,6 +10,7 @@
 //! pointing it at the developer's own library would rewrite it under test.
 
 use mytube_lib::{config, db::Db, models::*, transfer};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn chan(id: &str, title: &str) -> Channel {
@@ -115,10 +116,14 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     src.apply_import(
         &[chan("UC1", "One"), adhoc, member],
         &[watched, hidden, manual, done, gone, p1, p2],
+        &HashMap::new(),
         ImportMode::Merge,
         &[],
     )
     .unwrap();
+    // Retitled by a poll since: the name it was found under is a former one,
+    // and the only place another machine can learn it is the archive.
+    src.set_titles(&[("vid_watched".into(), "Watched one (retitled)".into())]).unwrap();
 
     // A cached thumbnail to ride along in the zip.
     let thumb = config::thumbs_dir().join("vid_watched.jpg");
@@ -137,8 +142,9 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
 
     let channels = src.export_channels().unwrap();
     let videos = src.export_videos().unwrap();
+    let names = src.export_former_titles().unwrap();
     let archive = tmp.path().join("mytube-export.zip");
-    transfer::write_archive(&archive, &channels, &videos, &settings, true, &|_, _, _| {}).unwrap();
+    transfer::write_archive(&archive, &channels, &videos, &names, &settings, true, &|_, _, _| {}).unwrap();
 
     // --- reading it, before committing to anything ------------------------
     let summary = transfer::read_summary(&archive, &Default::default()).unwrap();
@@ -174,7 +180,8 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
 
     let dst = Db::open_in_memory().unwrap();
     let report = dst
-        .apply_import(&prepared.channels, &prepared.videos, ImportMode::Merge, &prepared.archive_channel_ids)
+        .apply_import(&prepared.channels, &prepared.videos, &prepared.former_titles, ImportMode::Merge,
+                      &prepared.archive_channel_ids)
         .unwrap();
     assert_eq!(report.channels_added, 3);
     assert_eq!(report.videos_added, 7);
@@ -184,6 +191,8 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
 
     let w = got("vid_watched");
     assert!(w.watched && w.watched_at == Some(1_700_000_500), "watched state crossed");
+    assert_eq!(w.title, "Watched one (retitled)");
+    assert_eq!(dst.export_former_titles().unwrap(), names, "and the name it carried before");
     assert_eq!(
         w.thumb_path,
         Some(config::thumbs_dir().join("vid_watched.jpg").to_string_lossy().into_owned()),
@@ -221,7 +230,9 @@ fn a_library_survives_the_whole_journey_to_another_machine() {
     // Importing the very same archive again must be a no-op.
     let again = transfer::prepare_import(&archive, &picked, true, &|_, _, _| {}).unwrap();
     let second = dst
-        .apply_import(&again.channels, &again.videos, ImportMode::Merge, &again.archive_channel_ids)
+        .apply_import(&again.channels, &again.videos, &again.former_titles, ImportMode::Merge,
+                      &again.archive_channel_ids)
         .unwrap();
     assert_eq!(second, ImportReport::default(), "a second import changes nothing: {second:?}");
+    assert_eq!(dst.export_former_titles().unwrap(), names, "not even a name");
 }

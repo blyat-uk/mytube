@@ -14,6 +14,7 @@
 #![cfg(unix)]
 
 use mytube_lib::{config, db::Db, models::*, transfer};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -93,6 +94,7 @@ fn home_library(home: &Path) {
     db.apply_import(
         &[chan("UC1", "One"), chan("UC2", "Two")],
         &[watched, series, video("v3", "UC2")],
+        &HashMap::new(),
         ImportMode::Merge,
         &[],
     )
@@ -169,7 +171,8 @@ fn an_unattended_replace_needs_yes_and_without_it_changes_nothing() {
     // The laptop follows a channel home never had.
     Db::open(&laptop.join("mytube.db"))
         .unwrap()
-        .apply_import(&[chan("UCtrip", "Trip")], &[video("t1", "UCtrip")], ImportMode::Merge, &[])
+        .apply_import(&[chan("UCtrip", "Trip")], &[video("t1", "UCtrip")], &HashMap::new(),
+                      ImportMode::Merge, &[])
         .unwrap();
 
     let refused = mytube(&laptop, tmp.path(), &["import", "lib.zip", "--replace"]);

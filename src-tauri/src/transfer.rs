@@ -104,7 +104,8 @@ impl PortableSettings {
 }
 
 /// One video as the manifest stores it: every column of [`Video`] except the
-/// three that mean nothing on another machine.
+/// three that mean nothing on another machine, plus the names it carried
+/// before its current one, which `Video` does not hold.
 ///
 /// - `channel_title` is denormalised from a join, so it is rebuilt on import
 ///   from the channels list rather than carried.
@@ -151,6 +152,14 @@ struct ArchiveVideo {
     /// older build reading a newer archive just leaves the key unread.
     #[serde(default)]
     series_hidden: bool,
+    /// Every other name the video has carried (DB v12, `video_titles`), so a
+    /// series bond the old name made survives the trip. Left out when empty --
+    /// nearly every row -- so a library with no renames writes exactly the
+    /// manifest it did before. Absent from an archive written before that,
+    /// which kept no names; no new `FORMAT` for it, since an older build
+    /// reading a newer archive just leaves the key unread.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    former_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,11 +328,15 @@ impl ArchiveVideo {
             first_seen_at: v.first_seen_at,
             sibling_group: v.sibling_group.clone(),
             series_hidden: v.series_hidden,
+            // Not a column of `Video`: `write_archive` fills it from the names
+            // it was handed alongside.
+            former_titles: Vec::new(),
         }
     }
 
     /// The row to hand the database, before step 4 and step 5 of
-    /// `prepare_import` fill in `thumb_path` and the download.
+    /// `prepare_import` fill in `thumb_path` and the download. `former_titles`
+    /// has no column here; take it first.
     fn into_video(self, channel_title: String) -> Video {
         Video {
             id: self.id,
@@ -380,12 +393,15 @@ pub fn estimate(channels: &[Channel], videos: &[Video]) -> TransferEstimate {
     est
 }
 
-/// Writes the archive. `progress` is called as work proceeds so the caller can
-/// emit Tauri events without this module depending on Tauri.
+/// Writes the archive. `former_titles` is each video's former names by id, as
+/// `Db::export_former_titles` reads them -- sorted, so the same rows always
+/// write the same manifest. `progress` is called as work proceeds so the
+/// caller can emit Tauri events without this module depending on Tauri.
 pub fn write_archive(
     dest: &Path,
     channels: &[Channel],
     videos: &[Video],
+    former_titles: &HashMap<String, Vec<String>>,
     settings: &Settings,
     include_thumbs: bool,
     progress: &dyn Fn(usize, usize, &str),
@@ -406,7 +422,21 @@ pub fn write_archive(
         // never writes the column anyway. Written as false so the archive
         // does not claim a state it will not restore.
         channels: channels.iter().map(|c| Channel { auto_download: false, ..c.clone() }).collect(),
-        videos: videos.iter().map(|v| ArchiveVideo::of(v, &settings.download_dir)).collect(),
+        videos: videos
+            .iter()
+            .map(|v| ArchiveVideo {
+                // Read apart from the rows, so a poll retitling one in between
+                // could list its current title here too; it is not a former one.
+                former_titles: former_titles
+                    .get(&v.id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| **t != v.title)
+                    .cloned()
+                    .collect(),
+                ..ArchiveVideo::of(v, &settings.download_dir)
+            })
+            .collect(),
     };
     let json = serde_json::to_vec_pretty(&manifest)?;
 
@@ -624,6 +654,9 @@ pub struct Prepared {
     /// against the picked subset: leaving a row unticked means "skip it", and
     /// a checklist that quietly doubled as a deletion control would be a trap.
     pub archive_channel_ids: Vec<String>,
+    /// The former names of the rows in `videos`, by id -- so, like them, only
+    /// the ticked channels'. A row with none has no entry.
+    pub former_titles: HashMap<String, Vec<String>>,
 }
 
 /// The files an import touches outside the database: this machine's thumbnail
@@ -745,7 +778,8 @@ pub(crate) fn prepare_import_in(
         channels.iter().map(|c| (c.id.as_str(), c.title.as_str())).collect();
 
     let mut videos = Vec::with_capacity(archive_videos.len());
-    for av in archive_videos {
+    let mut former_titles: HashMap<String, Vec<String>> = HashMap::new();
+    for mut av in archive_videos {
         // 5. Re-root the download against the effective folder.
         let landed = (av.download_state == DownloadState::Done)
             .then(|| rejoin_path(&av, &download_dir))
@@ -757,6 +791,10 @@ pub(crate) fn prepare_import_in(
         let channel_title = titles.get(av.channel_id.as_str()).copied().unwrap_or("").to_string();
         let cached = dirs.thumbs.join(format!("{}{THUMB_SUFFIX}", av.id));
         let archived_at = av.downloaded_at;
+        let names = std::mem::take(&mut av.former_titles);
+        if !names.is_empty() {
+            former_titles.insert(av.id.clone(), names);
+        }
         let mut v = av.into_video(channel_title);
 
         v.thumb_path = cached.is_file().then(|| cached.to_string_lossy().into_owned());
@@ -775,7 +813,7 @@ pub(crate) fn prepare_import_in(
     }
 
     // 7. Hand the rows back. Nothing here has opened a database.
-    Ok(Prepared { channels, videos, report, archive_channel_ids })
+    Ok(Prepared { channels, videos, report, archive_channel_ids, former_titles })
 }
 
 /// `downloaded_at` survives the relink, since it records when *you* fetched the
@@ -987,7 +1025,8 @@ mod tests {
             }
 
             let zipped = tmp.path().join("a.zip");
-            write_archive(&zipped, &[channel("UC1", "Chan")], &[v], &s, false, &noop).unwrap();
+            write_archive(&zipped, &[channel("UC1", "Chan")], &[v], &HashMap::new(), &s, false, &noop)
+                .unwrap();
 
             let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
             assert_eq!(
@@ -1024,7 +1063,8 @@ mod tests {
 
         let zipped = tmp.path().join("a.zip");
         let s = settings_with_download_dir(&dl);
-        write_archive(&zipped, &[channel("UC1", "Chan")], &[v], &s, false, &noop).unwrap();
+        write_archive(&zipped, &[channel("UC1", "Chan")], &[v], &HashMap::new(), &s, false, &noop)
+            .unwrap();
 
         let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
         assert_eq!(m.videos[0].rel_path, None);
@@ -1046,7 +1086,7 @@ mod tests {
 
         let zipped = tmp.path().join("a.zip");
         let s = settings_with_download_dir(&dl);
-        write_archive(&zipped, &[on], &[], &s, false, &noop).unwrap();
+        write_archive(&zipped, &[on], &[], &HashMap::new(), &s, false, &noop).unwrap();
 
         let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
         assert!(!m.channels[0].auto_download);
@@ -1083,7 +1123,8 @@ mod tests {
         s.view.search = "should not travel".into();
 
         let zipped = tmp.path().join("a.zip");
-        write_archive(&zipped, &[ch.clone()], &[v.clone()], &s, true, &noop).unwrap();
+        write_archive(&zipped, &[ch.clone()], &[v.clone()], &HashMap::new(), &s, true, &noop)
+            .unwrap();
 
         let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
         assert_eq!(m.format, FORMAT);
@@ -1174,6 +1215,7 @@ mod tests {
         std::fs::create_dir_all(&dl).unwrap();
         let written = tmp.path().join("a.zip");
         write_archive(&written, &[channel("UC1", "Chan")], &[],
+                      &HashMap::new(),
                       &settings_with_download_dir(&dl), false, &noop).unwrap();
 
         // The same manifest as an older build would have written it: no
@@ -1210,6 +1252,7 @@ mod tests {
         std::fs::create_dir_all(&dl).unwrap();
         let written = tmp.path().join("a.zip");
         write_archive(&written, &[channel("UC1", "Chan")], &[video("v1", "UC1")],
+                      &HashMap::new(),
                       &settings_with_download_dir(&dl), false, &noop).unwrap();
 
         // The same manifest as 4.3.0 wrote it: no `series_hidden` on any video.
@@ -1236,6 +1279,117 @@ mod tests {
         assert!(v.hidden, "and the rest of the row is read as before");
     }
 
+    fn raw_manifest(path: &Path) -> String {
+        let mut raw = String::new();
+        open(path).unwrap().by_name(MANIFEST).unwrap().read_to_string(&mut raw).unwrap();
+        raw
+    }
+
+    /// `v1` renamed twice, `v2` never, on one channel and `v3` on another.
+    fn renamed() -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            ("v1".to_string(), vec!["Part 3".to_string(), "Part three".to_string()]),
+            ("v3".to_string(), vec!["Before".to_string()]),
+        ])
+    }
+
+    #[test]
+    fn former_titles_ride_with_their_row_and_come_back_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut names = renamed();
+        // Read apart from the rows, so a retitle in between can hand over the
+        // current title too: it stays out of the manifest.
+        names.get_mut("v1").unwrap().push("Title of v1".into());
+        let zipped = tmp.path().join("a.zip");
+        write_archive(&zipped, &[channel("UC1", "One"), channel("UC2", "Two")],
+                      &[video("v1", "UC1"), video("v2", "UC1"), video("v3", "UC2")], &names,
+                      &settings_with_download_dir(&dl), false, &noop)
+            .unwrap();
+
+        let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
+        assert_eq!(m.videos[0].former_titles, vec!["Part 3".to_string(), "Part three".into()]);
+        assert!(m.videos[1].former_titles.is_empty());
+        assert_eq!(raw_manifest(&zipped).matches("\"former_titles\"").count(), 2,
+                   "only on the rows that have some");
+
+        let p = prepare_import_in(&zipped, &["UC1".into(), "UC2".into()], false,
+                                  &dirs_in(&tmp.path().join("cfg")), &noop)
+            .unwrap();
+        assert_eq!(p.former_titles, renamed());
+        assert_eq!(p.videos[0].title, "Title of v1", "the row itself is read as before");
+    }
+
+    #[test]
+    fn a_library_with_no_renames_writes_no_former_titles_key_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        // Nothing, an empty list, and a list holding only the current title all
+        // mean "no former name", and all write the manifest 4.3.0 wrote.
+        let empties = [
+            HashMap::new(),
+            HashMap::from([("v1".to_string(), Vec::new())]),
+            HashMap::from([("v1".to_string(), vec!["Title of v1".to_string()])]),
+        ];
+        for names in empties {
+            let zipped = tmp.path().join("a.zip");
+            write_archive(&zipped, &[channel("UC1", "One")], &[video("v1", "UC1")], &names,
+                          &settings_with_download_dir(&dl), false, &noop)
+                .unwrap();
+            assert!(!raw_manifest(&zipped).contains("former_titles"), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn an_archive_from_before_former_titles_reads_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        let written = tmp.path().join("a.zip");
+        write_archive(&written, &[channel("UC1", "One"), channel("UC2", "Two")],
+                      &[video("v1", "UC1"), video("v3", "UC2")], &renamed(),
+                      &settings_with_download_dir(&dl), false, &noop)
+            .unwrap();
+
+        // The same manifest as an older build would have written it.
+        let mut m: serde_json::Value = serde_json::from_str(&raw_manifest(&written)).unwrap();
+        for row in m["videos"].as_array_mut().unwrap() {
+            assert!(row.as_object_mut().unwrap().remove("former_titles").is_some(), "export wrote it");
+        }
+        let old = tmp.path().join("old.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&old).unwrap());
+            z.start_file(MANIFEST, SimpleFileOptions::default()).unwrap();
+            z.write_all(m.to_string().as_bytes()).unwrap();
+            z.finish().unwrap();
+        }
+
+        let p = prepare_import_in(&old, &["UC1".into(), "UC2".into()], false,
+                                  &dirs_in(&tmp.path().join("cfg")), &noop)
+            .unwrap();
+        assert!(p.former_titles.is_empty(), "{:?}", p.former_titles);
+        assert_eq!(p.videos.len(), 2, "and every row is read as before");
+    }
+
+    #[test]
+    fn an_unticked_channels_former_titles_stay_in_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        let zipped = tmp.path().join("a.zip");
+        write_archive(&zipped, &[channel("UC1", "One"), channel("UC2", "Two")],
+                      &[video("v1", "UC1"), video("v3", "UC2")], &renamed(),
+                      &settings_with_download_dir(&dl), false, &noop)
+            .unwrap();
+
+        let p = prepare_import_in(&zipped, &["UC2".into()], false,
+                                  &dirs_in(&tmp.path().join("cfg")), &noop)
+            .unwrap();
+        assert_eq!(p.former_titles, HashMap::from([("v3".to_string(), vec!["Before".to_string()])]));
+    }
+
     // ------------------------------------------------------------- versioning
 
     #[test]
@@ -1246,6 +1400,7 @@ mod tests {
             &zipped,
             &[channel("UC1", "Chan")],
             &[],
+            &HashMap::new(),
             &settings_with_download_dir(tmp.path()),
             false,
             &noop,
@@ -1419,7 +1574,8 @@ mod tests {
 
         let zipped = tmp.path().join("a.zip");
         let s = settings_with_download_dir(&dl);
-        write_archive(&zipped, &[channel("UC1", "Chan")], &videos, &s, false, &noop).unwrap();
+        write_archive(&zipped, &[channel("UC1", "Chan")], &videos, &HashMap::new(), &s, false, &noop)
+            .unwrap();
 
         let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
         for (i, a) in m.videos.iter().enumerate().take(3) {
@@ -1452,7 +1608,8 @@ mod tests {
 
         let zipped = tmp.path().join("a.zip");
         let s = settings_with_download_dir(&dl);
-        write_archive(&zipped, &[channel("UC1", "Chan")], &[a, b], &s, false, &noop).unwrap();
+        write_archive(&zipped, &[channel("UC1", "Chan")], &[a, b], &HashMap::new(), &s, false, &noop)
+            .unwrap();
 
         // apply_settings, so the archive's download_dir — which exists here —
         // becomes the root the two rel_paths are rejoined to.
@@ -1482,6 +1639,7 @@ mod tests {
             &zipped,
             &[channel("UC1", "Chan")],
             &[],
+            &HashMap::new(),
             &settings_with_download_dir(&theirs),
             false,
             &noop,
@@ -1517,6 +1675,7 @@ mod tests {
             &zipped,
             &channels,
             &videos,
+            &HashMap::new(),
             &settings_with_download_dir(&dl),
             true,
             &noop,
@@ -1555,6 +1714,7 @@ mod tests {
             &zipped,
             &[channel("UC1", "Chan")],
             &[v],
+            &HashMap::new(),
             &settings_with_download_dir(&dl),
             true,
             &noop,
@@ -1588,6 +1748,7 @@ mod tests {
             &zipped,
             &[channel("UC1", "One"), channel("UC2", "Two")],
             &[video("v1", "UC1"), video("v2", "UC2"), video("v3", "UC2")],
+            &HashMap::new(),
             &settings_with_download_dir(&dl),
             false,
             &noop,
@@ -1624,6 +1785,7 @@ mod tests {
             &zipped,
             &[channel("UC1", "Chan")],
             &[v, video("v2", "UC1")],
+            &HashMap::new(),
             &settings_with_download_dir(&dl),
             true,
             &tick,
@@ -1667,12 +1829,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("mytube-export.zip");
         let settings = settings_with_download_dir(tmp.path());
-        write_archive(&dest, &[channel("UC1", "One")], &[video("v1", "UC1")], &settings, false, &noop)
+        let none = HashMap::new();
+        write_archive(&dest, &[channel("UC1", "One")], &[video("v1", "UC1")], &none, &settings, false, &noop)
             .unwrap();
         let before = std::fs::read(&dest).unwrap();
 
         let cut = std::panic::catch_unwind(|| {
-            write_archive(&dest, &[channel("UC2", "Two")], &[], &settings, false, &|done, _, _| {
+            write_archive(&dest, &[channel("UC2", "Two")], &[], &none, &settings, false, &|done, _, _| {
                 if done > 0 {
                     panic!("connection lost");
                 }
