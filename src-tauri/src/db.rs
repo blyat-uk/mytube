@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -208,6 +208,13 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
         }
         conn.execute_batch(SERIES_HIDDEN_TRIGGERS)?;
+    }
+
+    // v12: every name a video has carried besides its current one, so a
+    // clickbait rename cannot break the series its old name matched -- see
+    // `VIDEO_TITLES`. Nothing to seed: no former name was ever kept before.
+    if version < 12 {
+        conn.execute_batch(VIDEO_TITLES)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -398,6 +405,36 @@ BEGIN
 END;
 ";
 
+/// The names a video carried before its current one (v12).
+///
+/// Series matching runs on titles alone and is recomputed on every fetch, so
+/// a YouTuber retitling a part to chase the algorithm used to drop it off a
+/// card it had sat on for weeks. A video never forgets a name instead: the
+/// matcher takes every name here as well as the current title, so the old
+/// name keeps the bond and the new one widens it (see [`siblings::Atoms`]).
+///
+/// A trigger rather than the mutators, like the sync stamps: every path that
+/// retitles a row -- the poll's `set_titles`, a transfer Replace, `scripts/`
+/// -- records the old name without knowing this table exists. The current
+/// title is never also a former one; a title flipping back (YouTube's title
+/// A/B test serves different variants to different reads) moves between the
+/// two rather than piling up. An empty title is a mangled entry, not a name.
+/// The rows go with their video (`ON DELETE CASCADE`; `foreign_keys` is ON).
+const VIDEO_TITLES: &str = "
+CREATE TABLE IF NOT EXISTS video_titles (
+  video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  title    TEXT NOT NULL,
+  PRIMARY KEY (video_id, title)
+) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS video_title_kept AFTER UPDATE OF title ON videos
+WHEN NEW.title IS NOT OLD.title
+BEGIN
+  INSERT OR IGNORE INTO video_titles (video_id, title)
+    SELECT OLD.id, OLD.title WHERE OLD.title <> '';
+  DELETE FROM video_titles WHERE video_id = NEW.id AND title = NEW.title;
+END;
+";
+
 fn now() -> i64 { chrono::Utc::now().timestamp() }
 
 /// `search_match(query, title, channel)`: the feed's search box, as a
@@ -470,7 +507,7 @@ fn channel_rows(
         // A row whose duration has not resolved yet contributes nothing to its
         // series rather than dropping the series out of the ordering.
         facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched });
-        entries.push(siblings::Entry { id, title, group });
+        entries.push(siblings::Entry { id, title, former_titles: Vec::new(), group });
     }
     Ok((entries, facts))
 }
@@ -1226,8 +1263,9 @@ impl Db {
             }
             if videos.is_empty() { continue; }
             let stem = if videos.len() > 1 {
-                let titles: Vec<&str> = videos.iter().map(|v| v.title.as_str()).collect();
-                siblings::display_stem(&titles)
+                let names: Vec<Vec<&str>> =
+                    videos.iter().map(|v| vec![v.title.as_str()]).collect();
+                siblings::series_stem(&names)
             } else {
                 None
             };
@@ -1355,7 +1393,9 @@ impl Db {
         let mut st = conn.prepare_cached(
             "SELECT id, title, sibling_group FROM videos WHERE channel_id=?1")?;
         let rows = st.query_map(params![channel_id], |r| {
-            Ok(siblings::Entry { id: r.get(0)?, title: r.get(1)?, group: r.get(2)? })
+            Ok(siblings::Entry {
+                id: r.get(0)?, title: r.get(1)?, former_titles: Vec::new(), group: r.get(2)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }

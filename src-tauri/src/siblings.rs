@@ -318,11 +318,25 @@ pub fn display_stem(titles: &[&str]) -> Option<String> {
     if stem.is_empty() { None } else { Some(stem.to_string()) }
 }
 
+/// [`display_stem`] for parts that may each have carried several names:
+/// `parts[0]` is the card's leader, and each part lists its names with its
+/// current title first.
+///
+/// STUB: uses current titles only. To be replaced with the best stem over one
+/// name per part.
+pub fn series_stem(parts: &[Vec<&str>]) -> Option<String> {
+    let current: Vec<&str> = parts.iter().filter_map(|names| names.first().copied()).collect();
+    display_stem(&current)
+}
+
 /// One video as the grouping rule sees it.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub id: String,
     pub title: String,
+    /// Every name the video carried before `title` (`video_titles`, v12).
+    /// Empty for nearly every row; a renamed video matches on all of them.
+    pub former_titles: Vec<String>,
     /// Key shared with every video marked its sibling by hand. `None` -- the
     /// ordinary case -- leaves the title matcher to work alone.
     pub group: Option<String>,
@@ -350,9 +364,22 @@ pub struct Entry {
 ///
 /// With no keys anywhere every atom is a single video and the result is exactly
 /// what the matcher did before manual marking existed.
+///
+/// A video renamed after upload is the other way two names come to share a
+/// card, and it is treated like a hand-marked atom: every name it ever carried
+/// is matched, so the old one keeps the bond a clickbait rename would otherwise
+/// break, and a renamed video drawn into a card seeds with all its names, so a
+/// part uploaded later under the *new* name still brings the whole series.
+/// YouTube vouches for those names belonging together -- it is one video --
+/// which is a stronger promise than any fuzzy match. A video with one name
+/// still seeds nothing when it joins; the ceiling is unchanged.
 pub struct Atoms {
     ids: Vec<String>,
-    stems: Vec<Stem>,
+    /// Each entry's distinct names, its current title first. Two names that
+    /// normalise alike (a rename that only changed case or punctuation) are
+    /// one stem, so a cosmetic rename neither costs a comparison nor counts
+    /// as a second name for seeding.
+    stems: Vec<Vec<Stem>>,
     /// Which atom each entry landed in.
     atom_of: Vec<usize>,
     /// Entry indices per atom, in the order the entries came in.
@@ -391,7 +418,14 @@ impl Atoms {
                 atom_of[i] = atoms.len();
                 atoms.push(vec![i]);
             }
-            stems.push(Stem::new(normalize_memo(&e.title)));
+            let mut names: Vec<Stem> = Vec::with_capacity(1 + e.former_titles.len());
+            for title in std::iter::once(&e.title).chain(&e.former_titles) {
+                let norm = normalize_memo(title);
+                if !names.iter().any(|s| s.norm == norm) {
+                    names.push(Stem::new(norm));
+                }
+            }
+            stems.push(names);
             by_id.insert(e.id.clone(), i);
             ids.push(e.id);
         }
@@ -417,9 +451,12 @@ impl Atoms {
         // that pair has to bring what its other title reaches, or the series it
         // was marked to join would still arrive in pieces.
         //
-        // A singleton that joins adds nothing. That is the ceiling: only names
-        // a person vouched for can widen a group, so one loose fuzzy match
-        // cannot cascade through a channel.
+        // A renamed video is the same case with YouTube doing the vouching:
+        // its names are one video's, so it seeds with all of them.
+        //
+        // A singleton with one name that joins adds nothing. That is the
+        // ceiling: only names someone vouched for can widen a group, so one
+        // loose fuzzy match cannot cascade through a channel.
         let mut seeds = vec![home];
         let mut next = 0;
         while next < seeds.len() {
@@ -430,7 +467,7 @@ impl Atoms {
                     continue;
                 }
                 joined[a] = true;
-                if self.atoms[a].len() > 1 {
+                if self.atoms[a].len() > 1 || self.stems[self.atoms[a][0]].len() > 1 {
                     seeds.push(a);
                 }
             }
@@ -445,13 +482,16 @@ impl Atoms {
         out
     }
 
-    /// Whether any title in one atom reads as a part of the same upload as any
-    /// title in the other. Both sides are compared whole because a manual
-    /// group's titles are precisely the extra seeds the user supplied.
+    /// Whether any name in one atom reads as a part of the same upload as any
+    /// name in the other. Both sides are compared whole because a manual
+    /// group's titles are precisely the extra seeds the user supplied, and a
+    /// renamed video's former names are the ones YouTube no longer shows.
     fn atoms_match(&self, a: usize, b: usize) -> bool {
-        self.atoms[a]
-            .iter()
-            .any(|&i| self.atoms[b].iter().any(|&j| self.stems[i].matches(&self.stems[j])))
+        self.atoms[a].iter().any(|&i| {
+            self.atoms[b].iter().any(|&j| {
+                self.stems[i].iter().any(|x| self.stems[j].iter().any(|y| x.matches(y)))
+            })
+        })
     }
 }
 
@@ -778,6 +818,7 @@ mod tests {
             .map(|(id, title, group)| Entry {
                 id: (*id).into(),
                 title: (*title).into(),
+                former_titles: Vec::new(),
                 group: group.map(str::to_string),
             })
             .collect();
