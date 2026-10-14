@@ -451,11 +451,13 @@ pub struct Entry {
 /// A video renamed after upload is the other way two names come to share a
 /// card, and it is treated like a hand-marked atom: every name it ever carried
 /// is matched, so the old one keeps the bond a clickbait rename would otherwise
-/// break, and a renamed video drawn into a card seeds with all its names, so a
-/// part uploaded later under the *new* name still brings the whole series.
-/// YouTube vouches for those names belonging together -- it is one video --
-/// which is a stronger promise than any fuzzy match. A video with one name
-/// still seeds nothing when it joins; the ceiling is unchanged. Nor does a
+/// break, and a renamed video drawn into a card seeds with its *other* names --
+/// never the ones it joined through -- so a part uploaded later under the new
+/// name still brings the whole series, while the old name reaches no further
+/// than it did before the rename. YouTube vouches for those names belonging
+/// together -- it is one video -- which is a stronger promise than any fuzzy
+/// match. A video with one name still seeds nothing when it joins; the
+/// ceiling is unchanged. Nor does a
 /// rename that leaves the stem as it was -- `Part 1` added once part two came
 /// out, a title re-cased -- or one to a name that matches nothing: a second
 /// name has to be able to reach titles the first cannot before it vouches
@@ -553,24 +555,43 @@ impl Atoms {
         // that pair has to bring what its other title reaches, or the series it
         // was marked to join would still arrive in pieces.
         //
-        // A renamed video is the same case with YouTube doing the vouching:
-        // its names are one video's, so it seeds with all of them.
+        // A renamed video is the same case with YouTube doing the vouching,
+        // with one difference: it seeds with its *other* names, never the ones
+        // it joined through. Those it shares with what was already here, and
+        // seeding with them is exactly what a one-name joiner is refused --
+        // were it allowed, a rename to anything at all would let the old name
+        // start pulling in titles it never reached before the rename. So a
+        // part joining through its old name brings what its new name reaches
+        // (a later upload under the new name), and one joining through its new
+        // name brings what its old name reaches (the parts uploaded before),
+        // and a rename changes nothing else about any card.
         //
         // A singleton with one name that joins adds nothing. That is the
         // ceiling: only names someone vouched for can widen a group, so one
         // loose fuzzy match cannot cascade through a channel.
-        let mut seeds = vec![home];
+        let mut seeds = vec![Seed { atom: home, spent: Vec::new() }];
         let mut next = 0;
         while next < seeds.len() {
-            let seed = seeds[next];
+            let seed = seeds[next].clone();
             next += 1;
             for a in 0..self.atoms.len() {
-                if joined[a] || !self.atoms_match(seed, a) {
+                if joined[a] || !self.seed_matches(&seed, a) {
                     continue;
                 }
                 joined[a] = true;
-                if self.atoms[a].len() > 1 || self.stems[self.atoms[a][0]].len() > 1 {
-                    seeds.push(a);
+                if self.atoms[a].len() > 1 {
+                    seeds.push(Seed { atom: a, spent: Vec::new() });
+                    continue;
+                }
+                let names = &self.stems[self.atoms[a][0]];
+                if names.len() > 1 {
+                    let spent: Vec<bool> = names
+                        .iter()
+                        .map(|name| self.live_names(&seed).any(|s| s.matches(name)))
+                        .collect();
+                    if spent.contains(&false) {
+                        seeds.push(Seed { atom: a, spent });
+                    }
                 }
             }
         }
@@ -584,17 +605,37 @@ impl Atoms {
         out
     }
 
-    /// Whether any name in one atom reads as a part of the same upload as any
-    /// name in the other. Both sides are compared whole because a manual
-    /// group's titles are precisely the extra seeds the user supplied, and a
-    /// renamed video's former names are the ones YouTube no longer shows.
-    fn atoms_match(&self, a: usize, b: usize) -> bool {
-        self.atoms[a].iter().any(|&i| {
-            self.atoms[b].iter().any(|&j| {
-                self.stems[i].iter().any(|x| self.stems[j].iter().any(|y| x.matches(y)))
-            })
+    /// The names a seed searches with: every name of every video in its atom,
+    /// less those a renamed video joined through.
+    fn live_names<'s>(&'s self, seed: &'s Seed) -> impl Iterator<Item = &'s Stem> + 's {
+        self.atoms[seed.atom].iter().flat_map(move |&i| {
+            self.stems[i]
+                .iter()
+                .enumerate()
+                .filter(move |(k, _)| !seed.spent.get(*k).copied().unwrap_or(false))
+                .map(|(_, stem)| stem)
         })
     }
+
+    /// Whether any name the seed searches with reads as a part of the same
+    /// upload as any name in the atom. The atom's side is compared whole: a
+    /// manual group's titles are precisely the extra seeds the user supplied,
+    /// and a renamed video's former names are the ones YouTube no longer shows.
+    fn seed_matches(&self, seed: &Seed, atom: usize) -> bool {
+        self.live_names(seed).any(|s| {
+            self.atoms[atom].iter().any(|&j| self.stems[j].iter().any(|name| s.matches(name)))
+        })
+    }
+}
+
+/// An atom [`Atoms::group_led_by`] searches from.
+#[derive(Clone)]
+struct Seed {
+    atom: usize,
+    /// For a renamed video drawn in, which of its names (by index into its
+    /// stems) it joined through and so does not seed with. Empty for the
+    /// leader's atom and a hand-marked one, which seed with every name.
+    spent: Vec<bool>,
 }
 
 #[cfg(test)]
@@ -1171,6 +1212,35 @@ mod tests {
         assert!(sib("Everything Changed Part 2", "Everything Changed Forever"));
         assert!(!sib("EVERYTHING CHANGED", "Everything Changed Forever"));
         assert_eq!(renamed_led_by(rows, "a"), ["a", "b", "r"]);
+    }
+
+    #[test]
+    fn a_renamed_part_does_not_seed_with_the_name_it_joined_through() {
+        // `a` reaches `b` only through `b`'s old name, which also reaches `c`
+        // while `a`'s own title does not. Before the rename `b` was a one-name
+        // joiner and `c` stayed out; renaming `b` to something matching nothing
+        // must not change that -- the old name it joined through is spent, and
+        // the new one reaches nothing. Seeding with every name would let any
+        // rename at all turn an old title into a seed.
+        let rows: &[Named] = &[
+            ("a", vec!["Nightfall Ashen Court Chronicle Reborn Again"], None),
+            ("b", vec!["SHOCKING REVEAL", "Nightfall Ashen Court Part 2"], None),
+            ("c", vec!["Nightfall Ashen Court Of Dawn And Dusk Part 4"], None),
+        ];
+        assert!(sib("Nightfall Ashen Court Part 2", "Nightfall Ashen Court Of Dawn And Dusk Part 4"));
+        assert!(!sib(
+            "Nightfall Ashen Court Chronicle Reborn Again",
+            "Nightfall Ashen Court Of Dawn And Dusk Part 4",
+        ));
+        assert_eq!(renamed_led_by(rows, "a"), ["a", "b"]);
+
+        // Unrenamed, the same rows group exactly the same way.
+        let before: &[Named] = &[
+            ("a", vec!["Nightfall Ashen Court Chronicle Reborn Again"], None),
+            ("b", vec!["Nightfall Ashen Court Part 2"], None),
+            ("c", vec!["Nightfall Ashen Court Of Dawn And Dusk Part 4"], None),
+        ];
+        assert_eq!(renamed_led_by(before, "a"), ["a", "b"]);
     }
 
     #[test]
