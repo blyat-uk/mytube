@@ -18,6 +18,11 @@ export default defineConfig(async () => ({
     setupFiles: ["src/test-setup.ts"],
   },
 
+  // The webview loads the bundle from disk, never over a network, so Vite's
+  // 500 kB warning -- a page-weight heuristic for websites -- has nothing to
+  // protect here. It first fired at 526 kB, with the Add dialog's redesign.
+  build: { chunkSizeWarningLimit: 1024 },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
