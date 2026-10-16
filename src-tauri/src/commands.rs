@@ -142,6 +142,15 @@ pub async fn list_channels(state: State<'_, Arc<AppState>>) -> R<Vec<Channel>> {
     db_blocking(&state, |db| db.list_subscribed_channels()).await
 }
 
+/// The Add dialog's numbers for each subscription -- one row per channel
+/// `list_channels` returns, zeros included. Asked for separately rather than
+/// carried on `Channel`, whose shape every struct literal in the code base
+/// spells out, and fetched by the dialog alone.
+#[tauri::command]
+pub async fn subscription_stats(state: State<'_, Arc<AppState>>) -> R<Vec<ChannelStats>> {
+    db_blocking(&state, |db| db.subscription_stats()).await
+}
+
 /// Tells the UI whether the Add box holds a channel, a video, or a rejected Short.
 #[tauri::command]
 pub fn classify_add_input(input: String) -> R<AddKind> {
@@ -302,7 +311,13 @@ pub async fn add_channel(
 
 #[tauri::command]
 pub async fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    db_blocking(&state, move |db| db.remove_channel(&channel_id)).await
+    db_blocking(&state, move |db| {
+        db.remove_channel(&channel_id)?;
+        // After the row, so a removal that fails keeps its picture.
+        crate::avatar::forget(&channel_id);
+        Ok(())
+    })
+    .await
 }
 
 /// Parses the CSV without importing anything, so the UI can offer a checklist.

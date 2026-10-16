@@ -312,7 +312,13 @@ pub async fn probe(inv: &Invocation, q: &Quality, url: &str, download_dir: &str,
     parse_probe_output(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// JSON lines, never `--print` with a `|` separator: titles contain `|`.
+/// JSON, never `--print` with a `|` separator: titles contain `|`.
+///
+/// One document (`-J`) rather than a line per entry (`-j`), because only the
+/// document carries the channel itself: its picture (`thumbnails`, among them
+/// `avatar_uncropped`), `channel_follower_count` and `uploader_id`, the
+/// `@handle`. A `-j` line carries none of them. The entries are the same
+/// either way -- see [`parse_listing`] for the one field that differs.
 ///
 /// No cookies, deliberately. The listing serves members-only entries to anyone
 /// (see `poll::ingest_listing`), so cookies would buy it nothing, and reading
@@ -323,7 +329,7 @@ pub fn flat_playlist_args(r: &Runner, channel_id: &str, limit: u32) -> Vec<Strin
     let mut a = runtime_args(r);
     a.extend([
         s("--flat-playlist"),
-        s("-j"),
+        s("-J"),
         // Without this, a flat listing carries no upload date at all, and
         // backfilled videos cannot be interleaved into the feed by date.
         // Day-granular is plenty for ordering; RSS later supplies exact times
@@ -346,8 +352,64 @@ pub fn parse_progress_line(line: &str) -> Option<(f64, String, String)> {
     Some((percent.clamp(0.0, 100.0), parts[1].trim().to_string(), parts[2].trim().to_string()))
 }
 
-pub fn parse_flat_entry(json_line: &str) -> Option<FlatEntry> {
-    let v: serde_json::Value = serde_json::from_str(json_line.trim()).ok()?;
+/// One channel listing: its entries, and what it says about the channel.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Listing {
+    pub entries: Vec<FlatEntry>,
+    pub channel: crate::models::ChannelMeta,
+}
+
+/// Reads the document `yt-dlp --flat-playlist -J` prints for a channel tab.
+///
+/// The entries parse exactly as the `-j` lines they replaced did, with one
+/// field missing: a `-J` entry has no `upload_date`. yt-dlp derives that from
+/// `timestamp` only while processing each entry it prints as a line, so it was
+/// never more than a copy of the `timestamp` [`parse_flat_entry`] already
+/// prefers. Verified 2026-10-16 on yt-dlp 2026.10.10 nightly: 30 entries of
+/// `UC5qhtUpMhpBacu9sm3V2fag` read both ways parsed identically, every one of
+/// them carrying a `timestamp`.
+///
+/// Output that is not a document is an error, where a `-j` line that was not
+/// JSON used to be skipped: a whole listing that does not parse is a failed
+/// listing, and reading it as an empty one would report a clean poll for a
+/// channel nothing was read from.
+pub fn parse_listing(stdout: &str) -> Result<Listing> {
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| anyhow!("yt-dlp printed no listing: {e}"))?;
+    let entries = doc.get("entries")
+        .and_then(|x| x.as_array())
+        .map(|list| list.iter().filter_map(parse_flat_entry).collect())
+        .unwrap_or_default();
+    Ok(Listing { entries, channel: channel_meta(&doc) })
+}
+
+/// The channel's own fields at the top of a listing document.
+///
+/// The picture is the thumbnail yt-dlp names `avatar_uncropped`; the rest of
+/// `thumbnails` are banner crops and one square avatar under a numbered id,
+/// which says nothing about what it is. `uploader_id` is `@handle` for a
+/// channel that has one and its `UC…` id otherwise.
+fn channel_meta(doc: &serde_json::Value) -> crate::models::ChannelMeta {
+    let avatar_url = doc.get("thumbnails")
+        .and_then(|x| x.as_array())
+        .and_then(|thumbs| thumbs.iter().find(|t| {
+            t.get("id").and_then(|x| x.as_str()) == Some("avatar_uncropped")
+        }))
+        .and_then(|t| t.get("url")?.as_str())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string);
+    let handle = doc.get("uploader_id")
+        .and_then(|x| x.as_str())
+        .filter(|h| h.len() > 1 && h.starts_with('@'))
+        .map(str::to_string);
+    crate::models::ChannelMeta {
+        avatar_url,
+        follower_count: doc.get("channel_follower_count").and_then(|x| x.as_i64()),
+        handle,
+    }
+}
+
+pub fn parse_flat_entry(v: &serde_json::Value) -> Option<FlatEntry> {
     let id = v.get("id")?.as_str()?.to_string();
     Some(FlatEntry {
         id,
@@ -424,7 +486,7 @@ async fn run_with_timeout(
 /// The caller holds `inv` for as long as this runs, which is what keeps the
 /// updater from swapping yt-dlp out from under it.
 pub async fn flat_playlist(inv: &Invocation, channel_id: &str, limit: u32)
-    -> Result<Vec<FlatEntry>> {
+    -> Result<Listing> {
     let r = &inv.runner;
     let out = run_with_timeout(&r.program, flat_playlist_args(r, channel_id, limit),
                                LISTING_TIMEOUT)
@@ -434,8 +496,8 @@ pub async fn flat_playlist(inv: &Invocation, channel_id: &str, limit: u32)
         return Err(anyhow!("yt-dlp listing failed for {channel_id}: {}",
                            err.lines().last().unwrap_or("unknown error")));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines().filter_map(parse_flat_entry).collect())
+    parse_listing(&String::from_utf8_lossy(&out.stdout))
+        .map_err(|e| anyhow!("yt-dlp listing failed for {channel_id}: {e}"))
 }
 
 // ------------------------------------------------------------- formats
@@ -1204,10 +1266,12 @@ mod tests {
     }
 
     #[test]
-    fn flat_playlist_uses_json_lines_not_pipe_separated_print() {
+    fn flat_playlist_uses_one_json_document_not_pipe_separated_print() {
         let a = flat_playlist_args(&bare(), "UC1", 30);
         assert!(a.contains(&"--flat-playlist".to_string()));
-        assert!(a.contains(&"-j".to_string()), "must use JSON lines");
+        assert!(a.contains(&"-J".to_string()),
+                "must ask for the document: only it carries the channel's picture");
+        assert!(!a.contains(&"-j".to_string()), "a line per entry carries no channel fields");
         assert!(!a.contains(&"--print".to_string()), "--print splits on | inside titles");
         let i = a.iter().position(|x| x == "--playlist-end").unwrap();
         assert_eq!(a[i + 1], "30");
@@ -1231,10 +1295,15 @@ mod tests {
         }
     }
 
+    /// One entry of a listing, written as the JSON it arrives as.
+    fn flat_entry(json: &str) -> Option<FlatEntry> {
+        parse_flat_entry(&serde_json::from_str(json).expect("the test's JSON parses"))
+    }
+
     #[test]
     fn flat_entries_parse_including_titles_containing_pipes() {
         let line = r#"{"id":"abc","title":"A | B | C","duration":1365,"view_count":1800000}"#;
-        let e = parse_flat_entry(line).unwrap();
+        let e = flat_entry(line).unwrap();
         assert_eq!(e.id, "abc");
         assert_eq!(e.title, "A | B | C");
         assert_eq!(e.duration_secs, Some(1365));
@@ -1244,13 +1313,82 @@ mod tests {
 
     #[test]
     fn flat_entries_tolerate_nulls_and_bad_json() {
-        let e = parse_flat_entry(r#"{"id":"x","title":"T","duration":null,"live_status":"is_upcoming"}"#).unwrap();
+        let e = flat_entry(r#"{"id":"x","title":"T","duration":null,"live_status":"is_upcoming"}"#).unwrap();
         assert_eq!(e.duration_secs, None);
         assert_eq!(e.live_status.as_deref(), Some("is_upcoming"));
         // Fractional durations round down to whole seconds.
-        assert_eq!(parse_flat_entry(r#"{"id":"x","title":"T","duration":60.7}"#).unwrap().duration_secs, Some(60));
-        assert!(parse_flat_entry("not json").is_none());
-        assert!(parse_flat_entry(r#"{"title":"no id"}"#).is_none());
+        assert_eq!(flat_entry(r#"{"id":"x","title":"T","duration":60.7}"#).unwrap().duration_secs, Some(60));
+        assert!(flat_entry(r#"{"title":"no id"}"#).is_none());
+        assert!(flat_entry(r#""a string, not an entry""#).is_none());
+        // A whole listing that is not JSON is a failed listing, not an empty one.
+        assert!(parse_listing("not json").is_err());
+        assert!(parse_listing("").is_err());
+    }
+
+    /// A real `-J` listing of `UC5qhtUpMhpBacu9sm3V2fag`'s /videos tab
+    /// (2026-10-16, yt-dlp 2026.10.10 nightly, `--playlist-end 3`), trimmed to
+    /// the fields that matter: one banner crop of six, the uncropped banner,
+    /// the square avatar yt-dlp lists under a bare number, and the uncropped
+    /// avatar it names.
+    const LISTING: &str = r#"{"_type":"playlist","id":"UC5qhtUpMhpBacu9sm3V2fag",
+      "channel":"AnimeCapped Manga","channel_id":"UC5qhtUpMhpBacu9sm3V2fag",
+      "title":"AnimeCapped Manga - Videos","uploader":"AnimeCapped Manga",
+      "uploader_id":"@AnimeCapped25","channel_follower_count":83500,"playlist_count":null,
+      "thumbnails":[
+        {"url":"https://yt3.googleusercontent.com/PS2gxzR3lLxL99mtkg-2DB1PbVIiy4u2CRjWmajgcZBF1cbodq1uHHeiPDEK1WtJfhfWwTAyIA=w1060-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj","height":175,"width":1060,"preference":-10,"id":"0","resolution":"1060x175"},
+        {"url":"https://yt3.googleusercontent.com/PS2gxzR3lLxL99mtkg-2DB1PbVIiy4u2CRjWmajgcZBF1cbodq1uHHeiPDEK1WtJfhfWwTAyIA=s0","id":"banner_uncropped","preference":-5},
+        {"url":"https://yt3.googleusercontent.com/luE0EBCDULV72jOZ_jw1nP6SQbdfgeO1Tu4Va5NCBqNbygdNYi-PWilZwQtQeeRAARnJ9Sk_=s900-c-k-c0x00ffffff-no-rj","height":900,"width":900,"id":"7","resolution":"900x900"},
+        {"url":"https://yt3.googleusercontent.com/luE0EBCDULV72jOZ_jw1nP6SQbdfgeO1Tu4Va5NCBqNbygdNYi-PWilZwQtQeeRAARnJ9Sk_=s0","id":"avatar_uncropped","preference":1}],
+      "entries":[
+        {"_type":"url","id":"sZU2CGmHm94","url":"https://www.youtube.com/watch?v=sZU2CGmHm94","title":"(2) They Called Me TRASH, But I Can COPY Any TALENT!","duration":7895,"view_count":null,"timestamp":1792141200,"live_status":null,"availability":"subscriber_only"},
+        {"_type":"url","id":"kvhpbhn6kHE","url":"https://www.youtube.com/watch?v=kvhpbhn6kHE","title":"(13) Others Seek Ancient Techniques for Power, But My Secret to Becoming OP Is Raising Kids!","duration":7203,"view_count":2000,"timestamp":1792137600,"live_status":null,"availability":null},
+        {"_type":"url","id":"7gsxZjG_zeI","url":"https://www.youtube.com/watch?v=7gsxZjG_zeI","title":"(15) While Others Battle for Cultivation Resources... I Gain INFINITE Power Just by Raising My Kids!","duration":7150,"view_count":null,"timestamp":1792116000,"live_status":null,"availability":"subscriber_only"}]}"#;
+
+    /// The same three entries as `-j` printed them moments later, trimmed the
+    /// same way: the `upload_date` and `playlist_*` fields yt-dlp adds to a
+    /// line are the difference.
+    const LINES: [&str; 3] = [
+        r#"{"_type":"url","id":"sZU2CGmHm94","url":"https://www.youtube.com/watch?v=sZU2CGmHm94","title":"(2) They Called Me TRASH, But I Can COPY Any TALENT!","duration":7895,"view_count":null,"timestamp":1792141200,"live_status":null,"availability":"subscriber_only","upload_date":"20261016","playlist_index":1,"playlist_id":"UC5qhtUpMhpBacu9sm3V2fag"}"#,
+        r#"{"_type":"url","id":"kvhpbhn6kHE","url":"https://www.youtube.com/watch?v=kvhpbhn6kHE","title":"(13) Others Seek Ancient Techniques for Power, But My Secret to Becoming OP Is Raising Kids!","duration":7203,"view_count":2000,"timestamp":1792137600,"live_status":null,"availability":null,"upload_date":"20261016","playlist_index":2,"playlist_id":"UC5qhtUpMhpBacu9sm3V2fag"}"#,
+        r#"{"_type":"url","id":"7gsxZjG_zeI","url":"https://www.youtube.com/watch?v=7gsxZjG_zeI","title":"(15) While Others Battle for Cultivation Resources... I Gain INFINITE Power Just by Raising My Kids!","duration":7150,"view_count":null,"timestamp":1792116000,"live_status":null,"availability":"subscriber_only","upload_date":"20261016","playlist_index":3,"playlist_id":"UC5qhtUpMhpBacu9sm3V2fag"}"#,
+    ];
+
+    #[test]
+    fn a_listing_document_carries_the_channel_beside_its_entries() {
+        let l = parse_listing(LISTING).unwrap();
+        assert_eq!(l.channel, crate::models::ChannelMeta {
+            avatar_url: Some("https://yt3.googleusercontent.com/luE0EBCDULV72jOZ_jw1nP6SQbdfgeO1Tu4Va5NCBqNbygdNYi-PWilZwQtQeeRAARnJ9Sk_=s0".into()),
+            follower_count: Some(83_500),
+            handle: Some("@AnimeCapped25".into()),
+        });
+        let ids: Vec<&str> = l.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["sZU2CGmHm94", "kvhpbhn6kHE", "7gsxZjG_zeI"]);
+    }
+
+    /// The switch from `-j` to `-J` must not change a single entry: every
+    /// rule above is about what a poll does with them.
+    #[test]
+    fn a_documents_entries_parse_exactly_as_the_lines_they_replaced() {
+        let old: Vec<FlatEntry> = LINES.iter().map(|l| flat_entry(l).unwrap()).collect();
+        assert_eq!(parse_listing(LISTING).unwrap().entries, old);
+        assert_eq!(old[0].published_at, Some(1_792_141_200));
+        assert_eq!(old[0].availability.as_deref(), Some("subscriber_only"));
+        assert_eq!(old[1].view_count, Some(2000));
+    }
+
+    #[test]
+    fn what_a_listing_does_not_say_about_its_channel_is_left_unknown() {
+        // A channel without a handle lists its id as `uploader_id`.
+        let l = parse_listing(
+            r#"{"uploader_id":"UC5qhtUpMhpBacu9sm3V2fag","thumbnails":[
+                {"url":"https://yt3.googleusercontent.com/b=s0","id":"banner_uncropped"}],
+                "entries":[]}"#).unwrap();
+        assert_eq!(l.channel, crate::models::ChannelMeta::default(),
+                   "an id is no handle, and a banner is no picture");
+        assert!(l.entries.is_empty());
+
+        let bare = parse_listing(r#"{"uploader_id":"@","channel_follower_count":null}"#).unwrap();
+        assert_eq!(bare, Listing::default(), "no entries key is an empty listing, not an error");
     }
 
     #[test]
@@ -1263,18 +1401,18 @@ mod tests {
 
     #[test]
     fn flat_entries_carry_an_upload_date() {
-        let e = parse_flat_entry(
+        let e = flat_entry(
             r#"{"id":"x","title":"T","duration":60,"timestamp":1787011200,"upload_date":"20260818"}"#
         ).unwrap();
         assert_eq!(e.published_at, Some(1787011200), "timestamp wins when present");
 
-        let only_date = parse_flat_entry(r#"{"id":"x","title":"T","upload_date":"20260818"}"#).unwrap();
+        let only_date = flat_entry(r#"{"id":"x","title":"T","upload_date":"20260818"}"#).unwrap();
         assert_eq!(only_date.published_at, Some(1787011200), "falls back to upload_date");
 
-        let neither = parse_flat_entry(r#"{"id":"x","title":"T"}"#).unwrap();
+        let neither = flat_entry(r#"{"id":"x","title":"T"}"#).unwrap();
         assert_eq!(neither.published_at, None);
 
-        let junk = parse_flat_entry(r#"{"id":"x","title":"T","upload_date":"nonsense"}"#).unwrap();
+        let junk = flat_entry(r#"{"id":"x","title":"T","upload_date":"nonsense"}"#).unwrap();
         assert_eq!(junk.published_at, None, "malformed dates must not panic");
     }
 
@@ -1282,12 +1420,12 @@ mod tests {
     /// only way to know: the listing serves both to anyone, membership or not.
     #[test]
     fn flat_entries_carry_their_availability() {
-        let members = parse_flat_entry(
+        let members = flat_entry(
             r#"{"id":"x","title":"T","duration":7982,"availability":"subscriber_only"}"#
         ).unwrap();
         assert_eq!(members.availability.as_deref(), Some("subscriber_only"));
 
-        let public = parse_flat_entry(r#"{"id":"y","title":"T","duration":60}"#).unwrap();
+        let public = flat_entry(r#"{"id":"y","title":"T","duration":60}"#).unwrap();
         assert_eq!(public.availability, None, "a public entry says nothing at all");
     }
 
@@ -1434,13 +1572,27 @@ mod tests {
         #[tokio::test]
         async fn a_listing_runs_the_yt_dlp_it_was_handed() {
             let program = fake_ytdlp("listing-ok",
-                r#"echo '{"id":"a","title":"A","duration":60}'; echo '{"id":"b","title":"B"}'"#);
+                r#"echo '{"uploader_id":"@one","entries":[{"id":"a","title":"A","duration":60},{"id":"b","title":"B"}]}'"#);
             let inv = invocation(program.clone()).await;
-            let entries = flat_playlist(&inv, "UC1", 30).await;
+            let listing = flat_playlist(&inv, "UC1", 30).await;
             let _ = std::fs::remove_dir_all(program.parent().unwrap());
-            let ids: Vec<String> = entries.expect("the fake listing succeeds")
-                .into_iter().map(|e| e.id).collect();
+            let listing = listing.expect("the fake listing succeeds");
+            let ids: Vec<String> = listing.entries.into_iter().map(|e| e.id).collect();
             assert_eq!(ids, vec!["a", "b"]);
+            assert_eq!(listing.channel.handle.as_deref(), Some("@one"));
+        }
+
+        #[tokio::test]
+        async fn a_listing_that_prints_no_document_is_a_failure() {
+            // Exit 0 with nothing on stdout: read as an empty listing, a poll
+            // under an RSS outage would report a channel it learnt nothing
+            // about as polled.
+            let program = fake_ytdlp("listing-empty", "true");
+            let inv = invocation(program.clone()).await;
+            let listing = flat_playlist(&inv, "UC1", 30).await;
+            let _ = std::fs::remove_dir_all(program.parent().unwrap());
+            let err = listing.expect_err("no document is no listing");
+            assert!(err.to_string().contains("UC1"), "{err}");
         }
 
         #[tokio::test]

@@ -9,7 +9,8 @@ use crate::db::{Db, ResolvedMeta};
 use crate::models::*;
 use crate::queue::Queue;
 use crate::tools::Tools;
-use crate::{config, rss, tray, upload_date, ytdlp};
+use crate::ytdlp::{self, Listing};
+use crate::{avatar, config, rss, tray, upload_date};
 
 const FEED_CONCURRENCY: usize = 8;
 const RETRY_WINDOW_SECS: i64 = 30 * 24 * 3600;
@@ -86,7 +87,11 @@ fn listing_limit(pending: usize, backfill: u32) -> u32 {
 /// has finished, which is what keeps the updater from swapping yt-dlp under it;
 /// a yt-dlp that is not available yet is an ordinary listing failure. A
 /// listing sends no cookies, so none are resolved for it.
-async fn listing(tools: &Tools, channel_id: &str, limit: u32) -> Result<Vec<FlatEntry>> {
+///
+/// Every caller hands what it says about the channel itself to
+/// [`avatar::note`] once it has one, which is how subscriptions get their
+/// pictures, handles and subscriber counts without a request of their own.
+async fn listing(tools: &Tools, channel_id: &str, limit: u32) -> Result<Listing> {
     let inv = tools.ytdlp_without_cookies(&config::load().unwrap_or_default()).await?;
     ytdlp::flat_playlist(&inv, channel_id, limit).await
 }
@@ -99,19 +104,21 @@ async fn listing(tools: &Tools, channel_id: &str, limit: u32) -> Result<Vec<Flat
 /// lands on a video that resolved perfectly well weeks ago. See
 /// [`Db::set_titles`] for why the feed cannot be asked instead.
 ///
-/// Hands the entries back so the one call can also serve [`ingest_listing`],
-/// which needs the same listing to find what RSS never carried. Empty when the
-/// listing could not be read and the failure was swallowed.
+/// Hands the listing back so the one call can also serve [`ingest_listing`],
+/// which needs the same entries to find what RSS never carried, and
+/// [`avatar::note`], which needs what it says about the channel. Empty --
+/// no entries, nothing known about the channel -- when the listing could not
+/// be read and the failure was swallowed.
 async fn refresh_from_listing(db: &Db, tools: &Tools, channel_id: &str, backfill: u32,
                               mode: Ingest)
-    -> Result<Vec<FlatEntry>> {
+    -> Result<Listing> {
     let cutoff = chrono::Utc::now().timestamp() - RETRY_WINDOW_SECS;
     let pending = db.unresolved_video_ids(channel_id, cutoff)?;
 
-    let entries = match listing(tools, channel_id, listing_limit(pending.len(), backfill))
+    let listed = match listing(tools, channel_id, listing_limit(pending.len(), backfill))
         .await
     {
-        Ok(entries) => entries,
+        Ok(listed) => listed,
         // With nothing to resolve this call exists only to catch renames, and
         // the rest of the poll has already succeeded: RSS landed the new
         // videos and their dates. Failing the channel over a rename that can
@@ -122,16 +129,16 @@ async fn refresh_from_listing(db: &Db, tools: &Tools, channel_id: &str, backfill
         // here would report a clean poll for a channel nothing was read from.
         Err(err) if pending.is_empty() && mode == Ingest::MembersOnly => {
             eprintln!("mytube: title refresh for {channel_id} failed: {err}");
-            return Ok(Vec::new());
+            return Ok(Listing::default());
         }
         Err(err) => return Err(err),
     };
 
     db.set_titles(
-        &entries.iter().map(|e| (e.id.clone(), e.title.clone())).collect::<Vec<_>>(),
+        &listed.entries.iter().map(|e| (e.id.clone(), e.title.clone())).collect::<Vec<_>>(),
     )?;
 
-    let resolved: Vec<ResolvedMeta> = entries
+    let resolved: Vec<ResolvedMeta> = listed.entries
         .iter()
         .filter(|e| pending.contains(&e.id))
         .map(|e| ResolvedMeta {
@@ -143,7 +150,7 @@ async fn refresh_from_listing(db: &Db, tools: &Tools, channel_id: &str, backfill
         })
         .collect();
     db.resolve_listed(&resolved)?;
-    Ok(entries)
+    Ok(listed)
 }
 
 /// yt-dlp's word for a members-only upload.
@@ -288,8 +295,10 @@ async fn ingest_listing(state: &AppState, channel_id: &str, entries: &[FlatEntry
 /// the next poll could, and left out of it.
 pub async fn ingest_members_only(state: &AppState, channel_id: &str, depth: u32)
     -> Result<usize> {
-    let entries = listing(&state.tools, channel_id, depth).await?;
-    let added = ingest_listing(state, channel_id, &entries, true, Ingest::MembersOnly).await?;
+    let listed = listing(&state.tools, channel_id, depth).await?;
+    avatar::note(&state.db, &state.http, channel_id, &listed.channel).await;
+    let added = ingest_listing(state, channel_id, &listed.entries, true, Ingest::MembersOnly)
+        .await?;
     let hidden = sweep_hidden_series(&state.db, true).await;
     Ok(still_new(added.count, &added.ids.into_iter().collect(), &hidden))
 }
@@ -473,10 +482,10 @@ pub async fn poll_one(
         added.extend(insert_from_feed(&state.db, channel, feed)?);
     }
 
-    let entries = match refresh_from_listing(&state.db, &state.tools, &channel.id, backfill, mode)
+    let listed = match refresh_from_listing(&state.db, &state.tools, &channel.id, backfill, mode)
         .await
     {
-        Ok(entries) => entries,
+        Ok(listed) => listed,
         // Both sources gone. Only now is the channel an error, and it says so
         // with both reasons: a feed 404 alone is an outage to wait out, while a
         // feed *and* a listing failing together is a channel that is really
@@ -496,9 +505,14 @@ pub async fn poll_one(
             None => return Err(listing_err),
         },
     };
+    // The picture, handle and subscriber count ride on the listing this poll
+    // read anyway. This is what fills them in for a library that predates
+    // them, on its first poll after the update; a swallowed listing failure
+    // knows nothing about the channel, and records nothing.
+    avatar::note(&state.db, &state.http, &channel.id, &listed.channel).await;
     // Counted as new videos like any other: these are uploads you had not seen,
     // and the toast and the tray badge would be wrong without them.
-    added.extend(ingest_listing(state, &channel.id, &entries, channel.member, mode).await?);
+    added.extend(ingest_listing(state, &channel.id, &listed.entries, channel.member, mode).await?);
 
     // Only the feed carries a thumbnail URL. Rows ingested from the listing get
     // theirs inside `ingest_listing`, from `ytdlp::thumb_url_for`.
@@ -714,7 +728,10 @@ pub async fn queue_auto(state: &AppState, ids: Vec<String>, dir: &str, template:
 /// with videos you cannot download.
 pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) -> Result<usize> {
     let member = state.db.get_channel(channel_id)?.map(|c| c.member).unwrap_or(false);
-    let entries = listing(&state.tools, channel_id, count).await?;
+    let Listing { entries, channel: about } = listing(&state.tools, channel_id, count).await?;
+    // A new subscription's first listing is this one, so its picture is in
+    // place before the poll that follows the backfill even starts.
+    avatar::note(&state.db, &state.http, channel_id, &about).await;
 
     // Collected up front: an iterator borrowing `entries` across the await
     // makes the resulting future fail Tauri's higher-ranked lifetime bounds.
@@ -881,7 +898,7 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
 
         let tools = Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
         let inv = tools.ytdlp(&config::load().unwrap_or_default()).await.expect("a yt-dlp");
-        let videos = ytdlp::flat_playlist(&inv, CHANNEL, 30).await.expect("videos tab");
+        let videos = ytdlp::flat_playlist(&inv, CHANNEL, 30).await.expect("videos tab").entries;
 
         // The same arguments the poll uses, pointed at the other tab -- the URL
         // is the last one. Built here rather than behind a production helper
@@ -890,10 +907,9 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         *args.last_mut().unwrap() = format!("https://www.youtube.com/channel/{CHANNEL}/shorts");
         let out = crate::proc::command(&inv.runner.program)
             .args(&args).output().await.expect("yt-dlp runs");
-        let shorts: Vec<FlatEntry> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(ytdlp::parse_flat_entry)
-            .collect();
+        let shorts: Vec<FlatEntry> = ytdlp::parse_listing(&String::from_utf8_lossy(&out.stdout))
+            .expect("shorts tab")
+            .entries;
         assert!(!videos.is_empty() && !shorts.is_empty(), "both tabs must return entries");
 
         let short_ids: HashSet<String> = shorts.iter().map(|e| e.id.clone()).collect();

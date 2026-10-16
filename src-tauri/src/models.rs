@@ -26,6 +26,41 @@ pub struct Channel {
     pub auto_download: bool,
 }
 
+/// What a channel listing says about the channel itself, beside its entries
+/// (see `ytdlp::parse_listing`). Each part is absent when the listing did not
+/// carry it, and an absent part never clears what is stored -- see
+/// `Db::set_channel_meta`. Never crosses the IPC boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelMeta {
+    /// The `avatar_uncropped` thumbnail, as yt-dlp lists it (`…=s0`, full
+    /// size). `avatar::sized_url` turns it into the small picture actually
+    /// fetched.
+    pub avatar_url: Option<String>,
+    /// `channel_follower_count`: YouTube's rounded subscriber count (83500).
+    pub follower_count: Option<i64>,
+    /// `uploader_id` when it is an `@handle`; a channel without one lists its
+    /// `UC…` id there, which is no handle at all.
+    pub handle: Option<String>,
+}
+
+/// One subscription's numbers for the Add dialog's channel panel, from
+/// `Db::subscription_stats`. A dialog payload, so camelCase. Every count is
+/// over the channel's `ready` rows only -- what its feed can show.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelStats {
+    pub channel_id: String,
+    pub videos: i64,
+    pub downloaded: i64,
+    pub watched: i64,
+    pub hidden: i64,
+    /// Every ready row's `duration_secs` added up, an unknown one as 0.
+    pub runtime_secs: i64,
+    /// The newest `published_at` among them; `None` with no ready rows.
+    pub latest_upload: Option<i64>,
+    pub follower_count: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoStatus {
@@ -252,7 +287,7 @@ pub struct Feed {
     pub shorts_rejected: usize,
 }
 
-/// One JSON line from `yt-dlp --flat-playlist -j`.
+/// One of the `entries` of `yt-dlp --flat-playlist -J`'s document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlatEntry {
     pub id: String,

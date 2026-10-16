@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -215,6 +215,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     // `VIDEO_TITLES`. Nothing to seed: no former name was ever kept before.
     if version < 12 {
         conn.execute_batch(VIDEO_TITLES)?;
+    }
+
+    // v13: what a channel listing says about the channel itself. `avatar_url`
+    // is the picture's source as last fetched into `thumb_path` (which every
+    // channel row has had since v1 and none ever filled), so a change of
+    // picture is a different URL; `follower_count` is YouTube's rounded
+    // subscriber count. Nothing to seed: each subscription's first poll after
+    // the upgrade fills both. See `Db::set_channel_meta` and `avatar::note`.
+    if version < 13 {
+        for column in ["avatar_url TEXT", "follower_count INTEGER"] {
+            let name = column.split_whitespace().next().unwrap();
+            if !column_exists(conn, "channels", name)? {
+                conn.execute(&format!("ALTER TABLE channels ADD COLUMN {column}"), [])?;
+            }
+        }
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -796,6 +811,91 @@ impl Db {
     /// Only these are polled and only these appear in the channel filter.
     pub fn list_subscribed_channels(&self) -> Result<Vec<Channel>> {
         self.channels_where("subscribed=1")
+    }
+
+    /// Records what a channel listing said about the channel: its subscriber
+    /// count and its `@handle`. Each is written only when the listing carried
+    /// it, so a listing that comes back without one never blanks what the
+    /// Add dialog shows. The picture is not among them: `avatar_url` moves
+    /// only together with the file it names, in [`Db::set_channel_avatar`].
+    ///
+    /// The WHERE guard skips the write when nothing changed, which is every
+    /// poll of every channel but the first.
+    pub fn set_channel_meta(&self, id: &str, meta: &ChannelMeta) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE channels SET follower_count = COALESCE(?2, follower_count),
+                                 handle         = COALESCE(?3, handle)
+              WHERE id = ?1
+                AND (follower_count IS NOT COALESCE(?2, follower_count)
+                     OR handle IS NOT COALESCE(?3, handle))",
+            params![id, meta.follower_count, meta.handle],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a channel's picture has to be fetched: the listing offers a
+    /// different one (`url`) from the one last fetched, or the row does not
+    /// point at `path`, where it is kept -- never fetched at all, or a path
+    /// that came in from another machine's archive. Whether the file is still
+    /// on disk is for the caller to ask, since this layer never touches the
+    /// filesystem. False for an id with no row: there is nothing to record a
+    /// picture on.
+    pub fn avatar_needs_fetch(&self, id: &str, url: &str, path: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT avatar_url IS NOT ?2 OR thumb_path IS NOT ?3 FROM channels WHERE id = ?1",
+                params![id, url, path],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Records a picture fetched from `url` into `path`, both at once, so a
+    /// failed fetch leaves the row asking for it again.
+    pub fn set_channel_avatar(&self, id: &str, url: &str, path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE channels SET avatar_url = ?2, thumb_path = ?3 WHERE id = ?1",
+                     params![id, url, path])?;
+        Ok(())
+    }
+
+    /// The Add dialog's numbers for every subscription: one grouped query
+    /// under one lock, whatever the size of the list. Counts only `ready`
+    /// rows, as the feed does, and a subscription with none still gets its
+    /// row of zeros from the LEFT JOIN. `idx_videos_channel` leads with
+    /// `channel_id`, which is what keeps the join from scanning every video
+    /// once per channel: on a copy of the real library (47 subscriptions,
+    /// 4,440 videos) the plan is one index search per channel and the query
+    /// takes 3 ms.
+    pub fn subscription_stats(&self) -> Result<Vec<ChannelStats>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT c.id, COUNT(v.id),
+                    COALESCE(SUM(v.download_state = 'done'), 0),
+                    COALESCE(SUM(v.watched <> 0), 0),
+                    COALESCE(SUM(v.hidden <> 0), 0),
+                    COALESCE(SUM(COALESCE(v.duration_secs, 0)), 0),
+                    MAX(v.published_at),
+                    c.follower_count
+               FROM channels c
+               LEFT JOIN videos v ON v.channel_id = c.id AND v.status = 'ready'
+              WHERE c.subscribed = 1
+              GROUP BY c.id
+              ORDER BY c.title COLLATE NOCASE ASC")?;
+        let rows = st.query_map([], |r| Ok(ChannelStats {
+            channel_id: r.get(0)?,
+            videos: r.get(1)?,
+            downloaded: r.get(2)?,
+            watched: r.get(3)?,
+            hidden: r.get(4)?,
+            runtime_secs: r.get(5)?,
+            latest_upload: r.get(6)?,
+            follower_count: r.get(7)?,
+        }))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn channels_where(&self, cond: &str) -> Result<Vec<Channel>> {
@@ -6942,7 +7042,7 @@ mod former_titles_tests {
     /// A database exactly as v11 left it, built step by step the way
     /// `sync_tests` builds v9 -- not by migrating to the top and taking v12
     /// back off, which would quietly stop being v11 the day a v13 lands.
-    fn v11() -> Connection {
+    pub(super) fn v11() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.execute_batch(
@@ -7282,5 +7382,203 @@ mod former_titles_tests {
 
         add(&d, row("p2", "The Blackwood Tapes Part 2", 2_000));
         assert_eq!(d.hide_series_arrivals().unwrap(), owned(&["p2"]));
+    }
+}
+
+#[cfg(test)]
+mod channel_meta_tests {
+    use super::*;
+
+    fn chan(id: &str, title: &str, subscribed: bool) -> Channel {
+        Channel { id: id.into(), title: title.into(), handle: None,
+                  url: format!("https://www.youtube.com/channel/{id}"), thumb_path: None,
+                  subscribed, member: false, added_at: 0, last_polled_at: None,
+                  terminated: false, auto_download: false }
+    }
+
+    fn sql(d: &Db, batch: &str) { d.conn.lock().unwrap().execute_batch(batch).unwrap(); }
+
+    /// `avatar_url` and `follower_count` as stored, which no struct carries.
+    fn stored(d: &Db, id: &str) -> (Option<String>, Option<i64>) {
+        d.conn.lock().unwrap()
+            .query_row("SELECT avatar_url, follower_count FROM channels WHERE id=?1", params![id],
+                       |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+    }
+
+    fn meta(avatar: Option<&str>, followers: Option<i64>, handle: Option<&str>) -> ChannelMeta {
+        ChannelMeta { avatar_url: avatar.map(str::to_string), follower_count: followers,
+                      handle: handle.map(str::to_string) }
+    }
+
+    // ---- the v13 migration ----
+
+    /// A database exactly as v12 left it: v11, built step by step, plus the
+    /// one step v12 added.
+    fn v12() -> Connection {
+        let conn = super::former_titles_tests::v11();
+        conn.execute_batch(VIDEO_TITLES).unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn
+    }
+
+    #[test]
+    fn upgrading_a_v12_database_keeps_every_channel_and_knows_nothing_of_its_picture_yet() {
+        let conn = v12();
+        conn.execute_batch(
+            "INSERT INTO channels (id,title,handle,url,subscribed,added_at)
+               VALUES ('UC1','One','@one','u',1,7);",
+        ).unwrap();
+        let d = Db::init(conn).unwrap();
+
+        let version: i64 = d.conn.lock().unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let c = d.get_channel("UC1").unwrap().unwrap();
+        assert_eq!((c.title.as_str(), c.handle.as_deref(), c.thumb_path), ("One", Some("@one"), None));
+        assert_eq!(stored(&d, "UC1"), (None, None), "the first poll fills both");
+        assert!(d.avatar_needs_fetch("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap(),
+                "which is what fetches every existing subscription's picture");
+    }
+
+    #[test]
+    fn an_upgraded_database_has_exactly_the_schema_of_a_fresh_one() {
+        let upgraded = schema(&Db::init(v12()).unwrap());
+        assert_eq!(upgraded, schema(&Db::open_in_memory().unwrap()));
+        let channels = upgraded.iter().find(|(k, n, _)| k == "table" && n == "channels").unwrap();
+        let sql = channels.2.as_deref().unwrap();
+        assert!(sql.contains("avatar_url TEXT") && sql.contains("follower_count INTEGER"), "{sql}");
+    }
+
+    fn schema(d: &Db) -> Vec<(String, String, Option<String>)> {
+        let c = d.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)))
+            .unwrap();
+        rows.map(|r| {
+            let (kind, name, sql) = r.unwrap();
+            (kind, name, sql.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")))
+        })
+        .collect()
+    }
+
+    // ---- what a listing says about a channel ----
+
+    /// A listing that comes back without a field must not blank what the
+    /// dialog has been showing; one that carries a new value replaces it.
+    #[test]
+    fn channel_meta_fills_in_and_moves_on_but_never_clears() {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&chan("UC1", "One", true)).unwrap();
+
+        d.set_channel_meta("UC1", &meta(None, Some(83_500), Some("@one"))).unwrap();
+        assert_eq!(d.get_channel("UC1").unwrap().unwrap().handle.as_deref(), Some("@one"));
+        assert_eq!(stored(&d, "UC1").1, Some(83_500));
+
+        d.set_channel_meta("UC1", &ChannelMeta::default()).unwrap();
+        assert_eq!(d.get_channel("UC1").unwrap().unwrap().handle.as_deref(), Some("@one"));
+        assert_eq!(stored(&d, "UC1").1, Some(83_500));
+
+        d.set_channel_meta("UC1", &meta(None, Some(84_000), Some("@renamed"))).unwrap();
+        assert_eq!(d.get_channel("UC1").unwrap().unwrap().handle.as_deref(), Some("@renamed"));
+        assert_eq!(stored(&d, "UC1").1, Some(84_000));
+    }
+
+    /// The picture is recorded only with the file it names, never from the
+    /// listing alone: a fetch that failed must leave the row asking for it.
+    #[test]
+    fn channel_meta_never_records_the_picture() {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&chan("UC1", "One", true)).unwrap();
+        d.set_channel_meta("UC1", &meta(Some("https://yt3/a=s0"), Some(1), None)).unwrap();
+        assert_eq!(stored(&d, "UC1"), (None, Some(1)));
+        assert_eq!(d.get_channel("UC1").unwrap().unwrap().thumb_path, None);
+    }
+
+    #[test]
+    fn a_picture_needs_fetching_until_exactly_the_listed_one_is_recorded_where_it_belongs() {
+        let d = Db::open_in_memory().unwrap();
+        assert!(!d.avatar_needs_fetch("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap(),
+                "no row, nothing to record a picture on");
+
+        d.upsert_channel(&chan("UC1", "One", true)).unwrap();
+        assert!(d.avatar_needs_fetch("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap(),
+                "never fetched");
+
+        d.set_channel_avatar("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap();
+        assert_eq!(d.get_channel("UC1").unwrap().unwrap().thumb_path.as_deref(), Some("/t/UC1.jpg"));
+        assert!(!d.avatar_needs_fetch("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap());
+        assert!(d.avatar_needs_fetch("UC1", "https://yt3/b=s0", "/t/UC1.jpg").unwrap(),
+                "the channel changed its picture");
+        assert!(d.avatar_needs_fetch("UC1", "https://yt3/a=s0", "/elsewhere/UC1.jpg").unwrap(),
+                "the row names a file somewhere else, as an archive from another machine would");
+
+        // A path with no source: an archive's channel row carries `thumb_path`
+        // but never `avatar_url`.
+        sql(&d, "UPDATE channels SET avatar_url=NULL");
+        assert!(d.avatar_needs_fetch("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap());
+    }
+
+    /// Every poll upserts its channel to catch a rename, carrying whatever the
+    /// channel looked like when the poll began. None of that may undo what a
+    /// listing recorded.
+    #[test]
+    fn an_upsert_leaves_the_picture_the_count_and_the_handle_alone() {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&chan("UC1", "One", true)).unwrap();
+        d.set_channel_meta("UC1", &meta(None, Some(83_500), Some("@one"))).unwrap();
+        d.set_channel_avatar("UC1", "https://yt3/a=s0", "/t/UC1.jpg").unwrap();
+
+        d.upsert_channel(&chan("UC1", "Renamed", true)).unwrap();
+        let c = d.get_channel("UC1").unwrap().unwrap();
+        assert_eq!((c.title.as_str(), c.handle.as_deref(), c.thumb_path.as_deref()),
+                   ("Renamed", Some("@one"), Some("/t/UC1.jpg")));
+        assert_eq!(stored(&d, "UC1"), (Some("https://yt3/a=s0".into()), Some(83_500)));
+    }
+
+    // ---- subscription_stats ----
+
+    #[test]
+    fn stats_count_each_subscriptions_ready_rows_and_nothing_else() {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&chan("UC1", "Busy", true)).unwrap();
+        d.upsert_channel(&chan("UC2", "another, empty", true)).unwrap();
+        d.upsert_channel(&chan("UC3", "Ad-hoc uploader", false)).unwrap();
+        d.set_channel_meta("UC1", &meta(None, Some(83_500), None)).unwrap();
+        sql(&d,
+            "INSERT INTO videos (id,channel_id,title,status,duration_secs,published_at,
+                                 download_state,watched,hidden,first_seen_at)
+             VALUES ('a','UC1','A','ready',   100, 10,  'done',  0, 0, 1),
+                    ('b','UC1','B','ready',   NULL, 30, 'none',  1, 0, 1),
+                    ('c','UC1','C','ready',   50,  20,  'queued',1, 1, 1),
+                    ('p','UC1','P','pending', 900, 99,  'none',  0, 0, 1),
+                    ('u','UC1','U','upcoming',NULL,98,  'none',  0, 0, 1),
+                    ('x','UC3','X','ready',   60,  5,   'done',  1, 1, 1);");
+
+        let stats = d.subscription_stats().unwrap();
+        assert_eq!(stats, vec![
+            // Ordered as `list_channels` orders them, by title, case aside.
+            ChannelStats { channel_id: "UC2".into(), videos: 0, downloaded: 0, watched: 0,
+                           hidden: 0, runtime_secs: 0, latest_upload: None,
+                           follower_count: None },
+            ChannelStats { channel_id: "UC1".into(), videos: 3, downloaded: 1, watched: 2,
+                           hidden: 1, runtime_secs: 150, latest_upload: Some(30),
+                           follower_count: Some(83_500) },
+        ], "the pending and upcoming rows and the unsubscribed uploader count for nothing");
+    }
+
+    /// The command's payload, as the dialog reads it: camelCase, and a
+    /// channel with no videos has a null latest upload rather than a zero.
+    #[test]
+    fn stats_serialise_in_camel_case() {
+        let s = ChannelStats { channel_id: "UC1".into(), videos: 3, downloaded: 1, watched: 2,
+                               hidden: 1, runtime_secs: 150, latest_upload: None,
+                               follower_count: Some(83_500) };
+        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!({
+            "channelId": "UC1", "videos": 3, "downloaded": 1, "watched": 2, "hidden": 1,
+            "runtimeSecs": 150, "latestUpload": null, "followerCount": 83_500,
+        }));
     }
 }
