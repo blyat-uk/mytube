@@ -421,7 +421,16 @@ pub fn write_archive(
         // fetch every new upload into *this* machine's disk, and an import
         // never writes the column anyway. Written as false so the archive
         // does not claim a state it will not restore.
-        channels: channels.iter().map(|c| Channel { auto_download: false, ..c.clone() }).collect(),
+        //
+        // Nor does a channel's picture. Its `thumb_path` is an absolute path
+        // into this machine's config directory, like a video's, and the
+        // picture is no trouble to get back: the importing machine's first
+        // poll of the channel fetches it (see `avatar::note`). Written as null,
+        // which is what every archive carried before channels had pictures.
+        channels: channels
+            .iter()
+            .map(|c| Channel { auto_download: false, thumb_path: None, ..c.clone() })
+            .collect(),
         videos: videos
             .iter()
             .map(|v| ArchiveVideo {
@@ -1075,6 +1084,24 @@ mod tests {
         let p = prepare_import_in(&zipped, &["UC1".into()], false, &dirs_in(&cfg), &noop).unwrap();
         assert_eq!(p.videos[0].file_path.as_deref(), Some(&*stray.to_string_lossy()));
         assert_eq!(p.videos[0].download_state, DownloadState::Done);
+    }
+
+    #[test]
+    fn a_channels_picture_is_not_exported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("videos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let pictured = Channel {
+            thumb_path: Some("/home/me/.config/mytube/thumbs/channels/UC1.jpg".into()),
+            ..channel("UC1", "Chan")
+        };
+
+        let zipped = tmp.path().join("a.zip");
+        let s = settings_with_download_dir(&dl);
+        write_archive(&zipped, &[pictured], &[], &HashMap::new(), &s, false, &noop).unwrap();
+
+        let m = read_manifest(&mut open(&zipped).unwrap()).unwrap();
+        assert_eq!(m.channels[0].thumb_path, None);
     }
 
     #[test]
