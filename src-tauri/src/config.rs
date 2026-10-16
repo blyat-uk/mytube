@@ -109,6 +109,12 @@ pub struct ViewState {
     pub in_progress: bool,
     #[serde(default = "d_sort")]
     pub sort: SortOrder,
+    /// The Add dialog's subscription list, folded away. Remembered because the
+    /// dialog is mostly opened to paste a link, and someone who never reads the
+    /// list should not have it laid out under the input every time. Off (the
+    /// list shown) for a first run and for a view saved before the key.
+    #[serde(default)]
+    pub subs_folded: bool,
 }
 
 impl Default for ViewState {
@@ -123,6 +129,7 @@ impl Default for ViewState {
             groups_only: false,
             in_progress: false,
             sort: SortOrder::Newest,
+            subs_folded: false,
         }
     }
 }
@@ -565,6 +572,7 @@ mod tests {
             groups_only: true,
             in_progress: true,
             sort: SortOrder::Length,
+            subs_folded: true,
         };
         let json = s.to_json_string().unwrap();
         let back = Settings::from_json_str(&json).unwrap();
@@ -648,6 +656,20 @@ mod tests {
         assert!(s.view.grouped);
         let keyless = Settings::from_json_str(r#"{"view":{"hide_watched":true}}"#).unwrap();
         assert!(keyless.view.grouped);
+    }
+
+    #[test]
+    fn the_subscription_list_starts_unfolded_and_remembers_a_fold() {
+        // A view saved before the key existed shows the list, as it always did.
+        let old = Settings::from_json_str(r#"{"view":{"hide_watched":true}}"#).unwrap();
+        assert!(!old.view.subs_folded);
+        let folded = Settings::from_json_str(r#"{"view":{"subs_folded":true}}"#).unwrap();
+        assert!(folded.view.subs_folded);
+        // Folding is not a filter of the grouped feed: ungrouping, which takes
+        // the group-only chips with it, leaves the fold alone.
+        let ungrouped =
+            Settings::from_json_str(r#"{"view":{"subs_folded":true,"grouped":false}}"#).unwrap();
+        assert!(ungrouped.view.subs_folded);
     }
 
     #[test]
