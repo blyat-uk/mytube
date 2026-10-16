@@ -1,13 +1,20 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import TakeoutDialog from "./TakeoutDialog";
+import CustomDownloadDialog, { type Batch } from "./CustomDownloadDialog";
+import SubscriptionList from "./add/SubscriptionList";
 import {
-  IconAutoDownload, IconBusy, IconCheck, IconClose, IconDelete, IconExternal, IconMember,
-} from "./Icons";
+  ChannelAnswer, PlaylistCard, PreviewSkeleton, VideoCard, type Acting,
+} from "./add/LinkPreview";
+import { tickedEntries, wantsDownload } from "./add/playlist";
+import { useAutoHeight } from "./add/useAutoHeight";
+import { IconClose, IconLink } from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
-import { singleClick, usePending } from "../pending";
-import type { AddKind, Channel, TakeoutRow } from "../types";
+import { usePending } from "../pending";
+import type {
+  AddKind, AddPreview, Channel, ChannelStats, PlaylistPreview, TakeoutRow, Video,
+} from "../types";
 
 interface Props {
   open: boolean;
@@ -15,108 +22,289 @@ interface Props {
   channels: Channel[];
   /** Something changed server-side; the shell should reload channels and videos. */
   onChanged: () => void;
+  /** Whether the subscriptions list is folded away. The shell owns it, and
+   *  remembers it with the rest of the view. */
+  subsFolded: boolean;
+  onSubsFolded: (folded: boolean) => void;
 }
 
-const ACTION_LABEL: Record<AddKind, string> = {
-  channel: "Subscribe to channel",
-  video: "Download this video",
-  short: "MyTube does not handle Shorts",
+/**
+ * What the input holds, as far as it has been read.
+ *
+ * `kind` survives into `reading` so the chip and the card stay put while a
+ * link that was already understood is edited; it is only replaced once the
+ * edit has been read in turn.
+ */
+type Look =
+  | { phase: "empty" }
+  | { phase: "reading"; kind: AddKind | null }
+  | { phase: "loading"; kind: AddKind }
+  /** `preview` is null for a Short, which is refused before it is fetched. */
+  | { phase: "ready"; kind: AddKind; preview: AddPreview | null }
+  | { phase: "error"; kind: AddKind | null; message: string };
+
+type Custom =
+  | { kind: "video"; video: Video }
+  | { kind: "batch"; batch: Batch };
+
+const KIND_LABEL: Record<AddKind, string> = {
+  channel: "Channel",
+  video: "Video",
+  playlist: "Playlist",
+  short: "Short",
 };
 
-const HINT: Record<AddKind, string> = {
-  channel: "This looks like a channel. It will be subscribed and its recent videos backfilled.",
-  video: "This looks like a single video. It downloads right away and sorts to the top.",
-  short: "Shorts are excluded from MyTube by design.",
-};
+/** Typing waits this long before a link is read; a paste is read at once. */
+const READ_DELAY = 300;
 
-export default function AddChannelDialog({ open: isOpen, onClose, channels, onChanged }: Props) {
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+export default function AddChannelDialog({
+  open: isOpen, onClose, channels, onChanged, subsFolded, onSubsFolded,
+}: Props) {
   const toast = useToast();
   const [input, setInput] = useState("");
-  const [kind, setKind] = useState<AddKind | null>(null);
-  const [classifying, setClassifying] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [look, setLook] = useState<Look>({ phase: "empty" });
+  // Bumped to read the same input again: after a custom download was backed
+  // out of, the video is in the library now and the card should say so.
+  const [readAgain, setReadAgain] = useState(0);
+  const [ticked, setTicked] = useState<ReadonlySet<string>>(new Set());
   const [importing, setImporting] = useState(false);
   const [takeout, setTakeout] = useState<{ path: string; rows: TakeoutRow[] } | null>(null);
-  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
-  // Keyed by action and channel, not one flag for the list: joining reads a
-  // whole listing, turning auto-download on can queue a whole backlog, and a
-  // slow one must not lock the rest of the list.
+  const [custom, setCustom] = useState<Custom | null>(null);
+  const [stats, setStats] = useState<ReadonlyMap<string, ChannelStats> | null>(null);
+  const [reveal, setReveal] = useState<{ id: string; n: number } | null>(null);
+  // One key for the preview's three actions: an Add and a Download of the
+  // same paste must never both be out. `acting` says which one to spin.
   const { pending, slow, run } = usePending();
-  const act = (key: string) => ({ busy: pending.has(key), spinning: slow.has(key) });
-  /** The channel whose "turn auto-download on" prompt is open, if any. */
-  const [autoPrompt, setAutoPrompt] = useState<Channel | null>(null);
+  const [acting, setActing] = useState<Acting>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const classifyId = useRef(0);
+  const readId = useRef(0);
+  const readNow = useRef(false);
+  /** The text `look` describes, once it has been read. */
+  const shownText = useRef("");
+  const statsId = useRef(0);
+  // Read by the window's Escape handler: one Escape closes only the dialog on
+  // top. The custom download listens for its own; the Takeout checklist has
+  // none, so it is closed from here -- unless its import is running.
+  const stacked = useRef<"custom" | "takeout" | null>(null);
+  stacked.current = custom ? "custom" : takeout ? "takeout" : null;
+  const importingRef = useRef(false);
+  importingRef.current = importing;
 
   useEffect(() => {
-    if (!isOpen) return;
-    setConfirmRemove(null);
-    setAutoPrompt(null);
-    inputRef.current?.focus();
+    if (isOpen) inputRef.current?.focus();
   }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (stacked.current === "takeout") {
+        if (!importingRef.current) setTakeout(null);
+      } else if (stacked.current === null) {
+        onClose();
+      }
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [isOpen, onClose]);
 
-  // Debounced classification: the button has to say what it will do before it
-  // is pressed, but every keystroke must not become a command.
+  /** The counts behind the list and its panels. A failure is not worth a
+   *  toast -- they are a summary of what is already on screen elsewhere -- so
+   *  the rows simply read as empty. */
+  const refreshStats = useCallback(() => {
+    const id = ++statsId.current;
+    api.subscriptionStats().then(
+      (rows) => {
+        if (id === statsId.current) setStats(new Map(rows.map((r) => [r.channelId, r])));
+      },
+      () => {
+        if (id === statsId.current) setStats((s) => s ?? new Map());
+      },
+    );
+  }, []);
+
+  // On opening, and whenever the shell's channel list moves under an open
+  // dialog (a poll finishing, a change made here).
+  useEffect(() => {
+    if (isOpen) refreshStats();
+  }, [isOpen, channels, refreshStats]);
+
+  const changed = useCallback(() => {
+    onChanged();
+    refreshStats();
+  }, [onChanged, refreshStats]);
+
+  // Reading a link is two steps: what it is (pure parsing, instant), then
+  // what it holds (`preview_add`, which for a video or a playlist goes to
+  // YouTube). Both answer to one counter, so an edit made while either is out
+  // drops whatever the older text comes back with.
   useEffect(() => {
     const text = input.trim();
+    const id = ++readId.current;
     if (!text) {
-      classifyId.current++;
-      setKind(null);
-      setProblem(null);
-      setClassifying(false);
+      readNow.current = false;
+      shownText.current = "";
+      setLook({ phase: "empty" });
       return;
     }
-    setClassifying(true);
-    const id = ++classifyId.current;
+    // The same text read again (`readAgain`) keeps its card up until the new
+    // answer replaces it, rather than blinking back to a skeleton.
+    const again = text === shownText.current;
+    if (!again) setLook((l) => ({ phase: "reading", kind: "kind" in l ? l.kind : null }));
+    const delay = readNow.current || again ? 0 : READ_DELAY;
+    readNow.current = false;
+    const settle = (next: Look) => {
+      if (id !== readId.current) return;
+      shownText.current = text;
+      setLook(next);
+    };
     const t = window.setTimeout(async () => {
+      let kind: AddKind;
       try {
-        const k = await api.classifyAddInput(text);
-        if (id !== classifyId.current) return;
-        setKind(k);
-        setProblem(null);
+        kind = await api.classifyAddInput(text);
       } catch (err) {
-        if (id !== classifyId.current) return;
-        setKind(null);
-        setProblem(errText(err));
-      } finally {
-        if (id === classifyId.current) setClassifying(false);
+        settle({ phase: "error", kind: null, message: errText(err) });
+        return;
       }
-    }, 300);
+      if (id !== readId.current) return;
+      if (kind === "short") {
+        settle({ phase: "ready", kind, preview: null });
+        return;
+      }
+      if (!again) setLook({ phase: "loading", kind });
+      try {
+        const preview = await api.previewAdd(text);
+        if (id !== readId.current) return;
+        if (preview.kind === "playlist" && !again) {
+          setTicked(new Set(preview.playlist.entries.map((e) => e.id)));
+        }
+        settle({ phase: "ready", kind: preview.kind, preview });
+      } catch (err) {
+        // Whether a channel is one you already follow is a nicety; failing to
+        // find out must not stand between you and subscribing to it.
+        settle(kind === "channel"
+          ? { phase: "ready", kind, preview: { kind: "channel", subscribedId: null } }
+          : { phase: "error", kind, message: errText(err) });
+      }
+    }, delay);
     return () => window.clearTimeout(t);
-  }, [input]);
+  }, [input, readAgain]);
 
   if (!isOpen) return null;
 
-  const canSubmit = !busy && !classifying && (kind === "channel" || kind === "video");
+  const preview = look.phase === "ready" ? look.preview : null;
+  const out = pending.has("add") || pending.has("subscribe");
+  const busy = { acting: pending.has("add") ? acting : null, slow: slow.has("add") };
 
-  async function submit() {
+  function clearInput() {
+    setInput("");
+    inputRef.current?.focus();
+  }
+
+  function act(which: Exclude<Acting, null>, fn: () => Promise<void>) {
+    // Refused below anyway; returning first keeps the spinner on the button
+    // whose call is actually out.
+    if (pending.has("add")) return;
+    setActing(which);
+    void run("add", fn);
+  }
+
+  function subscribe() {
     const text = input.trim();
-    if (!canSubmit || !text) return;
-    setBusy(true);
-    try {
-      if (kind === "channel") {
-        const c = await api.addChannel(text);
-        toast.success(`Subscribed to ${c.title}.`);
+    void run("subscribe", async () => {
+      const c = await api.addChannel(text);
+      toast.success(`Subscribed to ${c.title}.`);
+      clearInput();
+      changed();
+    });
+  }
+
+  /** Add puts the video in the library and stops there; Download goes on to
+   *  queue it with the Settings quality; custom opens the quality dialog over
+   *  this one. Each adds first, so the feed has it whatever happens next. */
+  function videoAction(which: Exclude<Acting, null>) {
+    const text = input.trim();
+    act(which, async () => {
+      const v = await api.addVideo(text);
+      changed();
+      if (which === "add") {
+        toast.success(`Added “${v.title}”.`);
+        clearInput();
+      } else if (which === "download") {
+        try {
+          await api.enqueueDownload(v.id);
+        } catch (err) {
+          // Added, though: the card should stop offering Add.
+          setReadAgain((n) => n + 1);
+          throw err;
+        }
+        toast.success(`Downloading “${v.title}”.`);
+        clearInput();
       } else {
-        const v = await api.addVideo(text);
-        toast.success(`Added “${v.title}” — downloading now.`);
+        setCustom({ kind: "video", video: v });
       }
-      setInput("");
-      setKind(null);
-      onChanged();
-    } catch (err) {
-      toast.error(errText(err));
-    } finally {
-      setBusy(false);
+    });
+  }
+
+  /** The same three, for a playlist's ticked parts. Add takes the new ones;
+   *  Download every one not on disk or on its way, oldest first (the queue
+   *  orders them); custom one quality for all of those. */
+  function playlistAction(which: Exclude<Acting, null>, pl: PlaylistPreview) {
+    const picked = tickedEntries(pl.entries, ticked);
+    act(which, async () => {
+      const r = await api.addPlaylist(picked);
+      changed();
+      const skipped = new Set(r.skippedShorts);
+      const shorts = r.skippedShorts.length
+        ? `${plural(r.skippedShorts.length, "Short")} skipped`
+        : "";
+      if (which === "add") {
+        if (r.added.length > 0) {
+          toast.success(`Added ${plural(r.added.length, "video")}${shorts ? `, ${shorts}` : ""}.`);
+        } else {
+          toast.info(`Nothing new to add${shorts ? ` — ${shorts}` : ""}.`);
+        }
+        clearInput();
+        return;
+      }
+      const ids = picked
+        .filter((e) => wantsDownload(e.downloadState) && !skipped.has(e.id))
+        .map((e) => e.id);
+      if (which === "custom") {
+        if (ids.length === 0) {
+          toast.info(`Nothing to download${shorts ? ` — ${shorts}` : ""}.`);
+          setReadAgain((n) => n + 1);
+          return;
+        }
+        setCustom({ kind: "batch", batch: { ids, title: pl.title } });
+        return;
+      }
+      const queued = ids.length ? await api.enqueueDownloads(ids) : 0;
+      if (queued > 0) {
+        toast.success(`Queued ${plural(queued, "video")}${shorts ? `, ${shorts}` : ""}.`);
+      } else {
+        toast.info("Nothing to queue — every part is downloaded or on its way.");
+      }
+      clearInput();
+    });
+  }
+
+  /** Enter does what the primary button says, and nothing that downloads. */
+  function submit() {
+    if (out || look.phase !== "ready" || !preview) return;
+    if (preview.kind === "channel" && !preview.subscribedId) subscribe();
+    else if (preview.kind === "video" && !preview.video.inLibrary) videoAction("add");
+    else if (preview.kind === "playlist"
+      && tickedEntries(preview.playlist.entries, ticked).some((e) => !e.inLibrary)) {
+      playlistAction("add", preview.playlist);
     }
+  }
+
+  function showInList(id: string) {
+    onSubsFolded(false);
+    setReveal((r) => ({ id, n: (r?.n ?? 0) + 1 }));
   }
 
   /** Step one: parse the CSV and show the checklist. Nothing is imported yet. */
@@ -157,7 +345,7 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
       );
       if (failed) toast.error(`Could not import: ${result.failed.slice(0, 5).join(", ")}`);
       setTakeout(null);
-      onChanged();
+      changed();
     } catch (err) {
       toast.error(errText(err));
     } finally {
@@ -165,249 +353,147 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
     }
   }
 
-  /**
-   * Joins or leaves a channel's membership.
-   *
-   * Joining reads one listing at backfill depth there and then, and the count
-   * that comes back is how many members-only uploads it found — RSS never
-   * carried them, so they have been invisible for as long as the subscription
-   * has existed. Leaving collects nothing further and removes nothing already
-   * collected.
-   */
-  function setMember(c: Channel) {
-    void run(`member:${c.id}`, async () => {
-      const found = await api.setChannelMember(c.id, !c.member);
-      onChanged();
-      if (c.member) {
-        toast.info(`Left ${c.title}. Videos already collected stay.`);
-      } else if (found === 0) {
-        toast.info(`No members-only videos found on ${c.title}.`);
-      } else {
-        toast.success(`${found} members-only video${found === 1 ? "" : "s"} added.`);
-      }
-    });
+  // The zone under the input. Its key changes when what it shows is swapped,
+  // which is what lets its height slide rather than jump (`useAutoHeight`).
+  let zoneKey: string;
+  let zone: ReactNode;
+  const kind = look.phase === "empty" ? null : look.kind;
+  if (look.phase === "error") {
+    zoneKey = "warn";
+    zone = <p className="add-hint is-warn" role="alert">{look.message}</p>;
+  } else if (look.phase === "ready" && look.kind === "short") {
+    zoneKey = "warn";
+    zone = <p className="add-hint is-warn">Shorts are excluded from MyTube by design.</p>;
+  } else if (preview?.kind === "video") {
+    zoneKey = "video";
+    zone = (
+      <VideoCard
+        video={preview.video}
+        playlistId={preview.playlistId}
+        busy={busy}
+        onAdd={() => videoAction("add")}
+        onDownload={() => videoAction("download")}
+        onCustom={() => videoAction("custom")}
+        onWholePlaylist={() => {
+          readNow.current = true;
+          setInput(`https://www.youtube.com/playlist?list=${encodeURIComponent(preview.playlistId!)}`);
+          inputRef.current?.focus();
+        }}
+      />
+    );
+  } else if (preview?.kind === "playlist") {
+    zoneKey = "playlist";
+    zone = (
+      <PlaylistCard
+        key={preview.playlist.id}
+        playlist={preview.playlist}
+        ticked={ticked}
+        onTicked={setTicked}
+        busy={busy}
+        onAdd={() => playlistAction("add", preview.playlist)}
+        onDownload={() => playlistAction("download", preview.playlist)}
+        onCustom={() => playlistAction("custom", preview.playlist)}
+      />
+    );
+  } else if (kind === "video" || kind === "playlist") {
+    zoneKey = `${kind}:skeleton`;
+    zone = <PreviewSkeleton kind={kind} />;
+  } else if (kind === "channel") {
+    const id = preview?.kind === "channel" ? preview.subscribedId : null;
+    zoneKey = id ? "channel:followed" : "channel";
+    zone = (
+      <ChannelAnswer
+        alreadySubscribed={id ? (channels.find((c) => c.id === id) ?? true) : null}
+        checking={look.phase !== "ready"}
+        busy={out}
+        spinning={slow.has("subscribe")}
+        onSubscribe={subscribe}
+        onShow={() => id && showInList(id)}
+      />
+    );
+  } else {
+    zoneKey = "hint";
+    zone = (
+      <p className="add-hint">
+        {look.phase === "empty"
+          ? "Paste a channel to subscribe to, or a video or playlist to add or download."
+          : "Reading the link…"}
+      </p>
+    );
   }
 
-  /** Off is immediate and takes nothing back; on goes through the prompt. */
-  function toggleAutoDownload(c: Channel) {
-    if (pending.has(`auto:${c.id}`)) return;
-    if (c.auto_download) {
-      setAutoDownload(c, false, null);
-    } else {
-      setConfirmRemove(null);
-      setAutoPrompt(c);
-    }
-  }
-
-  function setAutoDownload(c: Channel, enabled: boolean, backlog: Backlog | null) {
-    setAutoPrompt(null);
-    void run(`auto:${c.id}`, async () => {
-      const queued = await api.setChannelAutoDownload(c.id, enabled, backlog);
-      onChanged();
-      if (!enabled) {
-        toast.info(`Auto-download off for ${c.title}.`);
-      } else {
-        toast.success(
-          `Auto-download on for ${c.title}.` +
-          (queued > 0 ? ` ${queued} video${queued === 1 ? "" : "s"} queued.` : ""),
-        );
-      }
-    });
-  }
-
-  function openChannel(c: Channel) {
-    // Keyed so a double press opens one browser tab, not two.
-    void run(`open:${c.id}`, () => api.openExternal(c.url));
-  }
-
-  /** Removal deletes every video the channel has, so it must not run twice --
-   *  the confirm's glyph stays pressed and disabled until the answer is in. */
-  function removeChannel(c: Channel) {
-    void run(`remove:${c.id}`, async () => {
-      await api.removeChannel(c.id);
-      toast.success(`Removed ${c.title} and its videos.`);
-      setConfirmRemove(null);
-      onChanged();
-    });
-  }
+  const chip = kind && look.phase !== "empty" ? kind : null;
 
   return (
     <>
-    <div className="modal-backdrop" onClick={onClose}>
+    <div
+      className="modal-backdrop"
+      // Pressed on the backdrop itself, not released there: a text selection
+      // dragged out of the input must not close the dialog, nor a press that
+      // began on a dialog stacked over this one.
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
       <div
         className="modal add-dialog"
         role="dialog"
         aria-modal="true"
-        aria-label="Add a channel or video"
-        onClick={(e) => e.stopPropagation()}
+        aria-label="Add a channel, video or playlist"
       >
         <div className="modal-head">
           <h2>Add</h2>
-          <button type="button" className="icon-btn" onClick={onClose} title="Close">
-            <span aria-hidden="true">✕</span>
+          <button type="button" className="icon-btn add-close" onClick={onClose} title="Close">
+            <span aria-hidden="true"><IconClose /></span>
             <span className="sr-only">Close</span>
           </button>
         </div>
 
         <form
           className="add-form"
-          onSubmit={(e) => { e.preventDefault(); void submit(); }}
+          onSubmit={(e) => { e.preventDefault(); submit(); }}
         >
+          <span className="add-form-glyph" aria-hidden="true"><IconLink /></span>
           <input
             ref={inputRef}
             className="text-input"
             value={input}
-            placeholder="Channel URL, @handle, UC… id, or a video URL"
-            aria-label="Channel or video to add"
+            placeholder="Channel, video or playlist link, or @handle"
+            aria-label="Channel, video or playlist to add"
+            spellCheck={false}
+            autoComplete="off"
+            onPaste={() => { readNow.current = true; }}
             onChange={(e) => setInput(e.currentTarget.value)}
           />
-          <button
-            type="submit"
-            className={`btn ${kind === "short" ? "btn-disabled" : "btn-primary"}`}
-            disabled={!canSubmit}
-          >
-            {busy
-              ? "Working…"
-              : classifying
-                ? "Checking…"
-                : kind
-                  ? ACTION_LABEL[kind]
-                  : "Add"}
-          </button>
+          {chip && (
+            <span
+              className={`add-kind${chip === "short" ? " is-warn" : ""}${look.phase === "reading" ? " is-stale" : ""}`}
+            >
+              {KIND_LABEL[chip]}
+            </span>
+          )}
         </form>
 
-        <p className={`add-hint${kind === "short" || problem ? " is-warn" : ""}`}>
-          {problem
-            ? problem
-            : kind
-              ? HINT[kind]
-              : "Accepts either a channel to subscribe to, or one video URL to download."}
+        <PreviewZone zoneKey={zoneKey}>{zone}</PreviewZone>
+        <p className="sr-only" role="status">
+          {look.phase === "reading" || look.phase === "loading" ? "Reading the link…" : ""}
         </p>
 
-        <div className="modal-divider" />
+        <div className="add-divider" />
 
-        <div className="modal-head">
-          <h3>
-            Subscriptions <span className="section-count">{channels.length}</span>
-          </h3>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => void pickCsv()}
-            disabled={importing}
-          >
-            {importing ? "Importing…" : "Import Takeout CSV"}
-          </button>
-        </div>
-
-        {channels.length === 0 ? (
-          <p className="add-hint">No channels yet.</p>
-        ) : (
-          <ul className="channel-list">
-            {channels.map((c) => (
-              <li
-                key={c.id}
-                className={`channel-row${autoPrompt?.id === c.id ? " has-prompt" : ""}`}
-              >
-                <span
-                  className={`channel-name${c.terminated ? " is-terminated" : ""}`}
-                  title={c.terminated
-                    ? `YouTube has terminated ${c.title}'s account. It is no longer polled; the videos already collected stay.`
-                    : c.handle ?? c.url}
-                >
-                  {c.title}
-                  {c.terminated && <span className="sr-only"> (terminated by YouTube)</span>}
-                </span>
-                {confirmRemove === c.id ? (
-                  <span className="inline-confirm">
-                    <span className="inline-confirm-text">Remove and delete its videos?</span>
-                    <ChannelAction
-                      label={`Remove ${c.title} and delete its videos`}
-                      tone="is-danger"
-                      {...act(`remove:${c.id}`)}
-                      onClick={() => removeChannel(c)}
-                    >
-                      <IconDelete />
-                    </ChannelAction>
-                    <ChannelAction
-                      label={`Keep ${c.title}`}
-                      // Too late to keep it once the removal is out.
-                      busy={pending.has(`remove:${c.id}`)}
-                      onClick={() => setConfirmRemove(null)}
-                    >
-                      <IconClose />
-                    </ChannelAction>
-                  </span>
-                ) : (
-                  <span className="channel-actions">
-                    <ChannelAction
-                      label={`Open ${c.title} on YouTube`}
-                      onClick={() => openChannel(c)}
-                    >
-                      <IconExternal />
-                    </ChannelAction>
-                    <ChannelAction
-                      // Every row carries one of these, so the name has to say
-                      // which channel it acts on.
-                      label={`Members — ${c.title}`}
-                      tone={c.member ? "is-on" : undefined}
-                      pressed={c.member}
-                      {...act(`member:${c.id}`)}
-                      // A terminated account has no uploads left to collect,
-                      // members-only or otherwise. Hidden rather than dropped:
-                      // the circle keeps its slot so the glyphs still line up
-                      // down the column.
-                      hidden={c.terminated}
-                      title={
-                        c.member
-                          ? `You are a member of ${c.title}. Its members-only uploads are collected with the rest.`
-                          : `Joined ${c.title}? Collect its members-only uploads too — the RSS feed never carries them.`
-                      }
-                      onClick={() => setMember(c)}
-                    >
-                      <IconMember joined={c.member} />
-                    </ChannelAction>
-                    <ChannelAction
-                      label={`Auto-download — ${c.title}`}
-                      tone={c.auto_download ? "is-on" : undefined}
-                      pressed={c.auto_download}
-                      {...act(`auto:${c.id}`)}
-                      // Nothing new will ever arrive from a terminated account.
-                      hidden={c.terminated}
-                      title={
-                        c.auto_download
-                          ? `New uploads from ${c.title} download on their own. Click to stop; nothing already queued or downloaded is touched.`
-                          : `Download new uploads from ${c.title} automatically.`
-                      }
-                      onClick={() => toggleAutoDownload(c)}
-                    >
-                      <IconAutoDownload on={c.auto_download} />
-                    </ChannelAction>
-                    <ChannelAction
-                      label={`Remove ${c.title}`}
-                      onClick={() => { setAutoPrompt(null); setConfirmRemove(c.id); }}
-                    >
-                      <IconDelete />
-                    </ChannelAction>
-                  </span>
-                )}
-                {autoPrompt?.id === c.id && (
-                  <AutoDownloadPrompt
-                    channel={c}
-                    onConfirm={(backlog) => setAutoDownload(c, true, backlog)}
-                    onCancel={() => setAutoPrompt(null)}
-                  />
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
+        <SubscriptionList
+          channels={channels}
+          stats={stats}
+          folded={subsFolded}
+          onFold={onSubsFolded}
+          reveal={reveal}
+          importing={importing}
+          onImportCsv={() => void pickCsv()}
+          onChanged={changed}
+        />
       </div>
-
     </div>
 
-    {/* A sibling, not a child: nesting it inside the backdrop above meant every
-        click inside it bubbled to that backdrop's onClose and shut everything. */}
+    {/* Siblings, not children: nested inside the backdrop above, every click
+        inside them bubbled to it. Later in the document, so they sit on top. */}
     {takeout && (
       <TakeoutDialog
         rows={takeout.rows}
@@ -416,238 +502,42 @@ export default function AddChannelDialog({ open: isOpen, onClose, channels, onCh
         onCancel={() => setTakeout(null)}
       />
     )}
+    {custom?.kind === "video" && (
+      <CustomDownloadDialog
+        video={custom.video}
+        onQueued={(v) => {
+          toast.success(`Downloading “${v.title}”.`);
+          clearInput();
+        }}
+        // Backed out of, the video is still added: read the link again so
+        // the card says it is in the library now.
+        onClose={() => { setCustom(null); setReadAgain((n) => n + 1); }}
+      />
+    )}
+    {custom?.kind === "batch" && (
+      <CustomDownloadDialog
+        batch={custom.batch}
+        onBatchQueued={(queued) => {
+          if (queued > 0) toast.success(`Queued ${plural(queued, "video")}.`);
+          else toast.info("Nothing to queue — every part is downloaded or on its way.");
+          clearInput();
+        }}
+        onClose={() => { setCustom(null); setReadAgain((n) => n + 1); }}
+      />
+    )}
     </>
   );
 }
 
-type Backlog = { includeWatched: boolean; includeHidden: boolean };
-
-/**
- * Asks how far back turning auto-download on should reach. "From now on" is
- * the default and queues nothing today; "Everything so far" takes what is
- * already in the library — never a fresh listing — and quotes a live count so
- * the confirm button says exactly how much it is about to start.
- */
-function AutoDownloadPrompt({ channel, onConfirm, onCancel }: {
-  channel: Channel;
-  onConfirm: (backlog: Backlog | null) => void;
-  onCancel: () => void;
-}) {
-  const [scope, setScope] = useState<"new" | "all">("new");
-  const [includeWatched, setIncludeWatched] = useState(false);
-  const [includeHidden, setIncludeHidden] = useState(false);
-  const [count, setCount] = useState<number | null>(null);
-  const [countError, setCountError] = useState<string | null>(null);
-  // Every tick fires a count; only the newest one may land.
-  const countReq = useRef(0);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  const titleId = `auto-dl-${channel.id}`;
-
-  // It opens inside the scrolling channel list, often below the fold.
-  useEffect(() => {
-    boxRef.current?.scrollIntoView?.({ block: "nearest" });
-  }, []);
-
-  useEffect(() => {
-    const id = ++countReq.current;
-    if (scope !== "all") return;
-    setCount(null);
-    setCountError(null);
-    api.autoDownloadBacklogCount(channel.id, includeWatched, includeHidden).then(
-      (n) => { if (id === countReq.current) setCount(n); },
-      (err) => { if (id === countReq.current) setCountError(errText(err)); },
-    );
-  }, [scope, includeWatched, includeHidden, channel.id]);
-
-  const all = scope === "all";
-  const label = all && count ? `Turn on & download ${count}` : "Turn on";
-  const summary = !all
-    ? "Nothing is queued today."
-    : countError
-      ? countError
-      : count === null
-        ? "Counting…"
-        : count === 0
-          ? "Nothing in the library left to fetch."
-          : null;
-
+/** The space under the input, which slides to the height of whatever it
+ *  holds. Mounted with the dialog, so its measuring starts when it is seen. */
+function PreviewZone({ zoneKey, children }: { zoneKey: string; children: ReactNode }) {
+  const { outer, inner } = useAutoHeight(zoneKey);
   return (
-    <div
-      ref={boxRef}
-      className="auto-dl-prompt"
-      role="group"
-      aria-labelledby={titleId}
-      onKeyDown={(e) => {
-        // Escape backs out of the prompt, not the whole dialog.
-        if (e.key === "Escape") { e.stopPropagation(); onCancel(); }
-      }}
-    >
-      <div className="auto-dl-head">
-        <span className="auto-dl-badge" aria-hidden="true"><IconAutoDownload on /></span>
-        <div className="auto-dl-heading">
-          <p id={titleId} className="auto-dl-title">Auto-download {channel.title}</p>
-          <p className="auto-dl-sub">New uploads join the download queue after every refresh.</p>
-        </div>
-      </div>
-
-      <div className="auto-dl-scope" role="radiogroup" aria-label="Which videos">
-        <ScopeOption
-          id={`${titleId}-new`}
-          name={`${titleId}-scope`}
-          checked={!all}
-          onSelect={() => setScope("new")}
-          title="From now on"
-          detail="Only what is uploaded next."
-        />
-        <ScopeOption
-          id={`${titleId}-all`}
-          name={`${titleId}-scope`}
-          checked={all}
-          onSelect={() => setScope("all")}
-          title="Everything so far as well"
-          detail="Plus what is already in your library."
-        />
-      </div>
-
-      {all && (
-        <div className="auto-dl-backlog">
-          <span className="auto-dl-backlog-label">Also include</span>
-          <ToggleChip label="Include watched" checked={includeWatched} onChange={setIncludeWatched}>
-            Watched
-          </ToggleChip>
-          <ToggleChip label="Include hidden" checked={includeHidden} onChange={setIncludeHidden}>
-            Hidden
-          </ToggleChip>
-        </div>
-      )}
-
-      <div className="auto-dl-foot">
-        <span className={`auto-dl-count${countError ? " is-error" : ""}`} aria-live="polite">
-          {summary ?? (
-            <>
-              <strong>{count}</strong> video{count === 1 ? "" : "s"} will be queued
-            </>
-          )}
-        </span>
-        <div className="auto-dl-buttons">
-          <button
-            type="button"
-            className="btn btn-quiet"
-            aria-label={`Cancel auto-download for ${channel.title}`}
-            onClick={onCancel}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
-            // Waiting for the count keeps the button from starting a number the
-            // user never saw.
-            disabled={all && count === null && !countError}
-            onClick={() => onConfirm(all ? { includeWatched, includeHidden } : null)}
-          >
-            {label}
-          </button>
-        </div>
+    <div ref={outer} className="add-zone">
+      <div ref={inner} className="add-zone-in">
+        <div key={zoneKey} className="add-zone-swap">{children}</div>
       </div>
     </div>
-  );
-}
-
-/** One of the two answers to "how far back?", as a selectable card. The input
- *  is the real control — only its title names it; the detail describes it. */
-function ScopeOption({ id, name, checked, onSelect, title, detail }: {
-  id: string;
-  name: string;
-  checked: boolean;
-  onSelect: () => void;
-  title: string;
-  detail: string;
-}) {
-  return (
-    <label className={`auto-dl-opt${checked ? " is-on" : ""}`}>
-      <input
-        type="radio"
-        className="sr-only"
-        name={name}
-        checked={checked}
-        onChange={onSelect}
-        aria-labelledby={`${id}-t`}
-        aria-describedby={`${id}-d`}
-      />
-      <span className="auto-dl-radio" aria-hidden="true" />
-      <span className="auto-dl-opt-text">
-        <span id={`${id}-t`} className="auto-dl-opt-title">{title}</span>
-        <span id={`${id}-d`} className="auto-dl-opt-detail">{detail}</span>
-      </span>
-    </label>
-  );
-}
-
-/** A real checkbox worn as a pill, ticked with a check glyph. */
-function ToggleChip({ label, checked, onChange, children }: {
-  label: string;
-  checked: boolean;
-  onChange: (on: boolean) => void;
-  children: string;
-}) {
-  return (
-    <label className={`auto-dl-chip${checked ? " is-on" : ""}`}>
-      <input
-        type="checkbox"
-        className="sr-only"
-        aria-label={label}
-        checked={checked}
-        onChange={(e) => onChange(e.currentTarget.checked)}
-      />
-      <span className="auto-dl-chip-box" aria-hidden="true">{checked && <IconCheck />}</span>
-      {children}
-    </label>
-  );
-}
-
-/**
- * One glyph in a channel row. The rows are narrow and every channel carries the
- * same four actions, so the words live in the tooltip and the screen-reader
- * name instead of on the button — and the name has to name the channel, since
- * a list of them reads as one column of identical buttons otherwise.
- *
- * DownloadsView has a `RowAction` of its own; this one additionally carries the
- * pressed state the membership and auto-download toggles need.
- *
- * `busy` disables it the moment its call goes out; `spinning` swaps the glyph
- * for IconBusy only once the call is slow enough to notice (`usePending`). The
- * second click of a double-click is dropped, since on a toggle it would join
- * and then leave.
- */
-function ChannelAction({ label, title, tone, pressed, busy, spinning, hidden, onClick, children }: {
-  label: string;
-  /** The long explanation, when the tooltip has more to say than the name. */
-  title?: string;
-  tone?: "is-on" | "is-danger";
-  pressed?: boolean;
-  busy?: boolean;
-  spinning?: boolean;
-  /** Keeps the slot but shows nothing and takes no focus or clicks. */
-  hidden?: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      className={`icon-btn${tone ? ` ${tone}` : ""}${spinning ? " is-spinning" : ""}${hidden ? " is-placeholder" : ""}`}
-      title={title ?? label}
-      aria-pressed={pressed}
-      aria-busy={busy || undefined}
-      disabled={busy || hidden}
-      aria-hidden={hidden || undefined}
-      tabIndex={hidden ? -1 : undefined}
-      onClick={singleClick(onClick)}
-    >
-      {/* `.is-spinning` turns this span, so the glyph has to sit inside one. */}
-      <span aria-hidden="true">{spinning ? <IconBusy /> : children}</span>
-      <span className="sr-only">{label}</span>
-    </button>
   );
 }

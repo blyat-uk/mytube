@@ -4,7 +4,7 @@ import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
   PlayerOption, BrowserScan, CookiesFileInfo, ToolStatus, Quality, VideoFormats, VersionInfo,
-  SyncStatus,
+  SyncStatus, ChannelStats, AddPreview, PlaylistEntry, AddPlaylistResult,
 } from "./types";
 
 export const api = {
@@ -13,9 +13,22 @@ export const api = {
   /** Writes only the feed's filters; `save_settings` ignores this block. */
   saveViewState: (view: ViewState) => invoke<void>("save_view_state", { view }),
   listChannels: () => invoke<Channel[]>("list_channels"),
+  /** Every subscribed channel's counts, for the Add dialog's list and panel.
+   *  One grouped query; a channel with nothing ready yet comes back as zeros. */
+  subscriptionStats: () => invoke<ChannelStats[]>("subscription_stats"),
   addChannel: (input: string) => invoke<Channel>("add_channel", { input }),
+  /** Puts one video in the library, sorted to the top, and nothing more: it
+   *  does not download. A video already there comes back untouched. */
   addVideo: (input: string) => invoke<Video>("add_video", { input }),
   classifyAddInput: (input: string) => invoke<AddKind>("classify_add_input", { input }),
+  /** What a pasted link is, read before anything is written: a video's or a
+   *  playlist's details and how much of it is already here, or for a channel
+   *  only whether you already follow it. */
+  previewAdd: (input: string) => invoke<AddPreview>("preview_add", { input }),
+  /** Adds the given parts of a previewed playlist as separate videos. Parts
+   *  already in the library are left alone, Shorts refused. */
+  addPlaylist: (entries: PlaylistEntry[]) =>
+    invoke<AddPlaylistResult>("add_playlist", { entries }),
   removeChannel: (channelId: string) => invoke<void>("remove_channel", { channelId }),
   previewTakeoutCsv: (path: string) => invoke<TakeoutRow[]>("preview_takeout_csv", { path }),
   importTakeoutCsv: (path: string, channelIds: string[]) =>
@@ -65,9 +78,11 @@ export const api = {
     invoke<void>("enqueue_download", { videoId, quality: quality ?? null }),
   /** Queues several videos, oldest upload first, so a series starts at its
    *  first part. The backend skips any already downloaded or on its way and
-   *  resolves with how many it queued. Stored overrides are left alone, as
-   *  `enqueueDownload` with no quality leaves them. */
-  enqueueDownloads: (videoIds: string[]) => invoke<number>("enqueue_downloads", { videoIds }),
+   *  resolves with how many it queued. With a `quality`, each one queued
+   *  takes it as its override, as `enqueueDownload` stores one; without,
+   *  stored overrides are left alone. */
+  enqueueDownloads: (videoIds: string[], quality?: Quality | null) =>
+    invoke<number>("enqueue_downloads", { videoIds, quality: quality ?? null }),
   /** Everything one video offers, and what the Settings default would pick
    *  from it. Runs yt-dlp, so it takes a few seconds. */
   probeFormats: (videoId: string) => invoke<VideoFormats>("probe_formats", { videoId }),
@@ -128,6 +143,12 @@ export const api = {
 export function thumbSrc(v: { thumb_path: string | null; thumb_url: string | null }): string {
   if (v.thumb_path) return convertFileSrc(v.thumb_path);
   return v.thumb_url ?? "";
+}
+
+/** A file on this machine, as the webview may load it: a channel's cached
+ *  picture, a previewed video's cached thumbnail. */
+export function fileSrc(path: string): string {
+  return convertFileSrc(path);
 }
 
 /** Commands reject with a plain string; normalise anything else for a toast. */

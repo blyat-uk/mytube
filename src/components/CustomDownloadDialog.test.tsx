@@ -8,12 +8,16 @@ const probeFormats = vi.fn<(id: string) => Promise<VideoFormats>>();
 const enqueueDownload = vi.fn<(id: string, q?: Quality | null) => Promise<void>>(
   () => Promise.resolve(),
 );
+const enqueueDownloads = vi.fn<(ids: string[], q?: Quality | null) => Promise<number>>(
+  (ids) => Promise.resolve(ids.length),
+);
 let quality: Quality = DEFAULT_QUALITY;
 
 vi.mock("../api", () => ({
   api: {
     probeFormats: (id: string) => probeFormats(id),
     enqueueDownload: (id: string, q?: Quality | null) => enqueueDownload(id, q),
+    enqueueDownloads: (ids: string[], q?: Quality | null) => enqueueDownloads(ids, q),
     getSettings: () => Promise.resolve({ quality } as Settings),
   },
   errText: (e: unknown) => String(e),
@@ -45,6 +49,7 @@ beforeEach(() => {
   quality = DEFAULT_QUALITY;
   probeFormats.mockImplementation(() => Promise.resolve(rickroll()));
   enqueueDownload.mockImplementation(() => Promise.resolve());
+  enqueueDownloads.mockImplementation((ids) => Promise.resolve(ids.length));
 });
 afterEach(cleanup);
 
@@ -131,5 +136,51 @@ describe("CustomDownloadDialog", () => {
     await act(async () => { probe.resolve(rickroll()); });
     await act(async () => {});
     expect(enqueueDownload).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A playlist's parts, downloaded one way. Exact format ids differ from video to
+ * video, so there is no probe: the preferences form is the whole dialog, and
+ * its one quality goes on every part.
+ */
+describe("CustomDownloadDialog for several videos", () => {
+  const BATCH = { ids: ["p1", "p2", "p3"], title: "The whole story" };
+
+  function renderBatch() {
+    const onBatchQueued = vi.fn();
+    const onClose = vi.fn();
+    render(<CustomDownloadDialog batch={BATCH} onBatchQueued={onBatchQueued} onClose={onClose} />);
+    return { onBatchQueued, onClose };
+  }
+
+  it("asks no video for its formats, and says one quality covers them all", async () => {
+    renderBatch();
+    expect(await screen.findByText(/One quality for all 3 videos/)).toBeTruthy();
+    expect(screen.getByText("The whole story · 3 videos")).toBeTruthy();
+    expect(probeFormats).not.toHaveBeenCalled();
+    // No probe, so nothing failed: no error to show.
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("starts from the Settings quality and queues every part with it", async () => {
+    quality = { ...DEFAULT_QUALITY, mode: "audio", audio_format: "mp3" };
+    const { onBatchQueued, onClose } = renderBatch();
+    const format = await screen.findByLabelText("Audio format") as HTMLSelectElement;
+    expect(format.options[format.selectedIndex].text).toBe("MP3");
+    fireEvent.click(screen.getByRole("button", { name: "Download 3" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(enqueueDownloads).toHaveBeenCalledWith(["p1", "p2", "p3"], quality);
+    expect(onBatchQueued).toHaveBeenCalledWith(3);
+    expect(enqueueDownload).not.toHaveBeenCalled();
+  });
+
+  it("stays open with the reason when queueing fails", async () => {
+    enqueueDownloads.mockImplementation(() => Promise.reject("database is locked"));
+    const { onBatchQueued, onClose } = renderBatch();
+    fireEvent.click(await screen.findByRole("button", { name: "Download 3" }));
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onBatchQueued).not.toHaveBeenCalled();
   });
 });

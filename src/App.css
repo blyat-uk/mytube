@@ -1629,106 +1629,712 @@ label.field-label { display: block; }
   margin: 20px -20px;
 }
 
-.add-form { display: flex; gap: 8px; }
-.add-form .text-input { flex: 1 1 auto; }
+/* --- the Add dialog ------------------------------------------------------ */
+
+/* The dialog runs as tall as the window allows, and the subscription list
+   takes whatever the input and its preview leave: a library of tens of
+   channels should read as a list, not a peephole. The backdrop pads 8vh above
+   and 20px below, which is what the max-height subtracts. Should the preview
+   alone outgrow that -- a playlist's parts open in a short window -- the
+   dialog scrolls as a whole rather than spilling out of its frame.
+
+   It is a named container (`add-dialog`): what fits beside a thumbnail, and
+   whether the Import button keeps its word, depends on the dialog's width in
+   rem, which no media query can see. */
+.modal.add-dialog {
+  /* The few colours the dialog needs beyond the palette, named once. */
+  --add-accent-text: #9ed3ff;
+  --add-accent-line: rgba(62, 166, 255, 0.35);
+  --add-star: #ffd34d;
+  --add-star-soft: rgba(255, 211, 77, 0.12);
+  --add-warn-text: #ffb9ba;
+  --add-danger-text: #ffc9ca;
+  --add-danger-line: rgba(255, 90, 95, 0.4);
+  --add-scrim: rgba(0, 0, 0, 0.78);
+
+  max-width: 65rem;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 8vh - 20px);
+  overflow-y: auto;
+  container: add-dialog / inline-size;
+}
+.add-close .icon { width: 16px; height: 16px; }
+
+/* Buttons here carry a glyph beside their word, at the smaller size the
+   mockups set them in. Scoped to the dialog: elsewhere .btn stays as it was. */
+.add-dialog .btn { display: inline-flex; align-items: center; gap: 7px; }
+.add-dialog .btn-sm { font-size: 1.3rem; padding: 5px 12px; }
+.add-dialog .btn-glyph { display: inline-flex; flex: none; }
+.add-dialog .btn-glyph .icon { width: 15px; height: 15px; }
+.add-dialog .btn.is-spinning .btn-glyph { animation: spin 900ms linear infinite; }
+.add-dialog .btn.is-on {
+  background: var(--accent-soft);
+  border-color: rgba(62, 166, 255, 0.5);
+  color: var(--add-accent-text);
+}
+.add-dialog .btn.is-on:hover:not(:disabled) { background: rgba(62, 166, 255, 0.24); }
+.add-dialog .btn-quiet.is-danger { color: var(--add-danger-text); }
+.add-dialog .btn-quiet.is-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: var(--add-danger-line);
+  color: var(--add-danger-text);
+}
+.add-dialog input[type="checkbox"] {
+  flex: none;
+  width: 15px; height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* The paste box: a link glyph on the left, and on the right, once the text
+   has been read, a chip saying what it is. */
+.add-form { position: relative; display: flex; flex: none; }
+.add-form .text-input {
+  flex: 1 1 auto;
+  /* Clears the glyph on the left and the widest chip ("Playlist") on the right. */
+  padding: 9px calc(18px + 7rem) 9px 34px;
+}
+.add-form-glyph {
+  position: absolute;
+  left: 11px; top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  color: var(--faint);
+  pointer-events: none;
+}
+.add-form-glyph .icon { width: 15px; height: 15px; }
+.add-kind {
+  position: absolute;
+  right: 8px; top: 50%;
+  transform: translateY(-50%);
+  padding: 0 9px;
+  border: 1px solid var(--add-accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--add-accent-text);
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1.6;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+  animation: add-chip-in 180ms var(--fold-ease);
+}
+.add-kind.is-warn {
+  border-color: var(--add-danger-line);
+  background: var(--danger-soft);
+  color: var(--add-warn-text);
+}
+/* Being read again after an edit: still what it was, until it is not. */
+.add-kind.is-stale { opacity: 0.45; }
+@keyframes add-chip-in {
+  from { opacity: 0; transform: translateY(-50%) scale(0.88); }
+}
+
+/* Under the input: a hint, a channel's one line, or a card. The outer box is
+   sized by useAutoHeight and slides only while `is-sliding`; flow-root keeps
+   the children's top margins inside what it measures. */
+.add-zone { flex: none; }
+.add-zone.is-sliding {
+  overflow: hidden;
+  transition: height 240ms var(--fold-ease);
+}
+.add-zone-in { display: flow-root; }
+.add-zone-swap { animation: add-swap-in 220ms var(--fold-ease); }
+@keyframes add-swap-in {
+  from { opacity: 0; transform: translateY(4px); }
+}
 
 .add-hint {
   margin: 10px 0 0;
   font-size: 1.25rem;
   color: var(--faint);
 }
-.add-hint.is-warn { color: #ffb9ba; }
+.add-hint.is-warn { color: var(--add-warn-text); }
 
-/* The Add dialog runs as tall as the window allows, and the subscription list
-   takes whatever the form above it leaves: a library of tens of channels
-   should read as a list, not a peephole. The backdrop pads 8vh above and 20px
-   below, which is what the max-height subtracts. */
-.modal.add-dialog {
+/* A channel: one line and its button, framed like the cards so the answer
+   reads as the input's, whatever the paste was. */
+.add-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 10px 10px 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+.add-line-text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.3rem;
+}
+.add-line-text b { color: var(--text); font-weight: 600; }
+
+/* --- the preview card --- */
+
+.add-pv {
+  margin-top: 12px;
+  padding: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+.add-pv-top { display: flex; gap: 14px; }
+
+.add-thumb {
+  position: relative;
+  flex: none;
+  width: 196px;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+.add-thumb img,
+.add-stack-img img,
+.add-part-thumb img {
+  display: block;
+  width: 100%; height: 100%;
+  object-fit: cover;
+}
+.add-thumb-dur {
+  position: absolute;
+  right: 6px; bottom: 6px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--add-scrim);
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A playlist's thumbnail: its first part, with two cards fanned out behind it
+   and the count over its right-hand third. */
+.add-stack {
+  position: relative;
+  isolation: isolate;
+  flex: none;
+  width: 196px;
+  aspect-ratio: 16 / 9;
+  margin-top: 8px;
+}
+.add-stack::before,
+.add-stack::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: -5px; left: 10px; right: 10px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  background: var(--card-hover);
+}
+.add-stack::after { z-index: -2; top: -9px; left: 20px; right: 20px; background: var(--card); }
+.add-stack-img {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+.add-stack-count {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 38%;
   display: flex;
   flex-direction: column;
-  max-height: calc(100vh - 8vh - 20px);
+  align-items: center;
+  justify-content: center;
+  background: var(--add-scrim);
+  line-height: 1.1;
 }
-.modal.add-dialog > :not(.channel-list) { flex: none; }
-.channel-list {
+.add-stack-count b { font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.add-stack-count small { font-size: 1.1rem; color: var(--muted); }
+
+.add-pv-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* Always room for two lines of title and one of meta, so a one-line title
+   and the skeleton before it take the same height as a two-line one: the
+   card never jumps when the real thing lands. */
+.add-pv-text { min-height: calc(2 * 1.35 * 1.45rem + 3px + 1.5 * 1.25rem); }
+.add-pv-title {
+  margin: 0;
+  font-size: 1.45rem;
+  font-weight: 600;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.add-pv-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 1.25rem;
+}
+.add-pv-meta-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-pv-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 10px;
+}
+/* A quiet line under the card: the whole playlist instead of one part, or
+   the parts behind the disclosure. */
+.add-pv-foot {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 10px 2px 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 1.3rem;
+  text-align: left;
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.add-pv-foot:hover { color: var(--text); }
+.add-pv-foot .icon { width: 14px; height: 14px; }
+
+.add-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.add-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted);
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.add-tag .icon { width: 11px; height: 11px; }
+.add-tag.is-new { background: var(--accent-soft); color: var(--add-accent-text); }
+.add-tag.is-ok { background: var(--ok-soft); color: var(--ok); }
+.add-tag.is-members { background: var(--add-star-soft); color: var(--add-star); }
+.add-tag.is-faint {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--faint);
+  font-weight: 500;
+}
+
+/* The parts, behind their disclosure: they unfold rather than appear. */
+.add-disclose-caret { display: inline-flex; transition: transform var(--fold-time) var(--fold-ease); }
+.add-disclose.is-open .add-disclose-caret { transform: rotate(180deg); }
+.add-disclose-note { color: var(--faint); white-space: pre; }
+.add-parts {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows var(--fold-time) var(--fold-ease), opacity 200ms ease;
+}
+.add-parts.is-open { grid-template-rows: 1fr; opacity: 1; }
+.add-parts-clip { min-height: 0; overflow: hidden; }
+.add-parts-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 0;
+  color: var(--faint);
+  font-size: 1.2rem;
+}
+.add-parts-all { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); cursor: pointer; }
+.add-parts-sum { margin-left: auto; font-variant-numeric: tabular-nums; }
+.add-parts-list {
   list-style: none;
-  margin: 0 -6px 0 0;
-  padding: 0 6px 0 0;
-  flex: 1 1 auto;
-  min-height: 160px;
+  margin: 8px 0 0;
+  padding: 4px;
+  /* Never so tall that a short window has no list of channels left under it. */
+  max-height: min(236px, 26vh);
   overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--card-hover) transparent;
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+}
+.add-part {
+  display: grid;
+  grid-template-columns: 15px 72px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.add-part:hover { background: var(--surface-2); }
+.add-part-thumb {
+  width: 72px;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 5px;
+  background: var(--card);
+}
+.add-part-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1.3rem; }
+.add-part-dur {
+  min-width: 5.4rem;
+  color: var(--faint);
+  font-size: 1.2rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+/* Unticked: still listed, so it can be ticked back, but out of the count. */
+.add-part > :not(input) { transition: opacity 120ms ease; }
+.add-part.is-off > :not(input) { opacity: 0.4; }
+
+/* The card a preview is about to become, pulsing where its words will be. */
+.add-bone {
+  color: transparent;
+  background: var(--card);
+  border-radius: 6px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  animation: add-pulse 1.4s ease-in-out infinite;
+}
+.add-dialog .btn.is-bone {
+  color: transparent;
+  background: var(--card);
+  border-color: transparent;
+  cursor: default;
+  animation: add-pulse 1.4s ease-in-out infinite;
+}
+.add-dialog .btn.is-bone .icon { visibility: hidden; }
+.add-pv.is-skeleton .add-thumb,
+.add-pv.is-skeleton .add-stack-img { animation: add-pulse 1.4s ease-in-out infinite; }
+.add-pv.is-skeleton .add-pv-foot { cursor: default; }
+@keyframes add-pulse { 50% { opacity: 0.5; } }
+
+/* --- subscriptions --- */
+
+.add-divider { flex: none; height: 1px; margin: 18px -20px 14px; background: var(--line); }
+
+.add-subs { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.add-subs-head { flex: none; display: flex; align-items: center; gap: 8px; }
+.add-fold {
+  appearance: none;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: -4px;
+  padding: 4px 8px 4px 4px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 1.45rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.add-fold:hover { background: var(--surface-2); }
+.add-fold-caret {
+  display: inline-flex;
+  color: var(--muted);
+  transition: transform var(--fold-time) var(--fold-ease);
+}
+.add-fold-caret .icon { width: 14px; height: 14px; }
+.add-subs.is-folded .add-fold-caret { transform: rotate(-90deg); }
+
+/* The filter and Import: only while the list is out. They fade, keeping the
+   header's height, and stop taking clicks the moment the fold starts. */
+.add-subs-tools {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  /* Flush right even when the box is wider than its contents: the filter's
+     input asks for its intrinsic width before the flex basis trims it. */
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+  transition: opacity 200ms ease 60ms;
+}
+.add-subs.is-folded .add-subs-tools { opacity: 0; pointer-events: none; transition-delay: 0s; }
+.add-filter { position: relative; display: flex; align-items: center; flex: 0 1 15rem; min-width: 7rem; }
+.add-filter-glyph {
+  position: absolute;
+  left: 9px;
+  display: flex;
+  color: var(--faint);
+  pointer-events: none;
+}
+.add-filter-glyph .icon { width: 14px; height: 14px; }
+.add-filter .text-input { width: 100%; padding: 5px 10px 5px 28px; font-size: 1.3rem; }
+.add-import { flex: none; }
+
+/* The list folds by its height, animated between measured pixels by
+   SubscriptionList: `grid-template-rows: 0fr <-> 1fr` would interpolate
+   against the whole list's height (forty rows) and reach the dialog's limit
+   in the first few frames. Folded, the box is simply 0 tall.
+   Out past the dialog's padding on the right, so the scrollbar sits in the
+   gutter rather than over the counts. */
+.add-subs-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 10px -10px 0 0;
+  overflow: hidden;
+  transition: margin-top var(--fold-time) var(--fold-ease), opacity 200ms ease;
+}
+.add-subs.is-folded .add-subs-body { height: 0; margin-top: 0; opacity: 0; }
+.add-subs-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0 10px 2px 0;
+  list-style: none;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
+.add-subs-empty { margin: 2px 0 4px; color: var(--faint); font-size: 1.3rem; }
 
-.channel-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 6px 6px 6px 10px;
-  border-radius: var(--radius-sm);
-}
-.channel-row:hover { background: var(--surface-2); }
-
-.channel-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* YouTube terminated the account: kept in the list, since its videos are still
-   in the library, but struck through in red so it stands out as gone. */
-.channel-name.is-terminated {
-  text-decoration: line-through;
-  color: var(--danger);
-}
-
-.channel-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+/* A row, and the row opened: raised, its picture larger, its name bold over
+   a second line, and its panel unfolding underneath. */
+.add-ch {
   flex: none;
+  border-radius: 10px;
+  transition:
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    margin var(--fold-time) var(--fold-ease);
 }
-
-/* A glyph a row has no use for, kept as an empty slot so the others still
-   line up down the column. */
-.channel-row .icon-btn.is-placeholder { visibility: hidden; }
-
-/* A row of glyphs, no words: the list is a scroll box, so a row that
-   wore three labelled buttons would show half the channels a row of circles
-   does. The star among them IS the membership status, read down the column. */
-.channel-row .icon-btn { width: 28px; height: 28px; }
-.channel-row .icon { width: 15px; height: 15px; }
-
-/* The inline "Remove and delete its videos?" row inside a channel list entry.
-   Named apart from .modal.confirm on purpose: a bare .confirm here used to
-   match the confirm modal too, laying its title, body and buttons out as three
-   centred columns. */
-.inline-confirm { display: flex; align-items: center; gap: 6px; }
-.inline-confirm-text { font-size: 1.25rem; color: var(--muted); white-space: nowrap; }
-
-/* "Turn auto-download on" asks how far back to reach, as a panel under its own
-   row rather than a second modal: the choice is about that one channel, and
-   the row above it says which. The row and panel read as one raised unit. */
-.channel-row.has-prompt {
-  flex-wrap: wrap;
-  row-gap: 10px;
-  margin: 4px 0;
-  padding-bottom: 12px;
+.add-ch:hover:not(.is-open) { background: var(--surface-2); }
+.add-ch.is-open {
+  margin: 6px 0;
   background: var(--surface-2);
   box-shadow: inset 0 0 0 1px var(--line);
 }
+.add-ch-head {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: padding var(--fold-time) var(--fold-ease);
+}
+/* Inset: the list clips anything drawn outside its rows. */
+.add-ch-head:focus-visible { outline-offset: -2px; border-radius: 10px; }
+.add-ch.is-open .add-ch-head { padding: 10px 10px 8px; }
+
+.add-pic {
+  flex: none;
+  display: block;
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--card);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
+  transition: width var(--fold-time) var(--fold-ease), height var(--fold-time) var(--fold-ease),
+    font-size var(--fold-time) var(--fold-ease);
+}
+/* The stand-in: initials on a disc whose hue comes from the name. In px, like
+   the picture it stands in for -- a glyph in a circle of fixed size. */
+.add-pic.is-initials {
+  display: grid;
+  place-items: center;
+  box-shadow: none;
+  background: linear-gradient(145deg, hsl(var(--hue) 42% 34%), hsl(calc(var(--hue) + 30) 40% 22%));
+  color: hsl(var(--hue) 80% 88%);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  user-select: none;
+}
+.add-ch.is-open .add-pic { width: 40px; height: 40px; font-size: 15px; }
+
+.add-ch-who { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.add-ch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-ch.is-open .add-ch-name { font-weight: 600; }
+/* YouTube terminated the account: kept, since its videos are still in the
+   library, but struck through in red so it stands out as gone. */
+.add-ch.is-terminated .add-ch-name { text-decoration: line-through; color: var(--danger); }
+.add-ch-sub {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  color: var(--faint);
+  font-size: 1.2rem;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: max-height var(--fold-time) var(--fold-ease), opacity 200ms ease;
+}
+.add-ch.is-open .add-ch-sub { max-height: 1.6rem; opacity: 1; }
+.add-ch-flag { flex: none; display: inline-flex; }
+.add-ch-flag .icon { width: 15px; height: 15px; }
+.add-ch-flag.is-member { color: var(--add-star); }
+.add-ch-flag.is-auto { color: var(--ok); }
+.add-ch-count {
+  flex: none;
+  color: var(--faint);
+  font-size: 1.25rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.add-ch-count b { font-weight: 600; }
+.add-ch-count b.is-some { color: var(--ok); }
+.add-ch-count-glyph { display: inline-block; margin-left: 3px; vertical-align: -2px; }
+.add-ch-count-glyph .icon { width: 13px; height: 13px; }
+.add-ch-caret { flex: none; display: inline-flex; color: var(--faint); transition: transform 200ms var(--fold-ease); }
+.add-ch-caret .icon { width: 14px; height: 14px; }
+.add-ch.is-open .add-ch-caret { transform: rotate(180deg); }
+
+.add-ch-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--fold-time) var(--fold-ease);
+}
+.add-ch.is-open .add-ch-panel { grid-template-rows: 1fr; }
+.add-ch-clip { min-height: 0; overflow: hidden; }
+/* A named container: the tiles and facts drop from four columns to two once
+   the panel is too narrow for "LATEST UPLOAD" -- words, so in rem. */
+.add-ch-panel-in { padding: 2px 12px 12px; container: add-panel / inline-size; }
+
+/* "Two tiers": four counts as tiles, and four facts in the same columns
+   under a dashed rule (a subgrid, so the two rows line up exactly). */
+.add-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.add-tile {
+  min-width: 0;
+  padding: 8px 11px;
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+}
+.add-tile b {
+  display: block;
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.add-tile span {
+  display: block;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 1.15rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.add-tile.is-ok b { color: var(--ok); }
+.add-tile.is-accent b { color: var(--add-accent-text); }
+.add-facts {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: subgrid;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--line);
+}
+.add-fact {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 9px;
+  align-items: start;
+  padding: 8px 10px;
+}
+.add-fact-glyph { grid-row: span 2; display: flex; margin-top: 2px; color: var(--faint); }
+.add-fact-glyph .icon { width: 16px; height: 16px; }
+.add-fact-label,
+.add-fact-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-fact-label {
+  color: var(--faint);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+.add-fact-value { font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+
+.add-ch-note { margin: 8px 2px 0; color: var(--muted); font-size: 1.25rem; }
+.add-ch-actions,
+.add-ch-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+}
+.add-ch-remove { margin-left: auto; }
+/* The question takes the actions' place at the actions' height, so the
+   panel does not jump when it is asked. */
+.add-ch-confirm { gap: 6px 12px; animation: add-swap-in 160ms var(--fold-ease); }
+.add-ch-confirm-text {
+  flex: 1 1 22rem;
+  min-width: 0;
+  margin: 0;
+  color: var(--add-danger-text);
+  font-size: 1.3rem;
+}
+.add-ch-confirm-text b { font-weight: 600; }
+.add-ch-confirm-buttons { display: flex; gap: 6px; margin-left: auto; }
+
+@container add-panel (max-width: 54rem) {
+  .add-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* Narrower than the mockup's 65rem: a smaller thumbnail leaves the title its
+   two lines, and Import gives up its word (its name stays, for a screen
+   reader) before the filter box is squeezed. */
+@container add-dialog (max-width: 52rem) {
+  .add-thumb, .add-stack { width: 150px; }
+}
+@container add-dialog (max-width: 42rem) {
+  .add-thumb, .add-stack { width: 112px; }
+  .add-pv-top { gap: 12px; }
+  .add-import-label {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .add-import { padding-left: 9px; padding-right: 9px; }
+  .add-part { grid-template-columns: 15px 56px minmax(0, 1fr) auto; }
+  .add-part-thumb { width: 56px; }
+  .add-part .add-tag { display: none; }
+}
+
+/* "Turn auto-download on" asks how far back to reach, as a panel inside the
+   opened channel rather than a second modal: the choice is about that one
+   channel, and the panel around it says which. */
 .auto-dl-prompt {
-  flex: 1 0 100%;
   display: flex;
   flex-direction: column;
   gap: 12px;
+  margin-top: 12px;
   padding: 14px;
-  margin-right: 4px;
   background: var(--bg);
   border: 1px solid var(--line-soft);
   border-radius: 10px;
@@ -1762,7 +2368,8 @@ label.field-label { display: block; }
 /* The two answers as cards: the whole card is the target, and the selected one
    carries the accent in its frame, its tint and its radio. */
 .auto-dl-scope { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-@media (max-width: 520px) { .auto-dl-scope { grid-template-columns: 1fr; } }
+/* Side by side while the panel has room for both answers' words. */
+@container add-panel (max-width: 44rem) { .auto-dl-scope { grid-template-columns: 1fr; } }
 .auto-dl-opt {
   position: relative;
   display: flex;

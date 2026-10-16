@@ -57,6 +57,7 @@ vi.mock("./api", () => {
       openExternal: (url: string) => openExternal(url),
       appVersionInfo: () => appVersionInfo(),
       syncNudge: () => syncNudge(),
+      subscriptionStats: () => Promise.resolve([]),
       saveSettings: () => Promise.resolve(),
       syncStatus: unanswered,
       detectBrowsers: unanswered,
@@ -74,6 +75,7 @@ function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
+    subs_folded: false,
     ...over,
   };
 }
@@ -337,6 +339,30 @@ describe("the default grouping", () => {
 
     await pause(500);
     expect(saveViewState).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The Add dialog's subscription list folds away, and the shell remembers it
+ * with the rest of the view -- which is what brings it back folded on the next
+ * launch.
+ */
+describe("the Add dialog's folded list", () => {
+  it("opens the dialog folded when it was left folded", async () => {
+    settings = settingsWith({ subs_folded: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await act(async () => { fireEvent.click(button("Add")); });
+    expect(button("Subscriptions 0").getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("writes the fold into the saved view", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await act(async () => { fireEvent.click(button("Add")); });
+    fireEvent.click(button("Subscriptions 0"));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView({ subs_folded: true }));
   });
 });
 

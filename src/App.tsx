@@ -35,12 +35,12 @@ export default function App() {
 function buildViewState(
   channelIds: string[], search: string, hideWatched: boolean,
   downloadedOnly: boolean, showHidden: boolean, grouped: boolean, groupsOnly: boolean,
-  inProgress: boolean, sort: SortOrder,
+  inProgress: boolean, sort: SortOrder, subsFolded: boolean,
 ): ViewState {
   return {
     channel_ids: channelIds, search,
     hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
-    grouped, groups_only: groupsOnly, in_progress: inProgress, sort,
+    grouped, groups_only: groupsOnly, in_progress: inProgress, sort, subs_folded: subsFolded,
   };
 }
 
@@ -83,6 +83,9 @@ function Shell() {
   const [tally, setTally] = useState<SeriesTally | null>(null);
   const [polling, setPolling] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  // The Add dialog's subscription list, folded away. Not a filter, but
+  // remembered with them: it is how this machine's user left the dialog.
+  const [subsFolded, setSubsFolded] = useState(false);
   // Every bump forces the mounted views to refetch.
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -274,6 +277,12 @@ function Shell() {
     },
   });
 
+  // Stable, since the Add dialog recounts its list whenever this changes.
+  const onAddChanged = useCallback(() => {
+    void loadChannels();
+    reload();
+  }, [loadChannels, reload]);
+
   const refresh = useCallback(async () => {
     if (polling) return;
     setPolling(true);
@@ -328,10 +337,13 @@ function Shell() {
         setGroupsOnly(v.groups_only);
         setInProgress(v.in_progress);
         setSort(v.sort);
+        // `=== true`: a view saved by an older build has no key at all.
+        const folded = v.subs_folded === true;
+        setSubsFolded(folded);
         persistedView.current = JSON.stringify(
           buildViewState(
             restored, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
-            v.groups_only, v.in_progress, v.sort,
+            v.groups_only, v.in_progress, v.sort, folded,
           ),
         );
       })
@@ -345,7 +357,7 @@ function Shell() {
         persistedView.current = JSON.stringify(
           buildViewState(
             channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-            inProgress, sort,
+            inProgress, sort, subsFolded,
           ),
         );
       })
@@ -370,12 +382,12 @@ function Shell() {
 
   // Debounced like saveCardSize, but there is no explicit call site for a
   // filter change -- every setter above is reachable straight from TopNav --
-  // so this watches the nine values instead of wrapping each setter.
+  // so this watches the ten values instead of wrapping each setter.
   useEffect(() => {
     if (!hydrated) return;
     const view = buildViewState(
       channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, sort,
+      inProgress, sort, subsFolded,
     );
     const serialised = JSON.stringify(view);
     if (serialised === persistedView.current) return;
@@ -386,7 +398,7 @@ function Shell() {
     }, 400);
     return () => window.clearTimeout(t);
   }, [hydrated, channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, sort]);
+      inProgress, sort, subsFolded]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
   // rendering before the saved view lands would spend a query on the
@@ -459,10 +471,9 @@ function Shell() {
         open={addOpen}
         onClose={() => setAddOpen(false)}
         channels={channels}
-        onChanged={() => {
-          void loadChannels();
-          reload();
-        }}
+        onChanged={onAddChanged}
+        subsFolded={subsFolded}
+        onSubsFolded={setSubsFolded}
       />
     </div>
   );

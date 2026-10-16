@@ -6,27 +6,60 @@ import {
 } from "../quality";
 import type { Quality, Video, VideoFormats } from "../types";
 
-interface Props {
-  video: Video;
-  /** Called once the download is queued, so the card can show it at once. */
-  onQueued: (video: Video) => void;
-  onClose: () => void;
+/** Several videos downloaded one way: a playlist's ticked parts. */
+export interface Batch {
+  ids: string[];
+  /** What they are, for the line under the heading: the playlist's title. */
+  title: string;
 }
+
+type Props = { onClose: () => void } & (
+  | {
+    video: Video;
+    /** Called once the download is queued, so the card can show it at once. */
+    onQueued: (video: Video) => void;
+    batch?: never;
+  }
+  | {
+    batch: Batch;
+    /** Called with how many of the batch were queued. */
+    onBatchQueued: (queued: number) => void;
+    video?: never;
+  }
+);
 
 type Stage =
   | { kind: "loading" }
   | { kind: "exact"; formats: VideoFormats; pick: ExactPick }
-  /** The probe failed: the preferences form, seeded from Settings, with why. */
-  | { kind: "generic"; error: string; quality: Quality };
+  /** The probe failed, or there is no one video to probe: the preferences
+   *  form, seeded from Settings. `error` says why, when there was a failure. */
+  | { kind: "generic"; error: string | null; quality: Quality };
+
+/** Settings' quality, or the built-in default when it cannot be read. */
+function settingsQuality(): Promise<Quality> {
+  return api.getSettings()
+    .then((s) => sanitizeQuality(s.quality))
+    .catch(() => ({ ...DEFAULT_QUALITY }));
+}
 
 /**
- * Download (custom)…: one video, downloaded some other way than Settings says.
- * It asks yt-dlp what the video really has and offers only that, starting on
- * what the Settings default would have picked. When the probe fails — no
- * network, a members-only video with no cookies — the generic form stands in,
- * so a custom download is still possible, just by preference rather than id.
+ * Download (custom)…: downloaded some other way than Settings says.
+ *
+ * For one video it asks yt-dlp what the video really has and offers only that,
+ * starting on what the Settings default would have picked. When the probe
+ * fails — no network, a members-only video with no cookies — the generic form
+ * stands in, so a custom download is still possible, just by preference
+ * rather than id.
+ *
+ * For a batch (a playlist's parts) there is no probe at all: exact format ids
+ * differ from video to video, so one set of them could only fit one. The
+ * generic form is the whole dialog, and the one quality it makes is stored
+ * on every part as its override.
  */
-export default function CustomDownloadDialog({ video, onQueued, onClose }: Props) {
+export default function CustomDownloadDialog(props: Props) {
+  const { onClose } = props;
+  const batch = props.batch ?? null;
+  const video = props.video ?? null;
   const [stage, setStage] = useState<Stage>({ kind: "loading" });
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -38,14 +71,17 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
     return () => { mounted.current = false; };
   }, []);
 
+  const videoId = video?.id ?? null;
   useEffect(() => {
     let alive = true;
     // Asked alongside the probe rather than after it: the exact form takes its
     // mode and post-processing from Settings, and the fallback all of it.
-    const base = api.getSettings()
-      .then((s) => sanitizeQuality(s.quality))
-      .catch(() => ({ ...DEFAULT_QUALITY }));
-    api.probeFormats(video.id).then(
+    const base = settingsQuality();
+    if (videoId === null) {
+      base.then((q) => { if (alive) setStage({ kind: "generic", error: null, quality: q }); });
+      return () => { alive = false; };
+    }
+    api.probeFormats(videoId).then(
       async (formats) => {
         const q = await base;
         if (alive) setStage({ kind: "exact", formats, pick: initialPick(formats, q) });
@@ -56,7 +92,7 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
       },
     );
     return () => { alive = false; };
-  }, [video.id]);
+  }, [videoId]);
 
   const cancel = useCallback(() => {
     if (!submitting) onClose();
@@ -80,9 +116,13 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
     setSubmitting(true);
     setSubmitError(null);
     try {
-      await api.enqueueDownload(video.id, quality);
       // Queued is queued whether or not the dialog is still up to see it.
-      onQueued(video);
+      if (props.batch) {
+        props.onBatchQueued(await api.enqueueDownloads(props.batch.ids, quality));
+      } else {
+        await api.enqueueDownload(props.video.id, quality);
+        props.onQueued(props.video);
+      }
       if (mounted.current) onClose();
     } catch (err) {
       if (!mounted.current) return;
@@ -90,6 +130,11 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
       setSubmitting(false);
     }
   }
+
+  const count = batch?.ids.length ?? 1;
+  const subject = batch
+    ? `${batch.title} · ${count} video${count === 1 ? "" : "s"}`
+    : video!.title;
 
   return (
     <div className="modal-backdrop" onMouseDown={cancel}>
@@ -102,12 +147,12 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="modal-title">Custom download</h2>
-        <p className="quality-dialog-video" title={video.title}>{video.title}</p>
+        <p className="quality-dialog-video" title={subject}>{subject}</p>
 
         {stage.kind === "loading" && (
           <div className="quality-loading">
             <span className="spinner" aria-hidden="true" />
-            Reading the formats this video has…
+            {batch ? "Reading your Settings…" : "Reading the formats this video has…"}
           </div>
         )}
 
@@ -122,11 +167,15 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
 
         {stage.kind === "generic" && (
           <>
-            <p className="tool-error quality-probe-error" role="alert">
-              Could not read this video's formats: {stage.error}
-            </p>
+            {stage.error !== null && (
+              <p className="tool-error quality-probe-error" role="alert">
+                Could not read this video's formats: {stage.error}
+              </p>
+            )}
             <p className="field-hint quality-note">
-              These preferences are used instead; yt-dlp picks the closest match.
+              {batch
+                ? `One quality for all ${count} videos: their formats differ, so yt-dlp picks the closest match for each.`
+                : "These preferences are used instead; yt-dlp picks the closest match."}
             </p>
             <QualityForm
               source="generic"
@@ -149,7 +198,7 @@ export default function CustomDownloadDialog({ video, onQueued, onClose }: Props
             disabled={quality === null || submitting}
             onClick={() => void download()}
           >
-            {submitting ? "Queueing…" : "Download"}
+            {submitting ? "Queueing…" : batch ? `Download ${count}` : "Download"}
           </button>
         </div>
       </div>

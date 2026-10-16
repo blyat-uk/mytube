@@ -53,6 +53,11 @@ import { ArrowUp } from "@phosphor-icons/react/dist/icons/ArrowUp";
 import { Warning } from "@phosphor-icons/react/dist/icons/Warning";
 import { TerminalWindow } from "@phosphor-icons/react/dist/icons/TerminalWindow";
 import { UploadSimple } from "@phosphor-icons/react/dist/icons/UploadSimple";
+import { Link } from "@phosphor-icons/react/dist/icons/Link";
+import { Timer } from "@phosphor-icons/react/dist/icons/Timer";
+import { CalendarBlank } from "@phosphor-icons/react/dist/icons/CalendarBlank";
+import { SlidersHorizontal } from "@phosphor-icons/react/dist/icons/SlidersHorizontal";
+import { FileArrowUp } from "@phosphor-icons/react/dist/icons/FileArrowUp";
 
 /* Size comes from CSS (`.icon`), which scales with the grid zoom, so the
    components only pin the weight. */
@@ -142,3 +147,18 @@ export const IconInfo = () => <Info className="icon" weight="bold" />;
 export const IconTerminal = () => <TerminalWindow className="icon" weight="bold" />;
 export const IconExport = () => <UploadSimple className="icon" weight="bold" />;
 export const IconImport = () => <DownloadSimple className="icon" weight="bold" />;
+
+/* The Add dialog. */
+/** The paste box: what goes in it is a link. */
+export const IconLink = () => <Link className="icon" weight="bold" />;
+/** Add to the library, without downloading. */
+export const IconAdd = () => <Plus className="icon" weight="bold" />;
+/** Download (custom)…: one video, or a playlist, some other way than Settings says. */
+export const IconCustomDownload = () => <SlidersHorizontal className="icon" weight="bold" />;
+/** Import a Google Takeout subscriptions CSV. */
+export const IconImportCsv = () => <FileArrowUp className="icon" weight="bold" />;
+/* A channel's facts, each beside its small label. */
+export const IconRuntime = () => <Timer className="icon" weight="bold" />;
+export const IconLatestUpload = () => <UploadSimple className="icon" weight="bold" />;
+export const IconSubscribedSince = () => <CalendarBlank className="icon" weight="bold" />;
+export const IconLastChecked = () => <ArrowClockwise className="icon" weight="bold" />;

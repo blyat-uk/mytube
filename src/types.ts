@@ -9,7 +9,7 @@ export type DownloadState = "none" | "queued" | "downloading" | "done" | "failed
 export type SortOrder =
   "newest" | "oldest" | "channel" | "downloaded" | "parts" | "length";
 
-export type AddKind = "channel" | "video" | "short";
+export type AddKind = "channel" | "video" | "short" | "playlist";
 
 export interface Channel {
   id: string; title: string; handle: string | null; url: string;
@@ -78,6 +78,90 @@ export interface VideoFilter {
 export interface TakeoutRow {
   channelId: string; title: string; alreadySubscribed: boolean;
 }
+
+/* ------------------------------------------------------------------ *
+ * The Add dialog
+ *
+ * camelCase like every dialog payload; the `Channel` rows it lists beside
+ * them stay snake_case.
+ * ------------------------------------------------------------------ */
+
+/** One subscribed channel's share of the library (`subscription_stats`).
+ *  Counts are over its ready rows only. A channel with none still has a row,
+ *  of zeros. */
+export interface ChannelStats {
+  channelId: string;
+  videos: number;
+  /** Of those, downloaded (`download_state = done`). */
+  downloaded: number;
+  watched: number;
+  hidden: number;
+  /** Their durations added up, an unresolved one counting as zero. */
+  runtimeSecs: number;
+  /** The newest upload's `published_at`, Unix seconds. */
+  latestUpload: number | null;
+  /** From the poll's channel listing; null until a listing has said. */
+  followerCount: number | null;
+}
+
+/** What a pasted link turned out to be, read before anything is written
+ *  (`preview_add`). A channel is not fetched: it only says whether you
+ *  already follow it. */
+export type AddPreview =
+  | { kind: "channel"; subscribedId: string | null }
+  /** `playlistId` is the link's `list=`, when it carried one (never a mix). */
+  | { kind: "video"; video: VideoPreview; playlistId: string | null }
+  | { kind: "playlist"; playlist: PlaylistPreview };
+
+export interface VideoPreview {
+  id: string; title: string;
+  channelId: string; channelTitle: string;
+  durationSecs: number | null; publishedAt: number | null;
+  /** The remote `hqdefault.jpg`. */
+  thumbUrl: string;
+  /** The cached thumbnail, when the video is already in the library. */
+  thumbPath: string | null;
+  inLibrary: boolean;
+  /** `none` when it is not in the library. */
+  downloadState: DownloadState;
+  /** Best effort: false when unknown. */
+  membersOnly: boolean;
+}
+
+export interface PlaylistPreview {
+  id: string; title: string;
+  channelId: string | null; channelTitle: string | null;
+  /** How many videos YouTube says the playlist holds. */
+  total: number;
+  /** The first 500 at most, private and deleted ones left out. */
+  entries: PlaylistEntry[];
+  /** Private or deleted entries that were left out. */
+  unavailable: number;
+  /** The playlist runs past the 500 that were read. Not `total >
+   *  entries.length`: left-out private parts make that true of a playlist
+   *  read to its end. */
+  truncated: boolean;
+}
+
+/** One part of a previewed playlist. Handed back whole to `add_playlist`. */
+export interface PlaylistEntry {
+  id: string; title: string;
+  channelId: string | null; channelTitle: string | null;
+  durationSecs: number | null;
+  thumbUrl: string; thumbPath: string | null;
+  inLibrary: boolean; downloadState: DownloadState;
+  membersOnly: boolean;
+}
+
+/** What `add_playlist` did with the parts it was given, by id. */
+export interface AddPlaylistResult {
+  /** Newly in the library, in the order given. */
+  added: string[];
+  /** Already there, and left untouched. */
+  present: string[];
+  /** Refused, as MyTube refuses every Short. */
+  skippedShorts: string[];
+}
 export interface ImportProgress { done: number; total: number; current: string; }
 
 /**
@@ -89,6 +173,9 @@ export interface ViewState {
   channel_ids: string[]; search: string;
   hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
   grouped: boolean; groups_only: boolean; in_progress: boolean; sort: SortOrder;
+  /** The Add dialog's subscription list, folded away. Not a filter: it rides
+   *  in this block because it is remembered the same way, per machine. */
+  subs_folded: boolean;
 }
 
 export interface Settings {

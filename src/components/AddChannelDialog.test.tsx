@@ -1,8 +1,13 @@
+import { useState } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
-import type { Channel } from "../types";
+import {
+  render, screen, fireEvent, cleanup, waitFor, act, within,
+} from "@testing-library/react";
+import type { Channel, ChannelStats } from "../types";
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: () => Promise.resolve(null) }));
+const pickFile = vi.fn<() => Promise<string | null>>(() => Promise.resolve(null));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: () => pickFile() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
 
 const setChannelMember =
   vi.fn<(id: string, member: boolean) => Promise<number>>(() => Promise.resolve(0));
@@ -15,14 +20,18 @@ const setChannelAutoDownload =
 const autoDownloadBacklogCount =
   vi.fn<(id: string, includeWatched: boolean, includeHidden: boolean) => Promise<number>>(
     () => Promise.resolve(0));
+const subscriptionStats = vi.fn<() => Promise<ChannelStats[]>>(() => Promise.resolve([]));
 
 vi.mock("../api", () => ({
   api: {
     classifyAddInput: () => Promise.resolve("channel"),
+    previewAdd: () => Promise.resolve({ kind: "channel", subscribedId: null }),
     addChannel: () => Promise.resolve({}),
     addVideo: () => Promise.resolve({}),
     removeChannel: (id: string) => removeChannel(id),
-    previewTakeoutCsv: () => Promise.resolve([]),
+    previewTakeoutCsv: () => Promise.resolve([
+      { channelId: "UCaaaaaaaaaaaaaaaaaaaaaa", title: "Alpha", alreadySubscribed: false },
+    ]),
     importTakeoutCsv: () => Promise.resolve({ added: 0, skipped: 0, failed: [] }),
     setChannelMember: (id: string, member: boolean) => setChannelMember(id, member),
     openExternal: (url: string) => openExternal(url),
@@ -30,8 +39,10 @@ vi.mock("../api", () => ({
       setChannelAutoDownload(id, enabled, backlog),
     autoDownloadBacklogCount: (id: string, w: boolean, h: boolean) =>
       autoDownloadBacklogCount(id, w, h),
+    subscriptionStats: () => subscriptionStats(),
   },
   errText: (e: unknown) => String(e),
+  fileSrc: (path: string) => `asset://localhost${path}`,
 }));
 
 import AddChannelDialog from "./AddChannelDialog";
@@ -49,25 +60,51 @@ function channel(over: Partial<Channel>): Channel {
   return { ...c, url: c.url || `https://www.youtube.com/channel/${c.id}` };
 }
 
+function stats(channelId: string, over: Partial<ChannelStats> = {}): ChannelStats {
+  return {
+    channelId, videos: 0, downloaded: 0, watched: 0, hidden: 0, runtimeSecs: 0,
+    latestUpload: null, followerCount: null, ...over,
+  };
+}
+
 const CHANNELS = [
   channel({ id: "UC1", title: "AnimeCapped Manga", member: true }),
   channel({ id: "UC2", title: "Daily Comics", member: false }),
 ];
 
-function renderDialog(channels: Channel[] = CHANNELS) {
+/** Renders the dialog and lets its first fetch (the counts) land inside act. */
+async function renderDialog(channels: Channel[] = CHANNELS, { folded = false } = {}) {
   const onChanged = vi.fn();
-  render(
-    <ToastProvider>
-      <AddChannelDialog open onClose={vi.fn()} channels={channels} onChanged={onChanged} />
-    </ToastProvider>,
-  );
-  return { onChanged };
+  const onClose = vi.fn();
+  const onSubsFolded = vi.fn();
+  let view!: ReturnType<typeof render>;
+  await act(async () => {
+    view = render(
+      <ToastProvider>
+        <AddChannelDialog
+          open
+          onClose={onClose}
+          channels={channels}
+          onChanged={onChanged}
+          subsFolded={folded}
+          onSubsFolded={onSubsFolded}
+        />
+      </ToastProvider>,
+    );
+  });
+  return { onChanged, onClose, onSubsFolded, container: view.container };
 }
 
-/** The rows act through glyphs, so every button is found by its accessible name. */
-const rowButton = (name: string) =>
-  screen.getByRole("button", { name }) as HTMLButtonElement;
-const memberChip = (title: string) => rowButton(`Members — ${title}`);
+/** A row's header is the button that opens it, named by the channel first. */
+const rowHead = (title: string) =>
+  screen.getByRole("button", { name: new RegExp(`^${title}`) }) as HTMLButtonElement;
+const panel = (title: string) => screen.getByRole("region", { name: title });
+const inPanel = (title: string, name: string | RegExp) =>
+  within(panel(title)).getByRole("button", { name }) as HTMLButtonElement;
+function openRow(title: string) {
+  fireEvent.click(rowHead(title));
+  return panel(title);
+}
 
 // A block body, not an expression: Vitest takes a value returned from a hook as
 // a teardown callback, and returning the mock itself would have it *called*
@@ -78,26 +115,210 @@ beforeEach(() => {
   removeChannel.mockReset().mockResolvedValue(undefined);
   setChannelAutoDownload.mockReset().mockResolvedValue(0);
   autoDownloadBacklogCount.mockReset().mockResolvedValue(0);
+  subscriptionStats.mockReset().mockResolvedValue([]);
+  pickFile.mockReset().mockResolvedValue(null);
 });
 afterEach(cleanup);
+
+describe("importing a Takeout CSV", () => {
+  it("lays the checklist over the dialog, and Escape closes only the checklist", async () => {
+    pickFile.mockResolvedValue("/home/me/subscriptions.csv");
+    const { onClose } = await renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: "Import CSV" }));
+    expect(await screen.findByRole("dialog", { name: "Choose subscriptions to import" })).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Choose subscriptions to import" })).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * One row open at a time: the list stays a list, and the opened channel is
+ * the one its panel's buttons act on.
+ */
+describe("opening a channel", () => {
+  it("opens one row at a time, saying so to a screen reader", async () => {
+    await renderDialog();
+    expect(rowHead("AnimeCapped Manga").getAttribute("aria-expanded")).toBe("false");
+    openRow("AnimeCapped Manga");
+    expect(rowHead("AnimeCapped Manga").getAttribute("aria-expanded")).toBe("true");
+    openRow("Daily Comics");
+    expect(rowHead("Daily Comics").getAttribute("aria-expanded")).toBe("true");
+    expect(rowHead("AnimeCapped Manga").getAttribute("aria-expanded")).toBe("false");
+    // And the open one closes again.
+    fireEvent.click(rowHead("Daily Comics"));
+    expect(rowHead("Daily Comics").getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("counts each channel's videos on its row, and lays the rest out in its panel", async () => {
+    const day = Date.UTC(2026, 7, 30, 12) / 1000;
+    subscriptionStats.mockResolvedValue([
+      stats("UC1", {
+        videos: 334, downloaded: 19, watched: 58, hidden: 2, runtimeSecs: 980 * 3600,
+        latestUpload: null, followerCount: 83_500,
+      }),
+    ]);
+    await renderDialog([
+      channel({ id: "UC1", title: "AnimeCapped Manga", handle: "@AnimeCapped25", added_at: day }),
+    ]);
+    expect(rowHead("AnimeCapped Manga").textContent).toContain("334 videos · 19");
+    const p = openRow("AnimeCapped Manga");
+    expect(rowHead("AnimeCapped Manga").textContent).toContain("@AnimeCapped25 · 83.5K subscribers");
+    expect(p.textContent).toContain("watched · 17%");
+    expect(p.textContent).toContain("980h");
+    expect(p.textContent).toContain("30 Aug 2026");
+    // Never polled yet.
+    expect(p.textContent).toContain("Never");
+  });
+
+  it("reads a channel the counts do not mention as all zeros", async () => {
+    subscriptionStats.mockResolvedValue([stats("UC1", { videos: 3 })]);
+    await renderDialog();
+    expect(rowHead("Daily Comics").textContent).toContain("0 videos · 0");
+  });
+
+  it("leaves out the second line when neither handle nor subscriber count is known", async () => {
+    await renderDialog([channel({ id: "UC2", title: "Daily Comics" })]);
+    openRow("Daily Comics");
+    expect(rowHead("Daily Comics").querySelector(".add-ch-sub")).toBeNull();
+  });
+
+  it("counts again after a change made in the dialog", async () => {
+    await renderDialog();
+    expect(subscriptionStats).toHaveBeenCalledTimes(1);
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Join members"));
+    await waitFor(() => expect(subscriptionStats).toHaveBeenCalledTimes(2));
+  });
+});
+
+/**
+ * Channel pictures arrive with the first poll after an update, and a file can
+ * always go missing; until then a channel wears its initials.
+ */
+describe("channel pictures", () => {
+  it("shows the cached picture when there is one", async () => {
+    const { container } = await renderDialog([
+      channel({ id: "UC1", title: "AnimeCapped Manga", thumb_path: "/c/thumbs/channels/UC1.jpg" }),
+    ]);
+    const img = container.querySelector("img.add-pic") as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe("asset://localhost/c/thumbs/channels/UC1.jpg");
+  });
+
+  it("falls back to the channel's initials with no picture, or one that will not load", async () => {
+    const { container } = await renderDialog([
+      channel({ id: "UC1", title: "AnimeCapped Manga", thumb_path: "/gone.jpg" }),
+      channel({ id: "UC2", title: "100 MILLION DOLLARS RECAP" }),
+    ]);
+    expect(container.querySelector(".add-pic.is-initials")?.textContent).toBe("1M");
+    fireEvent.error(container.querySelector("img.add-pic") as HTMLImageElement);
+    const discs = [...container.querySelectorAll(".add-pic.is-initials")].map((e) => e.textContent);
+    expect(discs).toEqual(["AM", "1M"]);
+    expect(container.querySelector("img.add-pic")).toBeNull();
+  });
+});
+
+/**
+ * The list folds away, and the shell remembers how it was left: the dialog is
+ * mostly opened to paste a link.
+ */
+describe("folding the list", () => {
+  it("asks the shell to fold it, and the fold button says which way it is", async () => {
+    const { onSubsFolded } = await renderDialog();
+    const fold = screen.getByRole("button", { name: /^Subscriptions/ });
+    expect(fold.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(fold);
+    expect(onSubsFolded).toHaveBeenCalledWith(true);
+  });
+
+  it("opens folded when it was left folded, with nothing in it reachable", async () => {
+    const { container } = await renderDialog(CHANNELS, { folded: true });
+    const fold = screen.getByRole("button", { name: /^Subscriptions/ });
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".add-subs-body")?.hasAttribute("inert")).toBe(true);
+    // The filter and Import go with the list.
+    expect(container.querySelector(".add-subs-tools")?.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("goes both ways under a shell that keeps the state", async () => {
+    const remembered = vi.fn();
+    function Shell() {
+      const [folded, setFolded] = useState(false);
+      return (
+        <ToastProvider>
+          <AddChannelDialog
+            open onClose={vi.fn()} channels={CHANNELS} onChanged={vi.fn()}
+            subsFolded={folded}
+            onSubsFolded={(f) => { remembered(f); setFolded(f); }}
+          />
+        </ToastProvider>
+      );
+    }
+    await act(async () => { render(<Shell />); });
+    const fold = () => screen.getByRole("button", { name: /^Subscriptions/ });
+    fireEvent.click(fold());
+    expect(fold().getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(fold());
+    expect(fold().getAttribute("aria-expanded")).toBe("true");
+    expect(remembered.mock.calls).toEqual([[true], [false]]);
+  });
+});
+
+describe("filtering the list", () => {
+  const MANY = [
+    channel({ id: "UC1", title: "AnimeCapped Manga", handle: "@AnimeCapped25" }),
+    channel({ id: "UC2", title: "Daily Comics", handle: "@dailycomics" }),
+    channel({ id: "UC3", title: "Arashi Recap", handle: null }),
+  ];
+  const filterBox = () => screen.getByRole("textbox", { name: "Filter channels" });
+
+  it("matches the name or the handle, in any case", async () => {
+    await renderDialog(MANY);
+    fireEvent.change(filterBox(), { target: { value: "RECAP" } });
+    expect(screen.queryByRole("button", { name: /^Arashi Recap/ })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /^Daily Comics/ })).toBeNull();
+    fireEvent.change(filterBox(), { target: { value: "@anime" } });
+    expect(screen.queryByRole("button", { name: /^AnimeCapped Manga/ })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /^Arashi Recap/ })).toBeNull();
+    fireEvent.change(filterBox(), { target: { value: "nothing like it" } });
+    expect(screen.getByText("No channel matches “nothing like it”.")).toBeTruthy();
+  });
+
+  it("clears on Escape without closing the dialog, which the next Escape does", async () => {
+    const { onClose } = await renderDialog(MANY);
+    fireEvent.change(filterBox(), { target: { value: "daily" } });
+    fireEvent.keyDown(filterBox(), { key: "Escape" });
+    expect((filterBox() as HTMLInputElement).value).toBe("");
+    expect(screen.queryByRole("button", { name: /^Arashi Recap/ })).not.toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(filterBox(), { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
 
 /**
  * The subscription list is the only place that shows every channel at once,
  * which is what makes membership readable at a glance rather than one channel
- * at a time.
+ * at a time: the star rides on the row, and the panel holds the toggle.
  */
-describe("membership in the subscriptions list", () => {
-  it("lights the channels already joined and leaves the rest dark", () => {
-    renderDialog();
-    expect(memberChip("AnimeCapped Manga").getAttribute("aria-pressed")).toBe("true");
-    expect(memberChip("Daily Comics").getAttribute("aria-pressed")).toBe("false");
+describe("membership", () => {
+  it("stars the channels already joined, and the panel's toggle agrees", async () => {
+    await renderDialog();
+    expect(rowHead("AnimeCapped Manga").textContent).toContain("member");
+    expect(rowHead("Daily Comics").textContent).not.toContain("member");
+    openRow("AnimeCapped Manga");
+    expect(inPanel("AnimeCapped Manga", "Member").getAttribute("aria-pressed")).toBe("true");
+    openRow("Daily Comics");
+    expect(inPanel("Daily Comics", "Join members").getAttribute("aria-pressed")).toBe("false");
   });
 
   it("joins a channel and says how many members-only videos that found", async () => {
     setChannelMember.mockResolvedValue(35);
-    const { onChanged } = renderDialog();
-
-    fireEvent.click(memberChip("Daily Comics"));
+    const { onChanged } = await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Join members"));
 
     await waitFor(() => expect(setChannelMember).toHaveBeenCalledWith("UC2", true));
     expect(await screen.findByText(/35 members-only videos added/)).toBeTruthy();
@@ -106,34 +327,36 @@ describe("membership in the subscriptions list", () => {
   });
 
   it("leaves a channel without touching what it already collected", async () => {
-    renderDialog();
-    fireEvent.click(memberChip("AnimeCapped Manga"));
+    await renderDialog();
+    openRow("AnimeCapped Manga");
+    fireEvent.click(inPanel("AnimeCapped Manga", "Member"));
     await waitFor(() => expect(setChannelMember).toHaveBeenCalledWith("UC1", false));
     expect(await screen.findByText(/Videos already collected stay/)).toBeTruthy();
   });
 
   /**
    * Joining reads a listing hundreds of entries deep and a watch page per
-   * video it finds, so the row has to say it is working — and refuse a second
-   * click, which would run the whole pass again.
+   * video it finds, so the button has to say it is working — and refuse a
+   * second click, which would run the whole pass again.
    */
   it("says it is working, and will not run twice", async () => {
     let finish = (_n: number) => {};
     setChannelMember.mockImplementation(() => new Promise((res) => { finish = res; }));
-    renderDialog();
+    await renderDialog();
+    openRow("Daily Comics");
+    const join = () => inPanel("Daily Comics", "Join members");
 
-    fireEvent.click(memberChip("Daily Comics"));
-    await waitFor(() => expect(memberChip("Daily Comics").disabled).toBe(true));
-    // The label is a glyph now, so "working" is the spinner and aria-busy.
-    expect(memberChip("Daily Comics").getAttribute("aria-busy")).toBe("true");
-    fireEvent.click(memberChip("Daily Comics"));
+    fireEvent.click(join());
+    await waitFor(() => expect(join().disabled).toBe(true));
+    expect(join().getAttribute("aria-busy")).toBe("true");
+    fireEvent.click(join());
     expect(setChannelMember).toHaveBeenCalledTimes(1);
 
-    // The other rows stay usable: one channel's listing is not the list's.
-    expect(memberChip("AnimeCapped Manga").disabled).toBe(false);
+    // Another channel stays usable: one channel's listing is not the list's.
+    openRow("AnimeCapped Manga");
+    expect(inPanel("AnimeCapped Manga", "Member").disabled).toBe(false);
 
     finish(0);
-    await waitFor(() => expect(memberChip("Daily Comics").disabled).toBe(false));
     expect(await screen.findByText(/No members-only videos found/)).toBeTruthy();
   });
 });
@@ -142,131 +365,132 @@ describe("membership in the subscriptions list", () => {
  * This list is the only place a whole channel — rather than one of its videos —
  * is on screen, so it is where "take me to it on YouTube" belongs.
  */
-describe("channel row actions", () => {
+describe("a channel's actions", () => {
   it("opens a channel on YouTube", async () => {
-    renderDialog();
-    fireEvent.click(rowButton("Open Daily Comics on YouTube"));
+    await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Open on YouTube"));
     await waitFor(() =>
       expect(openExternal).toHaveBeenCalledWith("https://www.youtube.com/channel/UC2"));
   });
 
-  it("asks before removing, and removes only on the second click", async () => {
-    renderDialog();
-    fireEvent.click(rowButton("Remove Daily Comics"));
+  it("asks before removing, naming what goes with it, and removes only when told", async () => {
+    subscriptionStats.mockResolvedValue([stats("UC2", { videos: 207 })]);
+    const { onChanged } = await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
     expect(removeChannel).not.toHaveBeenCalled();
-    expect(screen.getByText("Remove and delete its videos?")).toBeTruthy();
+    const ask = within(panel("Daily Comics")).getByRole("group", { name: "Remove Daily Comics?" });
+    expect(ask.textContent).toContain("Remove Daily Comics and delete its 207 videos?");
+    // The question stands where the actions were.
+    expect(within(panel("Daily Comics")).queryByRole("button", { name: "Open on YouTube" })).toBeNull();
 
-    fireEvent.click(rowButton("Remove Daily Comics and delete its videos"));
+    fireEvent.click(within(ask).getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC2"));
+    expect(await screen.findByText("Removed Daily Comics and its videos.")).toBeTruthy();
+    expect(onChanged).toHaveBeenCalled();
   });
 
   it("removes once, however often the confirmation is pressed", async () => {
     let finish = () => {};
     removeChannel.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
-    renderDialog();
-    fireEvent.click(rowButton("Remove Daily Comics"));
-    const yes = rowButton("Remove Daily Comics and delete its videos");
+    await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
+    const ask = within(panel("Daily Comics")).getByRole("group");
+    const yes = within(ask).getByRole("button", { name: "Remove" }) as HTMLButtonElement;
     fireEvent.click(yes);
     fireEvent.click(yes);
     expect(removeChannel).toHaveBeenCalledTimes(1);
     expect(yes.disabled).toBe(true);
     expect(yes.getAttribute("aria-busy")).toBe("true");
     // Too late to keep it once the removal is out.
-    expect(rowButton("Keep Daily Comics").disabled).toBe(true);
+    expect((within(ask).getByRole("button", { name: "Keep" }) as HTMLButtonElement).disabled)
+      .toBe(true);
 
     await act(async () => { finish(); });
-    await waitFor(() => expect(screen.queryByText("Remove and delete its videos?")).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("group", { name: "Remove Daily Comics?" })).toBeNull());
   });
 
-  it("backs out of the confirmation without removing anything", () => {
-    renderDialog();
-    fireEvent.click(rowButton("Remove Daily Comics"));
-    fireEvent.click(rowButton("Keep Daily Comics"));
+  it("backs out of the confirmation without removing anything", async () => {
+    await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
+    fireEvent.click(inPanel("Daily Comics", "Keep"));
     expect(removeChannel).not.toHaveBeenCalled();
-    expect(screen.queryByText("Remove and delete its videos?")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Remove Daily Comics?" })).toBeNull();
+    expect(inPanel("Daily Comics", "Open on YouTube")).toBeTruthy();
   });
 });
 
 /**
  * A channel whose account YouTube terminated stays listed — its videos are
- * still in the library — but there is nothing left to do with it except look.
+ * still in the library — but there is nothing left to do with it except look,
+ * open it and remove it.
  */
 describe("a terminated channel", () => {
   const gone = channel({ id: "UC3", title: "Free manhwa", terminated: true });
 
-  it("is struck through, and says why to a screen reader", () => {
-    renderDialog([gone]);
-    const name = screen.getByText(/Free manhwa/, { selector: ".channel-name" });
-    expect(name.classList.contains("is-terminated")).toBe(true);
-    expect(name.textContent).toContain("terminated by YouTube");
+  it("is struck through, and says why to a screen reader", async () => {
+    const { container } = await renderDialog([gone]);
+    expect(container.querySelector(".add-ch")?.classList.contains("is-terminated")).toBe(true);
+    expect(rowHead("Free manhwa").textContent).toContain("terminated by YouTube");
   });
 
-  it("can still be opened on YouTube", async () => {
-    renderDialog([gone]);
-    fireEvent.click(rowButton("Open Free manhwa on YouTube"));
+  it("offers only Open and Remove, and says its videos stay", async () => {
+    await renderDialog([gone]);
+    const p = openRow("Free manhwa");
+    const names = within(p).getAllByRole("button").map((b) => b.textContent);
+    expect(names).toEqual(["Open on YouTube", "Remove"]);
+    expect(p.textContent).toContain("YouTube has terminated this account");
+    expect(p.textContent).toContain("stay in your library");
+  });
+
+  it("can still be opened on YouTube, and removed after asking", async () => {
+    await renderDialog([gone]);
+    openRow("Free manhwa");
+    fireEvent.click(inPanel("Free manhwa", "Open on YouTube"));
     await waitFor(() =>
       expect(openExternal).toHaveBeenCalledWith("https://www.youtube.com/channel/UC3"));
-  });
-
-  it("can be removed, still asking first", async () => {
-    renderDialog([gone]);
-    fireEvent.click(rowButton("Remove Free manhwa"));
+    fireEvent.click(inPanel("Free manhwa", "Remove"));
     expect(removeChannel).not.toHaveBeenCalled();
-    fireEvent.click(rowButton("Remove Free manhwa and delete its videos"));
+    fireEvent.click(within(screen.getByRole("group", { name: "Remove Free manhwa?" }))
+      .getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC3"));
   });
 
-  it("hides the members toggle but keeps its slot, so the glyphs still line up", () => {
-    const { container } = render(
-      <ToastProvider>
-        <AddChannelDialog open onClose={vi.fn()} channels={[gone]} onChanged={vi.fn()} />
-      </ToastProvider>,
-    );
-    expect(screen.queryByRole("button", { name: "Members — Free manhwa" })).toBeNull();
-    const slot = container.querySelector(".channel-actions .is-placeholder") as HTMLButtonElement;
-    expect(slot).not.toBeNull();
-    expect(slot.disabled).toBe(true);
-    expect(slot.tabIndex).toBe(-1);
-    expect(container.querySelectorAll(".channel-actions .icon-btn")).toHaveLength(4);
-  });
-
-  it("hides the auto-download toggle too, keeping its slot", () => {
-    const { container } = render(
-      <ToastProvider>
-        <AddChannelDialog open onClose={vi.fn()} channels={[gone]} onChanged={vi.fn()} />
-      </ToastProvider>,
-    );
-    expect(screen.queryByRole("button", { name: "Auto-download — Free manhwa" })).toBeNull();
-    expect(container.querySelectorAll(".channel-actions .is-placeholder")).toHaveLength(2);
-  });
-
-  it("leaves a live channel's row alone", () => {
-    renderDialog([channel({ id: "UC2", title: "Daily Comics" })]);
-    expect(screen.getByText("Daily Comics").classList.contains("is-terminated")).toBe(false);
-    expect(rowButton("Remove Daily Comics").disabled).toBe(false);
+  it("leaves a live channel's row alone", async () => {
+    const { container } = await renderDialog([channel({ id: "UC2", title: "Daily Comics" })]);
+    expect(container.querySelector(".add-ch")?.classList.contains("is-terminated")).toBe(false);
   });
 });
 
 /**
  * Auto-download is opt-in per channel. Off is immediate and removes nothing;
- * on asks once whether the backlog already in the library comes too.
+ * on asks once, inside the panel, whether the backlog already in the library
+ * comes too.
  */
-describe("auto-download in the subscriptions list", () => {
-  const autoChip = (title: string) => rowButton(`Auto-download — ${title}`);
+describe("auto-download", () => {
   const AUTO = [
     channel({ id: "UC1", title: "AnimeCapped Manga", auto_download: true }),
     channel({ id: "UC2", title: "Daily Comics", auto_download: false }),
   ];
+  const autoToggle = (title: string) => inPanel(title, "Auto-download");
 
-  it("shows which channels download on their own, naming each one", () => {
-    renderDialog(AUTO);
-    expect(autoChip("AnimeCapped Manga").getAttribute("aria-pressed")).toBe("true");
-    expect(autoChip("Daily Comics").getAttribute("aria-pressed")).toBe("false");
+  it("marks the channels that download on their own, on the row and in the panel", async () => {
+    await renderDialog(AUTO);
+    expect(rowHead("AnimeCapped Manga").textContent).toContain("auto-download on");
+    expect(rowHead("Daily Comics").textContent).not.toContain("auto-download on");
+    openRow("AnimeCapped Manga");
+    expect(autoToggle("AnimeCapped Manga").getAttribute("aria-pressed")).toBe("true");
+    openRow("Daily Comics");
+    expect(autoToggle("Daily Comics").getAttribute("aria-pressed")).toBe("false");
   });
 
   it("turns off at once, with no prompt and no backlog", async () => {
-    const { onChanged } = renderDialog(AUTO);
-    fireEvent.click(autoChip("AnimeCapped Manga"));
+    const { onChanged } = await renderDialog(AUTO);
+    openRow("AnimeCapped Manga");
+    fireEvent.click(autoToggle("AnimeCapped Manga"));
     await waitFor(() =>
       expect(setChannelAutoDownload).toHaveBeenCalledWith("UC1", false, null));
     expect(screen.queryByRole("radiogroup")).toBeNull();
@@ -274,20 +498,22 @@ describe("auto-download in the subscriptions list", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
-  it("asks before turning on, and does nothing until confirmed", () => {
-    renderDialog(AUTO);
-    fireEvent.click(autoChip("Daily Comics"));
+  it("asks before turning on, inside the panel, and does nothing until confirmed", async () => {
+    await renderDialog(AUTO);
+    const p = openRow("Daily Comics");
+    fireEvent.click(autoToggle("Daily Comics"));
     expect(setChannelAutoDownload).not.toHaveBeenCalled();
-    expect(screen.getByText("Auto-download Daily Comics")).toBeTruthy();
-    const now = screen.getByRole("radio", { name: "From now on" }) as HTMLInputElement;
+    expect(within(p).getByText("Auto-download Daily Comics")).toBeTruthy();
+    const now = within(p).getByRole("radio", { name: "From now on" }) as HTMLInputElement;
     expect(now.checked).toBe(true);
     // The count is only worth asking for once the backlog is in play.
     expect(autoDownloadBacklogCount).not.toHaveBeenCalled();
   });
 
   it("turns on from now on without a backlog", async () => {
-    const { onChanged } = renderDialog(AUTO);
-    fireEvent.click(autoChip("Daily Comics"));
+    const { onChanged } = await renderDialog(AUTO);
+    openRow("Daily Comics");
+    fireEvent.click(autoToggle("Daily Comics"));
     fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
     await waitFor(() =>
       expect(setChannelAutoDownload).toHaveBeenCalledWith("UC2", true, null));
@@ -300,8 +526,9 @@ describe("auto-download in the subscriptions list", () => {
     autoDownloadBacklogCount.mockImplementation((_id, w, h) =>
       Promise.resolve(27 + (w ? 10 : 0) + (h ? 100 : 0)));
     setChannelAutoDownload.mockResolvedValue(37);
-    renderDialog(AUTO);
-    fireEvent.click(autoChip("Daily Comics"));
+    await renderDialog(AUTO);
+    openRow("Daily Comics");
+    fireEvent.click(autoToggle("Daily Comics"));
     fireEvent.click(screen.getByRole("radio", { name: "Everything so far as well" }));
 
     await waitFor(() =>
@@ -330,8 +557,9 @@ describe("auto-download in the subscriptions list", () => {
   it("keeps the newest count when an older one lands late", async () => {
     const pending: Array<(n: number) => void> = [];
     autoDownloadBacklogCount.mockImplementation(() => new Promise((res) => { pending.push(res); }));
-    renderDialog(AUTO);
-    fireEvent.click(autoChip("Daily Comics"));
+    await renderDialog(AUTO);
+    openRow("Daily Comics");
+    fireEvent.click(autoToggle("Daily Comics"));
     fireEvent.click(screen.getByRole("radio", { name: "Everything so far as well" }));
     await waitFor(() => expect(pending).toHaveLength(1));
     fireEvent.click(screen.getByRole("checkbox", { name: "Include watched" }));
@@ -345,8 +573,9 @@ describe("auto-download in the subscriptions list", () => {
 
   it("with nothing to fetch, still reads plain Turn on", async () => {
     autoDownloadBacklogCount.mockResolvedValue(0);
-    renderDialog(AUTO);
-    fireEvent.click(autoChip("Daily Comics"));
+    await renderDialog(AUTO);
+    openRow("Daily Comics");
+    fireEvent.click(autoToggle("Daily Comics"));
     fireEvent.click(screen.getByRole("radio", { name: "Everything so far as well" }));
     await waitFor(() => expect(autoDownloadBacklogCount).toHaveBeenCalled());
     fireEvent.click(await screen.findByRole("button", { name: "Turn on" }));
@@ -355,25 +584,31 @@ describe("auto-download in the subscriptions list", () => {
         "UC2", true, { includeWatched: false, includeHidden: false }));
   });
 
-  it("cancels without calling anything", () => {
-    renderDialog(AUTO);
-    fireEvent.click(autoChip("Daily Comics"));
+  it("cancels without calling anything, and Escape backs out of the prompt only", async () => {
+    const { onClose } = await renderDialog(AUTO);
+    openRow("Daily Comics");
+    fireEvent.click(autoToggle("Daily Comics"));
     fireEvent.click(screen.getByRole("button", { name: "Cancel auto-download for Daily Comics" }));
     expect(setChannelAutoDownload).not.toHaveBeenCalled();
     expect(screen.queryByRole("radiogroup")).toBeNull();
+
+    fireEvent.click(autoToggle("Daily Comics"));
+    fireEvent.keyDown(screen.getByRole("radio", { name: "From now on" }), { key: "Escape" });
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("says it is working, and will not run twice", async () => {
     let finish = (_n: number) => {};
     setChannelAutoDownload.mockImplementation(() => new Promise((res) => { finish = res; }));
-    renderDialog(AUTO);
-    fireEvent.click(autoChip("AnimeCapped Manga"));
-    await waitFor(() => expect(autoChip("AnimeCapped Manga").disabled).toBe(true));
-    expect(autoChip("AnimeCapped Manga").getAttribute("aria-busy")).toBe("true");
-    fireEvent.click(autoChip("AnimeCapped Manga"));
+    await renderDialog(AUTO);
+    openRow("AnimeCapped Manga");
+    fireEvent.click(autoToggle("AnimeCapped Manga"));
+    await waitFor(() => expect(autoToggle("AnimeCapped Manga").disabled).toBe(true));
+    expect(autoToggle("AnimeCapped Manga").getAttribute("aria-busy")).toBe("true");
+    fireEvent.click(autoToggle("AnimeCapped Manga"));
     expect(setChannelAutoDownload).toHaveBeenCalledTimes(1);
-    expect(autoChip("Daily Comics").disabled).toBe(false);
     finish(0);
-    await waitFor(() => expect(autoChip("AnimeCapped Manga").disabled).toBe(false));
+    await waitFor(() => expect(autoToggle("AnimeCapped Manga").disabled).toBe(false));
   });
 });
