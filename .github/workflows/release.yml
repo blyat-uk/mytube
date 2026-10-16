@@ -1,12 +1,14 @@
 name: Release
 
-# A v* tag builds the three bundles, smoke-tests each on its own OS and
-# publishes a GitHub Release with them. The smoke test is the real first-run
+# A v* tag runs the test suites, builds the three bundles, smoke-tests each on
+# its own OS and publishes a GitHub Release with them -- only once every test
+# and every smoke test has passed. There is no other CI: nothing runs on an
+# ordinary push. The smoke test is the real first-run
 # path: `mytube --self-test` downloads yt-dlp, ffmpeg and deno fresh from their
 # publishers into an empty directory, verifies each checksum, runs each one and
 # checks yt-dlp sees deno as a JS runtime — the only place the per-OS source
 # table is proven on a real machine. A manual run, or a push to the
-# `release-check` branch, builds and tests without releasing -- the branch is
+# `release-check` branch, tests and builds without releasing -- the branch is
 # for checking a release build from a machine with no `gh` to dispatch with.
 
 on:
@@ -50,6 +52,112 @@ jobs:
           fi
           echo "version=$tauri" >> "$GITHUB_OUTPUT"
 
+  # The frontend and backend suites on the three OSes MyTube ships for. They
+  # run beside the builds rather than before them, so testing adds no time to
+  # a release; publishing waits for both.
+  test:
+    name: Test (${{ matrix.os_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tests only, so the glibc floor does not matter here: unlike the
+          # Linux build, this runs on the runner itself, not in ubuntu:22.04.
+          - runner: ubuntu-24.04
+            os_name: linux
+          - runner: windows-latest
+            os_name: windows
+          - runner: macos-latest      # Apple Silicon
+            os_name: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      # The Windows image checks out with autocrlf=true, which would rewrite the
+      # RSS fixtures `include_str!` embeds byte for byte.
+      - name: Keep line endings as committed
+        if: matrix.os_name == 'windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      # Tauri's Debian prerequisites, minus libayatana-appindicator3-dev: the
+      # Linux tray speaks StatusNotifierItem itself (ksni) and links no
+      # appindicator library.
+      - name: Linux build dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev librsvg2-dev patchelf
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend tests
+        run: bun run test
+
+      # Also makes dist/, which `tauri::generate_context!` needs to exist
+      # before the Rust half will compile.
+      - name: Frontend type-check and build
+        run: bun run build
+
+      - name: Backend tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --manifest-path src-tauri/Cargo.toml 2>&1 | tee cargo-test.log
+
+      # Job logs need a signed-in viewer; annotations do not. Each failing
+      # test's name and output becomes one, so a red run can be read from the
+      # API or the run's summary page by anyone.
+      - name: Report failing tests
+        if: failure()
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" - <<'PY'
+          import re
+          text = open("cargo-test.log", encoding="utf-8", errors="replace").read().replace("\r\n", "\n")
+          blocks = re.findall(r"^---- (\S+) stdout ----\n(.*?)(?=^---- |^failures:|\Z)", text, re.S | re.M)
+          if not blocks:
+              blocks = [("cargo test", text[-4000:])]
+          for name, body in blocks[:20]:
+              body = body.strip()[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title={name.replace('::', '.')}::{body}")
+          PY
+
+  # The Cloudflare Worker in sync-server/ is its own bun project. Its tests run
+  # in workerd, which is the same on every OS, so Linux alone is enough.
+  sync-server:
+    name: Sync server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sync-server
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bun run typecheck
+
+      - name: Tests
+        run: bun run test
+
   build:
     name: Build (${{ matrix.os_name }})
     needs: version
@@ -91,7 +199,8 @@ jobs:
       # bundler sets it for linuxdeploy too; this covers anything it spawns.
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
-      # Same reason as ci.yml: the RSS fixtures are embedded byte for byte.
+      # Same reason as in the test job: the RSS fixtures are embedded byte for
+      # byte.
       - name: Keep line endings as committed
         if: matrix.os_name == 'windows'
         run: git config --global core.autocrlf false
@@ -314,7 +423,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: [version, build]
+    needs: [version, test, sync-server, build]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

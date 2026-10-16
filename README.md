@@ -7,7 +7,6 @@
 **Website: [mytube.blyat.uk](https://mytube.blyat.uk/)**
 
 [![Latest release](https://img.shields.io/github/v/release/blyat-uk/mytube?label=release&color=2563eb)](https://github.com/blyat-uk/mytube/releases/latest)
-[![CI](https://github.com/blyat-uk/mytube/actions/workflows/ci.yml/badge.svg)](https://github.com/blyat-uk/mytube/actions/workflows/ci.yml)
 ![Windows · macOS · Linux](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-555)
 [![MIT](https://img.shields.io/github/license/blyat-uk/mytube?color=555)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-wiki-2563eb)](https://github.com/blyat-uk/mytube/wiki)
