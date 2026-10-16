@@ -151,111 +151,50 @@ pub async fn subscription_stats(state: State<'_, Arc<AppState>>) -> R<Vec<Channe
     db_blocking(&state, |db| db.subscription_stats()).await
 }
 
-/// Tells the UI whether the Add box holds a channel, a video, or a rejected Short.
+/// Tells the UI whether the Add box holds a channel, a video, a playlist, or
+/// a rejected Short. A mix is an error, worded for under the input.
 #[tauri::command]
 pub fn classify_add_input(input: String) -> R<AddKind> {
     match resolve::parse_add_input(&input).map_err(e)? {
         resolve::AddTarget::Channel(_) => Ok(AddKind::Channel),
         resolve::AddTarget::Video(_) => Ok(AddKind::Video),
         resolve::AddTarget::Short(_) => Ok(AddKind::Short),
+        resolve::AddTarget::Playlist(_) => Ok(AddKind::Playlist),
     }
 }
 
-/// Adds one video without subscribing, then downloads it immediately.
-/// It sorts to the top of the grid by `sort_at`, while its card still shows
-/// the real upload date.
+/// Adds one video to the library without subscribing -- and without
+/// downloading it: the Add box's Download is this followed by
+/// `enqueue_download`. It sorts to the top of the grid by `sort_at`, while
+/// its card still shows the real upload date. Read from the watch page, so it
+/// needs no yt-dlp unless that page does not parse; a Short is refused, and a
+/// video already in the library comes back untouched. See [`crate::add::add_video`].
 #[tauri::command]
 pub async fn add_video(input: String, state: State<'_, Arc<AppState>>) -> R<Video> {
-    let video_id = match resolve::parse_add_input(&input).map_err(e)? {
-        resolve::AddTarget::Video(id) => id,
-        resolve::AddTarget::Short(_) => {
-            return Err("MyTube does not handle YouTube Shorts.".into())
-        }
-        resolve::AddTarget::Channel(_) => {
-            return Err("That is a channel link. Use Add channel to subscribe.".into())
-        }
-    };
-    let (s, known) = {
-        let id = video_id.clone();
-        db_blocking(&state, move |db| Ok((config::load()?, db.get_video(&id)?.is_some()))).await?
-    };
+    crate::add::add_video(&state, &input).await.map_err(e)
+}
 
-    if !known {
-        // The lease lives exactly as long as the probe; the download that
-        // follows takes its own in the queue.
-        let inv = state.tools.ytdlp(&s).await.map_err(e)?;
-        let probe = ytdlp::probe(
-            &inv,
-            &s.quality,
-            &ytdlp::watch_url(&video_id),
-            &s.download_dir,
-            &s.filename_template,
-        )
-        .await
-        .map_err(e)?;
-        drop(inv);
+/// What the Add box's input would add, for its preview card: a channel (only
+/// whether you already follow it -- no network), a video (from the library
+/// when it is there, else its watch page), or a playlist (listed through
+/// yt-dlp with the user's cookies, each part marked against the library).
+#[tauri::command]
+pub async fn preview_add(
+    input: String,
+    state: State<'_, Arc<AppState>>,
+) -> R<crate::add::AddPreview> {
+    crate::add::preview(&state, &input).await.map_err(e)
+}
 
-        let channel_id = if probe.channel_id.is_empty() {
-            "UC000000000000000000000".to_string()
-        } else {
-            probe.channel_id.clone()
-        };
-
-        // subscribed = false: keeps the uploader's name on the card without
-        // adding them to the subscription list or any poll cycle.
-        let channel = Channel {
-            id: channel_id.clone(),
-            title: if probe.channel_title.is_empty() {
-                "Added manually".into()
-            } else {
-                probe.channel_title.clone()
-            },
-            handle: None,
-            url: format!("https://www.youtube.com/channel/{channel_id}"),
-            thumb_path: None,
-            subscribed: false,
-            member: false,
-            added_at: chrono::Utc::now().timestamp(),
-            last_polled_at: None,
-            terminated: false, auto_download: false,
-        };
-        let video = NewVideo {
-            id: video_id.clone(),
-            channel_id,
-            title: probe.title.clone(),
-            description: None,
-            thumb_url: Some(ytdlp::thumb_url_for(&video_id)),
-            published_at: probe.published_at, // true upload date, for display
-            sort_at: Some(chrono::Utc::now().timestamp()), // top of the grid
-            feed_rank: 0,
-            added_manually: true,
-            duration_secs: probe.duration_secs,
-            view_count: None,
-            status: VideoStatus::Ready,
-        };
-        db_blocking(&state, move |db| {
-            db.upsert_channel(&channel)?;
-            db.insert_video_if_new(&video)
-        })
-        .await?;
-
-        poll::cache_thumb(
-            &state.http,
-            &state.db,
-            &video_id,
-            &ytdlp::thumb_url_for(&video_id),
-        )
-        .await;
-    }
-
-    state
-        .queue
-        .enqueue(video_id.clone(), s.download_dir, s.filename_template)
-        .await
-        .map_err(e)?;
-    db_blocking(&state, move |db| db.get_video(&video_id))
-        .await?
-        .ok_or_else(|| "Video disappeared after being added".to_string())
+/// Adds the ticked parts of a previewed playlist as separate videos -- never a
+/// followed playlist, never hand-linked. Parts already in the library are left
+/// alone, Shorts are skipped, and nothing is downloaded.
+#[tauri::command]
+pub async fn add_playlist(
+    entries: Vec<crate::add::PlaylistEntry>,
+    state: State<'_, Arc<AppState>>,
+) -> R<crate::add::AddPlaylistResult> {
+    crate::add::add_playlist(&state, entries).await.map_err(e)
 }
 
 #[tauri::command]
@@ -673,16 +612,32 @@ pub async fn enqueue_download(
 /// their places in the queue's line are that order exactly -- enqueued side by
 /// side, they would take them in whatever order the blocking pool ran them.
 /// A part that will not queue is logged and passed over, as the auto-download
-/// sweep does: the rest of the series is still worth having. Like a plain
-/// Download, it leaves a stored quality alone, so a failed custom download is
-/// retried as it was.
+/// sweep does: the rest of the series is still worth having. Without
+/// `quality`, like a plain Download, it leaves a stored quality alone, so a
+/// failed custom download is retried as it was.
+///
+/// `quality` is a playlist's "Download (custom)…": one quality for every
+/// video, stored on each before it is queued exactly as `enqueue_download`
+/// stores one -- so each job reads it when it starts and a Retry repeats it --
+/// and, like there, never under a video already queued or downloading.
 #[tauri::command]
 pub async fn enqueue_downloads(
     video_ids: Vec<String>,
+    quality: Option<Quality>,
     state: State<'_, Arc<AppState>>,
 ) -> R<usize> {
     let s = blocking(config::load).await?;
     let ids = db_blocking(&state, move |db| db.download_order(&video_ids)).await?;
+    if let Some(q) = quality {
+        let mut idle = Vec::with_capacity(ids.len());
+        // Owned ids again, for the same reason as the loop below.
+        for id in ids.clone() {
+            if !state.queue.is_active(&id).await {
+                idle.push(id);
+            }
+        }
+        db_blocking(&state, move |db| crate::add::store_quality(db, &idle, &q)).await?;
+    }
     let mut queued = 0;
     // Owned ids, moved one at a time: nothing borrowed from an iterator lives
     // across the await (see "Async gotchas" in CLAUDE.md).

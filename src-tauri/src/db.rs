@@ -1798,6 +1798,26 @@ impl Db {
         Ok(())
     }
 
+    /// What the Add box's preview needs to know about each of `ids` the
+    /// library already holds: its download state and its cached thumbnail.
+    /// An id missing from the map is not in the library. Any `status`, and
+    /// hidden rows too: the question is whether adding it would insert
+    /// anything, and `INSERT OR IGNORE` would not.
+    pub fn library_state(&self, ids: &[String])
+        -> Result<HashMap<String, (DownloadState, Option<String>)>> {
+        if ids.is_empty() { return Ok(HashMap::new()); }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, download_state, thumb_path FROM videos WHERE id IN ({placeholders})");
+        let mut st = conn.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(ids), |r| {
+            Ok((r.get::<_, String>(0)?,
+                (DownloadState::parse(&r.get::<_, String>(1)?), r.get::<_, Option<String>>(2)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
     /// Which of `ids` a "Download all" queues, in the order to queue them:
     /// oldest upload first, so a series downloads from part 1, and the queue
     /// (`queue::Line`) starts them in exactly that order.

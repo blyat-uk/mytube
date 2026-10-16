@@ -701,6 +701,150 @@ pub async fn formats(inv: &Invocation, video_id: &str, q: &Quality) -> Result<Vi
     parse_formats(&String::from_utf8_lossy(&out.stdout))
 }
 
+// ------------------------------------------------------------- playlists
+
+/// How many of a playlist's videos the Add box lists. Past this the preview
+/// says "Showing the first 500 of N"; a listing that long already takes a
+/// while, and a checklist longer than that is not one anybody reads.
+pub const PLAYLIST_LIMIT: u32 = 500;
+
+pub fn playlist_url(list_id: &str) -> String {
+    format!("https://www.youtube.com/playlist?list={list_id}")
+}
+
+/// One playlist as one JSON document (`-J`), so its own title, owner and
+/// count come with the entries. Verified 2026-10-16 on `PLEgOOfzzbNNk`: the
+/// document carries `id`, `title`, `channel`, `channel_id`, `playlist_count`
+/// and `entries[]`, each entry `id`, `title`, `duration`, `channel`,
+/// `channel_id` and `availability` (`subscriber_only` for a members-only part)
+/// -- but no upload date, which is why an add reads the watch pages.
+///
+/// *With* cookies, unlike a channel listing: this is a one-off the user asked
+/// for, and it is what makes their own private playlists, Watch later and
+/// Liked videos list at all: they belong to an account, and a signed-out
+/// request has none.
+pub fn playlist_args(r: &Runner, list_id: &str) -> Vec<String> {
+    let mut a = runtime_args(r);
+    a.extend(cookie_args(&r.cookies));
+    a.extend([
+        s("--flat-playlist"),
+        s("-J"),
+        s("--playlist-end"), PLAYLIST_LIMIT.to_string(),
+        s("--no-warnings"),
+        s("--color"), s("no_color"),
+        playlist_url(list_id),
+    ]);
+    a
+}
+
+/// A playlist as `playlist_args` lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Playlist {
+    pub id: String,
+    pub title: String,
+    /// Whose playlist it is, when the listing names an owner.
+    pub channel_id: Option<String>,
+    pub channel_title: Option<String>,
+    /// `playlist_count`: how many videos YouTube says it holds, which is more
+    /// than `entries` when it runs past [`PLAYLIST_LIMIT`].
+    pub count: Option<usize>,
+    pub entries: Vec<PlaylistItem>,
+}
+
+/// One entry of a [`Playlist`], exactly as listed: nothing is filtered here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistItem {
+    pub id: String,
+    pub title: String,
+    /// The uploader. Missing on a collaboration -- the first part of
+    /// `PLEgOOfzzbNNk` names five `creators` and carries a `channel` but no
+    /// `channel_id`.
+    pub channel_id: Option<String>,
+    pub channel_title: Option<String>,
+    pub duration_secs: Option<i64>,
+    /// `subscriber_only`, `private`, `needs_auth`, … -- what the video is,
+    /// as with a channel listing's entries.
+    pub availability: Option<String>,
+}
+
+fn text_of(v: &serde_json::Value, key: &str) -> Option<String> {
+    str_of(v, key).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+}
+
+fn playlist_item(v: &serde_json::Value) -> Option<PlaylistItem> {
+    Some(PlaylistItem {
+        id: text_of(v, "id")?,
+        title: text_of(v, "title").unwrap_or_default(),
+        channel_id: text_of(v, "channel_id"),
+        channel_title: text_of(v, "channel").or_else(|| text_of(v, "uploader")),
+        duration_secs: v.get("duration").and_then(|x| x.as_f64()).map(|d| d as i64),
+        availability: text_of(v, "availability"),
+    })
+}
+
+/// Parses `playlist_args`' document. An entry without an id is skipped; a
+/// document that is not a playlist (`null`, which is what yt-dlp prints
+/// beside an error) is an error.
+pub fn parse_playlist(json: &str) -> Result<Playlist> {
+    let v: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| anyhow!("yt-dlp's playlist listing did not parse: {e}"))?;
+    let id = text_of(&v, "id").ok_or_else(|| anyhow!("yt-dlp listed no playlist"))?;
+    let entries = v
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(playlist_item).collect())
+        .unwrap_or_default();
+    Ok(Playlist {
+        title: text_of(&v, "title").unwrap_or_else(|| id.clone()),
+        id,
+        channel_id: text_of(&v, "channel_id"),
+        channel_title: text_of(&v, "channel").or_else(|| text_of(&v, "uploader")),
+        count: v.get("playlist_count").and_then(|c| c.as_u64()).map(|c| c as usize),
+        entries,
+    })
+}
+
+/// What the Add box shows when a listing fails: the sentence YouTube said
+/// when there is one (`ERROR: [youtube:tab] PLEgOOfzzbNNx: YouTube said: The
+/// playlist does not exist.` becomes the last four words), else yt-dlp's last
+/// error with its `ERROR: [extractor] id: ` preamble taken off.
+///
+/// The one rewritten outright is yt-dlp's auth check, which is what a private
+/// playlist (or a malformed id) gets signed out -- verified 2026-10-16 with
+/// `PLzzzzzzzzzzzzzzzzzzzzzz` -- and which tells the user to pass an
+/// extractor argument they have no way to pass.
+pub fn listing_error(stderr: &str) -> String {
+    let Some(line) = stderr.lines().rev().find(|l| l.contains("ERROR")) else {
+        return "yt-dlp could not list that playlist".to_string();
+    };
+    if let Some((_, said)) = line.split_once("YouTube said: ") {
+        return said.trim().to_string();
+    }
+    if line.contains("require authentication") {
+        return "That playlist is private, or does not exist. A private one of your own \
+                lists once MyTube is signed in to YouTube (Settings → YouTube sign-in)."
+            .to_string();
+    }
+    let line = line.trim().trim_start_matches("ERROR:").trim();
+    match line.strip_prefix('[').and_then(|l| l.split_once("] ")) {
+        Some((_, rest)) => rest.split_once(": ").map_or(rest, |(_, msg)| msg).trim().to_string(),
+        None => line.to_string(),
+    }
+}
+
+/// Lists one playlist. The caller holds `inv` -- resolved *with* cookies,
+/// see [`playlist_args`] -- for as long as this runs; a timeout kills the
+/// whole tree (see `run_with_timeout`). 500 entries list in a few seconds,
+/// so the channel listing's ceiling is plenty.
+pub async fn playlist(inv: &Invocation, list_id: &str) -> Result<Playlist> {
+    let r = &inv.runner;
+    let out = run_with_timeout(&r.program, playlist_args(r, list_id), LISTING_TIMEOUT).await?;
+    if !out.status.success() {
+        return Err(anyhow!("{}", listing_error(&String::from_utf8_lossy(&out.stderr))));
+    }
+    parse_playlist(&String::from_utf8_lossy(&out.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -1,3 +1,4 @@
+pub mod add;
 pub mod app_update;
 pub mod avatar;
 pub mod cli;
@@ -22,6 +23,7 @@ pub mod tools;
 pub mod transfer;
 pub mod tray;
 pub mod upload_date;
+pub mod watch_page;
 pub mod window;
 pub mod ytdlp;
 
@@ -178,6 +180,8 @@ pub fn run() {
             commands::add_channel,
             commands::add_video,
             commands::classify_add_input,
+            commands::preview_add,
+            commands::add_playlist,
             commands::remove_channel,
             commands::import_takeout_csv,
             commands::preview_takeout_csv,

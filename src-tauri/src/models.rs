@@ -313,6 +313,7 @@ pub enum AddKind {
     Channel,
     Video,
     Short,
+    Playlist,
 }
 
 /// Result of the phase-1 `--simulate` probe: metadata plus the intended output path.
