@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   formatDuration, formatTotalRuntime, formatRelative, formatViews, formatBytes, cardAction,
-  videoUrl, hasDownloadedFile, seriesRuntime,
+  videoUrl, hasDownloadedFile, seriesRuntime, formatDay, formatCompact, formatLibraryRuntime,
+  percentOf, initials, nameHue,
 } from "./format";
 
 describe("formatDuration", () => {
@@ -252,5 +253,51 @@ describe("filename template helpers", () => {
   it("offers token chips that are all yt-dlp fields", () => {
     expect(TOKEN_CHIPS.length).toBeGreaterThanOrEqual(6);
     for (const t of TOKEN_CHIPS) expect(t).toMatch(/^%\(.+\)[sd]$/);
+  });
+});
+
+/**
+ * The Add dialog's channel panel. Its facts sit in narrow columns beside
+ * English labels, so each helper answers in a short, fixed register.
+ */
+describe("the channel panel's helpers", () => {
+  it("dates a subscription day first, whatever the machine's locale", () => {
+    // Noon UTC, so no timezone the suite runs in moves it to another day.
+    expect(formatDay(Date.UTC(2026, 7, 30, 12) / 1000)).toBe("30 Aug 2026");
+    expect(formatDay(null)).toBe("—");
+  });
+
+  it("words subscriber counts the way YouTube does", () => {
+    expect(formatCompact(83_500)).toBe("83.5K");
+    expect(formatCompact(1_234_567)).toBe("1.23M");
+    expect(formatCompact(947)).toBe("947");
+  });
+
+  it("keeps the minutes of a short library and drops them from a long one", () => {
+    expect(formatLibraryRuntime(47 * 3600 + 55 * 60)).toBe("47h 55m");
+    expect(formatLibraryRuntime(980 * 3600 + 1234)).toBe("980h");
+    expect(formatLibraryRuntime(1204 * 3600)).toBe("1,204h");
+    expect(formatLibraryRuntime(0)).toBe("—");
+  });
+
+  it("shares out nothing as zero rather than NaN", () => {
+    expect(percentOf(58, 334)).toBe(17);
+    expect(percentOf(3, 0)).toBe(0);
+  });
+
+  it("takes a stand-in picture's letters from the first two words", () => {
+    expect(initials("100 MILLION DOLLARS RECAP")).toBe("1M");
+    expect(initials("Arashi Recap")).toBe("AR");
+    expect(initials("ackerman")).toBe("A");
+    expect(initials("(2) the sequel")).toBe("2T");
+    expect(initials("—")).toBe("?");
+  });
+
+  it("gives a name the same hue every time, somewhere on the wheel", () => {
+    const h = nameHue("AnimeCapped Manga");
+    expect(h).toBe(nameHue("AnimeCapped Manga"));
+    expect(h).toBeGreaterThanOrEqual(0);
+    expect(h).toBeLessThan(360);
+    expect(nameHue("Arashi Recap")).not.toBe(h);
   });
 });

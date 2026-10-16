@@ -210,6 +210,77 @@ export function formatDate(ts: number | null): string {
 }
 
 /* ------------------------------------------------------------------ *
+ * The Add dialog's channel panel
+ * ------------------------------------------------------------------ */
+
+/**
+ * A day as "30 Aug 2026": day first, the month in three letters. Pinned to
+ * en-GB rather than the machine's locale because it sits in a fixed-width fact
+ * column beside English labels, where "8/30/2026" or "30.08.2026" would be the
+ * odd one out.
+ */
+export function formatDay(ts: number | null): string {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleDateString("en-GB", {
+    day: "numeric", month: "short", year: "numeric",
+  });
+}
+
+const COMPACT = new Intl.NumberFormat("en", { notation: "compact", maximumSignificantDigits: 3 });
+
+/** A subscriber count the way YouTube itself words it: 83.5K, 1.2M, 947. */
+export function formatCompact(n: number): string {
+  return COMPACT.format(n);
+}
+
+/**
+ * Everything a channel has in the library, added up. Under a hundred hours
+ * it is `formatTotalRuntime`'s "47h 55m"; past that the minutes are noise
+ * against the hours and only the hours are given, grouped -- "980h",
+ * "1,204h" -- since a total that size is read for its scale, not its
+ * precision.
+ */
+export function formatLibraryRuntime(secs: number): string {
+  if (!secs || secs <= 0) return "—";
+  const h = secs / 3600;
+  if (h < 100) return formatTotalRuntime(secs);
+  return `${Math.round(h).toLocaleString("en")}h`;
+}
+
+/** A whole-number share, 0 when there is nothing to share out. */
+export function percentOf(part: number, whole: number): number {
+  return whole > 0 ? Math.round((part / whole) * 100) : 0;
+}
+
+/**
+ * The letters on a channel's stand-in picture: the first letter or digit of
+ * its first two words, so "100 MILLION DOLLARS RECAP" is "1M" and "Arashi
+ * Recap" is "AR". A one-word name gives one letter; a name with no letter or
+ * digit at all gives "?", never an empty disc.
+ */
+export function initials(name: string): string {
+  const letters = name
+    .split(/\s+/)
+    .map((w) => w.match(/[\p{L}\p{N}]/u)?.[0])
+    .filter((c): c is string => !!c)
+    .slice(0, 2)
+    .join("");
+  return letters ? letters.toLocaleUpperCase() : "?";
+}
+
+/**
+ * A hue for a channel's stand-in picture, from its name. Stable across runs
+ * and machines, so a channel keeps its colour until its real picture arrives,
+ * and spread round the wheel so neighbours in an alphabetical list rarely
+ * share one.
+ */
+export function nameHue(name: string): number {
+  let h = 7;
+  for (const ch of name) h = (Math.imul(h, 31) + ch.codePointAt(0)!) >>> 0;
+  return h % 360;
+}
+
+/* ------------------------------------------------------------------ *
  * Card zoom
  * ------------------------------------------------------------------ */
 
