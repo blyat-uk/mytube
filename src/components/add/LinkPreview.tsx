@@ -20,11 +20,10 @@ export interface PreviewBusy { acting: Acting; slow: boolean }
  * (any of its actions out disables all three), while only the button pressed
  * spins once the call is slow.
  */
-function ActButton({ glyph, label, primary, quiet, disabled, spinning, busy, onClick }: {
+function ActButton({ glyph, label, primary, disabled, spinning, busy, onClick }: {
   glyph: ReactNode;
   label: string;
   primary?: boolean;
-  quiet?: boolean;
   disabled?: boolean;
   spinning?: boolean;
   busy?: boolean;
@@ -34,7 +33,7 @@ function ActButton({ glyph, label, primary, quiet, disabled, spinning, busy, onC
     <button
       type="button"
       className={[
-        "btn btn-sm", primary && "btn-primary", quiet && "btn-quiet", spinning && "is-spinning",
+        "btn btn-sm", primary && "btn-primary", spinning && "is-spinning",
       ].filter(Boolean).join(" ")}
       disabled={disabled || busy}
       aria-busy={spinning || undefined}
@@ -182,7 +181,6 @@ export function VideoCard({ video: v, playlistId, busy, onAdd, onDownload, onCus
             <ActButton
               glyph={<IconCustomDownload />}
               label="Download (custom)…"
-              quiet
               disabled={onDisk || onItsWay}
               busy={out}
               spinning={busy.slow && busy.acting === "custom"}
@@ -319,7 +317,6 @@ export function PlaylistCard({ playlist: pl, ticked, onTicked, busy, onAdd, onDo
             <ActButton
               glyph={<IconCustomDownload />}
               label="Download (custom)…"
-              quiet
               disabled={c.toDownload === 0}
               busy={out}
               spinning={busy.slow && busy.acting === "custom"}
