@@ -7,7 +7,7 @@
 //! leaves the same stem behind, so that stem -- the *core* -- is what siblings
 //! are matched on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A title reduced to the stem it shares with its siblings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,7 +413,7 @@ fn closest_name<'n, 'w>(lead: &[&str], names: &'n [Vec<&'w str>]) -> &'n [&'w st
 }
 
 /// One video as the grouping rule sees it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Entry {
     pub id: String,
     pub title: String,
@@ -423,6 +423,12 @@ pub struct Entry {
     /// Key shared with every video marked its sibling by hand. `None` -- the
     /// ordinary case -- leaves the title matcher to work alone.
     pub group: Option<String>,
+    /// The videos its description links (`videos.part_links`), any channel,
+    /// in library or not -- the rule keeps only those among the entries.
+    pub links: Vec<String>,
+    /// The user unlinked it (`part_links_refused`): its description links
+    /// count for nothing either way, and no title places it.
+    pub refused: bool,
 }
 
 /// One channel's videos, bucketed into the indivisible units the grouping rule
@@ -462,6 +468,42 @@ pub struct Entry {
 /// out, a title re-cased -- or one to a name that matches nothing: a second
 /// name has to be able to reach titles the first cannot before it vouches
 /// for anything.
+///
+/// **Descriptions** are the third way, and the strongest after a hand mark.
+/// Recap channels now give each part a fresh clickbait title but still list
+/// the other parts in its description (see [`crate::part_links`]), and a
+/// video whose description links another entry is that entry's sibling
+/// whatever either is called. A link is a *claim*; two entries claiming each
+/// other are *mutual*. Every connected run of claims is one atom, unioned
+/// with any hand group it touches, and is never split -- an atom holding a
+/// claim is *backed*. Three rules keep that from welding two shows:
+///
+/// - **Only when sure.** A video claimed one way by two entries that are not
+///   connected once it is taken out is linked from two separate shows (a
+///   plug for show A's part in show B's description), and is linked to
+///   neither. A claimant with no other link counts with the other lone ones,
+///   so a star -- every part naming part one only -- is one show. That is the user's rule, verbatim; it is computed for every
+///   video at once from the claim graph's biconnected components, so a chain
+///   (each part names the one before) or prev/next links (mutual) are never
+///   mistaken for it, and a description not fetched yet cannot cause it --
+///   only a description that was read makes a claim.
+/// - **Islands.** That contested video, and one the user unlinked
+///   (`refused`), take no part in title matching: no name of theirs matches
+///   or seeds, so only a hand mark places them. Otherwise a title would put
+///   back exactly what the user, or the descriptions' disagreement, took out.
+/// - **Shows, and homes.** Backed atoms whose names share an *identical*
+///   stem are one show and always share a card: a gap in the links (a part
+///   whose description is not in yet, a chain part that skipped its link)
+///   must not split a series its titles have always held together. A mere
+///   shared opening -- how two different shows of one recap channel get
+///   welded today -- joins no backed atom to another. An atom no description
+///   backs gets a *home*: the one show its names match best (an identical
+///   stem beats a shared opening), and it may only ever join that show's
+///   card; one matching two shows equally joins neither. Homes are what make
+///   the answer independent of which atom happens to be looked at first.
+///
+/// With no claims and no refusals every atom is unbacked with no home to
+/// choose, and the result is exactly what the matcher did before.
 pub struct Atoms {
     ids: Vec<String>,
     /// Each entry's distinct names, its current title first unless that is
@@ -469,46 +511,283 @@ pub struct Atoms {
     /// core (a rename that only changed case, punctuation or the part marker)
     /// are one stem, and a name that can match nothing is none, so neither
     /// costs a comparison nor counts as a second name for seeding. An
-    /// untitled video has no stem at all.
+    /// untitled video has no stem at all, and neither has an island.
     stems: Vec<Vec<Stem>>,
     /// Which atom each entry landed in.
     atom_of: Vec<usize>,
     /// Entry indices per atom, in the order the entries came in.
     atoms: Vec<Vec<usize>>,
     by_id: HashMap<String, usize>,
+    /// Per atom, the show it belongs to when a description link backs it
+    /// (the representative atom's index), else `None`.
+    show: Vec<Option<usize>>,
+    /// Per unbacked atom, where its titles place it among the shows.
+    home: Vec<Home>,
+    /// Per entry, whether a description link of its own put it on its card.
+    linked: Vec<bool>,
+}
+
+/// Where an atom no description backs belongs, judged by its titles alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Home {
+    /// It resembles no show the descriptions assembled; titles place it
+    /// exactly as they did before descriptions were read.
+    Free,
+    /// The one show it resembles best.
+    Show(usize),
+    /// Two shows resemble it equally well: not sure, so it joins neither.
+    Torn,
+}
+
+/// A union-find over entry or atom indices, path-halving.
+struct Unions(Vec<usize>);
+
+impl Unions {
+    fn new(n: usize) -> Self {
+        Self((0..n).collect())
+    }
+
+    fn find(&mut self, mut i: usize) -> usize {
+        while self.0[i] != i {
+            self.0[i] = self.0[self.0[i]];
+            i = self.0[i];
+        }
+        i
+    }
+
+    fn join(&mut self, a: usize, b: usize) {
+        let (a, b) = (self.find(a), self.find(b));
+        // The lower index wins, so a root never depends on the order of joins.
+        if a != b {
+            self.0[a.max(b)] = a.min(b);
+        }
+    }
+}
+
+/// One undirected link between two entries, `a < b`, and who claims whom.
+struct Link {
+    a: usize,
+    b: usize,
+    a_claims_b: bool,
+    b_claims_a: bool,
+}
+
+impl Link {
+    /// The other end of the link from `x`, and whether that end claims `x`
+    /// one way -- `x` not claiming it back.
+    fn one_way_onto(&self, x: usize) -> (usize, bool) {
+        if x == self.a {
+            (self.b, self.b_claims_a && !self.a_claims_b)
+        } else {
+            (self.a, self.a_claims_b && !self.b_claims_a)
+        }
+    }
+}
+
+/// Which biconnected component each link lies in (Tarjan, iterative).
+///
+/// Two neighbours `u` and `w` of `x` stay connected once `x` is removed
+/// exactly when the links `{u,x}` and `{w,x}` share a component, which is
+/// the question "linked from two separate shows" asks of every video: one
+/// pass answers it for all of them, where a search per video would cost a
+/// pass each -- and a full-list series has a claimed video for nearly every
+/// part.
+fn link_blocks(adj: &[Vec<(usize, usize)>], links: usize) -> Vec<usize> {
+    let n = adj.len();
+    let mut disc = vec![usize::MAX; n];
+    let mut low = vec![0; n];
+    let mut block = vec![usize::MAX; links];
+    let (mut next_block, mut time) = (0, 0);
+    let mut pending: Vec<usize> = Vec::new();
+    // Each frame: the vertex, the link it was reached by, the next neighbour.
+    let mut frames: Vec<(usize, usize, usize)> = Vec::new();
+    for root in 0..n {
+        if disc[root] != usize::MAX || adj[root].is_empty() {
+            continue;
+        }
+        disc[root] = time;
+        low[root] = time;
+        time += 1;
+        frames.push((root, usize::MAX, 0));
+        while let Some(top) = frames.last_mut() {
+            let (v, via) = (top.0, top.1);
+            if top.2 < adj[v].len() {
+                let (w, k) = adj[v][top.2];
+                top.2 += 1;
+                if k == via {
+                    continue;
+                }
+                if disc[w] == usize::MAX {
+                    pending.push(k);
+                    disc[w] = time;
+                    low[w] = time;
+                    time += 1;
+                    frames.push((w, k, 0));
+                } else if disc[w] < disc[v] {
+                    pending.push(k);
+                    low[v] = low[v].min(disc[w]);
+                }
+                continue;
+            }
+            frames.pop();
+            if let Some(&(u, _, _)) = frames.last() {
+                low[u] = low[u].min(low[v]);
+                if low[v] >= disc[u] {
+                    while let Some(e) = pending.pop() {
+                        block[e] = next_block;
+                        if e == via {
+                            break;
+                        }
+                    }
+                    next_block += 1;
+                }
+            }
+        }
+    }
+    block
+}
+
+/// The description half of the grouping rule, on its own: who claims whom,
+/// who is contested, and whose own link survived. Titles play no part, so a
+/// reader that only needs to know which videos a description linked
+/// ([`description_linked`]) never normalises one.
+struct Claims {
+    links: Vec<Link>,
+    contested: Vec<bool>,
+    linked: Vec<bool>,
+}
+
+impl Claims {
+    fn of(entries: &[Entry], by_id: &HashMap<String, usize>) -> Self {
+        let n = entries.len();
+        // The claims, deduplicated into one link per pair. A refused video's
+        // count for nothing in either direction: the user took it out.
+        let mut links: Vec<Link> = Vec::new();
+        let mut link_of: HashMap<(usize, usize), usize> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if e.refused {
+                continue;
+            }
+            for target in &e.links {
+                let Some(&j) = by_id.get(target) else { continue };
+                if j == i || entries[j].refused {
+                    continue;
+                }
+                let (a, b) = (i.min(j), i.max(j));
+                let k = *link_of.entry((a, b)).or_insert_with(|| {
+                    links.push(Link { a, b, a_claims_b: false, b_claims_a: false });
+                    links.len() - 1
+                });
+                if i == a { links[k].a_claims_b = true } else { links[k].b_claims_a = true }
+            }
+        }
+        let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+        for (k, l) in links.iter().enumerate() {
+            adj[l.a].push((l.b, k));
+            adj[l.b].push((l.a, k));
+        }
+        let blocks = link_blocks(&adj, links.len());
+        // A claimant whose only link is this one -- a star's parts, each
+        // naming part one and nothing else -- is no evidence of a show of its
+        // own: alone it is connected to nothing, so the lone ones count as
+        // one group between them, and only a claimant with links elsewhere
+        // brings its block. That is what tells "watch part 1 here" from a
+        // plug in another show's description.
+        const LONE: usize = usize::MAX;
+        let contested: Vec<bool> = (0..n)
+            .map(|x| {
+                let mut seen: Option<usize> = None;
+                adj[x].iter().any(|&(_, k)| {
+                    let (u, one_way) = links[k].one_way_onto(x);
+                    if !one_way {
+                        return false;
+                    }
+                    let group = if adj[u].len() < 2 { LONE } else { blocks[k] };
+                    match seen {
+                        None => { seen = Some(group); false }
+                        Some(g) => g != group,
+                    }
+                })
+            })
+            .collect();
+
+        let mut linked = vec![false; n];
+        for l in &links {
+            if !contested[l.a] && !contested[l.b] {
+                linked[l.a] = true;
+                linked[l.b] = true;
+            }
+        }
+        Claims { links, contested, linked }
+    }
+
+    /// The links that survive the contest, the ones atoms are built from.
+    fn kept(&self) -> impl Iterator<Item = &Link> {
+        self.links.iter().filter(|l| !self.contested[l.a] && !self.contested[l.b])
+    }
+}
+
+/// Every entry a description link of its own puts on a card -- what
+/// [`Atoms::linked_ids`] answers, without reading a title: the menu's
+/// "Unlink from siblings" and the unlink itself only need this much, and a
+/// whole [`Atoms`] (every title normalised, every home matched) for a page of
+/// downloads would be the grouped walk's cost paid for one flag.
+pub fn description_linked(entries: &[Entry]) -> HashSet<String> {
+    let by_id: HashMap<String, usize> =
+        entries.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
+    let claims = Claims::of(entries, &by_id);
+    entries.iter().zip(&claims.linked)
+        .filter(|(_, &linked)| linked)
+        .map(|(e, _)| e.id.clone())
+        .collect()
 }
 
 impl Atoms {
     pub fn new(entries: Vec<Entry>) -> Self {
-        let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+        let n = entries.len();
+        let mut by_id = HashMap::with_capacity(n);
         for (i, e) in entries.iter().enumerate() {
-            if let Some(k) = &e.group {
-                buckets.entry(k.clone()).or_default().push(i);
-            }
+            by_id.insert(e.id.clone(), i);
         }
 
-        let n = entries.len();
-        let mut atom_of = vec![usize::MAX; n];
-        let mut atoms: Vec<Vec<usize>> = Vec::new();
-        for members in buckets.into_values() {
+        let claims = Claims::of(&entries, &by_id);
+        let mut unions = Unions::new(n);
+        for l in claims.kept() {
+            unions.join(l.a, l.b);
+        }
+        let Claims { contested, linked, .. } = claims;
+        let mut buckets: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if let Some(k) = &e.group {
+                buckets.entry(k.as_str()).or_default().push(i);
+            }
+        }
+        for members in buckets.values() {
             // A key left holding one live member -- the rest deleted since --
             // is not a group, and honouring it would pin a lone card in place.
             if members.len() < 2 {
                 continue;
             }
-            for &i in &members {
-                atom_of[i] = atoms.len();
+            for &i in &members[1..] {
+                unions.join(members[0], i);
             }
-            atoms.push(members);
+        }
+
+        let mut atom_of = vec![usize::MAX; n];
+        let mut atoms: Vec<Vec<usize>> = Vec::new();
+        let mut atom_at_root: HashMap<usize, usize> = HashMap::new();
+        for i in 0..n {
+            let root = unions.find(i);
+            let a = *atom_at_root.entry(root).or_insert_with(|| {
+                atoms.push(Vec::new());
+                atoms.len() - 1
+            });
+            atom_of[i] = a;
+            atoms[a].push(i);
         }
 
         let (mut ids, mut stems) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        let mut by_id = HashMap::with_capacity(n);
         for (i, e) in entries.into_iter().enumerate() {
-            if atom_of[i] == usize::MAX {
-                atom_of[i] = atoms.len();
-                atoms.push(vec![i]);
-            }
             // Folded on the core alone, keeping a marker if either name had one:
             // `Stem::matches` reads the marker only to let a *different* core
             // in, so a marked stem matches everything its unmarked twin does,
@@ -516,11 +795,13 @@ impl Atoms {
             // `Part 1` a first part so often gains once part two is up would
             // make it two names, and a seed that reaches nothing new.
             let mut names: Vec<Stem> = Vec::with_capacity(1 + e.former_titles.len());
-            for title in std::iter::once(&e.title).chain(&e.former_titles) {
-                let norm = normalize_memo(title);
-                match names.iter_mut().find(|s| s.norm.core == norm.core) {
-                    Some(same) => same.norm.had_marker |= norm.had_marker,
-                    None => names.push(Stem::new(norm)),
+            if !(contested[i] || e.refused) {
+                for title in std::iter::once(&e.title).chain(&e.former_titles) {
+                    let norm = normalize_memo(title);
+                    match names.iter_mut().find(|s| s.norm.core == norm.core) {
+                        Some(same) => same.norm.had_marker |= norm.had_marker,
+                        None => names.push(Stem::new(norm)),
+                    }
                 }
             }
             // An empty stem with no marker matches no title at all (see
@@ -530,10 +811,103 @@ impl Atoms {
             // match.
             names.retain(|s| !s.norm.core.is_empty() || s.norm.had_marker);
             stems.push(names);
-            by_id.insert(e.id.clone(), i);
             ids.push(e.id);
         }
-        Self { ids, stems, atom_of, atoms, by_id }
+
+        let mut atoms_out = Self {
+            ids,
+            stems,
+            atom_of,
+            atoms,
+            by_id,
+            show: Vec::new(),
+            home: Vec::new(),
+            linked,
+        };
+        atoms_out.place_shows();
+        atoms_out
+    }
+
+    /// Settles [`Atoms::show`] and [`Atoms::home`]: backed atoms sharing an
+    /// identical stem are one show, and every other atom finds the one show
+    /// its names match best, if any.
+    fn place_shows(&mut self) {
+        let count = self.atoms.len();
+        let backed: Vec<bool> = self.atoms.iter()
+            .map(|members| members.iter().any(|&i| self.linked[i]))
+            .collect();
+        let mut shows = Unions::new(count);
+        let mut by_core: HashMap<&str, usize> = HashMap::new();
+        for a in (0..count).filter(|&a| backed[a]) {
+            for &i in &self.atoms[a] {
+                for name in &self.stems[i] {
+                    if name.norm.core.is_empty() {
+                        continue;
+                    }
+                    match by_core.get(name.norm.core.as_str()) {
+                        Some(&b) => shows.join(a, b),
+                        None => { by_core.insert(&name.norm.core, a); }
+                    }
+                }
+            }
+        }
+        let show: Vec<Option<usize>> =
+            (0..count).map(|a| backed[a].then(|| shows.find(a))).collect();
+
+        let any_backed = backed.contains(&true);
+        let home: Vec<Home> = (0..count)
+            .map(|a| {
+                if backed[a] || !any_backed {
+                    return Home::Free;
+                }
+                let names = || self.atoms[a].iter().flat_map(|&i| &self.stems[i]);
+                let pick = |found: HashSet<usize>| match found.len() {
+                    0 => None,
+                    1 => found.into_iter().next().map(Home::Show),
+                    _ => Some(Home::Torn),
+                };
+                let exact: HashSet<usize> = names()
+                    .filter(|s| !s.norm.core.is_empty())
+                    .filter_map(|s| by_core.get(s.norm.core.as_str()))
+                    .filter_map(|&b| show[b])
+                    .collect();
+                if let Some(h) = pick(exact) {
+                    return h;
+                }
+                let loose: HashSet<usize> = (0..count)
+                    .filter(|&b| backed[b])
+                    .filter(|&b| {
+                        names().any(|s| {
+                            self.atoms[b].iter().any(|&j| self.stems[j].iter().any(|t| s.matches(t)))
+                        })
+                    })
+                    .filter_map(|b| show[b])
+                    .collect();
+                pick(loose).unwrap_or(Home::Free)
+            })
+            .collect();
+        self.show = show;
+        self.home = home;
+    }
+
+    /// Every video a description link of its own put on its card -- what the
+    /// menu's "Unlink from siblings" can take back. A contested video is not
+    /// among them, nor one the user already unlinked.
+    pub fn linked_ids(&self) -> HashSet<&str> {
+        (0..self.ids.len())
+            .filter(|&i| self.linked[i])
+            .map(|i| self.ids[i].as_str())
+            .collect()
+    }
+
+    /// Whether an unbacked atom may join a card whose show is `show`: only
+    /// its own show's, or -- while its titles resemble no show at all -- any.
+    fn may_join(&self, atom: usize, show: Option<usize>) -> bool {
+        match self.home[atom] {
+            Home::Free => true,
+            Home::Show(s) => show == Some(s),
+            Home::Torn => show.is_none(),
+        }
     }
 
     /// Ids of every video belonging on the card `anchor` leads. The anchor
@@ -570,12 +944,32 @@ impl Atoms {
         // ceiling: only names someone vouched for can widen a group, so one
         // loose fuzzy match cannot cascade through a channel.
         let mut seeds = vec![Seed { atom: home, spent: Vec::new() }];
+        // The show the card stands for, when descriptions assembled one: the
+        // leader's own, or the one its titles call home. Every backed atom of
+        // it is on the card from the start, and seeds; no other backed atom
+        // ever joins by title, and an unbacked one only if this is its home.
+        let show = self.show[home].or(match self.home[home] {
+            Home::Show(s) => Some(s),
+            _ => None,
+        });
+        if let Some(s) = show {
+            for a in 0..self.atoms.len() {
+                if !joined[a] && self.show[a] == Some(s) {
+                    joined[a] = true;
+                    seeds.push(Seed { atom: a, spent: Vec::new() });
+                }
+            }
+        }
         let mut next = 0;
         while next < seeds.len() {
             let seed = seeds[next].clone();
             next += 1;
             for a in 0..self.atoms.len() {
-                if joined[a] || !self.seed_matches(&seed, a) {
+                if joined[a]
+                    || self.show[a].is_some()
+                    || !self.may_join(a, show)
+                    || !self.seed_matches(&seed, a)
+                {
                     continue;
                 }
                 joined[a] = true;
@@ -973,6 +1367,7 @@ mod tests {
                 title: names[0].into(),
                 former_titles: names[1..].iter().map(|t| t.to_string()).collect(),
                 group: group.map(str::to_string),
+                ..Entry::default()
             })
             .collect();
         let mut got: Vec<String> =
@@ -1404,5 +1799,282 @@ mod tests {
         let parts: Vec<Vec<&str>> =
             names.iter().map(|n| n.iter().map(String::as_str).collect()).collect();
         assert_eq!(series_stem(&parts).as_deref(), Some("The Blackwood Tapes"));
+    }
+
+    /* ---------------- atoms: description links ---------------- */
+
+    fn ent(id: &str, title: &str) -> Entry {
+        Entry { id: id.into(), title: title.into(), ..Entry::default() }
+    }
+
+    /// A video whose description links `to`.
+    fn linking(id: &str, title: &str, to: &[&str]) -> Entry {
+        Entry { links: to.iter().map(|s| s.to_string()).collect(), ..ent(id, title) }
+    }
+
+    /// [`renamed_led_by`] for entries built whole.
+    fn card(entries: &[Entry], anchor: &str) -> Vec<String> {
+        let mut got: Vec<String> = Atoms::new(entries.to_vec())
+            .group_led_by(anchor)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if !got.is_empty() {
+            got[1..].sort();
+        }
+        got
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// Titles that share nothing, so only links can join them.
+    const WORDS: [&str; 10] = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf",
+                               "Hotel", "India", "Juliet"];
+
+    #[test]
+    fn full_list_joins_unrelated_titles() {
+        // `6MmIixGviow`'s shape: the newest part lists every one before it.
+        let mut rows: Vec<Entry> = (1..10).map(|i| ent(&format!("p{i}"), WORDS[i - 1])).collect();
+        let earlier: Vec<String> = (1..10).map(|i| format!("p{i}")).collect();
+        let earlier: Vec<&str> = earlier.iter().map(String::as_str).collect();
+        rows.push(linking("p10", WORDS[9], &earlier));
+        assert_eq!(card(&rows, "p10").len(), 10);
+        assert_eq!(sorted(card(&rows, "p3")), sorted(card(&rows, "p10")));
+    }
+
+    #[test]
+    fn chain_joins() {
+        let rows = [ent("p1", "Alpha"), linking("p2", "Bravo", &["p1"]),
+                    linking("p3", "Charlie", &["p2"]), linking("p4", "Delta", &["p3"])];
+        assert_eq!(card(&rows, "p1"), ["p1", "p2", "p3", "p4"]);
+    }
+
+    #[test]
+    fn mutual_prev_next_is_not_contested() {
+        // Every middle part is claimed from both sides here; the claims are
+        // mutual, so none of them says "two shows".
+        let rows = [linking("p1", "Alpha", &["p2"]), linking("p2", "Bravo", &["p1", "p3"]),
+                    linking("p3", "Charlie", &["p2", "p4"]), linking("p4", "Delta", &["p3"])];
+        assert_eq!(card(&rows, "p2"), ["p2", "p1", "p3", "p4"]);
+    }
+
+    #[test]
+    fn star_layout_is_not_contested() {
+        // "Watch Part 1 here": every later part names the first and nothing
+        // else. Its claimants share nothing but part one, and that is no
+        // sign of two shows -- each of them is a lone video pointing at it.
+        for titles in [["Saga Part 1", "Saga Part 2", "Saga Part 3", "Saga Part 4"],
+                       ["Alpha", "Bravo", "Charlie", "Delta"]] {
+            let rows = [ent("p1", titles[0]), linking("p2", titles[1], &["p1"]),
+                        linking("p3", titles[2], &["p1"]), linking("p4", titles[3], &["p1"])];
+            assert_eq!(card(&rows, "p1"), ["p1", "p2", "p3", "p4"], "{titles:?}");
+        }
+    }
+
+    #[test]
+    fn a_star_plugged_from_another_show_is_contested() {
+        // The star's lone claimants are one show between them; a claimant
+        // with links of its own elsewhere is a second.
+        let rows = [ent("p1", "Alpha"), linking("p2", "Bravo", &["p1"]),
+                    linking("p3", "Charlie", &["p1"]),
+                    ent("b1", "Kilo"), linking("b2", "Lima", &["b1", "p1"])];
+        assert_eq!(card(&rows, "p1"), ["p1"]);
+        assert_eq!(card(&rows, "b1"), ["b1", "b2"]);
+    }
+
+    /// Show A lists its parts the full-list way; show B's second part also
+    /// plugs A's second part.
+    fn promo_rows(a2_title: &str) -> Vec<Entry> {
+        vec![
+            ent("a1", "Saga Part 1"),
+            linking("a2", a2_title, &["a1"]),
+            linking("a3", "Charlie", &["a1", "a2"]),
+            linking("a4", "Delta", &["a1", "a2", "a3"]),
+            ent("b1", "Kilo"),
+            linking("b2", "Lima", &["b1", "a2"]),
+        ]
+    }
+
+    #[test]
+    fn promo_link_contests_the_target() {
+        let rows = promo_rows("Bravo");
+        assert_eq!(card(&rows, "a2"), ["a2"]);
+        assert_eq!(card(&rows, "a1"), ["a1", "a3", "a4"]);
+        assert_eq!(card(&rows, "b1"), ["b1", "b2"]);
+    }
+
+    #[test]
+    fn contested_is_an_island() {
+        // Its title would put it with a1, but the descriptions disagree about
+        // where it belongs, so nothing places it but a hand mark.
+        let rows = promo_rows("Saga Part 2");
+        assert_eq!(card(&rows, "a2"), ["a2"]);
+        assert_eq!(card(&rows, "a1"), ["a1", "a3", "a4"]);
+    }
+
+    #[test]
+    fn refused_is_an_island() {
+        let rows = [
+            ent("p1", "Saga Part 1"),
+            Entry { refused: true, ..linking("p2", "Saga Part 2", &["p1"]) },
+            linking("p3", "Charlie", &["p1", "p2"]),
+        ];
+        assert_eq!(card(&rows, "p1"), ["p1", "p3"]);
+        assert_eq!(card(&rows, "p2"), ["p2"]);
+    }
+
+    #[test]
+    fn a_hand_mark_still_places_an_island() {
+        let rows = [
+            ent("p1", "Saga Part 1"),
+            Entry { refused: true, group: Some("g".into()), ..ent("p2", "Bravo") },
+            Entry { group: Some("g".into()), ..ent("p9", "Juliet") },
+        ];
+        assert_eq!(card(&rows, "p2"), ["p2", "p9"]);
+    }
+
+    #[test]
+    fn hand_and_description_union() {
+        let rows = [
+            Entry { group: Some("g".into()), ..ent("x", "Alpha") },
+            Entry { group: Some("g".into()), ..linking("y", "Bravo", &["z"]) },
+            ent("z", "Charlie"),
+        ];
+        assert_eq!(card(&rows, "x"), ["x", "y", "z"]);
+        assert_eq!(card(&rows, "z"), ["z", "x", "y"]);
+    }
+
+    /// Two runs of one show split by a gap in the links, and a second show
+    /// whose title only shares an opening with the first.
+    fn two_shows() -> Vec<Entry> {
+        vec![
+            ent("a1", "Blackwood Tapes Part 1"),
+            linking("a2", "Blackwood Tapes Part 2", &["a1"]),
+            ent("b1", "Blackwood Tapes Part 3"),
+            linking("b2", "Blackwood Tapes Part 4", &["b1"]),
+            ent("c1", "Blackwood Tapes Of Doom Part 1"),
+            linking("c2", "Blackwood Tapes Of Doom Part 2", &["c1"]),
+        ]
+    }
+
+    #[test]
+    fn backed_atoms_join_only_on_identical_titles() {
+        let rows = two_shows();
+        assert_eq!(card(&rows, "a1"), ["a1", "a2", "b1", "b2"]);
+        assert_eq!(card(&rows, "c1"), ["c1", "c2"]);
+        // The control: without the links the shared opening welds all six,
+        // which is exactly what the descriptions are there to overrule.
+        let bare: Vec<Entry> = rows.iter().map(|e| Entry { links: Vec::new(), ..e.clone() }).collect();
+        assert_eq!(card(&bare, "a1").len(), 6);
+    }
+
+    #[test]
+    fn loose_video_still_fuzzy_matches_a_backed_atom() {
+        let rows = [
+            ent("c1", "Blackwood Tapes Of Doom Part 1"),
+            linking("c2", "Blackwood Tapes Of Doom Part 2", &["c1"]),
+            ent("d", "Blackwood Tapes Of Doom And Gloom Part 3"),
+        ];
+        assert_eq!(card(&rows, "c1"), ["c1", "c2", "d"]);
+        assert_eq!(card(&rows, "d"), ["d", "c1", "c2"]);
+    }
+
+    #[test]
+    fn a_loose_video_goes_to_the_show_it_matches_best() {
+        // `d` shares an opening with A and B but carries C's exact stem, so
+        // it belongs to C -- led from anywhere, and never bridging A to C.
+        let mut rows = two_shows();
+        rows.push(ent("d", "Blackwood Tapes Of Doom Part 3"));
+        assert_eq!(card(&rows, "d"), ["d", "c1", "c2"]);
+        assert_eq!(card(&rows, "c1"), ["c1", "c2", "d"]);
+        assert_eq!(card(&rows, "a1"), ["a1", "a2", "b1", "b2"]);
+    }
+
+    #[test]
+    fn a_loose_video_matching_two_shows_alike_joins_neither() {
+        let rows = [
+            ent("a1", "Blackwood Tapes Of Doom Part 1"),
+            linking("a2", "Blackwood Tapes Of Doom Part 2", &["a1"]),
+            ent("c1", "Blackwood Tapes Of Gloom Part 1"),
+            linking("c2", "Blackwood Tapes Of Gloom Part 2", &["c1"]),
+            ent("d", "Blackwood Tapes Part 9"),
+        ];
+        assert_eq!(card(&rows, "d"), ["d"]);
+        assert_eq!(card(&rows, "a1"), ["a1", "a2"]);
+        assert_eq!(card(&rows, "c1"), ["c1", "c2"]);
+    }
+
+    #[test]
+    fn the_answer_does_not_depend_on_entry_order() {
+        let mut rows = two_shows();
+        rows.push(ent("d", "Blackwood Tapes Of Doom Part 3"));
+        rows.extend(promo_rows("Saga Part 2").into_iter().map(|e| Entry {
+            id: format!("x{}", e.id),
+            links: e.links.iter().map(|l| format!("x{l}")).collect(),
+            ..e
+        }));
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        for e in &rows {
+            assert_eq!(sorted(card(&rows, &e.id)), sorted(card(&reversed, &e.id)), "{}", e.id);
+        }
+    }
+
+    #[test]
+    fn links_to_unknown_ids_and_to_itself_are_ignored() {
+        let rows = [linking("p1", "Alpha", &["p1", "elsewhere"]), ent("p2", "Bravo")];
+        assert_eq!(card(&rows, "p1"), ["p1"]);
+        assert!(Atoms::new(rows.to_vec()).linked_ids().is_empty());
+    }
+
+    #[test]
+    fn linked_ids_reports_description_groups_only() {
+        let mut rows = promo_rows("Saga Part 2");
+        rows.push(Entry { group: Some("g".into()), ..ent("h1", "Mike") });
+        rows.push(Entry { group: Some("g".into()), ..ent("h2", "November") });
+        rows.push(ent("t1", "Oscar Part 1"));
+        rows.push(ent("t2", "Oscar Part 2"));
+        let atoms = Atoms::new(rows);
+        let mut got: Vec<&str> = atoms.linked_ids().into_iter().collect();
+        got.sort();
+        // a2 is contested: linked from two shows, so linked to neither.
+        assert_eq!(got, ["a1", "a3", "a4", "b1", "b2"]);
+    }
+
+    #[test]
+    fn description_linked_needs_no_titles_and_agrees_with_the_atoms() {
+        let mut star = vec![ent("s1", "Alpha"), linking("s2", "Bravo", &["s1"])];
+        star.push(Entry { refused: true, ..linking("s3", "Charlie", &["s1"]) });
+        for rows in [promo_rows("Saga Part 2"), two_shows(), star] {
+            let mut want: Vec<String> =
+                Atoms::new(rows.clone()).linked_ids().into_iter().map(String::from).collect();
+            want.sort();
+            let untitled: Vec<Entry> =
+                rows.into_iter().map(|e| Entry { title: String::new(), ..e }).collect();
+            let mut got: Vec<String> = description_linked(&untitled).into_iter().collect();
+            got.sort();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn ten_thousand_links_build_quickly() {
+        let n = 300;
+        let rows: Vec<Entry> = (0..n)
+            .map(|i| {
+                let to: Vec<String> = (1..=30).map(|k| format!("v{}", (i + k * 7) % n)).collect();
+                Entry { links: to, ..ent(&format!("v{i}"), &format!("Title number {i}")) }
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let atoms = Atoms::new(rows);
+        for i in 0..n {
+            atoms.group_led_by(&format!("v{i}"));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500),
+                "{:?}", started.elapsed());
     }
 }

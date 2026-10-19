@@ -43,6 +43,13 @@ export interface Video {
   /** Hidden with its whole series: a part that joins this video's card later
    *  arrives hidden and marked too. Un-hiding one part keeps the mark. */
   series_hidden: boolean;
+  /** Unlinked by hand: no description link, and no title, puts it on a card
+   *  again. Only marking it places it. */
+  part_links_refused: boolean;
+  /** A description link of its own put it on its card, so "Unlink from
+   *  siblings" applies though nothing was marked by hand. Computed by the
+   *  feed's reads; false everywhere else. */
+  part_linked: boolean;
 }
 
 /**

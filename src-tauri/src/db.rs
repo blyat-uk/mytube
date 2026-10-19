@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::models::*;
+use crate::part_links;
 use crate::quality::Quality;
 use crate::search;
 use crate::siblings;
@@ -49,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -230,6 +231,30 @@ fn migrate(conn: &Connection) -> Result<()> {
                 conn.execute(&format!("ALTER TABLE channels ADD COLUMN {column}"), [])?;
             }
         }
+    }
+
+    // v14: the other parts of a series as each video's description lists
+    // them -- see `crate::part_links` and the description rule on
+    // `siblings::Atoms`. `part_links` is derived from `description` and
+    // written beside it by every write; NULL means "not parsed yet", which is
+    // how the upgrade leaves every row, so `Db::derive_part_links` (run at
+    // startup, off the main thread) parses the lot once. `description_tried_at`
+    // is the background catch-up's own bookkeeping (`crate::descriptions`).
+    // `part_links_refused` is the unlink the user made, remembered: stamped by
+    // trigger like `series_hidden`, so it syncs.
+    if version < 14 {
+        for column in [
+            "part_links TEXT",
+            "description_tried_at INTEGER",
+            "part_links_refused INTEGER NOT NULL DEFAULT 0",
+            "part_links_refused_changed_at INTEGER",
+        ] {
+            let name = column.split_whitespace().next().unwrap();
+            if !column_exists(conn, "videos", name)? {
+                conn.execute(&format!("ALTER TABLE videos ADD COLUMN {column}"), [])?;
+            }
+        }
+        conn.execute_batch(PART_LINKS_REFUSED_TRIGGERS)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -420,6 +445,25 @@ BEGIN
 END;
 ";
 
+/// The v14 stamp on the remembered unlink, kept exactly like
+/// `SERIES_HIDDEN_TRIGGERS`.
+const PART_LINKS_REFUSED_TRIGGERS: &str = "
+CREATE TRIGGER IF NOT EXISTS sync_part_links_refused_changed
+AFTER UPDATE OF part_links_refused ON videos
+WHEN NEW.part_links_refused IS NOT OLD.part_links_refused
+ AND NEW.part_links_refused_changed_at IS OLD.part_links_refused_changed_at
+BEGIN
+  UPDATE videos SET part_links_refused_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_part_links_refused_inserted AFTER INSERT ON videos
+WHEN NEW.part_links_refused <> 0 AND NEW.part_links_refused_changed_at IS NULL
+BEGIN
+  UPDATE videos SET part_links_refused_changed_at = CAST(strftime('%s','now') AS INTEGER)
+   WHERE rowid = NEW.rowid;
+END;
+";
+
 /// The names a video carried before its current one (v12).
 ///
 /// Series matching runs on titles alone and is recomputed on every fetch, so
@@ -512,8 +556,8 @@ fn channel_rows(
 ) -> Result<(Vec<siblings::Entry>, HashMap<String, PartFacts>)> {
     let mut former = former_titles(conn, channel_id)?;
     let mut st = conn.prepare_cached(
-        "SELECT id, title, duration_secs, sibling_group, watched FROM videos
-         WHERE channel_id=?1 AND status='ready'",
+        "SELECT id, title, duration_secs, sibling_group, watched, part_links, part_links_refused
+         FROM videos WHERE channel_id=?1 AND status='ready'",
     )?;
     let rows = st.query_map(params![channel_id], |r| {
         Ok((
@@ -522,20 +566,40 @@ fn channel_rows(
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, bool>(4)?,
+            part_links::decode(r.get::<_, Option<String>>(5)?.as_deref()),
+            r.get::<_, bool>(6)?,
         ))
     })?;
 
     let mut entries = Vec::new();
     let mut facts = HashMap::new();
     for row in rows {
-        let (id, title, secs, group, watched) = row?;
+        let (id, title, secs, group, watched, links, refused) = row?;
         // A row whose duration has not resolved yet contributes nothing to its
         // series rather than dropping the series out of the ordering.
         facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched });
         let former_titles = former.remove(&id).unwrap_or_default();
-        entries.push(siblings::Entry { id, title, former_titles, group });
+        entries.push(siblings::Entry { id, title, former_titles, group, links, refused });
     }
     Ok((entries, facts))
+}
+
+/// A channel's ready rows as the description rule alone sees them: ids and
+/// claims, titles left empty. For the readers that need to know which videos
+/// a description linked and nothing else; see [`siblings::description_linked`].
+fn claim_rows(conn: &Connection, channel_id: &str) -> Result<Vec<siblings::Entry>> {
+    let mut st = conn.prepare_cached(
+        "SELECT id, part_links, part_links_refused FROM videos
+         WHERE channel_id=?1 AND status='ready'")?;
+    let rows = st.query_map(params![channel_id], |r| {
+        Ok(siblings::Entry {
+            id: r.get(0)?,
+            links: part_links::decode(r.get::<_, Option<String>>(1)?.as_deref()),
+            refused: r.get(2)?,
+            ..Default::default()
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Every name each video on a channel carried before its current title
@@ -713,6 +777,9 @@ struct Walk {
     /// The former names of the few parts that have any, set aside before the
     /// atoms took the entries whole: they name a card as well as match it.
     former: HashMap<String, Vec<String>>,
+    /// Every part a description link of its own put on its card
+    /// ([`siblings::Atoms::linked_ids`]), for `Video::part_linked`.
+    linked: HashSet<String>,
 }
 
 impl WalkRows {
@@ -751,6 +818,7 @@ impl WalkRows {
         let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
         let mut parts: HashMap<String, PartFacts> = HashMap::new();
         let mut former: HashMap<String, Vec<String>> = HashMap::new();
+        let mut linked: HashSet<String> = HashSet::new();
         for (channel, (entries, facts)) in self.by_channel {
             parts.extend(facts);
             former.extend(
@@ -758,7 +826,9 @@ impl WalkRows {
                     .filter(|e| !e.former_titles.is_empty())
                     .map(|e| (e.id.clone(), e.former_titles.clone())),
             );
-            index.insert(channel, siblings::Atoms::new(entries));
+            let atoms = siblings::Atoms::new(entries);
+            linked.extend(atoms.linked_ids().into_iter().map(String::from));
+            index.insert(channel, atoms);
         }
 
         // Top-down: the first part to survive the filters leads its group, and
@@ -776,7 +846,7 @@ impl WalkRows {
             for m in &members { consumed.insert(m.clone()); }
             groups.push(members);
         }
-        Walk { groups, parts, former }
+        Walk { groups, parts, former, linked }
     }
 }
 
@@ -812,8 +882,23 @@ fn stats_filter(f: &StatsFilter) -> VideoFilter {
 
 const INSERT_VIDEO: &str = "INSERT OR IGNORE INTO videos
      (id,channel_id,title,description,thumb_url,published_at,sort_at,feed_rank,
-      added_manually,duration_secs,view_count,status,first_seen_at)
-     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+      added_manually,duration_secs,view_count,status,first_seen_at,part_links)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)";
+
+/// A description with the links derived from it, for a row that has one. The
+/// guard keeps an unchanged description -- nearly every feed entry of nearly
+/// every poll -- from rewriting the row.
+const SET_DESCRIPTION: &str = "UPDATE videos SET description=?2, part_links=?3
+     WHERE id=?1 AND description IS NOT ?2";
+
+/// The rows the background catch-up still has to read; `?1` is the instant a
+/// failed attempt must predate to be tried again.
+const NEEDS_DESCRIPTION: &str = "status='ready' AND description IS NULL
+     AND (description_tried_at IS NULL OR description_tried_at < ?1)";
+
+/// How long the background catch-up leaves a watch page that would not parse
+/// (a removed video, a bot check) before asking again.
+pub const DESCRIPTION_RETRY_SECS: i64 = 7 * 86_400;
 
 const UPDATE_META: &str = "UPDATE videos SET
        duration_secs=COALESCE(?2, duration_secs),
@@ -858,7 +943,8 @@ fn insert_all(conn: &Connection, videos: &[NewVideo]) -> Result<usize> {
         let n = st.execute(params![v.id, v.channel_id, v.title, v.description, v.thumb_url,
                                    v.published_at, v.sort_at, v.feed_rank,
                                    v.added_manually as i64, v.duration_secs, v.view_count,
-                                   v.status.as_str(), now()])?;
+                                   v.status.as_str(), now(),
+                                   part_links::derive(v.description.as_deref(), &v.id)])?;
         if n > 0 { added += 1; }
     }
     Ok(added)
@@ -1269,13 +1355,23 @@ impl Db {
     /// title the row carries now, and an id belonging to no row all record
     /// nothing. A name that fails to write is skipped like a date -- the feed
     /// carries it again next poll, and it is not worth the new rows.
+    ///
+    /// A description, unlike a title, is current in the feed: an uploader who
+    /// adds "Part 11" to part ten's description shows up in the next poll
+    /// (checked 2026-10-19: entries whose `<updated>` moved carried exactly
+    /// their watch pages' text). So `descriptions` are written over the
+    /// stored ones, with their links, which is also what gives a row the
+    /// listing inserted -- with no description at all -- its own.
     pub fn apply_feed(
         &self,
         dates: &[(String, i64)],
         titles: &[(String, String)],
+        descriptions: &[(String, String)],
         fresh: &[NewVideo],
     ) -> Result<usize> {
-        if dates.is_empty() && titles.is_empty() && fresh.is_empty() { return Ok(0); }
+        if dates.is_empty() && titles.is_empty() && descriptions.is_empty() && fresh.is_empty() {
+            return Ok(0);
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         set_published_all(&tx, dates)?;
@@ -1289,10 +1385,92 @@ impl Db {
                 // the transaction with it fails the commit below.
                 let _ = keep.execute(params![id, title]);
             }
+            let mut describe = tx.prepare_cached(SET_DESCRIPTION)?;
+            for (id, text) in descriptions {
+                let _ = describe.execute(params![id, text, part_links::derive(Some(text), id)]);
+            }
         }
         let added = insert_all(&tx, fresh)?;
         tx.commit()?;
         Ok(added)
+    }
+
+    /// Descriptions read from watch pages, with their links, each stamped as
+    /// tried. Returns how many rows changed.
+    pub fn set_descriptions(&self, found: &[(String, String)]) -> Result<usize> {
+        if found.is_empty() { return Ok(0); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = 0;
+        {
+            let mut describe = tx.prepare_cached(SET_DESCRIPTION)?;
+            let mut tried = tx.prepare_cached(
+                "UPDATE videos SET description_tried_at=?2 WHERE id=?1")?;
+            let at = now();
+            for (id, text) in found {
+                changed += describe.execute(params![id, text, part_links::derive(Some(text), id)])?;
+                tried.execute(params![id, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// The background catch-up asked for this row's page at `at`, and got
+    /// nothing it could read; it is not asked again for
+    /// [`DESCRIPTION_RETRY_SECS`].
+    pub fn mark_description_tried(&self, id: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE videos SET description_tried_at=?2 WHERE id=?1", params![id, at])?;
+        Ok(())
+    }
+
+    /// Parses `part_links` for every row holding a description nobody has
+    /// parsed yet: all of them, the first start after the v14 upgrade, and
+    /// afterwards whatever a path that writes a description without its
+    /// links left behind (the Python `scripts/`). One transaction.
+    pub fn derive_part_links(&self) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let rows: Vec<(String, String)> = {
+            let mut st = tx.prepare(
+                "SELECT id, description FROM videos
+                 WHERE description IS NOT NULL AND part_links IS NULL")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        {
+            let mut st = tx.prepare("UPDATE videos SET part_links=?2 WHERE id=?1")?;
+            for (id, text) in &rows {
+                st.execute(params![id, part_links::derive(Some(text), id)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Ready rows with no description, newest first -- recent series matter
+    /// most, so they are put right first -- leaving out any whose page failed
+    /// to parse within [`DESCRIPTION_RETRY_SECS`] of `now`.
+    pub fn videos_needing_description(&self, now: i64, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare_cached(&format!(
+            "SELECT id FROM videos WHERE {NEEDS_DESCRIPTION}
+             ORDER BY published_at DESC NULLS LAST, id LIMIT ?2"))?;
+        let rows = st.query_map(params![now - DESCRIPTION_RETRY_SECS, limit as i64],
+                                |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many rows [`Db::videos_needing_description`] has left, for the
+    /// journal.
+    pub fn count_videos_needing_description(&self, now: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM videos WHERE {NEEDS_DESCRIPTION}"),
+            params![now - DESCRIPTION_RETRY_SECS],
+            |r| r.get(0))?;
+        Ok(n as usize)
     }
 
     /// Fills a date only where one is missing. An exact RSS timestamp must never
@@ -1382,38 +1560,82 @@ impl Db {
     /// Takes the lock only to read the channel's rows and matches after letting
     /// go of it, so it must never be called with the lock held -- it is not
     /// reentrant.
-    fn sibling_ids(&self, anchor_id: &str) -> Result<Vec<String>> {
+    fn sibling_ids(&self, anchor_id: &str) -> Result<(Vec<String>, HashSet<String>)> {
         let entries = {
             let conn = self.conn.lock().unwrap();
             let channel_id: Option<String> = conn
                 .query_row("SELECT channel_id FROM videos WHERE id=?1", params![anchor_id],
                            |r| r.get(0))
                 .optional()?;
-            let Some(channel_id) = channel_id else { return Ok(Vec::new()) };
+            let Some(channel_id) = channel_id else { return Ok((Vec::new(), HashSet::new())) };
             channel_rows(&conn, &channel_id)?.0
         };
         let atoms = siblings::Atoms::new(entries);
-        Ok(atoms.group_led_by(anchor_id).into_iter().map(String::from).collect())
+        let linked = atoms.linked_ids().into_iter().map(String::from).collect();
+        Ok((atoms.group_led_by(anchor_id).into_iter().map(String::from).collect(), linked))
+    }
+
+    /// Which of `videos` a description link of their own put on a card, read
+    /// the way the grouped walk reads them: every ready row of each channel
+    /// among them, with the lock released for the matching. What lets the
+    /// ungrouped feed offer "Unlink from siblings" on the same cards the
+    /// grouped one does.
+    ///
+    /// Only the claims are read -- no title, no former name -- and only the
+    /// claim graph is built ([`siblings::description_linked`]): the Downloads
+    /// tab asks this of every page it loads, and a whole grouping of each
+    /// channel on it would be the grouped walk's cost paid for one flag.
+    fn linked_among(&self, videos: &[Video]) -> Result<HashSet<String>> {
+        let mut channels: Vec<&str> = videos.iter().map(|v| v.channel_id.as_str()).collect();
+        channels.sort_unstable();
+        channels.dedup();
+        let rows = {
+            let conn = self.conn.lock().unwrap();
+            channels.iter()
+                .map(|c| claim_rows(&conn, c))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut linked = HashSet::new();
+        for entries in rows {
+            // A channel no description links within costs nothing more.
+            if entries.iter().all(|e| e.links.is_empty()) { continue; }
+            linked.extend(siblings::description_linked(&entries));
+        }
+        Ok(linked)
     }
 
     pub fn list_videos(&self, f: &VideoFilter) -> Result<Vec<Video>> {
         // Before the lock, not under it: see `sibling_ids`.
-        let series = match &f.sibling_of {
-            Some(anchor) => self.sibling_ids(anchor)?,
-            None => Vec::new(),
+        let (series, linked) = match &f.sibling_of {
+            Some(anchor) => {
+                let (ids, linked) = self.sibling_ids(anchor)?;
+                (ids, Some(linked))
+            }
+            None => (Vec::new(), None),
         };
-        let conn = self.conn.lock().unwrap();
-        let Some((mut sql, mut args)) = feed_query(f, SELECT_VIDEO, series) else {
-            return Ok(Vec::new());
-        };
-        args.push(Box::new(f.limit));
-        sql.push_str(&format!(" LIMIT ?{}", args.len()));
-        args.push(Box::new(f.offset));
-        sql.push_str(&format!(" OFFSET ?{}", args.len()));
+        let mut videos = {
+            let conn = self.conn.lock().unwrap();
+            let Some((mut sql, mut args)) = feed_query(f, SELECT_VIDEO, series) else {
+                return Ok(Vec::new());
+            };
+            args.push(Box::new(f.limit));
+            sql.push_str(&format!(" LIMIT ?{}", args.len()));
+            args.push(Box::new(f.offset));
+            sql.push_str(&format!(" OFFSET ?{}", args.len()));
 
-        let mut st = conn.prepare(&sql)?;
-        let rows = st.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), map_video)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            let mut st = conn.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), map_video)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        // After the lock, like the series' ids before it: see `linked_among`.
+        let linked = match linked {
+            Some(linked) => linked,
+            None => self.linked_among(&videos)?,
+        };
+        for v in &mut videos {
+            v.part_linked = linked.contains(&v.id);
+        }
+        Ok(videos)
     }
 
     /// The feed as cards, with each channel's multi-part uploads collapsed into
@@ -1447,7 +1669,7 @@ impl Db {
             let conn = self.conn.lock().unwrap();
             WalkRows::read(&conn, f)?
         };
-        let Walk { mut groups, parts, former } = rows.walk();
+        let Walk { mut groups, parts, former, linked } = rows.walk();
 
         // After the walk, not in it: a lone video must still strike itself off
         // and claim nothing, and only the finished walk knows who is alone.
@@ -1524,7 +1746,9 @@ impl Db {
             rest.sort_by_key(|id| rank.get(*id).copied().unwrap_or(usize::MAX));
             let mut videos: Vec<Video> = Vec::with_capacity(members.len());
             for id in std::iter::once(&members[0]).chain(rest) {
-                if let Some(v) = rows.get(id) { videos.push(v.clone()); }
+                if let Some(v) = rows.get(id) {
+                    videos.push(Video { part_linked: linked.contains(id), ..v.clone() });
+                }
             }
             if videos.is_empty() { continue; }
             let stem = if videos.len() > 1 {
@@ -1734,27 +1958,67 @@ impl Db {
         Ok(n as usize)
     }
 
-    /// Takes one video back out of its hand-built group.
+    /// Takes one video back out of its card: out of its hand-built group, and
+    /// out of reach of every description link, for good.
     ///
     /// A key left holding a single member is cleared outright, since a group of
     /// one is not a group -- which is also what makes unlinking either half of
     /// a mistaken pair dissolve the whole thing. [`siblings::Atoms`] ignores
     /// singleton keys at read time regardless, so a video deleted out of a pair
     /// can never strand the other; this keeps the table itself honest.
+    ///
+    /// When a description link of its own put it on its card, the unlink is
+    /// remembered: `part_links_refused` is set, so no description pulls it
+    /// back, and it keeps every title from placing it (an island, see
+    /// `siblings::Atoms`) -- or a part whose title matches would never leave.
+    /// A hand mark still puts it anywhere. A video only a hand mark held is
+    /// handed back to its titles, exactly as before descriptions were read:
+    /// that unlink undoes a mark, very often a drag that slipped, and must not
+    /// cut the video off from the series its title belongs to.
+    ///
+    /// A part a description held that was hidden with its series comes back:
+    /// unlinking says it is not part of that show, so it has no business
+    /// staying hidden as part of it -- least of all when the hidden-series
+    /// sweep followed a wrong link to hide it. Its `series_hidden_changed_at`
+    /// is stamped so the sweep counts it as decided and never hides it again.
+    ///
+    /// The claims are read and matched before the write's lock is taken, as in
+    /// [`Db::sibling_ids`].
     pub fn unlink_siblings(&self, id: &str) -> Result<()> {
+        let claims = {
+            let conn = self.conn.lock().unwrap();
+            let channel: Option<String> = conn
+                .query_row("SELECT channel_id FROM videos WHERE id=?1", params![id], |r| r.get(0))
+                .optional()?;
+            let Some(channel) = channel else { return Ok(()) };
+            claim_rows(&conn, &channel)?
+        };
+        let refuse = siblings::description_linked(&claims).contains(id);
+
         let conn = self.conn.lock().unwrap();
-        let key: Option<Option<String>> = conn
+        let tx = conn.unchecked_transaction()?;
+        let key: Option<Option<String>> = tx
             .query_row("SELECT sibling_group FROM videos WHERE id=?1", params![id], |r| r.get(0))
             .optional()?;
-        let Some(Some(key)) = key else { return Ok(()) };
+        let Some(key) = key else { return Ok(()) };
 
-        conn.execute("UPDATE videos SET sibling_group=NULL WHERE id=?1", params![id])?;
-        let left: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM videos WHERE sibling_group=?1", params![key], |r| r.get(0))?;
-        if left < 2 {
-            conn.execute("UPDATE videos SET sibling_group=NULL WHERE sibling_group=?1",
-                         params![key])?;
+        if let Some(key) = key {
+            tx.execute("UPDATE videos SET sibling_group=NULL WHERE id=?1", params![id])?;
+            let left: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM videos WHERE sibling_group=?1", params![key], |r| r.get(0))?;
+            if left < 2 {
+                tx.execute("UPDATE videos SET sibling_group=NULL WHERE sibling_group=?1",
+                           params![key])?;
+            }
         }
+        if refuse {
+            tx.execute("UPDATE videos SET part_links_refused=1 WHERE id=?1", params![id])?;
+            tx.execute(
+                "UPDATE videos SET hidden=0, series_hidden=0, series_hidden_changed_at=?2
+                 WHERE id=?1 AND series_hidden=1",
+                params![id, now()])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1768,11 +2032,19 @@ impl Db {
     fn series_entries(conn: &Connection, channel_id: &str) -> Result<Vec<siblings::Entry>> {
         let mut former = former_titles(conn, channel_id)?;
         let mut st = conn.prepare_cached(
-            "SELECT id, title, sibling_group FROM videos WHERE channel_id=?1")?;
+            "SELECT id, title, sibling_group, part_links, part_links_refused
+             FROM videos WHERE channel_id=?1")?;
         let rows = st.query_map(params![channel_id], |r| {
             let id: String = r.get(0)?;
             let former_titles = former.remove(&id).unwrap_or_default();
-            Ok(siblings::Entry { id, title: r.get(1)?, former_titles, group: r.get(2)? })
+            Ok(siblings::Entry {
+                id,
+                title: r.get(1)?,
+                former_titles,
+                group: r.get(2)?,
+                links: part_links::decode(r.get::<_, Option<String>>(3)?.as_deref()),
+                refused: r.get(4)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -2120,7 +2392,8 @@ SELECT v.id, v.channel_id, c.title, v.title, v.description, v.thumb_url, v.thumb
        v.published_at, v.sort_at, v.feed_rank, v.added_manually,
        v.duration_secs, v.view_count, v.status, v.hidden,
        v.watched, v.watched_at, v.download_state, v.download_error, v.file_path,
-       v.downloaded_at, v.first_seen_at, v.sibling_group, v.series_hidden
+       v.downloaded_at, v.first_seen_at, v.sibling_group, v.series_hidden,
+       v.part_links_refused
 FROM videos v JOIN channels c ON c.id = v.channel_id";
 
 /// The same shape as `SELECT_VIDEO` -- the join stays, since `By channel`
@@ -2143,6 +2416,8 @@ fn map_video(r: &Row) -> rusqlite::Result<Video> {
         downloaded_at: r.get(20)?, first_seen_at: r.get(21)?,
         sibling_group: r.get(22)?,
         series_hidden: r.get::<_, i64>(23)? != 0,
+        part_links_refused: r.get::<_, i64>(24)? != 0,
+        part_linked: false,
     })
 }
 
@@ -3496,7 +3771,7 @@ mod tests {
 
         let dates = vec![("known".to_string(), 1234), ("manual".to_string(), 42),
                          ("gone".to_string(), 7)];
-        let added = d.apply_feed(&dates, &[], &[vid("new", "UC1", Some(99))]).unwrap();
+        let added = d.apply_feed(&dates, &[], &[], &[vid("new", "UC1", Some(99))]).unwrap();
         assert_eq!(added, 1);
 
         let known = d.get_video("known").unwrap().unwrap();
@@ -3986,10 +4261,12 @@ INSERT INTO videos
   (id,channel_id,title,description,thumb_url,thumb_path,published_at,sort_at,feed_rank,
    added_manually,duration_secs,view_count,status,hidden,watched,watched_at,
    download_state,download_error,file_path,downloaded_at,first_seen_at,sibling_group,
-   series_hidden)
-VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+   series_hidden,part_links,part_links_refused)
+VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,
+        ?25)
 ON CONFLICT(id) DO UPDATE SET
   channel_id=excluded.channel_id, title=excluded.title, description=excluded.description,
+  part_links=excluded.part_links, part_links_refused=excluded.part_links_refused,
   thumb_url=excluded.thumb_url, thumb_path=excluded.thumb_path,
   published_at=excluded.published_at, sort_at=excluded.sort_at,
   feed_rank=excluded.feed_rank, added_manually=excluded.added_manually,
@@ -4025,6 +4302,15 @@ ON CONFLICT(id) DO UPDATE SET
 /// un-hidden on its own still carries its series' mark, and a part hidden on
 /// its own carries none, so neither flag can stand in for the other.
 ///
+/// `part_links_refused` is lifted the same way: an unlink made on either
+/// machine is the user's word that no description may place that video.
+///
+/// A missing `description` is filled, with its links -- never one that is
+/// there, which the local poll owns like the title. It saves the background
+/// catch-up a watch page per row the other machine already read. SET reads
+/// the row as it was before the update, so the `CASE` sees whether the
+/// description was missing.
+///
 /// The WHERE guard repeats every rule above as a predicate so that `changes()`
 /// counts rows that actually moved. It is what makes a second run of the same
 /// archive report zero updates instead of rewriting the whole library.
@@ -4041,9 +4327,14 @@ UPDATE videos SET
   download_state = CASE WHEN ?8 = 'done' THEN ?8  ELSE download_state END,
   file_path      = CASE WHEN ?8 = 'done' THEN ?9  ELSE file_path      END,
   downloaded_at  = CASE WHEN ?8 = 'done' THEN ?10 ELSE downloaded_at  END,
-  series_hidden  = MAX(series_hidden, ?11)
+  series_hidden  = MAX(series_hidden, ?11),
+  description    = COALESCE(description, ?12),
+  part_links     = CASE WHEN description IS NULL THEN ?13 ELSE part_links END,
+  part_links_refused = MAX(part_links_refused, ?14)
 WHERE id = ?1
   AND ( watched < ?2
+     OR part_links_refused < ?14
+     OR (description IS NULL AND ?12 IS NOT NULL)
      OR hidden < ?3
      OR series_hidden < ?11
      OR added_manually < ?4
@@ -4277,7 +4568,9 @@ impl Db {
                     params![v.id, v.watched as i64, v.hidden as i64, v.added_manually as i64,
                             v.watched_at, v.sibling_group, v.thumb_path,
                             v.download_state.as_str(), v.file_path, v.downloaded_at,
-                            v.series_hidden as i64],
+                            v.series_hidden as i64, v.description,
+                            part_links::derive(v.description.as_deref(), &v.id),
+                            v.part_links_refused as i64],
                 )?;
             } else {
                 tx.execute(
@@ -4288,7 +4581,9 @@ impl Db {
                             v.status.as_str(), v.hidden as i64, v.watched as i64,
                             v.watched_at, v.download_state.as_str(), v.download_error,
                             v.file_path, v.downloaded_at, v.first_seen_at, v.sibling_group,
-                            v.series_hidden as i64],
+                            v.series_hidden as i64,
+                            part_links::derive(v.description.as_deref(), &v.id),
+                            v.part_links_refused as i64],
                 )?;
                 if existed { report.videos_updated += 1 } else { report.videos_added += 1 }
             }
@@ -4342,7 +4637,8 @@ mod import_tests {
                 view_count: Some(1), status: VideoStatus::Ready, hidden: false,
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
-                first_seen_at: 500, sibling_group: None, series_hidden: false }
+                first_seen_at: 500, sibling_group: None, series_hidden: false,
+                part_links_refused: false, part_linked: false }
     }
 
     /// Every user-owned column set to something distinguishable, so a round
@@ -5138,7 +5434,8 @@ mod auto_download_tests {
                 view_count: Some(1), status: VideoStatus::Ready, hidden: false,
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
-                first_seen_at: SINCE + 60, sibling_group: None, series_hidden: false }
+                first_seen_at: SINCE + 60, sibling_group: None, series_hidden: false,
+                part_links_refused: false, part_linked: false }
     }
 
     #[test]
@@ -5187,12 +5484,12 @@ use crate::sync::snapshot::{
 /// an un-watch travels at all.
 const SYNC_TOUCHED: &str = "(added_manually <> 0 OR watched_changed_at IS NOT NULL
      OR hidden_changed_at IS NOT NULL OR sibling_changed_at IS NOT NULL
-     OR series_hidden_changed_at IS NOT NULL)";
+     OR series_hidden_changed_at IS NOT NULL OR part_links_refused_changed_at IS NOT NULL)";
 
 const SYNC_VIDEO_COLUMNS: &str = "id, channel_id, title, published_at, sort_at, duration_secs,
      added_manually, first_seen_at, watched, watched_at, watched_changed_at,
      hidden, hidden_changed_at, sibling_group, sibling_changed_at,
-     series_hidden, series_hidden_changed_at";
+     series_hidden, series_hidden_changed_at, part_links_refused, part_links_refused_changed_at";
 
 const SYNC_CHANNEL_COLUMNS: &str =
     "id, title, handle, url, subscribed, subscribed_changed_at, member, member_changed_at";
@@ -5206,6 +5503,7 @@ fn map_sync_video(r: &Row) -> rusqlite::Result<SyncVideo> {
         hidden: r.get(11)?, hidden_changed_at: r.get(12)?,
         sibling_group: r.get(13)?, sibling_changed_at: r.get(14)?,
         series_hidden: r.get(15)?, series_hidden_changed_at: r.get(16)?,
+        part_links_refused: r.get(17)?, part_links_refused_changed_at: r.get(18)?,
     })
 }
 
@@ -5253,11 +5551,13 @@ fn channel_state(c: &SyncChannel) -> (bool, Option<i64>, bool, Option<i64>) {
 /// Everything about a video that sync owns. `added_at` is `first_seen_at`.
 #[allow(clippy::type_complexity)]
 fn video_state(v: &SyncVideo)
-    -> (bool, Option<i64>, Option<i64>, bool, Option<i64>, Option<&str>, Option<i64>, bool, i64,
-        bool, Option<i64>) {
-    (v.watched, v.watched_at, v.watched_changed_at, v.hidden, v.hidden_changed_at,
-     v.sibling_group.as_deref(), v.sibling_changed_at, v.added_manually, v.added_at,
-     v.series_hidden, v.series_hidden_changed_at)
+    -> ((bool, Option<i64>, Option<i64>, bool, Option<i64>, Option<&str>, Option<i64>, bool, i64,
+         bool, Option<i64>), (bool, Option<i64>)) {
+    // Nested because the standard library compares tuples of at most twelve.
+    ((v.watched, v.watched_at, v.watched_changed_at, v.hidden, v.hidden_changed_at,
+      v.sibling_group.as_deref(), v.sibling_changed_at, v.added_manually, v.added_at,
+      v.series_hidden, v.series_hidden_changed_at),
+     (v.part_links_refused, v.part_links_refused_changed_at))
 }
 
 /// `removed_at` only ever moves forward, so a second apply of the same
@@ -5305,16 +5605,18 @@ const INSERT_SYNC_VIDEO: &str = "
 INSERT INTO videos (id, channel_id, title, thumb_url, published_at, sort_at, feed_rank,
                     added_manually, duration_secs, status, first_seen_at,
                     watched, watched_at, watched_changed_at, hidden, hidden_changed_at,
-                    sibling_group, sibling_changed_at, series_hidden, series_hidden_changed_at)
+                    sibling_group, sibling_changed_at, series_hidden, series_hidden_changed_at,
+                    part_links_refused, part_links_refused_changed_at)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 'ready', ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-        ?17, ?18)";
+        ?17, ?18, ?19, ?20)";
 
 const SET_SYNC_VIDEO: &str = "
 UPDATE videos SET watched = ?2, watched_at = ?3, watched_changed_at = ?4,
                   hidden = ?5, hidden_changed_at = ?6,
                   sibling_group = ?7, sibling_changed_at = ?8,
                   added_manually = ?9, first_seen_at = ?10,
-                  series_hidden = ?11, series_hidden_changed_at = ?12
+                  series_hidden = ?11, series_hidden_changed_at = ?12,
+                  part_links_refused = ?13, part_links_refused_changed_at = ?14
  WHERE id = ?1";
 
 /// [`RESTAMP_SYNC_CHANNEL`], for a video.
@@ -5322,7 +5624,8 @@ const RESTAMP_SYNC_VIDEO: &str = "
 UPDATE videos SET watched_changed_at = COALESCE(?2, watched_changed_at),
                   hidden_changed_at  = COALESCE(?3, hidden_changed_at),
                   sibling_changed_at = COALESCE(?4, sibling_changed_at),
-                  series_hidden_changed_at = COALESCE(?5, series_hidden_changed_at)
+                  series_hidden_changed_at = COALESCE(?5, series_hidden_changed_at),
+                  part_links_refused_changed_at = COALESCE(?6, part_links_refused_changed_at)
  WHERE id = ?1";
 
 fn insert_sync_channel(conn: &Connection, c: &SyncChannel) -> Result<()> {
@@ -5342,7 +5645,8 @@ fn insert_sync_video(conn: &Connection, v: &SyncVideo) -> Result<()> {
                 v.duration_secs, v.added_at, v.watched as i64, v.watched_at,
                 v.watched_changed_at, v.hidden as i64, v.hidden_changed_at,
                 v.sibling_group, v.sibling_changed_at, v.series_hidden as i64,
-                v.series_hidden_changed_at],
+                v.series_hidden_changed_at, v.part_links_refused as i64,
+                v.part_links_refused_changed_at],
     )?;
     Ok(())
 }
@@ -5525,10 +5829,12 @@ impl Db {
                             joined.hidden_changed_at, joined.sibling_group,
                             joined.sibling_changed_at, joined.added_manually as i64,
                             joined.added_at, joined.series_hidden as i64,
-                            joined.series_hidden_changed_at])?;
+                            joined.series_hidden_changed_at, joined.part_links_refused as i64,
+                            joined.part_links_refused_changed_at])?;
                         tx.execute(RESTAMP_SYNC_VIDEO, params![
                             joined.id, joined.watched_changed_at, joined.hidden_changed_at,
-                            joined.sibling_changed_at, joined.series_hidden_changed_at])?;
+                            joined.sibling_changed_at, joined.series_hidden_changed_at,
+                            joined.part_links_refused_changed_at])?;
                         writes += 1;
                     }
                     continue;
@@ -6043,7 +6349,8 @@ mod sync_tests {
                 view_count: Some(1), status: VideoStatus::Ready, hidden: false,
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
-                first_seen_at: 500, sibling_group: None, series_hidden: false }
+                first_seen_at: 500, sibling_group: None, series_hidden: false,
+                part_links_refused: false, part_linked: false }
     }
 
     /// Raw SQL, for what only a migration, the clock or another machine
@@ -6957,6 +7264,38 @@ mod sync_tests {
         assert_eq!(anon(&b), after_first);
     }
 
+    // ---- a remembered unlink ----
+
+    fn refusal(d: &Db, id: &str) -> (bool, Option<i64>) {
+        d.conn.lock().unwrap().query_row(
+            "SELECT part_links_refused, part_links_refused_changed_at FROM videos WHERE id=?1",
+            params![id], |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn an_unlink_travels_with_its_own_stamp() {
+        let (a, b) = (library(), library());
+        pin(&a, "videos", "a", "part_links_refused=1, part_links_refused_changed_at=150");
+        let s = a.sync_snapshot("desk").unwrap();
+        assert_eq!(s.videos.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["a"],
+                   "the stamp alone carries the row");
+        assert!(sync(&a, &b).changed);
+        assert_eq!(refusal(&b, "a"), (true, Some(150)), "copied, never restamped here");
+        assert!(!sync(&a, &b).changed, "a second apply writes nothing");
+
+        pin(&b, "videos", "a", "part_links_refused=0, part_links_refused_changed_at=200");
+        assert!(sync(&b, &a).changed);
+        assert_eq!(refusal(&a, "a"), (false, Some(200)), "the later word wins");
+    }
+
+    #[test]
+    fn a_library_that_never_unlinked_snapshots_as_before() {
+        let d = library();
+        d.set_watched("a", true).unwrap();
+        let raw = serde_json::to_string(&d.sync_snapshot("x").unwrap()).unwrap();
+        assert!(!raw.contains("part_links_refused"), "{raw}");
+    }
+
     // ---- a hidden series ----
 
     /// Hides or un-hides one part with its series the way
@@ -7434,7 +7773,7 @@ mod former_titles_tests {
     // ---- the feed ----
 
     fn feed_title(d: &Db, id: &str, title: &str) {
-        d.apply_feed(&[], &[(id.into(), title.into())], &[]).unwrap();
+        d.apply_feed(&[], &[(id.into(), title.into())], &[], &[]).unwrap();
     }
 
     #[test]
@@ -7468,7 +7807,7 @@ mod former_titles_tests {
             // No such row: the foreign key would refuse it, and must not have to.
             ("gone".to_string(), "Deleted Since".to_string()),
         ];
-        assert_eq!(d.apply_feed(&[], &titles, &[]).unwrap(), 0);
+        assert_eq!(d.apply_feed(&[], &titles, &[], &[]).unwrap(), 0);
         assert_eq!(names_kept(&d), 0);
         assert_eq!(title(&d, "a"), "The Blackwood Tapes");
     }
@@ -7479,6 +7818,7 @@ mod former_titles_tests {
         let added = d.apply_feed(
             &[("a".into(), 1_234)],
             &[("a".into(), "The Blackwood Tapes Part 2".into())],
+            &[],
             &[row("b", "The Blackwood Tapes Part 3", 2_000)],
         ).unwrap();
         assert_eq!(added, 1);
@@ -7623,7 +7963,7 @@ mod channel_meta_tests {
 
     /// A database exactly as v12 left it: v11, built step by step, plus the
     /// one step v12 added.
-    fn v12() -> Connection {
+    pub(super) fn v12() -> Connection {
         let conn = super::former_titles_tests::v11();
         conn.execute_batch(VIDEO_TITLES).unwrap();
         conn.pragma_update(None, "user_version", 12).unwrap();
@@ -8207,5 +8547,504 @@ mod feed_stats_tests {
             "channelIds": ["UC1"], "search": "tapes",
         })).unwrap();
         assert_eq!((f.channel_ids, f.search), (vec!["UC1".to_string()], Some("tapes".into())));
+    }
+}
+
+#[cfg(test)]
+mod part_links_tests {
+    use super::*;
+
+    const DAY: i64 = 86_400;
+
+    fn db() -> Db { Db::open_in_memory().unwrap() }
+
+    fn channel(d: &Db, id: &str) {
+        d.upsert_channel(&Channel {
+            id: id.into(), title: format!("T-{id}"), handle: None,
+            url: format!("https://www.youtube.com/channel/{id}"), thumb_path: None,
+            subscribed: true, member: false, added_at: 0, last_polled_at: None,
+            terminated: false, auto_download: false,
+        }).unwrap();
+    }
+
+    fn new_video(id: &str, description: Option<&str>, published: i64) -> NewVideo {
+        NewVideo {
+            id: id.into(), channel_id: "UC1".into(), title: format!("t-{id}"),
+            description: description.map(str::to_string), thumb_url: None,
+            published_at: Some(published), sort_at: Some(published), feed_rank: 0,
+            added_manually: false, duration_secs: Some(600), view_count: None,
+            status: VideoStatus::Ready,
+        }
+    }
+
+    fn column<T: rusqlite::types::FromSql>(d: &Db, id: &str, name: &str) -> T {
+        d.conn.lock().unwrap()
+            .query_row(&format!("SELECT {name} FROM videos WHERE id=?1"), params![id], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A database exactly as v13 left it.
+    fn v13() -> Connection {
+        let conn = super::channel_meta_tests::v12();
+        conn.execute_batch(
+            "ALTER TABLE channels ADD COLUMN avatar_url TEXT;
+             ALTER TABLE channels ADD COLUMN follower_count INTEGER;",
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 13).unwrap();
+        conn
+    }
+
+    fn schema(d: &Db) -> Vec<(String, String, Option<String>)> {
+        let conn = d.conn.lock().unwrap();
+        let mut st = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migrates_v13_to_v14() {
+        let conn = v13();
+        conn.execute_batch(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7);
+             INSERT INTO videos (id,channel_id,title,description,status,first_seen_at)
+               VALUES ('p2','UC1','Two','Part 1 https://youtu.be/AAAAAAAAAAA','ready',1),
+                      ('p1','UC1','One',NULL,'ready',1);",
+        ).unwrap();
+        let d = Db::init(conn).unwrap();
+        let version: i64 = d.conn.lock().unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(column::<Option<String>>(&d, "p2", "part_links"), None, "derived later");
+        assert_eq!(column::<i64>(&d, "p2", "part_links_refused"), 0);
+        assert_eq!(column::<Option<i64>>(&d, "p2", "description_tried_at"), None);
+
+        assert_eq!(d.derive_part_links().unwrap(), 1, "only the row with a description");
+        assert_eq!(column::<Option<String>>(&d, "p2", "part_links").as_deref(), Some("AAAAAAAAAAA"));
+        assert_eq!(column::<Option<String>>(&d, "p1", "part_links"), None);
+        assert_eq!(d.derive_part_links().unwrap(), 0, "nothing left to derive");
+    }
+
+    #[test]
+    fn an_upgraded_database_has_exactly_the_schema_of_a_fresh_one() {
+        assert_eq!(schema(&Db::init(v13()).unwrap()), schema(&db()));
+    }
+
+    #[test]
+    fn insert_writes_part_links() {
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[
+            new_video("a", Some("Part 1 https://youtu.be/BBBBBBBBBBB"), 10),
+            new_video("b", None, 10),
+            new_video("c", Some(""), 10),
+        ]).unwrap();
+        assert_eq!(column::<Option<String>>(&d, "a", "part_links").as_deref(), Some("BBBBBBBBBBB"));
+        assert_eq!(column::<Option<String>>(&d, "b", "part_links"), None);
+        assert_eq!(column::<Option<String>>(&d, "c", "part_links").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn apply_feed_refreshes_description_and_links() {
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[new_video("a", None, 10)]).unwrap();
+        let desc = |s: &str| vec![("a".to_string(), s.to_string())];
+
+        d.apply_feed(&[], &[], &desc("Part 1 https://youtu.be/BBBBBBBBBBB"), &[]).unwrap();
+        assert_eq!(column::<Option<String>>(&d, "a", "part_links").as_deref(), Some("BBBBBBBBBBB"));
+
+        // The uploader adds the next part to an older one's description.
+        let longer = "Part 1 https://youtu.be/BBBBBBBBBBB\nPart 3 https://youtu.be/CCCCCCCCCCC";
+        d.apply_feed(&[], &[], &desc(longer), &[]).unwrap();
+        assert_eq!(column::<Option<String>>(&d, "a", "description").as_deref(), Some(longer));
+        assert_eq!(column::<Option<String>>(&d, "a", "part_links").as_deref(),
+                   Some("BBBBBBBBBBB CCCCCCCCCCC"));
+
+        // Unchanged: nothing written, which the trigger-free count shows.
+        let before: i64 = d.conn.lock().unwrap().query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
+        d.apply_feed(&[], &[], &desc(longer), &[]).unwrap();
+        let after: i64 = d.conn.lock().unwrap().query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn set_descriptions_stamps_tried() {
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[new_video("a", None, 10)]).unwrap();
+        let n = d.set_descriptions(&[("a".into(), "Part 1 https://youtu.be/BBBBBBBBBBB".into()),
+                                     ("missing".into(), "x".into())]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(column::<Option<String>>(&d, "a", "part_links").as_deref(), Some("BBBBBBBBBBB"));
+        assert!(column::<Option<i64>>(&d, "a", "description_tried_at").is_some());
+    }
+
+    #[test]
+    fn needing_description_order_and_retry() {
+        let d = db();
+        channel(&d, "UC1");
+        let now = 100 * DAY;
+        d.insert_videos_if_new(&[
+            new_video("old", None, 10),
+            new_video("new", None, 50),
+            new_video("has", Some("text"), 60),
+            NewVideo { status: VideoStatus::Pending, ..new_video("pending", None, 70) },
+            new_video("tried6", None, 40),
+            new_video("tried8", None, 30),
+        ]).unwrap();
+        {
+            let conn = d.conn.lock().unwrap();
+            conn.execute("UPDATE videos SET description_tried_at=?1 WHERE id='tried6'",
+                         params![now - 6 * DAY]).unwrap();
+            conn.execute("UPDATE videos SET description_tried_at=?1 WHERE id='tried8'",
+                         params![now - 8 * DAY]).unwrap();
+        }
+        assert_eq!(d.videos_needing_description(now, 10).unwrap(), ["new", "tried8", "old"]);
+        assert_eq!(d.videos_needing_description(now, 1).unwrap(), ["new"]);
+        assert_eq!(d.count_videos_needing_description(now).unwrap(), 3);
+
+        d.mark_description_tried("new", now).unwrap();
+        assert_eq!(d.videos_needing_description(now, 10).unwrap(), ["tried8", "old"]);
+    }
+
+    fn archive_video(id: &str, description: Option<&str>) -> Video {
+        Video { id: id.into(), channel_id: "UC1".into(), channel_title: "T-UC1".into(),
+                title: format!("t-{id}"), description: description.map(str::to_string),
+                thumb_url: None, thumb_path: None, published_at: Some(1_000),
+                sort_at: Some(1_000), feed_rank: 0, added_manually: false,
+                duration_secs: Some(600), view_count: Some(1), status: VideoStatus::Ready,
+                hidden: false, watched: false, watched_at: None,
+                download_state: DownloadState::None, download_error: None, file_path: None,
+                downloaded_at: None, first_seen_at: 500, sibling_group: None,
+                series_hidden: false,
+                part_links_refused: false, part_linked: false }
+    }
+
+    fn import(d: &Db, videos: &[Video], mode: ImportMode) {
+        let ch = d.get_channel("UC1").unwrap().unwrap();
+        d.apply_import(&[ch], videos, &HashMap::new(), mode, &["UC1".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn import_put_and_merge_write_part_links() {
+        let d = db();
+        channel(&d, "UC1");
+        let linking = Some("Part 1 https://youtu.be/BBBBBBBBBBB");
+        import(&d, &[archive_video("new", linking)], ImportMode::Replace);
+        assert_eq!(column::<Option<String>>(&d, "new", "part_links").as_deref(), Some("BBBBBBBBBBB"));
+
+        d.insert_videos_if_new(&[new_video("bare", None, 10),
+                                 new_video("kept", Some("mine"), 10)]).unwrap();
+        import(&d, &[archive_video("new", linking), archive_video("bare", linking),
+                     archive_video("kept", linking)], ImportMode::Merge);
+        assert_eq!(column::<Option<String>>(&d, "bare", "description").as_deref(), linking,
+                   "a missing description is filled");
+        assert_eq!(column::<Option<String>>(&d, "bare", "part_links").as_deref(), Some("BBBBBBBBBBB"));
+        assert_eq!(column::<Option<String>>(&d, "kept", "description").as_deref(), Some("mine"),
+                   "a present one is never overwritten");
+        assert_eq!(column::<Option<String>>(&d, "kept", "part_links").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn merge_import_lifts_refusal() {
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[new_video("a", None, 10)]).unwrap();
+        import(&d, &[Video { part_links_refused: true, ..archive_video("a", None) }],
+               ImportMode::Merge);
+        assert_eq!(column::<i64>(&d, "a", "part_links_refused"), 1);
+        import(&d, &[archive_video("a", None)], ImportMode::Merge);
+        assert_eq!(column::<i64>(&d, "a", "part_links_refused"), 1, "a merge never lowers it");
+    }
+
+    #[test]
+    fn replace_import_applies_refusal() {
+        let d = db();
+        channel(&d, "UC1");
+        import(&d, &[Video { part_links_refused: true, ..archive_video("a", None) }],
+               ImportMode::Replace);
+        assert_eq!(column::<i64>(&d, "a", "part_links_refused"), 1);
+        import(&d, &[archive_video("a", None)], ImportMode::Replace);
+        assert_eq!(column::<i64>(&d, "a", "part_links_refused"), 0, "verbatim");
+    }
+
+    #[test]
+    fn refused_trigger_stamps() {
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[new_video("a", None, 10)]).unwrap();
+        assert_eq!(column::<Option<i64>>(&d, "a", "part_links_refused_changed_at"), None);
+        d.conn.lock().unwrap()
+            .execute("UPDATE videos SET part_links_refused=1 WHERE id='a'", []).unwrap();
+        assert!(column::<Option<i64>>(&d, "a", "part_links_refused_changed_at").is_some());
+
+        d.conn.lock().unwrap().execute(
+            "INSERT INTO videos (id,channel_id,title,status,first_seen_at,part_links_refused)
+             VALUES ('b','UC1','t','ready',1,1)", []).unwrap();
+        assert!(column::<Option<i64>>(&d, "b", "part_links_refused_changed_at").is_some());
+    }
+
+    #[test]
+    fn channel_rows_carry_links_and_refusal() {
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[new_video("a", Some("https://youtu.be/BBBBBBBBBBB"), 10),
+                                 new_video("b", None, 10)]).unwrap();
+        d.conn.lock().unwrap()
+            .execute("UPDATE videos SET part_links_refused=1 WHERE id='b'", []).unwrap();
+        let conn = d.conn.lock().unwrap();
+        for entries in [channel_rows(&conn, "UC1").unwrap().0,
+                        Db::series_entries(&conn, "UC1").unwrap()] {
+            let a = entries.iter().find(|e| e.id == "a").unwrap();
+            let b = entries.iter().find(|e| e.id == "b").unwrap();
+            assert_eq!((a.links.clone(), a.refused), (vec!["BBBBBBBBBBB".to_string()], false));
+            assert_eq!((b.links.clone(), b.refused), (Vec::<String>::new(), true));
+        }
+    }
+
+    /// Rows `(id, description)` on UC1, titled so no two match.
+    fn rows(d: &Db, rows: &[(&str, Option<&str>)]) {
+        let videos: Vec<NewVideo> =
+            rows.iter().map(|(id, desc)| new_video(id, *desc, 10)).collect();
+        d.insert_videos_if_new(&videos).unwrap();
+    }
+
+    fn link(ids: &[&str]) -> String {
+        ids.iter().map(|id| format!("Part https://youtu.be/{id}\n")).collect()
+    }
+
+    /// Every card's members, each sorted, the cards sorted.
+    fn grouped(d: &Db) -> Vec<Vec<String>> {
+        let f = VideoFilter { show_hidden: true, ..VideoFilter::default() };
+        let mut out: Vec<Vec<String>> = d.list_video_groups(&f).unwrap().into_iter()
+            .map(|g| {
+                let mut ids: Vec<String> = g.videos.into_iter().map(|v| v.id).collect();
+                ids.sort();
+                ids
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn ids(v: &[&[&str]]) -> Vec<Vec<String>> {
+        v.iter().map(|c| c.iter().map(|s| s.to_string()).collect()).collect()
+    }
+
+    // Eleven-character ids, so the descriptions can link them.
+    const P1: &str = "p1_________";
+    const P2: &str = "p2_________";
+    const P3: &str = "p3_________";
+
+    #[test]
+    fn unlink_refuses_description_links() {
+        let d = db();
+        channel(&d, "UC1");
+        rows(&d, &[(P1, None), (P2, Some(&link(&[P1]))), (P3, Some(&link(&[P1, P2])))]);
+        assert_eq!(grouped(&d), ids(&[&[P1, P2, P3]]));
+
+        d.unlink_siblings(P2).unwrap();
+        assert_eq!(column::<i64>(&d, P2, "part_links_refused"), 1);
+        assert_eq!(grouped(&d), ids(&[&[P1, P3], &[P2]]));
+        d.derive_part_links().unwrap();
+        assert_eq!(grouped(&d), ids(&[&[P1, P3], &[P2]]), "remembered");
+    }
+
+    #[test]
+    fn undoing_a_hand_mark_lets_titles_place_it_again() {
+        // A drag that slipped: "Saga Part 3" marked with an unrelated video.
+        // Nothing a description said is being refused, so unlinking it hands
+        // it back to its titles, as it always did.
+        let d = db();
+        channel(&d, "UC1");
+        d.insert_videos_if_new(&[
+            NewVideo { title: "Saga Part 1".into(), ..new_video(P1, None, 10) },
+            NewVideo { title: "Saga Part 2".into(), ..new_video(P2, None, 10) },
+            NewVideo { title: "Saga Part 3".into(), ..new_video(P3, None, 10) },
+            NewVideo { title: "Zulu".into(), ..new_video("z", None, 10) },
+        ]).unwrap();
+        d.mark_siblings(&[P3.to_string(), "z".to_string()]).unwrap();
+        assert_eq!(grouped(&d), ids(&[&[P1, P2, P3, "z"]]));
+
+        d.unlink_siblings(P3).unwrap();
+        assert_eq!(column::<i64>(&d, P3, "part_links_refused"), 0);
+        assert_eq!(grouped(&d), ids(&[&[P1, P2, P3], &["z"]]));
+    }
+
+    #[test]
+    fn unlink_from_hand_and_description_leaves_card() {
+        let d = db();
+        channel(&d, "UC1");
+        rows(&d, &[(P1, None), (P2, Some(&link(&[P3]))), (P3, None)]);
+        d.mark_siblings(&[P1.to_string(), P2.to_string()]).unwrap();
+        assert_eq!(grouped(&d), ids(&[&[P1, P2, P3]]));
+
+        d.unlink_siblings(P2).unwrap();
+        assert_eq!(grouped(&d), ids(&[&[P1], &[P2], &[P3]]));
+        assert_eq!(column::<Option<String>>(&d, P1, "sibling_group"), None, "the pair dissolved");
+    }
+
+    #[test]
+    fn unlink_brings_back_a_series_hidden_part() {
+        let d = db();
+        channel(&d, "UC1");
+        rows(&d, &[(P1, None), (P2, Some(&link(&[P1])))]);
+        d.set_series_hidden(P1, true).unwrap();
+        assert_eq!(column::<i64>(&d, P2, "hidden"), 1);
+
+        d.unlink_siblings(P2).unwrap();
+        assert_eq!((column::<i64>(&d, P2, "hidden"), column::<i64>(&d, P2, "series_hidden")), (0, 0));
+        assert!(column::<Option<i64>>(&d, P2, "series_hidden_changed_at").is_some());
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(column::<i64>(&d, P2, "hidden"), 0, "decided, so never swept back");
+        assert_eq!(column::<i64>(&d, P1, "hidden"), 1, "the rest of the series stays hidden");
+    }
+
+    #[test]
+    fn part_linked_is_reported() {
+        let d = db();
+        channel(&d, "UC1");
+        rows(&d, &[(P1, None), (P2, Some(&link(&[P1]))), ("h1", None), ("h2", None)]);
+        d.insert_videos_if_new(&[
+            NewVideo { title: "Saga Part 1".into(), ..new_video("t1", None, 10) },
+            NewVideo { title: "Saga Part 2".into(), ..new_video("t2", None, 10) },
+        ]).unwrap();
+        d.mark_siblings(&["h1".to_string(), "h2".to_string()]).unwrap();
+        let linked = |videos: Vec<Video>| {
+            let mut got: Vec<String> =
+                videos.into_iter().filter(|v| v.part_linked).map(|v| v.id).collect();
+            got.sort();
+            got
+        };
+
+        let grouped: Vec<Video> = d.list_video_groups(&VideoFilter::default()).unwrap()
+            .into_iter().flat_map(|g| g.videos).collect();
+        assert_eq!(linked(grouped), [P1, P2]);
+        assert_eq!(linked(d.list_videos(&VideoFilter::default()).unwrap()), [P1, P2]);
+        let series = VideoFilter { sibling_of: Some(P2.into()), ..VideoFilter::default() };
+        assert_eq!(linked(d.list_videos(&series).unwrap()), [P1, P2]);
+        assert!(!d.get_video(P1).unwrap().unwrap().part_linked, "elsewhere it is never computed");
+    }
+
+    #[test]
+    fn sweep_follows_description_links() {
+        let d = db();
+        channel(&d, "UC1");
+        rows(&d, &[(P1, None), (P2, Some(&link(&[P1])))]);
+        d.set_series_hidden(P1, true).unwrap();
+        rows(&d, &[(P3, Some(&link(&[P1, P2])))]);
+        assert_eq!(d.hide_series_arrivals().unwrap(), [P3]);
+        assert_eq!(column::<i64>(&d, P3, "hidden"), 1);
+    }
+
+    /// What description links do to the real library's cards: the copy as the
+    /// upgrade leaves it (no `part_links` parsed, so titles and hand marks
+    /// alone) against the same copy once `derive_part_links` has run. Needs a
+    /// **copy** -- `Db::open` migrates:
+    ///
+    ///     sqlite3 "file:$HOME/.config/mytube/mytube.db?mode=ro" ".backup /tmp/lib.db"
+    ///     MYTUBE_DB=/tmp/lib.db cargo test description_links_on_the_real_library -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads a copy of the real library"]
+    fn description_links_on_the_real_library() {
+        let path = std::env::var("MYTUBE_DB")
+            .expect("set MYTUBE_DB to a *copy* of the library; this opens it read-write");
+        let d = Db::open(std::path::Path::new(&path)).expect("library opens");
+        d.conn.lock().unwrap().execute("UPDATE videos SET part_links=NULL", []).unwrap();
+        let f = VideoFilter { limit: 100_000, show_hidden: true, ..Default::default() };
+        let read = |d: &Db| {
+            let started = std::time::Instant::now();
+            let groups = d.list_video_groups(&f).unwrap();
+            (groups, started.elapsed())
+        };
+        let (before, t_before) = read(&d);
+        let parsed = d.derive_part_links().unwrap();
+        let (after, t_after) = read(&d);
+
+        let card_of: HashMap<&str, usize> = after.iter().enumerate()
+            .flat_map(|(i, g)| g.videos.iter().map(move |v| (v.id.as_str(), i)))
+            .collect();
+        let was_of: HashMap<&str, usize> = before.iter().enumerate()
+            .flat_map(|(i, g)| g.videos.iter().map(move |v| (v.id.as_str(), i)))
+            .collect();
+        let show = |g: &VideoGroup| {
+            for v in &g.videos {
+                println!("      {}{}", if v.part_linked { "[d] " } else { "    " }, v.title);
+            }
+        };
+
+        let mut splits = 0;
+        let mut identical_splits = 0;
+        println!("\n===== series the descriptions took apart =====");
+        for g in before.iter().filter(|g| g.videos.len() > 1) {
+            let mut into: Vec<usize> = g.videos.iter().map(|v| card_of[v.id.as_str()]).collect();
+            into.sort_unstable();
+            into.dedup();
+            if into.len() < 2 { continue; }
+            splits += 1;
+            let cores: HashSet<String> =
+                g.videos.iter().map(|v| siblings::normalize(&v.title).core).collect();
+            if cores.len() == 1 { identical_splits += 1; }
+            println!("\n  [{}] {} parts -> {} cards{}", g.videos[0].channel_title, g.videos.len(),
+                     into.len(), if cores.len() == 1 { "  (IDENTICAL TITLES)" } else { "" });
+            for i in into { println!("    card:"); show(&after[i]); }
+        }
+
+        let mut merges = 0;
+        println!("\n===== cards the descriptions put together =====");
+        for g in after.iter().filter(|g| g.videos.len() > 1) {
+            let mut from: Vec<usize> = g.videos.iter().map(|v| was_of[v.id.as_str()]).collect();
+            from.sort_unstable();
+            from.dedup();
+            if from.len() < 2 { continue; }
+            merges += 1;
+            println!("\n  [{}] {} parts from {} cards", g.videos[0].channel_title, g.videos.len(),
+                     from.len());
+            show(g);
+        }
+
+        if let Some(&i) = card_of.get("6MmIixGviow") {
+            println!("\n===== the card holding 6MmIixGviow =====");
+            show(&after[i]);
+        }
+        let linked = after.iter().flat_map(|g| &g.videos).filter(|v| v.part_linked).count();
+        let series = |gs: &[VideoGroup]| gs.iter().filter(|g| g.videos.len() > 1).count();
+        // Contested: a claim lands on it or leaves it, yet no link of its own
+        // survived. (Nothing in a fresh copy is refused.)
+        let channels: Vec<String> = after.iter().map(|g| g.videos[0].channel_id.clone())
+            .collect::<HashSet<_>>().into_iter().collect();
+        let mut contested: Vec<String> = Vec::new();
+        for c in &channels {
+            let entries = claim_rows(&d.conn.lock().unwrap(), c).unwrap();
+            let here: HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+            let mut touched: HashSet<&str> = HashSet::new();
+            for e in &entries {
+                for l in e.links.iter().filter(|l| *l != &e.id && here.contains(l.as_str())) {
+                    touched.insert(e.id.as_str());
+                    touched.insert(l.as_str());
+                }
+            }
+            let kept = siblings::description_linked(&entries);
+            contested.extend(touched.into_iter().filter(|id| !kept.contains(*id)).map(String::from));
+        }
+        let title_of: HashMap<&str, &str> = after.iter().flat_map(|g| &g.videos)
+            .map(|v| (v.id.as_str(), v.title.as_str())).collect();
+        println!("\n===== contested: linked from two shows, so linked to neither =====");
+        for id in &contested { println!("      {}", title_of.get(id.as_str()).unwrap_or(&"?")); }
+        let swept = d.hide_series_arrivals().unwrap().len();
+        println!(
+            "\n=== parsed {parsed} descriptions; {linked} videos linked by one, {} contested; \
+             the first sweep would hide {swept}\n\
+             === before: {} cards, {} series, built in {t_before:?}\n\
+             === after:  {} cards, {} series, built in {t_after:?}\n\
+             === {merges} cards put together, {splits} series taken apart \
+             ({identical_splits} of them with identical titles) ===",
+            contested.len(), before.len(), series(&before), after.len(), series(&after),
+        );
     }
 }

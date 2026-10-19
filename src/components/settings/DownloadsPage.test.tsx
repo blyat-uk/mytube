@@ -33,6 +33,8 @@ const VIDEO: Video = {
   download_error: null, file_path: null, downloaded_at: null, first_seen_at: 0,
   sibling_group: null,
   series_hidden: false,
+  part_links_refused: false,
+  part_linked: false,
 };
 
 describe("the page", () => {

@@ -19,7 +19,10 @@
 //!   never matched on);
 //! - the ld+json `uploadDate` that [`upload_date::parse_upload_date`] reads;
 //! - `playerMicroformatRenderer.canonicalUrl`, which is `/shorts/<id>` for a
-//!   Short (`8Pae6Wy1abE`) and `/watch?v=<id>` otherwise.
+//!   Short (`8Pae6Wy1abE`) and `/watch?v=<id>` otherwise;
+//! - `videoDetails.shortDescription`, the description in full despite its
+//!   name -- the same text the RSS feed carries (checked 2026-10-19), and what
+//!   [`crate::part_links`] reads a series' other parts from.
 
 use std::sync::OnceLock;
 
@@ -33,7 +36,7 @@ use crate::{upload_date, ytdlp};
 /// for `/shorts/` -- whose whole answer is a status and a redirect -- that
 /// hides the answer entirely. Verified 2026-10-16: `/shorts/8Pae6Wy1abE`
 /// answers 200 with it. It identifies nobody; it is the "reject all" answer.
-const CONSENT_COOKIE: &str = "SOCS=CAI";
+pub(crate) const CONSENT_COOKIE: &str = "SOCS=CAI";
 
 /// What MyTube needs from one watch page.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +57,9 @@ pub struct WatchPage {
     /// `/shorts/` probe in [`is_short`] is the real test; this is what the page
     /// already says, for when that probe could not answer.
     pub canonical_short: bool,
+    /// The description: `""` when the details say it is empty, `None` when
+    /// they do not say. See [`parse_description`].
+    pub description: Option<String>,
 }
 
 /// The JSON object starting right after `key` in `html`, where the object
@@ -71,6 +77,24 @@ fn object_at(html: &str, key: &str, starts: &str) -> Option<Value> {
         .next()?
         .ok()?;
     value.is_object().then_some(value)
+}
+
+/// The description from `video_id`'s watch page, untrimmed. `None` when the
+/// page has no player details -- a consent wall, a bot check, a removed
+/// video -- or details without the key, or details about another video: all
+/// of them "nothing was read", never "no description", and the caller must
+/// not store any of them as one, since a stored description is never asked
+/// for again. `Some("")` only when the key is there and empty.
+pub fn parse_description(html: &str, video_id: &str) -> Option<String> {
+    let details = object_at(html, r#""videoDetails":"#, r#"{"videoId""#)?;
+    if str_field(&details, "videoId").as_deref() != Some(video_id) {
+        return None;
+    }
+    description_of(&details)
+}
+
+fn description_of(details: &Value) -> Option<String> {
+    details.get("shortDescription").and_then(Value::as_str).map(str::to_string)
 }
 
 fn str_field(v: &Value, key: &str) -> Option<String> {
@@ -113,6 +137,7 @@ pub fn parse(html: &str) -> Option<WatchPage> {
         published_at: upload_date::parse_upload_date(html),
         members_only,
         canonical_short,
+        description: description_of(&details),
     })
 }
 
@@ -345,5 +370,29 @@ mod tests {
         let p = fetch(&http(), "yi8Ehs1Mrwc").await.expect("page parsed");
         assert!(p.members_only);
         assert_eq!(is_short("yi8Ehs1Mrwc").await, Some(false));
+    }
+
+    #[test]
+    fn parse_reads_short_description() {
+        let p = parse(PUBLIC).expect("parses");
+        assert_eq!(p.description.as_deref(), Some("Braces in prose } { are fine inside a string."));
+        let escaped = r#""videoDetails":{"videoId":"abcdefghijk","title":"T","shortDescription":"Part 1 https://youtu.be/AAAAAAAAAAA\nPart 2 \"two\""}"#;
+        assert_eq!(parse_description(escaped, "abcdefghijk").as_deref(),
+                   Some("Part 1 https://youtu.be/AAAAAAAAAAA\nPart 2 \"two\""));
+    }
+
+    #[test]
+    fn page_without_details_has_no_description() {
+        // A consent wall or a bot check: nothing read, so nothing stored.
+        assert_eq!(parse_description("<html>Before you continue to YouTube</html>", "x"), None);
+        // Details without the key at all are a page reshaped, not a video
+        // with no description: nothing read either.
+        assert_eq!(parse_description(MEMBERS, "yi8Ehs1Mrwc"), None);
+        assert_eq!(parse(MEMBERS).unwrap().description, None);
+        // The key, empty: read, and there is none.
+        let empty = r#""videoDetails":{"videoId":"abcdefghijk","title":"T","shortDescription":""}"#;
+        assert_eq!(parse_description(empty, "abcdefghijk").as_deref(), Some(""));
+        // A page about some other video says nothing about this one.
+        assert_eq!(parse_description(empty, "zzzzzzzzzzz"), None);
     }
 }

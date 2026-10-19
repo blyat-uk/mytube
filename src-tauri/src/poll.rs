@@ -213,25 +213,33 @@ fn ingestable(entries: &[FlatEntry], known: &HashSet<String>, member: bool, mode
 /// entry missing from it keeps the listing's approximate bucket, which at least
 /// interleaves it into the feed instead of piling it at the bottom.
 fn insert_from_listing(db: &Db, channel_id: &str, entries: &[FlatEntry],
-                       dates: &HashMap<String, i64>) -> Result<usize> {
-    let rows: Vec<NewVideo> = entries.iter().map(|e| {
-        let when = dates.get(&e.id).copied().or(e.published_at);
-        NewVideo {
-            id: e.id.clone(),
-            channel_id: channel_id.to_string(),
-            title: e.title.clone(),
-            description: None,
-            thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
-            published_at: when,
-            sort_at: when,
-            feed_rank: 0,
-            added_manually: false,
-            duration_secs: e.duration_secs,
-            view_count: e.view_count,
-            status: ytdlp::status_from(e.live_status.as_deref(), e.duration_secs),
-        }
-    }).collect();
+                       pages: &HashMap<String, upload_date::PageFacts>) -> Result<usize> {
+    let rows: Vec<NewVideo> =
+        entries.iter().map(|e| listing_row(channel_id, 0, e, pages.get(&e.id))).collect();
     db.insert_videos_if_new(&rows)
+}
+
+/// A listing entry as a row, with what its watch page said where one was
+/// read: the real date, when the page gave one -- otherwise the approximate
+/// bucket, which at least interleaves the video into the feed instead of
+/// piling it up at the bottom -- and the description a listing never carries.
+fn listing_row(channel_id: &str, rank: i64, e: &FlatEntry,
+               page: Option<&upload_date::PageFacts>) -> NewVideo {
+    let when = page.and_then(|p| p.published_at).or(e.published_at);
+    NewVideo {
+        id: e.id.clone(),
+        channel_id: channel_id.to_string(),
+        title: e.title.clone(),
+        description: page.and_then(|p| p.description.clone()),
+        thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
+        published_at: when,
+        sort_at: when,
+        feed_rank: rank,
+        added_manually: false,
+        duration_secs: e.duration_secs,
+        view_count: e.view_count,
+        status: ytdlp::status_from(e.live_status.as_deref(), e.duration_secs),
+    }
 }
 
 /// What one write of fresh rows added: the database's own count of rows that
@@ -358,11 +366,29 @@ pub async fn repair_dates(state: &AppState) -> usize {
     if ids.is_empty() {
         return 0;
     }
-    let real: Vec<(String, i64)> =
-        upload_date::fetch_many(&state.http, ids).await.into_iter().collect();
+    let (real, descriptions) = split_facts(upload_date::fetch_many(&state.http, ids).await);
+    // The same pages carry the description, which these rows -- written from a
+    // listing -- were never given; keeping it costs nothing and saves the
+    // background catch-up a request each.
+    let _ = state.db.set_descriptions(&descriptions);
     // One transaction for up to `DATE_REPAIR_LIMIT` rows, rather than a lock
     // and a commit per row while the UI is trying to read.
     state.db.set_published_at_many(&real).unwrap_or(0)
+}
+
+/// What watch pages said, as the two writes that keep it: dates, and
+/// descriptions. Each in id order, so a batch writes the same way every time.
+fn split_facts(found: HashMap<String, upload_date::PageFacts>)
+    -> (Vec<(String, i64)>, Vec<(String, String)>) {
+    let mut found: Vec<(String, upload_date::PageFacts)> = found.into_iter().collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut dates = Vec::new();
+    let mut descriptions = Vec::new();
+    for (id, facts) in found {
+        if let Some(ts) = facts.published_at { dates.push((id.clone(), ts)); }
+        if let Some(text) = facts.description { descriptions.push((id, text)); }
+    }
+    (dates, descriptions)
 }
 
 /// Writes a feed's entries as new rows, returning what was actually new.
@@ -374,6 +400,7 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
     let existing = db.existing_video_ids(&ids)?;
     let mut dates: Vec<(String, i64)> = Vec::new();
     let mut titles: Vec<(String, String)> = Vec::new();
+    let mut descriptions: Vec<(String, String)> = Vec::new();
     let mut fresh: Vec<NewVideo> = Vec::new();
 
     for e in &feed.entries {
@@ -406,6 +433,11 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
             // has it renamed, `set_titles` retitles it and the database's
             // trigger keeps the old name on its own.
             titles.push((e.video_id.clone(), e.title.clone()));
+            // A description, unlike the title, the feed keeps current -- and
+            // it is how a row the listing inserted gets one at all.
+            if let Some(text) = &e.description {
+                descriptions.push((e.video_id.clone(), text.clone()));
+            }
             continue;
         }
         fresh.push(NewVideo {
@@ -429,7 +461,7 @@ fn insert_from_feed(db: &Db, channel: &Channel, feed: &Feed) -> Result<Added> {
     // One lock and one commit for the whole feed. A date or a former name that
     // fails to write is skipped, as a date always was; only an insert failing
     // fails the poll.
-    let count = db.apply_feed(&dates, &titles, &fresh)?;
+    let count = db.apply_feed(&dates, &titles, &descriptions, &fresh)?;
     Ok(Added { count, ids: fresh.into_iter().map(|v| v.id).collect() })
 }
 
@@ -755,23 +787,9 @@ pub async fn backfill_channel(state: &AppState, channel_id: &str, count: u32) ->
     // Built whole and written in one transaction: a deepen can be hundreds of
     // rows, and a lock and a commit per row kept the UI's reads waiting behind
     // every one of them.
-    let rows: Vec<NewVideo> = fresh.iter().map(|(rank, e)| NewVideo {
-        id: e.id.clone(),
-        channel_id: channel_id.to_string(),
-        title: e.title.clone(),
-        description: None,
-        thumb_url: Some(ytdlp::thumb_url_for(&e.id)),
-        // The real date when the watch page gave one; otherwise the
-        // approximate bucket, which at least interleaves the video into the
-        // feed instead of piling it up at the bottom.
-        published_at: real.get(&e.id).copied().or(e.published_at),
-        sort_at: real.get(&e.id).copied().or(e.published_at),
-        feed_rank: *rank as i64,
-        added_manually: false,
-        duration_secs: e.duration_secs,
-        view_count: e.view_count,
-        status: ytdlp::status_from(e.live_status.as_deref(), e.duration_secs),
-    }).collect();
+    let rows: Vec<NewVideo> = fresh.iter()
+        .map(|(rank, e)| listing_row(channel_id, *rank as i64, e, real.get(&e.id)))
+        .collect();
     let added = state.db.insert_videos_if_new(&rows)?;
     cache_thumbs(
         state,
@@ -1022,7 +1040,9 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
         member_channel(&db);
 
         let entries = vec![entry("a", Some("subscriber_only")), entry("b", Some("subscriber_only"))];
-        let dates = HashMap::from([("a".to_string(), REAL)]);
+        let dates = HashMap::from([("a".to_string(),
+                                    upload_date::PageFacts { published_at: Some(REAL),
+                                                             description: None })]);
         assert_eq!(insert_from_listing(&db, CH, &entries, &dates).unwrap(), 2);
 
         let a = db.get_video("a").unwrap().unwrap();
@@ -1271,5 +1291,31 @@ SYSTEM to Slaughter 10,000 Barbarians ALONE!";
             summary_line(&s, 0, 0, 0),
             "polled 27 channels, nothing new, 2 errors: Alpha: boom; Beta: bang"
         );
+    }
+
+    #[test]
+    fn a_listing_row_takes_what_the_watch_page_said() {
+        let e = FlatEntry { published_at: Some(86_400), ..entry("aaaaaaaaaaa", None) };
+        let facts = upload_date::PageFacts {
+            published_at: Some(99),
+            description: Some("Part 1 https://youtu.be/BBBBBBBBBBB".into()),
+        };
+        let row = listing_row("UC1", 3, &e, Some(&facts));
+        assert_eq!((row.published_at, row.sort_at, row.feed_rank), (Some(99), Some(99), 3));
+        assert_eq!(row.description, facts.description);
+        let bare = listing_row("UC1", 0, &e, None);
+        assert_eq!((bare.published_at, bare.description), (Some(86_400), None));
+    }
+
+    #[test]
+    fn repaired_pages_split_into_dates_and_descriptions() {
+        let mut found = HashMap::new();
+        found.insert("a".to_string(),
+                     upload_date::PageFacts { published_at: Some(5), description: None });
+        found.insert("b".to_string(),
+                     upload_date::PageFacts { published_at: None, description: Some("d".into()) });
+        let (dates, descriptions) = split_facts(found);
+        assert_eq!(dates, [("a".to_string(), 5)]);
+        assert_eq!(descriptions, [("b".to_string(), "d".to_string())]);
     }
 }

@@ -810,7 +810,9 @@ export default function SubscriptionsView(p: Props) {
         onSelect: () => p.onFindSiblings(video),
       });
     }
-    if (video.sibling_group) {
+    // A hand mark, or a description's link: either way the card holds it by
+    // something the user can take back, and the backend remembers it.
+    if (video.sibling_group || video.part_linked) {
       items.push({
         label: "Unlink from siblings",
         onSelect: () => void unlinkSiblings(video),

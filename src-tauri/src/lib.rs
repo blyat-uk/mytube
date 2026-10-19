@@ -6,9 +6,11 @@ pub mod commands;
 pub mod config;
 pub mod cookie_file;
 pub mod db;
+pub mod descriptions;
 pub mod detect;
 pub mod library_transfer;
 pub mod models;
+pub mod part_links;
 pub mod player;
 pub mod poll;
 pub mod proc;
@@ -146,6 +148,10 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 }
             });
+
+            // The descriptions no source has given yet, one watch page at a
+            // time on a clock of its own -- see `descriptions` for the pace.
+            tauri::async_runtime::spawn(descriptions::run(state.clone()));
 
             tauri::async_runtime::spawn(async move {
                 // Replaces absent and approximate-bucket dates with real ones.

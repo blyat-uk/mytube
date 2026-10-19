@@ -77,6 +77,8 @@ fn video(id: &str, channel_id: &str) -> Video {
         first_seen_at: 1_000,
         sibling_group: None,
         series_hidden: false,
+        part_links_refused: false,
+        part_linked: false,
     }
 }
 

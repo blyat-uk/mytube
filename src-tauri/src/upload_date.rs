@@ -14,6 +14,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 
 use crate::rss::USER_AGENT;
+use crate::watch_page;
 
 /// Matches the ld+json instant. `publishDate` is the fallback: the two agree
 /// on every page checked, but only `uploadDate` is guaranteed by schema.org.
@@ -52,18 +53,42 @@ pub fn parse_upload_date(html: &str) -> Option<i64> {
     Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
 }
 
-async fn fetch_one(http: &reqwest::Client, video_id: &str) -> Option<i64> {
+/// What one watch page says that a listing cannot: the real upload instant,
+/// and the description (see [`crate::part_links`]) -- the same request
+/// answers both, so a row written from a listing gets its description for
+/// free.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageFacts {
+    pub published_at: Option<i64>,
+    /// `None` when the page carried no player details at all; see
+    /// [`watch_page::parse_description`].
+    pub description: Option<String>,
+}
+
+pub fn facts_from_html(html: &str, video_id: &str) -> PageFacts {
+    PageFacts {
+        published_at: parse_upload_date(html),
+        description: watch_page::parse_description(html, video_id),
+    }
+}
+
+async fn fetch_one(http: &reqwest::Client, video_id: &str) -> Option<PageFacts> {
     let url = crate::ytdlp::watch_url(video_id);
+    // The consent cookie as `watch_page::fetch` sends it: without it a
+    // European address is answered with the consent interstitial, which holds
+    // neither the date nor the description.
     let resp = http
         .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::COOKIE, watch_page::CONSENT_COOKIE)
         .send()
         .await
         .ok()?;
     if !resp.status().is_success() {
         return None;
     }
-    parse_upload_date(&resp.text().await.ok()?)
+    let facts = facts_from_html(&resp.text().await.ok()?, video_id);
+    (facts != PageFacts::default()).then_some(facts)
 }
 
 /// Matches the concurrency already used for feeds and thumbnails.
@@ -71,12 +96,12 @@ const CONCURRENCY: usize = 8;
 
 /// Resolves as many ids as it can. Ids whose page fails or parses to nothing
 /// are simply absent from the map, leaving the caller's existing value alone.
-pub async fn fetch_many<I>(http: &reqwest::Client, ids: I) -> HashMap<String, i64>
+pub async fn fetch_many<I>(http: &reqwest::Client, ids: I) -> HashMap<String, PageFacts>
 where
     I: IntoIterator<Item = String>,
 {
     stream::iter(ids)
-        .map(|id| async move { fetch_one(http, &id).await.map(|ts| (id, ts)) })
+        .map(|id| async move { fetch_one(http, &id).await.map(|facts| (id, facts)) })
         .buffer_unordered(CONCURRENCY)
         .filter_map(|found| async move { found })
         .collect()
@@ -156,12 +181,24 @@ mod tests {
             .unwrap();
 
         // Uploaded 2026-07-18; the channel listing buckets it at 2026-07-30.
-        let ts = fetch_one(&http, "sxKEb786yiU").await.expect("date resolved");
+        let page = fetch_one(&http, "sxKEb786yiU").await.expect("page read");
+        let ts = page.published_at.expect("date resolved");
+        assert!(page.description.is_some(), "the same page carries the description");
 
         assert!(!is_bucketed(ts), "a real date carries a time of day");
         assert_eq!(
             chrono::DateTime::from_timestamp(ts, 0).unwrap().format("%Y-%m-%d").to_string(),
             "2026-07-18"
         );
+    }
+
+    #[test]
+    fn facts_from_html_reads_date_and_description() {
+        let html = concat!(r#"{"uploadDate":"2026-07-18T11:03:09-07:00"}"#,
+                           r#""videoDetails":{"videoId":"abcdefghijk","shortDescription":"Part 1"}"#);
+        let f = facts_from_html(html, "abcdefghijk");
+        assert!(f.published_at.is_some());
+        assert_eq!(f.description.as_deref(), Some("Part 1"));
+        assert_eq!(facts_from_html("<html>nothing here</html>", "abcdefghijk"), PageFacts::default());
     }
 }

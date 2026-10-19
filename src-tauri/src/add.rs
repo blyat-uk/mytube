@@ -193,6 +193,7 @@ struct Found {
     duration_secs: Option<i64>,
     published_at: Option<i64>,
     members_only: bool,
+    description: Option<String>,
 }
 
 impl From<WatchPage> for Found {
@@ -205,6 +206,7 @@ impl From<WatchPage> for Found {
             duration_secs: p.duration_secs,
             published_at: p.published_at,
             members_only: p.members_only,
+            description: p.description,
         }
     }
 }
@@ -220,6 +222,9 @@ impl From<ProbeInfo> for Found {
             duration_secs: p.duration_secs,
             published_at: p.published_at,
             members_only: false,
+            // The probe prints no description; the pasted video's next feed
+            // or the background catch-up brings it.
+            description: None,
         }
     }
 }
@@ -295,8 +300,11 @@ impl Found {
         let (channel_id, channel_title) = uploader(self.channel_id.clone(), self.channel_title.clone());
         Plan {
             uploaders: vec![ad_hoc_channel(&channel_id, &channel_title, now)],
-            rows: vec![manual_row(&self.id, self.title.clone(), channel_id, self.duration_secs,
-                                  self.published_at, 0, now)],
+            rows: vec![NewVideo {
+                description: self.description.clone(),
+                ..manual_row(&self.id, self.title.clone(), channel_id, self.duration_secs,
+                             self.published_at, 0, now)
+            }],
             skipped_shorts: Vec::new(),
         }
     }
@@ -442,15 +450,18 @@ fn plan_playlist(fresh: &[PlaylistEntry], looked: &HashMap<String, Lookup>, now:
             .map(str::to_string)
             .or_else(|| page.map(|p| p.title.clone()))
             .unwrap_or_else(|| e.id.clone());
-        plan.rows.push(manual_row(
-            &e.id,
-            title,
-            channel_id,
-            e.duration_secs.or_else(|| page.and_then(|p| p.duration_secs)),
-            page.and_then(|p| p.published_at),
-            rank as i64,
-            now,
-        ));
+        plan.rows.push(NewVideo {
+            description: page.and_then(|p| p.description.clone()),
+            ..manual_row(
+                &e.id,
+                title,
+                channel_id,
+                e.duration_secs.or_else(|| page.and_then(|p| p.duration_secs)),
+                page.and_then(|p| p.published_at),
+                rank as i64,
+                now,
+            )
+        });
     }
     plan
 }
@@ -679,6 +690,7 @@ mod tests {
             published_at,
             members_only: false,
             canonical_short: false,
+            description: None,
         }
     }
 
@@ -1189,5 +1201,25 @@ mod tests {
         assert_eq!(p.channel_title.as_deref(), Some("AnimeCapped Manga"));
         assert_eq!(p.entries.iter().filter(|e| e.members_only).count(), 2);
         assert!(p.entries.iter().all(|e| e.channel_id.as_deref() == Some(OWNER)));
+    }
+
+    #[test]
+    fn a_pasted_videos_description_is_kept() {
+        let p = WatchPage { description: Some("Part 1 https://youtu.be/BBBBBBBBBBB".into()),
+                            ..page("aaaaaaaaaaa", Some((OWNER, "Owner")), Some(5)) };
+        let plan = Found::from(p).plan(1);
+        assert_eq!(plan.rows[0].description.as_deref(), Some("Part 1 https://youtu.be/BBBBBBBBBBB"));
+    }
+
+    #[test]
+    fn a_playlist_parts_description_is_kept() {
+        let e = entry("aaaaaaaaaaa", "Part 1", Some((OWNER, "Owner")), Some(60));
+        let mut looked = HashMap::new();
+        looked.insert(e.id.clone(), Lookup::Page(Some(WatchPage {
+            description: Some("links".into()),
+            ..page(&e.id, Some((OWNER, "Owner")), Some(5))
+        })));
+        let plan = plan_playlist(&[e], &looked, 1);
+        assert_eq!(plan.rows[0].description.as_deref(), Some("links"));
     }
 }

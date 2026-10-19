@@ -231,6 +231,17 @@ pub struct Video {
     /// arrives hidden and marked too. Implies nothing about `hidden` on its
     /// own -- un-hiding one part keeps the mark. See the v11 migration step.
     pub series_hidden: bool,
+    /// The user unlinked it from a card (v14): its description's links count
+    /// for nothing either way, and no title puts it back. Only a hand mark
+    /// places it. See `siblings::Atoms`.
+    #[serde(default)]
+    pub part_links_refused: bool,
+    /// Computed, never stored: a description link of its own put it on its
+    /// card, so "Unlink from siblings" applies though nothing was marked by
+    /// hand. Filled by the feed's readers (`list_videos`,
+    /// `list_video_groups`); false everywhere else.
+    #[serde(default)]
+    pub part_linked: bool,
 }
 
 /// A row to insert. Separate from `Video` because inserts have no joined

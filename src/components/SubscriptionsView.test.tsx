@@ -97,6 +97,7 @@ function video(over: Partial<Video> = {}): Video {
     view_count: 1500, status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "done", download_error: null, file_path: "/videos/some.mkv",
     downloaded_at: null, first_seen_at: 0, sibling_group: null, series_hidden: false,
+    part_links_refused: false, part_linked: false,
     ...over,
   };
 }
@@ -1096,6 +1097,15 @@ describe("marking siblings by hand", () => {
     cleanup();
 
     videos = [video({ id: "a", sibling_group: "g1" })];
+    renderView();
+    fireEvent.click(within(await openMenu(), "Unlink from siblings"));
+    await waitFor(() => expect(unlinkSiblings).toHaveBeenCalledWith("a"));
+  });
+
+  it("offers Unlink for a video its description linked", async () => {
+    // No hand mark: a description put it on its card, and Unlink is how it
+    // comes off.
+    videos = [video({ id: "a", sibling_group: null, part_linked: true })];
     renderView();
     fireEvent.click(within(await openMenu(), "Unlink from siblings"));
     await waitFor(() => expect(unlinkSiblings).toHaveBeenCalledWith("a"));

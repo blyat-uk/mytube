@@ -72,6 +72,14 @@ pub struct SyncVideo {
     pub series_hidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_hidden_changed_at: Option<i64>,
+    /// Unlinked by hand, so no description puts it on a card (DB v14): a pair
+    /// of its own, kept exactly like `series_hidden` -- left out while unset,
+    /// so a library that never unlinked hashes as it did before, and read as
+    /// never set from a machine that does not know the keys.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub part_links_refused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_links_refused_changed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -193,7 +201,7 @@ pub(crate) fn merge_channel(copies: &[&SyncChannel]) -> SyncChannel {
 pub(crate) fn merge_video(copies: &[&SyncVideo]) -> SyncVideo {
     let meta = winner(copies, |v| {
         (newest(&[v.watched_changed_at, v.hidden_changed_at, v.sibling_changed_at,
-                  v.series_hidden_changed_at]),
+                  v.series_hidden_changed_at, v.part_links_refused_changed_at]),
          v.added_at, v.title.clone(), v.channel_id.clone(),
          v.published_at, v.sort_at, v.duration_secs)
     });
@@ -201,6 +209,7 @@ pub(crate) fn merge_video(copies: &[&SyncVideo]) -> SyncVideo {
     let hidden = winner(copies, |v| (v.hidden_changed_at, v.hidden));
     let sibling = winner(copies, |v| (v.sibling_changed_at, v.sibling_group.clone()));
     let series = winner(copies, |v| (v.series_hidden_changed_at, v.series_hidden));
+    let refused = winner(copies, |v| (v.part_links_refused_changed_at, v.part_links_refused));
     SyncVideo {
         id: meta.id.clone(),
         channel_id: meta.channel_id.clone(),
@@ -219,6 +228,8 @@ pub(crate) fn merge_video(copies: &[&SyncVideo]) -> SyncVideo {
         sibling_changed_at: sibling.sibling_changed_at,
         series_hidden: series.series_hidden,
         series_hidden_changed_at: series.series_hidden_changed_at,
+        part_links_refused: refused.part_links_refused,
+        part_links_refused_changed_at: refused.part_links_refused_changed_at,
     }
 }
 
@@ -240,7 +251,8 @@ mod tests {
                     watched: false, watched_at: None, watched_changed_at: None,
                     hidden: false, hidden_changed_at: None,
                     sibling_group: None, sibling_changed_at: None,
-                    series_hidden: false, series_hidden_changed_at: None }
+                    series_hidden: false, series_hidden_changed_at: None,
+                    part_links_refused: false, part_links_refused_changed_at: None }
     }
 
     fn snap(name: &str, channels: Vec<SyncChannel>, videos: Vec<SyncVideo>,
@@ -356,6 +368,34 @@ mod tests {
         let unhid = SyncVideo { hidden_changed_at: Some(8), ..vid("a") };
         let m = one(both, unhid);
         assert!(!m.hidden && m.series_hidden, "{m:?}");
+    }
+
+    #[test]
+    fn an_unlink_is_settled_by_its_own_stamp() {
+        let refused = |at| SyncVideo { part_links_refused: true,
+                                       part_links_refused_changed_at: Some(at), ..vid("a") };
+        let allowed = |at| SyncVideo { part_links_refused_changed_at: Some(at), ..vid("a") };
+        let pair = |v: SyncVideo| (v.part_links_refused, v.part_links_refused_changed_at);
+        for (x, y, want) in [
+            (refused(10), allowed(20), (false, Some(20))),
+            (allowed(10), refused(20), (true, Some(20))),
+            (refused(10), vid("a"), (true, Some(10))),
+            (refused(7), allowed(7), (true, Some(7))),
+        ] {
+            assert_eq!(pair(one(x.clone(), y.clone())), want, "{x:?} / {y:?}");
+            assert_eq!(pair(one(y, x)), want);
+        }
+    }
+
+    #[test]
+    fn an_unset_unlink_is_left_out_of_the_json() {
+        let plain = serde_json::to_string(&vid("a")).unwrap();
+        assert!(!plain.contains("part_links_refused"), "{plain}");
+        let refused = SyncVideo { part_links_refused: true,
+                                  part_links_refused_changed_at: Some(9), ..vid("a") };
+        let raw = serde_json::to_string(&refused).unwrap();
+        assert!(raw.contains(r#""part_links_refused":true"#), "{raw}");
+        assert_eq!(serde_json::from_str::<SyncVideo>(&raw).unwrap(), refused);
     }
 
     #[test]

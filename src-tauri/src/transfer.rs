@@ -152,6 +152,12 @@ struct ArchiveVideo {
     /// older build reading a newer archive just leaves the key unread.
     #[serde(default)]
     series_hidden: bool,
+    /// Unlinked by hand, so no description puts it on a card (DB v14). Left
+    /// out while false -- nearly every row -- so a library with no unlinks
+    /// writes the manifest it always did; no new `FORMAT`, as for
+    /// `series_hidden`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    part_links_refused: bool,
     /// Every other name the video has carried (DB v12, `video_titles`), so a
     /// series bond the old name made survives the trip. Left out when empty --
     /// nearly every row -- so a library with no renames writes exactly the
@@ -328,6 +334,7 @@ impl ArchiveVideo {
             first_seen_at: v.first_seen_at,
             sibling_group: v.sibling_group.clone(),
             series_hidden: v.series_hidden,
+            part_links_refused: v.part_links_refused,
             // Not a column of `Video`: `write_archive` fills it from the names
             // it was handed alongside.
             former_titles: Vec::new(),
@@ -363,6 +370,8 @@ impl ArchiveVideo {
             first_seen_at: self.first_seen_at,
             sibling_group: self.sibling_group,
             series_hidden: self.series_hidden,
+            part_links_refused: self.part_links_refused,
+            part_linked: false,
         }
     }
 }
@@ -887,6 +896,8 @@ mod tests {
             first_seen_at: 1_756_000_000,
             sibling_group: Some("grp-1".into()),
             series_hidden: true,
+            part_links_refused: false,
+            part_linked: false,
         }
     }
 
@@ -1308,6 +1319,26 @@ mod tests {
         let v = &p.videos[0];
         assert!(!v.series_hidden, "an archive silent on it hides no series");
         assert!(v.hidden, "and the rest of the row is read as before");
+    }
+
+    #[test]
+    fn an_unlink_travels_and_is_left_out_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = tmp.path().join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        let plain = tmp.path().join("plain.zip");
+        write_archive(&plain, &[channel("UC1", "Chan")], &[video("v1", "UC1")], &HashMap::new(),
+                      &settings_with_download_dir(&dl), false, &noop).unwrap();
+        assert!(!raw_manifest(&plain).contains("part_links_refused"),
+                "a library with no unlinks writes the manifest it always did");
+
+        let refused = tmp.path().join("refused.zip");
+        let v = Video { part_links_refused: true, ..video("v1", "UC1") };
+        write_archive(&refused, &[channel("UC1", "Chan")], &[v], &HashMap::new(),
+                      &settings_with_download_dir(&dl), false, &noop).unwrap();
+        let p = prepare_import_in(&refused, &["UC1".into()], false,
+                                  &dirs_in(&tmp.path().join("cfg")), &noop).unwrap();
+        assert!(p.videos[0].part_links_refused);
     }
 
     fn raw_manifest(path: &Path) -> String {
