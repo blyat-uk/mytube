@@ -459,7 +459,9 @@ describe("a playlist", () => {
     paste(PLAYLIST_URL);
     fireEvent.click(await screen.findByRole("button", { name: "Download (custom)…" }));
     const custom = await screen.findByRole("dialog", { name: "Custom download" });
-    expect(within(custom).getByText(/One quality for all 4 videos/)).toBeTruthy();
+    // Awaited: the form waits for the Settings read, and a slow runner is
+    // still showing "Reading your Settings…" when the dialog itself is found.
+    expect(await within(custom).findByText(/One quality for all 4 videos/)).toBeTruthy();
     fireEvent.click(await within(custom).findByRole("button", { name: "Download 4" }));
     await waitFor(() => expect(enqueueDownloads).toHaveBeenCalledWith(
       ["part2", "part3", "part4", "part5"], DEFAULT_QUALITY,

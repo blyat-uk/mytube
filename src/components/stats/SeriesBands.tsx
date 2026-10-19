@@ -1,7 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { thumbSrc } from "../../api";
 import type { Video } from "../../types";
-import { bandStates, cssUrl, placeAround, seriesModel, type Band, type Figure } from "./seriesBands";
+import { bandStates, cssUrl, placeAround, seriesModel, type Band, type Figure } from "./bands";
 
 export interface SeriesBandsProps {
   /** Every loaded part of the open series, in any order: the bands put them in

@@ -3,7 +3,7 @@ import type { Video } from "../../types";
 import {
   bandGap, bandStates, bandWeights, cssUrl, nextIndex, placeAround, runtimeOf, seriesFigures,
   seriesModel, uploadOrder,
-} from "./seriesBands";
+} from "./bands";
 
 function video(over: Partial<Video> = {}): Video {
   return {
