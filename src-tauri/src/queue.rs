@@ -2116,7 +2116,16 @@ mod tests {
         go[2].take().unwrap().send(()).unwrap();
         assert!(eventually(|| starts.lock().unwrap().len() == 4).await, "d never started");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(*starts.lock().unwrap(), ["a", "b", "c", "d"], "e waits for d: one at a time");
+        // a, b and c took their three slots at once and note their starts from
+        // two worker threads, in whatever order those run (one run in fourteen
+        // here, and a Windows release run, saw b first). The order of who gets
+        // a slot is the line's, tested above; what this one is about is d
+        // after them, and e not yet.
+        let started = starts.lock().unwrap().clone();
+        let mut first = started[..3].to_vec();
+        first.sort();
+        assert_eq!(first, ["a", "b", "c"]);
+        assert_eq!(&started[3..], ["d"], "e waits for d: one at a time");
         drop(go);
         assert!(eventually(|| starts.lock().unwrap().len() == 5).await);
     }
