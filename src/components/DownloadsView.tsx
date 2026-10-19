@@ -2,11 +2,15 @@ import {
   useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject,
 } from "react";
 import ConfirmDialog from "./ConfirmDialog";
-import { IconBusy, IconCancel, IconDelete, IconPlay, IconRetry, IconWatched } from "./Icons";
+import {
+  IconBusy, IconCancel, IconDelete, IconExternal, IconPlay, IconRetry, IconWatched,
+} from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText, thumbSrc } from "../api";
 import { useDownloadEvents } from "../events";
-import { formatDuration, formatRelative, hasDownloadedFile, popoutPlacement } from "../format";
+import {
+  cardActionLabel, formatDuration, formatRelative, hasDownloadedFile, popoutPlacement, videoUrl,
+} from "../format";
 import { singleClick, usePending } from "../pending";
 import { createProgressStore, useProgress, type ProgressStore } from "../progress";
 import type { DownloadState, Video } from "../types";
@@ -199,6 +203,9 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
   // Nothing to show optimistically, but a double press would otherwise open
   // the file in two players.
   const play = (v: Video) => run(v.id, () => api.openInPlayer(v.id));
+  // A key of its own, as on a card: a browser slow to come up must not lock
+  // the row's download actions.
+  const openOnYouTube = (v: Video) => run(`open:${v.id}`, () => api.openExternal(videoUrl(v)));
   const retry = (v: Video) => run(v.id, () => api.enqueueDownload(v.id), {
     optimistic: () => {
       put(v.id, { download_state: "queued", download_error: null });
@@ -227,6 +234,12 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
   };
   /** What a row's action buttons need to know about a call in flight. */
   const state = (key: string) => ({ busy: pending.has(key), spinning: slow.has(key) });
+  /** Last in every row, so the right-aligned actions line it up in one column. */
+  const openAction = (v: Video) => (
+    <RowAction label={cardActionLabel("open")} {...state(`open:${v.id}`)} onClick={() => void openOnYouTube(v)}>
+      <IconExternal />
+    </RowAction>
+  );
 
   if (loading && items.length === 0) {
     return (
@@ -256,6 +269,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
             <RowAction label="Cancel download" {...state(v.id)} onClick={() => void cancel(v)}>
               <IconCancel />
             </RowAction>
+            {openAction(v)}
           </Row>
         ))}
       </Section>
@@ -277,6 +291,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
             <RowAction label="Delete file" tone="is-danger" {...state(v.id)} onClick={() => void remove(v)}>
               <IconDelete />
             </RowAction>
+            {openAction(v)}
           </Row>
         ))}
       </Section>
@@ -290,6 +305,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
             <RowAction label="Retry download" {...state(v.id)} onClick={() => void retry(v)}>
               <IconRetry />
             </RowAction>
+            {openAction(v)}
           </Row>
         ))}
       </Section>

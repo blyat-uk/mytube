@@ -10,6 +10,7 @@ const deleteDownload = vi.fn((_id: string) => Promise.resolve());
 const cancelDownload = vi.fn((_id: string) => Promise.resolve());
 const enqueueDownload = vi.fn((_id: string) => Promise.resolve());
 const openInPlayer = vi.fn((_id: string) => Promise.resolve());
+const openExternal = vi.fn((_url: string) => Promise.resolve());
 
 vi.mock("../api", () => ({
   api: {
@@ -19,6 +20,7 @@ vi.mock("../api", () => ({
     cancelDownload: (id: string) => cancelDownload(id),
     enqueueDownload: (id: string) => enqueueDownload(id),
     openInPlayer: (id: string) => openInPlayer(id),
+    openExternal: (url: string) => openExternal(url),
   },
   thumbSrc: (v: { thumb_path: string | null }) => v.thumb_path ?? "",
   errText: (e: unknown) => String(e),
@@ -57,6 +59,7 @@ beforeEach(() => {
   cancelDownload.mockImplementation(() => Promise.resolve());
   enqueueDownload.mockImplementation(() => Promise.resolve());
   openInPlayer.mockImplementation(() => Promise.resolve());
+  openExternal.mockImplementation(() => Promise.resolve());
 });
 afterEach(cleanup);
 
@@ -136,6 +139,35 @@ describe("Downloads row actions", () => {
       // No visible words: the glyph stands in, and the tooltip names it.
       expect(button.getAttribute("title")).toBeTruthy();
     }
+  });
+
+  it("offers every row, in every section, a way to its YouTube page as the last action", async () => {
+    videos = [
+      video({ id: "a", title: "Running", download_state: "downloading" }),
+      video({ id: "b", title: "Finished", download_state: "done" }),
+      video({ id: "c", title: "Broken", download_state: "failed", file_path: null }),
+    ];
+    renderView();
+
+    await screen.findByText("Finished");
+    const rows = [...document.querySelectorAll(".dl-row")];
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      const buttons = within(row as HTMLElement).getAllByRole("button");
+      // Last in every row, so the rows' right-aligned actions put it in one column.
+      const open = buttons[buttons.length - 1];
+      expect(open.textContent).toBe("Open on YouTube");
+      expect(open.classList.contains("icon-btn")).toBe(true);
+      expect(open.getAttribute("title")).toBeTruthy();
+    }
+  });
+
+  it("opens the video's watch page in the browser", async () => {
+    videos = [video({ id: "a b", title: "Finished", download_state: "done" })];
+    renderView();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open on YouTube" }));
+    await waitFor(() => expect(openExternal).toHaveBeenCalledWith("https://www.youtube.com/watch?v=a%20b"));
   });
 
   it("marks a finished download watched, then asks whether to delete its file", async () => {
@@ -251,6 +283,24 @@ describe("Downloads row actions in flight", () => {
 
     await act(async () => { finish(); });
     await waitFor(() => expect(play.disabled).toBe(false));
+  });
+
+  it("never locks a row's download actions while the browser is coming up", async () => {
+    let finish = () => {};
+    openExternal.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+    renderView();
+
+    const open = await screen.findByRole<HTMLButtonElement>("button", { name: "Open on YouTube" });
+    fireEvent.click(open, { detail: 1 });
+    fireEvent.click(open, { detail: 2 });
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(open.disabled).toBe(true));
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Play" }).disabled).toBe(false);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Delete file" }).disabled).toBe(false);
+
+    await act(async () => { finish(); });
+    await waitFor(() => expect(open.disabled).toBe(false));
   });
 
   it("deletes a file once, however often the button is pressed", async () => {
