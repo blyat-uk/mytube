@@ -174,6 +174,21 @@ describe("the folded search", () => {
     expect(box()).toBeDefined();
   });
 
+  // The shell clears the search itself when a card narrows the feed to its
+  // channel. The box keeps a copy of its own for the debounce, so it has to
+  // follow -- and, empty, fold back to the magnifier.
+  it("empties and folds back when the search is cleared from above", async () => {
+    const p = renderNav({ search: "blackwood" });
+    expect(box().value).toBe("blackwood");
+    // Into the same container, which is a re-render with the one prop changed.
+    const container = screen.getByRole("banner").parentElement!;
+    render(<TopNav {...p} search="" />, { container });
+    expect(screen.queryByRole("searchbox")).toBeNull();
+    // Past the debounce: the old query is not sent back up after it.
+    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 300)));
+    expect(p.onSearch).not.toHaveBeenCalled();
+  });
+
   it("leaves on Esc without leaving an open series", () => {
     const p = renderNav({ series: null });
     fireEvent.click(screen.getByRole("button", { name: "Open search" }));

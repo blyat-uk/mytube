@@ -151,6 +151,15 @@ pub async fn subscription_stats(state: State<'_, Arc<AppState>>) -> R<Vec<Channe
     db_blocking(&state, |db| db.subscription_stats()).await
 }
 
+/// The stats above the Subscriptions grid (Settings -> Appearance -> Show
+/// stats) for the channel pick and the search box. The clock is read here, not
+/// in `Db`, so the database layer stays testable at any moment.
+#[tauri::command]
+pub async fn feed_stats(filter: StatsFilter, state: State<'_, Arc<AppState>>) -> R<FeedStats> {
+    let now = chrono::Utc::now().timestamp();
+    db_blocking(&state, move |db| db.feed_stats(&filter, now)).await
+}
+
 /// Tells the UI whether the Add box holds a channel, a video, a playlist, or
 /// a rejected Short. A mix is an error, worded for under the input.
 #[tauri::command]

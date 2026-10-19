@@ -104,6 +104,61 @@ export interface ChannelStats {
   followerCount: number | null;
 }
 
+/** Which videos the feed's stats count (`feed_stats`): the channel pick and the
+ *  search, and nothing else. The Show toggles never change the numbers, and
+ *  hidden videos are always counted. */
+export interface StatsFilter {
+  /** Any of these channels; empty is every channel. */
+  channelIds: string[];
+  search: string | null;
+}
+
+/** The Subscriptions feed's stats, drawn as the waveform above the grid
+ *  (Settings → Appearance → Show stats). Over `status = 'ready'` rows only. */
+export interface FeedStats {
+  /** Every video counted: toWatch + watched + hidden. */
+  videos: number;
+  /** Cards of two or more parts the grouped feed would show for the same pick,
+   *  each counted by its whole group. */
+  series: number;
+  /** Not watched and not hidden (a downloaded one included). */
+  toWatch: number;
+  /** Watched and not hidden. */
+  watched: number;
+  /** With a file on disk (`download_state = done`), watched, hidden or not. */
+  downloaded: number;
+  /** Hidden, watched or not. */
+  hidden: number;
+  /** Every duration added up, an unresolved one counting as zero. */
+  runtimeSecs: number;
+  /** Some video has no duration yet, so `runtimeSecs` understates: drawn "+". */
+  runtimeUnknown: boolean;
+  /** Published in the last seven days. */
+  newThisWeek: number;
+  /** The local date the stats were counted on (`"2026-10-19"`): the wave's
+   *  right edge, on the same clock that dated `days`. */
+  today: string;
+  /** One per local calendar day that had an upload, oldest first; days with
+   *  none are absent. The waveform buckets them into bars itself. A video with
+   *  no `published_at` is in the totals and on no day. */
+  days: StatsDay[];
+}
+
+/** One day of uploads in the waveform's four segments, which never overlap:
+ *  they add up to the day's videos. */
+export interface StatsDay {
+  /** `"2024-03-14"`, local time. */
+  day: string;
+  /** Watched, not hidden. */
+  watched: number;
+  /** Downloaded and not watched, not hidden. */
+  downloaded: number;
+  /** Neither watched nor downloaded, not hidden. */
+  unwatched: number;
+  /** Hidden, whatever else. */
+  hidden: number;
+}
+
 /** What a pasted link turned out to be, read before anything is written
  *  (`preview_add`). A channel is not fetched: it only says whether you
  *  already follow it. */
@@ -209,6 +264,9 @@ export interface Settings {
    *  as `--text-scale`: text only, never icons, thumbnails or spacing. It
    *  makes up for this machine's screen, which is why it is in this block. */
   text_scale: number;
+  /** The stats above the Subscriptions feed and inside a series (Settings →
+   *  Appearance). Off unless switched on; machine-local like `text_scale`. */
+  show_stats: boolean;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;

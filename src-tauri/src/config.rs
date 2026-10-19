@@ -244,6 +244,13 @@ pub struct Settings {
     /// `adopt_portable` leaves it be.
     #[serde(default = "d_text_scale")]
     pub text_scale: u32,
+    /// Settings -> Appearance's Show stats: the waveform above the
+    /// Subscriptions grid and the bands above a series. Off by default.
+    /// Machine-local like `text_scale`: whether there is room for it is this
+    /// screen's question, so a named field that never rides `extra` into an
+    /// export, and `adopt_portable` leaves it be.
+    #[serde(default)]
+    pub show_stats: bool,
     #[serde(default = "d_window_width")]
     pub window_width: u32,
     #[serde(default = "d_window_height")]
@@ -327,7 +334,8 @@ impl Settings {
     }
 
     /// Takes the portable half of `incoming`, keeping this machine's window
-    /// geometry, text size and feed filters. The mirror of `keep_view_of`.
+    /// geometry, text size, stats switch and feed filters. The mirror of
+    /// `keep_view_of`.
     ///
     /// The split is between settings that describe *the library* — where
     /// downloads land, how they are named, what plays them, how hard to poll,
@@ -888,6 +896,43 @@ mod tests {
         incoming.text_scale = 90;
         local.adopt_portable_with(&incoming, |_| true);
         assert_eq!(local.text_scale, 140, "another machine's screen set this one's text");
+    }
+
+    #[test]
+    fn stats_default_off_and_round_trip_as_a_named_key() {
+        assert!(!Settings::default().show_stats);
+        let s = Settings::from_json_str(r#"{"show_stats":true}"#).unwrap();
+        assert!(s.show_stats);
+        // Named, not `extra`: `extra` is what an export carries off the machine.
+        assert!(s.extra.is_empty(), "{:?}", s.extra);
+        let written = s.to_json_string().unwrap();
+        assert!(written.contains(r#""show_stats": true"#), "{written}");
+        assert!(Settings::from_json_str(&written).unwrap().show_stats);
+    }
+
+    #[test]
+    fn adopt_portable_leaves_the_stats_switch_alone() {
+        let mut local = Settings::from_json_str(r#"{"show_stats":true}"#).unwrap();
+        let mut incoming = an_incoming_file();
+        incoming.show_stats = false;
+        local.adopt_portable_with(&incoming, |_| true);
+        assert!(local.show_stats, "another machine switched this one's stats off");
+
+        let mut local = Settings::default();
+        incoming.show_stats = true;
+        local.adopt_portable_with(&incoming, |_| true);
+        assert!(!local.show_stats, "another machine switched this one's stats on");
+    }
+
+    #[test]
+    fn a_stats_switch_saved_from_the_settings_page_is_what_gets_written() {
+        // `save_settings` defers to the file for the blocks the page holds a
+        // stale copy of; the switch is the page's own, so it must not be one.
+        let disk = Settings::default();
+        let mut sent = Settings::from_json_str(r#"{"show_stats":true}"#).unwrap();
+        sent.keep_view_of(&disk);
+        sent.keep_machine_overrides_of(&disk);
+        assert!(sent.show_stats);
     }
 
     #[test]

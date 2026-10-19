@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconCaret, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly, IconHidden,
-  IconNewRelease, IconSearch, IconSeries, IconSettings, IconSubscriptions, IconUnwatched,
+  IconBusy, IconCaret, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly,
+  IconHidden, IconNewRelease, IconSearch, IconSeries, IconSettings, IconShow, IconSubscriptions,
+  IconUnwatched,
 } from "./Icons";
 import FiltersPanel, { activeFilterCount, SORTS } from "./FiltersPanel";
 import { ChannelButton, ChannelPopover } from "./ChannelPicker";
+import type { CallState, SeriesActions } from "./SubscriptionsView";
 import { useToolbarFit } from "../toolbarFit";
+import { singleClick } from "../pending";
 import type { AppUpdate, Channel, SortOrder } from "../types";
 
 export type Tab = "subscriptions" | "downloads" | "settings";
@@ -41,6 +44,82 @@ function tallyText(s: SeriesCrumb): string {
   return `${s.parts} parts${runtime}`;
 }
 
+/**
+ * One of the crumb's series actions: a glyph and its words, the words folding
+ * away on a narrow window (App.css) while the glyph, the name and the tooltip
+ * stay. Disabled the moment its call goes out; the glyph turns only once the
+ * call is slow enough to notice.
+ */
+function CrumbAction({ glyph, label, title, state, danger, onClick }: {
+  glyph: ReactElement;
+  label: string;
+  title: string;
+  state: CallState;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  const spinning = state === "slow";
+  return (
+    <button
+      type="button"
+      className={["crumb-act", danger && "is-danger", spinning && "is-spinning"].filter(Boolean).join(" ")}
+      aria-label={label}
+      title={title}
+      aria-busy={state !== "idle" || undefined}
+      disabled={state !== "idle"}
+      // Each press changes what is under the pointer -- Hide turns into
+      // Un-hide as soon as the call is back -- so a double-click's second half
+      // would undo the first.
+      onClick={singleClick(onClick)}
+    >
+      <span className="crumb-act-glyph" aria-hidden="true">{spinning ? <IconBusy /> : glyph}</span>
+      <span className="crumb-act-label">{label}</span>
+    </button>
+  );
+}
+
+/**
+ * What the series card's menu offers, on the crumb of the series it stands
+ * for. Hide (or Un-hide) leads because it is always there; Download comes and
+ * goes with what is left to fetch, and last in the row its going moves
+ * nothing. Ahead of Hide it would slide Hide under the pointer that had just
+ * pressed Download.
+ */
+function SeriesActionButtons({ a }: { a: SeriesActions }) {
+  const parts = `${a.due} ${a.due === 1 ? "part" : "parts"}`;
+  return (
+    <div className="crumb-actions" role="group" aria-label="Series actions">
+      {a.marked ? (
+        <CrumbAction
+          glyph={<IconShow />}
+          label="Un-hide series"
+          title="Bring every part back, and let parts that join the series later into the feed"
+          state={a.hiding}
+          onClick={a.onUnhide}
+        />
+      ) : (
+        <CrumbAction
+          glyph={<IconHidden />}
+          label="Hide series"
+          title="Hide every part, and any part that joins the series later"
+          state={a.hiding}
+          danger
+          onClick={a.onHide}
+        />
+      )}
+      {a.due > 0 && (
+        <CrumbAction
+          glyph={<IconDownload />}
+          label={`Download ${parts}`}
+          title={`Download the ${parts} not downloaded yet, oldest first`}
+          state={a.downloading}
+          onClick={a.onDownload}
+        />
+      )}
+    </div>
+  );
+}
+
 interface Props {
   tab: Tab;
   onTab: (t: Tab) => void;
@@ -66,6 +145,9 @@ interface Props {
   onInProgress: (v: boolean) => void;
   /** The open series, or null for the ordinary feed. Replaces the tab strip. */
   series: SeriesCrumb | null;
+  /** What the crumb can do with the open series, once its parts are in. Absent
+   *  or null, it offers nothing -- as for a series of one. */
+  seriesActions?: SeriesActions | null;
   onExitSeries: () => void;
   polling: boolean;
   onRefresh: () => void;
@@ -91,6 +173,16 @@ export default function TopNav(p: Props) {
     return () => window.clearTimeout(t);
   }, [text, p.onSearch]);
 
+  // The box keeps its own copy for the debounce, but the shell can change the
+  // search too -- a card's "See all videos from …" clears it -- so a value
+  // from above that this box did not send replaces what it holds, a query
+  // still being typed included.
+  useEffect(() => {
+    if (p.search === emitted.current) return;
+    emitted.current = p.search;
+    setText(p.search);
+  }, [p.search]);
+
   const searchRef = useRef<HTMLInputElement | null>(null);
   const compactSearchRef = useRef<HTMLInputElement | null>(null);
   const rowRef = useRef<HTMLDivElement | null>(null);
@@ -100,10 +192,13 @@ export default function TopNav(p: Props) {
   const channelBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const showFilters = p.tab === "subscriptions";
+  const actions = p.series ? p.seriesActions ?? null : null;
   const fit = useToolbarFit(
     { row: rowRef, full: fullRef, compact: compactRef },
     showFilters,
-    p.series ? "crumb" : "tabs",
+    // The actions are a row child of their own, and they arrive after the
+    // crumb does, once the parts are in: a new child to watch.
+    p.series ? (actions ? "crumb+actions" : "crumb") : "tabs",
   );
   const folded = fit === "folded";
   const foldedRef = useRef(folded);
@@ -236,29 +331,35 @@ export default function TopNav(p: Props) {
         {p.series ? (
           /* The series replaces the tab strip rather than adding a bar of its
              own: it is where you are, not a notice about where you are. */
-          <nav className="crumb" aria-label="Breadcrumb">
-            <button type="button" className="crumb-parent" onClick={p.onExitSeries}>
-              Subscriptions
-            </button>
-            <span className="crumb-sep" aria-hidden="true">›</span>
-            <span className="crumb-here" aria-current="page">
-              <span className="crumb-name" title={p.series.name}>{p.series.name}</span>
-              <button
-                type="button"
-                className="crumb-x"
-                onClick={p.onExitSeries}
-                aria-label="Leave this series"
-                title="Leave this series (Esc)"
-              >
-                <IconClose />
+          <>
+            <nav className="crumb" aria-label="Breadcrumb">
+              <button type="button" className="crumb-parent" onClick={p.onExitSeries}>
+                Subscriptions
               </button>
-            </span>
-            {/* The count lands a moment after the crumb does, so it is spoken
-                when it arrives rather than sitting there unannounced. */}
-            {tallyText(p.series) && (
-              <span className="crumb-meta" role="status">{tallyText(p.series)}</span>
-            )}
-          </nav>
+              <span className="crumb-sep" aria-hidden="true">›</span>
+              <span className="crumb-here" aria-current="page">
+                <span className="crumb-name" title={p.series.name}>{p.series.name}</span>
+                <button
+                  type="button"
+                  className="crumb-x"
+                  onClick={p.onExitSeries}
+                  aria-label="Leave this series"
+                  title="Leave this series (Esc)"
+                >
+                  <IconClose />
+                </button>
+              </span>
+              {/* The count lands a moment after the crumb does, so it is spoken
+                  when it arrives rather than sitting there unannounced. */}
+              {tallyText(p.series) && (
+                <span className="crumb-meta" role="status">{tallyText(p.series)}</span>
+              )}
+            </nav>
+            {/* Beside the crumb rather than in it: the crumb is navigation, and
+                these act on the series. As a child of the row they are counted
+                by toolbarFit.ts like everything else that is not a cluster. */}
+            {actions && <SeriesActionButtons a={actions} />}
+          </>
         ) : (
           <nav className="tabs" aria-label="Sections">
             {TABS.map((t) => (

@@ -33,6 +33,16 @@ export interface SettingsDoc {
   reload: () => Promise<void>;
 }
 
+export interface SettingsDocOptions {
+  /**
+   * Told what landed, after every save that did. The view is unmounted
+   * whenever another tab is up, so a setting the rest of the app follows
+   * (Show stats) reaches the shell through here -- including a save that lands
+   * after the tab has already been left.
+   */
+  onSaved?: (settings: Settings) => void;
+}
+
 /**
  * The one copy of settings.json the Settings view edits.
  *
@@ -42,8 +52,12 @@ export interface SettingsDoc {
  * spreads the whole object the backend handed over, so keys Rust flattened in
  * (hand-written, or from a newer build) survive the round trip.
  */
-export function useSettingsDoc(): SettingsDoc {
+export function useSettingsDoc({ onSaved }: SettingsDocOptions = {}): SettingsDoc {
   const toast = useToast();
+  // Read when a save lands rather than captured by `commit`, so a new handler
+  // never changes the identity of the verbs every page holds.
+  const saved = useRef(onSaved);
+  saved.current = onSaved;
   const [settings, setSettings] = useState<Settings | null>(null);
   const [failed, setFailed] = useState(false);
   const [savedAt, setSavedAt] = useState(0);
@@ -87,6 +101,7 @@ export function useSettingsDoc(): SettingsDoc {
         await api.saveSettings(latest);
         persisted.current = serialised;
         setSavedAt(Date.now());
+        saved.current?.(latest);
       } catch (err) {
         toast.error(errText(err));
       }

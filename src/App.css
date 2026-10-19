@@ -41,6 +41,14 @@
   --resume-text: #ecd6a6;
   --resume-text-dim: #bba77c;
 
+  /* The stats (Settings > Appearance > Show stats) draw a video's state the way
+     YouTube draws the bar under a thumbnail: red watched, green on disk, a
+     quiet grey for what is left, and hatching for what you hid. */
+  --stat-watched: var(--brand);
+  --stat-disk: rgba(86, 211, 100, 0.85);
+  --stat-left: rgba(255, 255, 255, 0.24);
+  --hatch: repeating-linear-gradient(-45deg, #5a5a5a 0 2px, #2c2c2c 2px 5px);
+
   /* The top row's fold: long enough to follow, short enough not to lag a drag. */
   --fold-time: 260ms;
   --fold-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
@@ -373,6 +381,60 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   color: var(--faint);
   font-size: 1.2rem;
   white-space: nowrap;
+}
+
+/* The open series' own actions -- the series card menu's, beside the tally.
+   Quiet pills like the row's chips, the hide in the menu's danger red; they
+   give up their words on a narrow window ("narrow windows", below) and keep
+   their glyphs. Never shrunk: the crumb's name is what gives way. */
+.crumb-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  margin-left: 2px;
+}
+.crumb-act {
+  appearance: none;
+  font: inherit;
+  font-size: 1.3rem;
+  font-weight: 500;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 12px 5px 10px;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease,
+    padding var(--fold-time) var(--fold-ease);
+}
+.crumb-act:hover:not(:disabled) { background: var(--card); color: var(--text); }
+/* Disabled only ever means its call is out, so it is not dimmed -- a quick
+   answer would flash -- and says so with the cursor until the glyph turns. */
+.crumb-act:disabled { cursor: progress; }
+.crumb-act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.crumb-act.is-danger { color: #ff8a8d; }
+.crumb-act.is-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: rgba(255, 90, 95, 0.4);
+  color: #ffc9ca;
+}
+.crumb-act-glyph { display: inline-flex; flex: none; }
+.crumb-act.is-spinning .crumb-act-glyph { animation: spin 900ms linear infinite; }
+/* Folded like a tab's label -- zero width, never `display: none` -- so a
+   resize shows the words going rather than a jump. */
+.crumb-act-label {
+  display: inline-flex;
+  overflow: hidden;
+  max-width: 12em;
+  margin-left: 6px;
+  transition: max-width var(--fold-time) var(--fold-ease), opacity 200ms ease,
+    margin var(--fold-time) var(--fold-ease);
+  transition-delay: var(--fold-stagger);
 }
 
 /* --- controls ------------------------------------------------------------ */
@@ -1362,6 +1424,217 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .dot { color: var(--faint); }
 .card-speed { color: var(--accent); font-variant-numeric: tabular-nums; }
 
+/* --- feed stats: the waveform ------------------------------------------- */
+
+/* The library as a sound wave over the feed (FeedWaveform.tsx): the totals
+   either side like a player's timestamps, four figures under it. A named
+   container, so the flanks step under the wave by the width the feed actually
+   has, in rem -- at 200% text they need twice the room. */
+.wv-box { container: wv / inline-size; margin: 2px 0 30px; }
+
+/* Its height never depends on the numbers, only on the width it is given: the
+   feed keeps the last stats up while a refetch is out and swaps the new ones
+   in place, and the scroll position restored under it must not move. So the
+   pill's row is always there, the axis row too, the figures never wrap by how
+   wide their numbers are, and no caption takes a second line. */
+.wv {
+  /* The row the "+N this week" pill sits in above the wave. */
+  --wv-top: calc(1.84rem + 3px);
+  position: relative;
+  display: grid;
+  /* The flanks never wrap their words: the wave gives way first, then, below
+     62rem, the flanks move under it. --wv-w is set by the component: a short
+     history draws a short wave, and the flanks close in around it. */
+  grid-template-columns: minmax(max-content, 1fr) minmax(0, var(--wv-w, 720px)) minmax(max-content, 1fr);
+  column-gap: 28px;
+  max-width: calc(776px + 30.4rem);
+  margin: 0 auto;
+}
+
+.wv-flank {
+  grid-row: 1;
+  align-self: start;
+  /* The number's middle on the wave's axis, its caption hanging below. */
+  margin-top: calc(var(--wv-top) + 48px - 1.3rem);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+  min-width: 0;
+}
+.wv-flank.is-l { grid-column: 1; text-align: right; justify-items: end; }
+.wv-flank.is-r { grid-column: 3; }
+.wv-flank b {
+  font-size: 2.6rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.wv-flank b, .wv-flank span { white-space: nowrap; }
+.wv-flank span { font-size: 1.25rem; color: var(--muted); }
+
+.wv-mid { grid-row: 1; grid-column: 2; min-width: 0; }
+.wv-top { position: relative; height: var(--wv-top); }
+.wv-new {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  padding: 0 8px;
+  font-size: 1.15rem;
+  line-height: 1.6;
+  font-weight: 650;
+  color: #ff9fb3;
+  background: rgba(255, 45, 85, 0.13);
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* The SVG is laid out absolutely so its width attribute never props the
+   column open: the column sets the width, the component measures it. */
+.wv-wave { position: relative; height: 96px; cursor: default; }
+.wv-svg { position: absolute; left: 0; top: 0; display: block; overflow: visible; }
+
+.wv-s.is-watched { fill: var(--stat-watched); }
+.wv-s.is-downloaded { fill: var(--stat-disk); }
+.wv-s.is-unwatched { fill: var(--stat-left); }
+
+.wv-bars { transition: opacity 140ms ease; }
+.wv.is-hovering .wv-bars { opacity: 0.5; }
+.wv-hot { pointer-events: none; }
+/* A quiet stretch cut out of the wave: the broken-axis mark. */
+.wv-break {
+  fill: none;
+  stroke: #5a5a5a;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+.wv-hot .wv-break { stroke: var(--muted); }
+
+/* Once a session: the bars grow out of the axis in a sweep from the oldest to
+   this month. Every bar scales about the same line, the wave's middle. */
+.wv-bars.is-entering .wv-bar {
+  transform-box: view-box;
+  transform-origin: 0 48px;
+  animation: wv-grow 460ms var(--fold-ease) both;
+}
+@keyframes wv-grow { from { transform: scaleY(0); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .wv-bars.is-entering .wv-bar { animation: none; }
+}
+
+.wv-axis {
+  position: relative;
+  height: calc(1.15rem * 1.4 + 8px);
+  font-size: 1.15rem;
+  line-height: 1.4;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.wv-year {
+  position: absolute;
+  top: 3px;
+  padding-top: 5px;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.wv-year::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 1px;
+  height: 4px;
+  background: #4a4a4a;
+}
+/* Near an end a label hangs inwards from its tick rather than past the wave. */
+.wv-year.is-start { transform: translateX(-0.5px); }
+.wv-year.is-start::before { left: 0; }
+.wv-year.is-end { transform: translateX(calc(-100% + 0.5px)); }
+.wv-year.is-end::before { left: auto; right: 0; }
+
+.wv-figs {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+  gap: 14px 38px;
+  margin-top: 18px;
+}
+.wv-fig { display: flex; flex-direction: column; align-items: center; min-width: 0; }
+.wv-fig b, .wv-fig span { white-space: nowrap; }
+.wv-fig b {
+  font-size: 2.2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.wv-fig span { font-size: 1.25rem; color: var(--muted); }
+
+/* A capsule standing for a colour of the wave, above its figure and beside a
+   tooltip's row. "To watch" a touch brighter than its bars: alone on the page
+   background, the bars' grey would read as disabled. */
+.wv-mk { display: block; flex: none; width: 6px; height: 16px; border-radius: 3px; }
+.wv-fig .wv-mk { margin-bottom: 6px; }
+.wv-mk.is-left { background: rgba(255, 255, 255, 0.32); }
+.wv-mk.is-watched { background: var(--stat-watched); }
+.wv-mk.is-disk { background: var(--stat-disk); }
+.wv-mk.is-hidden { background: var(--hatch); }
+
+/* Placed by the component beside its bar (a transform, measured before
+   paint), so it is drawn from the top-left corner. */
+.wv-tip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 5;
+  pointer-events: none;
+  padding: 9px 12px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  white-space: nowrap;
+  animation: wv-tip-in 110ms ease-out;
+}
+@keyframes wv-tip-in { from { opacity: 0; } }
+.wv-tip-month { font-size: 1.3rem; font-weight: 650; line-height: 1.3; }
+.wv-tip-count { font-size: 1.2rem; color: var(--faint); line-height: 1.35; }
+.wv-tip-rows {
+  list-style: none;
+  margin: 7px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 1.25rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.wv-tip-rows li { display: flex; align-items: center; gap: 8px; line-height: 1.35; }
+.wv-tip-rows b { color: var(--text); font-weight: 650; }
+.wv-tip-rows em { font-style: normal; color: var(--ok); }
+.wv-tip .wv-mk { width: 4px; height: 12px; border-radius: 2px; }
+
+/* Narrow: the wave takes the whole row and the flanks pair up under it,
+   mirrored about the middle, so nothing ever scrolls sideways. A hairline
+   between them, or side by side "2,667 17,154h" reads as one number. */
+@container wv (max-width: 62rem) {
+  .wv { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 0; }
+  .wv-mid { grid-column: 1 / -1; justify-self: center; width: min(100%, var(--wv-w, 720px)); }
+  .wv-flank { grid-row: 2; margin-top: 14px; }
+  .wv-flank.is-l { padding-right: 18px; border-right: 1px solid var(--line); }
+  .wv-flank.is-r { grid-column: 2; padding-left: 18px; }
+  .wv-flank span { overflow: hidden; text-overflow: ellipsis; }
+  .wv-figs { grid-row: 3; gap: 14px 30px; }
+}
+
+/* Too narrow for four in a row: two by two, decided by the width alone. */
+@container wv (max-width: 34rem) {
+  .wv-figs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-items: center; }
+}
+
 /* --- grid states --------------------------------------------------------- */
 
 .grid-sentinel { height: 1px; }
@@ -1403,6 +1676,269 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .empty h2 { font-size: 1.7rem; margin-bottom: 8px; }
 .empty p { color: var(--muted); margin: 0 0 18px; }
 .empty p:last-child { margin-bottom: 0; }
+
+/* --- series bands -------------------------------------------------------- */
+
+/* Inside a series, with Show stats on: one band per part in upload order, as
+   wide as the part is long, filled with that part's own thumbnail blurred down
+   to its colours -- so the row reads as the series itself rather than as a
+   chart about it, without repeating the thumbnails the grid shows under it.
+   The rails under it are the bar YouTube draws under a thumbnail. */
+.series-bands {
+  /* Named: the spread figures size against it in cqi, and an unnamed
+     container would rebind the unnamed queries further down. */
+  container: series-bands / inline-size;
+  width: min(100%, 880px);
+  margin: 0 auto 30px;
+  /* The next label's room: its line in rem, then its gap. */
+  padding-top: calc(1.6rem + 14px);
+}
+
+/* Bands and brackets in one grid, whose columns are the parts' runtimes in
+   fr (set inline), so a bracket over parts 1 to 7 ends where band 7 does. */
+.sb-grid {
+  position: relative;
+  display: grid;
+  grid-template-rows: 56px auto;
+  column-gap: var(--sb-gap, 3px);
+  row-gap: 20px;
+}
+
+.sb-band { position: relative; grid-row: 1; min-width: 0; }
+.sb-fill {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: 4px;
+  /* Under the picture, and all there is when a part has none. */
+  background: linear-gradient(160deg, #353535, #242424);
+}
+.sb-band.is-first .sb-fill { border-radius: 9px 4px 4px 9px; }
+.sb-band.is-last .sb-fill { border-radius: 4px 9px 9px 4px; }
+/* Oversized before the blur, so the blur's soft edge falls outside the band. */
+.sb-fill::before {
+  content: "";
+  position: absolute;
+  inset: -16px;
+  background-image: var(--img);
+  background-size: cover;
+  background-position: center;
+  filter: blur(8px) saturate(1.3);
+}
+/* A hairline of light round the edge and a shade along the foot, so a dark
+   thumbnail still reads as a band and the rails have something to hang from. */
+.sb-fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+    inset 0 -18px 24px -18px rgba(0, 0, 0, 0.5);
+  transition: box-shadow 120ms ease;
+}
+/* Hovered: lit, and edged in light -- the edge alone vanishes on a sliver. */
+.sb-band.is-tip .sb-fill::before { filter: blur(8px) saturate(1.45) brightness(1.2); }
+.sb-band.is-tip .sb-fill::after {
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.34),
+    inset 0 -18px 24px -18px rgba(0, 0, 0, 0.5);
+}
+
+/* Hidden: a hidden card's grey, under its hatching. */
+.sb-band.is-hidden .sb-fill::before { filter: blur(8px) grayscale(0.7) brightness(0.75); }
+.sb-band.is-hidden.is-tip .sb-fill::before { filter: blur(8px) grayscale(0.7) brightness(0.95); }
+.sb-band.is-hidden .sb-fill::after { background: var(--hatch); opacity: 0.6; }
+
+/* The rails: red under what you watched, green under what is on disk. */
+.sb-band.is-watched::after,
+.sb-band.is-disk::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-radius: 2px;
+}
+.sb-band.is-watched::after { bottom: -7px; height: 3px; background: var(--stat-watched); }
+.sb-band.is-disk::before { bottom: -12px; height: 2px; background: var(--stat-disk); }
+
+/* The part to watch next: a series in progress's amber, ringed clear of its
+   neighbours and drawn over them. */
+.sb-band.is-next { z-index: 1; }
+.sb-band.is-next .sb-fill { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--resume); }
+
+/* What the pointer hovers: the band, half the gap either side of it and the
+   rails under it, so sweeping along the row never drops the tooltip in a gap. */
+.sb-hit {
+  position: absolute;
+  inset: 0 calc(var(--sb-gap, 3px) / -2 - 0.5px) -14px;
+}
+
+/* A long series is slivers: tighter corners, and rails that run on across the
+   1px gaps, so a run of watched parts is one line rather than a dotted one. */
+.sb-grid.is-dense .sb-fill { border-radius: 2px; }
+.sb-grid.is-dense .sb-band.is-first .sb-fill { border-radius: 6px 2px 2px 6px; }
+.sb-grid.is-dense .sb-band.is-last .sb-fill { border-radius: 2px 6px 6px 2px; }
+.sb-grid.is-dense .sb-band.is-watched::after,
+.sb-grid.is-dense .sb-band.is-disk::before { right: -1px; border-radius: 0; }
+
+.sb-next {
+  position: absolute;
+  grid-area: 1 / 1 / 2 / -1;
+  bottom: calc(100% + 9px);
+  left: 0;
+  white-space: nowrap;
+  font-size: 1.2rem;
+  font-weight: 650;
+  line-height: 1.3;
+  color: var(--resume);
+  pointer-events: none;
+}
+.sb-next span { margin-left: 6px; color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+/* The figures. Bracketed, each centres on its bracket and, when the bracket
+   is too short for it, leans out over its neighbour rather than off the end
+   of the block: auto margins centre while there is room and give way to the
+   start when there is not, and the right bracket's start is its right. */
+.sb-brk {
+  position: relative;
+  grid-row: 2;
+  display: flex;
+  min-width: 0;
+  padding-top: 9px;
+  border-top: 1px solid #3a3a3a;
+}
+.sb-brk::before,
+.sb-brk::after {
+  content: "";
+  position: absolute;
+  top: -5px;
+  width: 1px;
+  height: 5px;
+  background: #3a3a3a;
+}
+.sb-brk::before { left: 0; }
+.sb-brk::after { right: 0; }
+.sb-brk.is-watched { border-top-color: rgba(255, 45, 85, 0.55); }
+.sb-brk.is-watched::before,
+.sb-brk.is-watched::after { background: rgba(255, 45, 85, 0.55); }
+.sb-brk.is-left { flex-direction: row-reverse; }
+
+.sb-fig {
+  flex: none;
+  margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  white-space: nowrap;
+}
+.sb-fig b {
+  font-size: 1.9rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.sb-fig span { font-size: 1.25rem; color: var(--muted); }
+.sb-fig em { font-style: normal; color: var(--ok); }
+
+/* Too close to share the middle: each to its own end of the block, wrapping
+   inside its half. Set by measurement (SeriesBands.tsx). */
+.series-bands[data-spread] .sb-fig {
+  margin-inline: 0;
+  max-width: calc(50cqi - 12px);
+  white-space: normal;
+  text-wrap: balance;
+}
+.series-bands[data-spread] .sb-brk.is-watched .sb-fig { align-items: flex-start; text-align: left; }
+.series-bands[data-spread] .sb-brk.is-left .sb-fig { align-items: flex-end; text-align: right; }
+
+/* Without a clean prefix there is nothing to bracket: the same figures, plain,
+   each over a short rail in its colour so it still points at the bands. */
+.sb-plain {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px 48px;
+}
+.sb-plain .sb-fig { margin-inline: 0; white-space: normal; }
+.sb-mk { display: block; width: 26px; height: 3px; margin: 6px 0 5px; border-radius: 2px; }
+.sb-mk.is-watched { background: var(--stat-watched); }
+.sb-mk.is-left { background: var(--stat-left); }
+
+/* The hovered part. Fixed, because the bands sit at the top of the scroll
+   area, which would clip it; placed by SeriesBands.tsx. */
+.sb-tip {
+  position: fixed;
+  z-index: 50;
+  left: 0;
+  top: 0;
+  width: max-content;
+  min-width: 16rem;
+  max-width: min(30rem, calc(100vw - 32px));
+  padding: 8px 12px 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  animation: sb-tip-in 110ms ease-out;
+}
+@keyframes sb-tip-in { from { opacity: 0; } }
+/* The caret, on the band's middle even when the box is held at an edge. */
+.sb-tip::after {
+  content: "";
+  position: absolute;
+  left: var(--caret, 50%);
+  top: 100%;
+  width: 9px;
+  height: 9px;
+  margin: -4px 0 0 -5px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-width: 0 1px 1px 0;
+  transform: rotate(45deg);
+}
+.sb-tip[data-side="below"]::after {
+  top: auto;
+  bottom: 100%;
+  margin: 0 0 -4px -5px;
+  border-width: 1px 0 0 1px;
+}
+.sb-tip-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 14px;
+  font-size: 1.15rem;
+  line-height: 1.45;
+}
+.sb-tip-part { font-weight: 600; color: var(--faint); font-variant-numeric: tabular-nums; }
+.sb-tip-part span { color: var(--muted); font-weight: 500; }
+.sb-tip-part span::before { content: "·"; margin: 0 6px; color: var(--faint); }
+.sb-tip-states { display: flex; flex-wrap: wrap; gap: 2px 10px; margin-left: auto; color: var(--muted); }
+.sb-tip-title {
+  margin-top: 3px;
+  font-size: 1.3rem;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+.sb-state { display: inline-flex; align-items: center; gap: 5px; }
+.sb-state i { width: 12px; height: 3px; border-radius: 2px; background: var(--stat-left); }
+.sb-state.is-watched i { background: var(--stat-watched); }
+.sb-state.is-downloaded i { height: 2px; background: var(--stat-disk); }
+.sb-state.is-hidden i { height: 6px; border-radius: 1px; background: var(--hatch); }
+.sb-state.is-next { color: var(--resume); font-weight: 600; }
+.sb-state.is-next i { background: var(--resume); }
 
 /* --- downloads ----------------------------------------------------------- */
 
@@ -2543,6 +3079,10 @@ label.field-label { display: block; }
    title once the title would be squeezed: words again, so rem. */
 @container app (max-width: 98rem) {
   .crumb-name { max-width: 22ch; }
+  /* The series actions keep their glyphs, their names in the tooltip: worded,
+     beside a long name they would squeeze it well under the 22ch above. */
+  .crumb-act { padding: 5px 8px; }
+  .crumb-act-label { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
   .dl-row { grid-template-columns: 96px minmax(0, 1fr); }
   .dl-actions { grid-column: 1 / -1; justify-content: flex-start; }
   .row-error { max-width: none; }

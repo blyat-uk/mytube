@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { screen, fireEvent, cleanup, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/event", async () => (await import("./testApi")).eventModule);
 vi.mock("@tauri-apps/plugin-dialog", async () => (await import("./testApi")).dialogModule);
@@ -9,6 +9,8 @@ import { api, backend, lastSaved, resetHarness, SETTINGS } from "./testApi";
 import { railItem, renderSettings } from "./testRender";
 import { scaleAfterKey, summary } from "./AppearancePage";
 import type { SettingsCtx } from "./context";
+import SettingsView from "../SettingsView";
+import { ToastProvider } from "../Toast";
 
 beforeEach(() => {
   resetHarness();
@@ -138,6 +140,64 @@ describe("Appearance · text size", () => {
   });
 });
 
+describe("Appearance · show stats", () => {
+  const statsSwitch = () => screen.getByRole("switch", { name: "Show stats" }) as HTMLInputElement;
+
+  it("is off by default, and says what it shows", async () => {
+    await renderSettings("appearance");
+    expect(statsSwitch().checked).toBe(false);
+    const hint = statsSwitch().getAttribute("aria-describedby");
+    expect(document.getElementById(hint!)!.textContent).toMatch(/Subscriptions feed.*series/);
+  });
+
+  it("shows a stored on", async () => {
+    backend.settings = { ...SETTINGS, show_stats: true };
+    await renderSettings("appearance");
+    expect(statsSwitch().checked).toBe(true);
+  });
+
+  it("saves at once when flipped on, and again when flipped back off", async () => {
+    await renderSettings("appearance");
+    fireEvent.click(statsSwitch());
+    expect((await saved(1)).show_stats).toBe(true);
+    expect(statsSwitch().checked).toBe(true);
+    // The rest of the file rides along untouched.
+    expect(lastSaved().text_scale).toBe(SETTINGS.text_scale);
+    expect(lastSaved().player_command).toBe(SETTINGS.player_command);
+
+    fireEvent.click(statsSwitch());
+    expect((await saved(2)).show_stats).toBe(false);
+    expect(statsSwitch().checked).toBe(false);
+  });
+
+  it("says so in the rail while they are on", async () => {
+    await renderSettings("appearance");
+    expect(lineOf("Appearance")).toBe("Text size 100%");
+    fireEvent.click(statsSwitch());
+    expect(lineOf("Appearance")).toBe("Text size 100% · stats on");
+    await saved();
+  });
+
+  /* The shell follows the switch through this: Settings is unmounted by the
+     time the feed is back on screen. */
+  it("hands every save that landed to the shell, and none that failed", async () => {
+    const onSaved = vi.fn();
+    render(
+      <ToastProvider>
+        <SettingsView initialSection="appearance" onSaved={onSaved} />
+      </ToastProvider>,
+    );
+    fireEvent.click(await screen.findByRole("switch", { name: "Show stats" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(onSaved.mock.calls[0][0]).toMatchObject({ show_stats: true, text_scale: 100 });
+
+    api.saveSettings.mockImplementationOnce(() => Promise.reject("disk full"));
+    fireEvent.click(statsSwitch());
+    expect(await screen.findByText("disk full")).toBeTruthy();
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("Appearance · keys", () => {
   it("steps by 10, pages by 50, and jumps to either end", () => {
     expect(scaleAfterKey(100, "ArrowRight")).toBe(110);
@@ -162,6 +222,11 @@ describe("Appearance · rail", () => {
     expect(summary(ctx(125))).toEqual({ text: "Text size 130%" });
     expect(summary(ctx(100))).toEqual({ text: "Text size 100%" });
     expect(summary(ctx(200))).toEqual({ text: "Text size 200%" });
+  });
+
+  it("adds the stats while they are on", () => {
+    const on = { settings: { ...SETTINGS, text_scale: 120, show_stats: true } } as SettingsCtx;
+    expect(summary(on)).toEqual({ text: "Text size 120% · stats on" });
   });
 
   it("reads the stored size in the rail", async () => {

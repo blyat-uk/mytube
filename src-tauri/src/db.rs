@@ -594,7 +594,22 @@ fn feed_query(
     select: &str,
     series: Vec<String>,
 ) -> Option<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
-    let mut sql = format!("{select} WHERE v.status='ready'");
+    let (clause, args) = feed_where(f, series)?;
+    Some((format!("{select}{clause}{}", order_by(f.sort)), args))
+}
+
+/// [`feed_query`]'s `WHERE` clause on its own, leading space included, with the
+/// arguments its numbered holes bind, from `?1` up. Split out for
+/// [`Db::feed_stats`], whose aggregates can carry no `ORDER BY` but must count
+/// exactly the rows the feed would show: one clause is what keeps the search
+/// box and the channel pick from meaning one thing in the grid and another in
+/// the numbers above it. The select it follows must join `channels` as `c`,
+/// since the search reaches the channel's name.
+fn feed_where(
+    f: &VideoFilter,
+    series: Vec<String>,
+) -> Option<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    let mut sql = String::from(" WHERE v.status='ready'");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if f.sibling_of.is_some() {
@@ -625,7 +640,6 @@ fn feed_query(
             sql.push_str(&format!(" AND search_match(?{}, v.title, c.title)", args.len()));
         }
     }
-    sql.push_str(order_by(f.sort));
     Some((sql, args))
 }
 
@@ -673,6 +687,127 @@ fn hydrate(
         rows.insert(v.id.clone(), v);
     }
     Ok(())
+}
+
+/// The grouping walk's reading half: everything [`WalkRows::walk`] needs,
+/// read under the connection lock so the walk itself can run without it.
+///
+/// Shared by [`Db::list_video_groups`] and [`Db::feed_stats`], so the number
+/// of series above the feed is counted by the very walk that draws the cards
+/// below it -- two copies of it could disagree about what a series is.
+struct WalkRows {
+    /// The feed's rows, in its order, each with its channel. Each is a
+    /// candidate leader: the walk takes them top-down.
+    seeds: Vec<(String, String)>,
+    /// Every ready row on each channel a seed belongs to, read once per channel.
+    by_channel: HashMap<String, (Vec<siblings::Entry>, HashMap<String, PartFacts>)>,
+}
+
+/// The finished walk, before any page is cut or any row hydrated.
+struct Walk {
+    /// Each card's members, leader first, in the feed's order. A lone video is
+    /// a card of one.
+    groups: Vec<Vec<String>>,
+    /// What each part on a channel in play contributes to its card.
+    parts: HashMap<String, PartFacts>,
+    /// The former names of the few parts that have any, set aside before the
+    /// atoms took the entries whole: they name a card as well as match it.
+    former: HashMap<String, Vec<String>>,
+}
+
+impl WalkRows {
+    /// Reads the seeds `f` selects and every ready row on their channels.
+    /// Matching against the unfiltered set is the whole point: the filterbar
+    /// must not be able to shorten a series, only to hide one. `sibling_of` is
+    /// ignored -- a series view is a flat list on purpose.
+    ///
+    /// Takes the connection rather than the lock, so a caller with more to
+    /// read can do it all under one acquisition.
+    fn read(conn: &Connection, f: &VideoFilter) -> Result<Self> {
+        let seed_filter = VideoFilter { sibling_of: None, ..f.clone() };
+        let Some((sql, args)) = feed_query(&seed_filter, SELECT_VIDEO_IDS, Vec::new()) else {
+            return Ok(Self { seeds: Vec::new(), by_channel: HashMap::new() });
+        };
+        let mut st = conn.prepare(&sql)?;
+        let seeds: Vec<(String, String)> = st
+            .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut by_channel = HashMap::new();
+        for (_, channel) in &seeds {
+            if by_channel.contains_key(channel) { continue; }
+            by_channel.insert(channel.clone(), channel_rows(conn, channel)?);
+        }
+        Ok(Self { seeds, by_channel })
+    }
+
+    /// The matching half, which is where the time goes -- a regex pass over
+    /// every title in play and a comparison per candidate pair -- and so the
+    /// half that must run with the lock released.
+    fn walk(self) -> Walk {
+        // Bucketed first. The atoms take the entries whole, so the former
+        // names are set aside before they do, for the few rows that have any.
+        let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
+        let mut parts: HashMap<String, PartFacts> = HashMap::new();
+        let mut former: HashMap<String, Vec<String>> = HashMap::new();
+        for (channel, (entries, facts)) in self.by_channel {
+            parts.extend(facts);
+            former.extend(
+                entries.iter()
+                    .filter(|e| !e.former_titles.is_empty())
+                    .map(|e| (e.id.clone(), e.former_titles.clone())),
+            );
+            index.insert(channel, siblings::Atoms::new(entries));
+        }
+
+        // Top-down: the first part to survive the filters leads its group, and
+        // every part it claims is struck off so it cannot open a group of its
+        // own further down the feed.
+        let mut consumed: HashSet<String> = HashSet::new();
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (id, channel) in &self.seeds {
+            if consumed.contains(id) { continue; }
+            let mut members: Vec<String> =
+                index[channel].group_led_by(id).into_iter().map(String::from).collect();
+            // A seed the atoms do not know is a row that stopped being `ready`
+            // between the two queries; it still deserves its own card.
+            if members.is_empty() { members.push(id.clone()); }
+            for m in &members { consumed.insert(m.clone()); }
+            groups.push(members);
+        }
+        Walk { groups, parts, former }
+    }
+}
+
+/// How far back [`FeedStats::new_this_week`] reaches.
+const WEEK_SECS: i64 = 7 * 86_400;
+
+/// The feed filter the stats count by: `f`'s pick and search, with every Show
+/// toggle open -- hidden videos counted, watched ones too, on disk or not --
+/// since the numbers describe what the pick narrows the library to, not what
+/// the grid is wearing at the moment.
+///
+/// The sort is pinned to the feed's default. It is the one thing besides the
+/// filters that can move the series count: the part that leads a card decides
+/// which loose matches it takes in, so a different order can split or join a
+/// borderline series -- on a copy of the real library (2026-10-19, 4,819
+/// videos) the grouped feed held 491 series sorted Newest and 493 sorted
+/// Oldest. The stats follow the pick and the search alone, and flipping the
+/// sort must not make the number twitch.
+fn stats_filter(f: &StatsFilter) -> VideoFilter {
+    VideoFilter {
+        channel_ids: f.channel_ids.clone(),
+        search: f.search.clone(),
+        show_hidden: true,
+        hide_watched: false,
+        downloaded_only: false,
+        groups_only: false,
+        in_progress: false,
+        sibling_of: None,
+        sort: SortOrder::Newest,
+        ..VideoFilter::default()
+    }
 }
 
 const INSERT_VIDEO: &str = "INSERT OR IGNORE INTO videos
@@ -1306,61 +1441,14 @@ impl Db {
     /// rows a moment stale, which the next refetch corrects; a row deleted in it
     /// is simply absent from the hydrated page.
     pub fn list_video_groups(&self, f: &VideoFilter) -> Result<Vec<VideoGroup>> {
-        let seed_filter = VideoFilter { sibling_of: None, ..f.clone() };
-        let Some((sql, args)) = feed_query(&seed_filter, SELECT_VIDEO_IDS, Vec::new()) else {
-            return Ok(Vec::new());
-        };
-
-        // Every ready video on each channel in play, read once. Matching
-        // against the unfiltered set is the whole point: the filterbar must not
-        // be able to shorten a series, only to hide one.
-        let (seeds, rows_by_channel) = {
+        // Every ready video on each channel in play, read once; then the walk,
+        // with the lock released.
+        let rows = {
             let conn = self.conn.lock().unwrap();
-            let mut st = conn.prepare(&sql)?;
-            let seeds: Vec<(String, String)> = st
-                .query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut rows_by_channel = HashMap::new();
-            for (_, channel) in &seeds {
-                if rows_by_channel.contains_key(channel) { continue; }
-                rows_by_channel.insert(channel.clone(), channel_rows(&conn, channel)?);
-            }
-            (seeds, rows_by_channel)
+            WalkRows::read(&conn, f)?
         };
+        let Walk { mut groups, parts, former } = rows.walk();
 
-        // Bucketed with the lock released. The atoms take the entries whole,
-        // so the former names -- which name a card as well as match it -- are
-        // set aside first, for the few rows that have any.
-        let mut index: HashMap<String, siblings::Atoms> = HashMap::new();
-        let mut parts: HashMap<String, PartFacts> = HashMap::new();
-        let mut former: HashMap<String, Vec<String>> = HashMap::new();
-        for (channel, (entries, facts)) in rows_by_channel {
-            parts.extend(facts);
-            former.extend(
-                entries.iter()
-                    .filter(|e| !e.former_titles.is_empty())
-                    .map(|e| (e.id.clone(), e.former_titles.clone())),
-            );
-            index.insert(channel, siblings::Atoms::new(entries));
-        }
-
-        // Top-down: the first part to survive the filters leads its group, and
-        // every part it claims is struck off so it cannot open a group of its
-        // own further down the feed.
-        let mut consumed: HashSet<String> = HashSet::new();
-        let mut groups: Vec<Vec<String>> = Vec::new();
-        for (id, channel) in &seeds {
-            if consumed.contains(id) { continue; }
-            let mut members: Vec<String> =
-                index[channel].group_led_by(id).into_iter().map(String::from).collect();
-            // A seed the atoms do not know is a row that stopped being `ready`
-            // between the two queries; it still deserves its own card.
-            if members.is_empty() { members.push(id.clone()); }
-            for m in &members { consumed.insert(m.clone()); }
-            groups.push(members);
-        }
         // After the walk, not in it: a lone video must still strike itself off
         // and claim nothing, and only the finished walk knows who is alone.
         if f.groups_only {
@@ -1460,6 +1548,106 @@ impl Db {
             out.push(VideoGroup { videos, stem });
         }
         Ok(out)
+    }
+
+    /// The stats above the feed for the channel pick and the search in `f`, as
+    /// of `now` (Unix seconds; a parameter so a test can stand anywhere).
+    ///
+    /// The rows are the feed's own, through [`feed_where`], with every Show
+    /// toggle open (see [`stats_filter`]). The totals and the days are one
+    /// aggregate statement each; the series count is the grouping walk itself,
+    /// which only has to say how many groups it built, so not one row is
+    /// hydrated for it. The three reads share one hold of the lock, so they
+    /// describe one moment of the library, and the matching runs after it is
+    /// released, as it does for the grid.
+    ///
+    /// "Today" is worked out by SQLite from `now` with the same `'localtime'`
+    /// modifier that files each video under its day, so the waveform's right
+    /// edge and the bars beside it never follow two clocks.
+    pub fn feed_stats(&self, f: &StatsFilter, now: i64) -> Result<FeedStats> {
+        let filter = stats_filter(f);
+        let Some((clause, mut args)) = feed_where(&filter, Vec::new()) else {
+            return Ok(FeedStats::default());
+        };
+        // The clause binds `?1..=?holes`; the totals add two more after them.
+        let holes = args.len();
+        args.push(Box::new(now - WEEK_SECS));
+        args.push(Box::new(now));
+        let bind = |n: usize| rusqlite::params_from_iter(args[..n].iter().map(|b| b.as_ref()));
+
+        let (mut stats, days, rows) = {
+            let conn = self.conn.lock().unwrap();
+            // A NULL or zero duration is one the listing never gave; it adds
+            // nothing to the runtime, and says the runtime is short by it.
+            let totals = format!(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(v.watched = 0 AND v.hidden = 0), 0),
+                        COALESCE(SUM(v.watched <> 0 AND v.hidden = 0), 0),
+                        COALESCE(SUM(v.download_state = 'done'), 0),
+                        COALESCE(SUM(v.hidden <> 0), 0),
+                        COALESCE(SUM(COALESCE(v.duration_secs, 0)), 0),
+                        COALESCE(MAX(COALESCE(v.duration_secs, 0) = 0), 0),
+                        COALESCE(SUM(v.published_at >= ?{week}), 0),
+                        strftime('%Y-%m-%d', ?{now}, 'unixepoch', 'localtime')
+                   FROM videos v JOIN channels c ON c.id = v.channel_id{clause}",
+                week = holes + 1,
+                now = holes + 2,
+            );
+            let stats = conn.query_row(&totals, bind(holes + 2), |r| {
+                Ok(
+                    FeedStats {
+                        videos: r.get(0)?,
+                        series: 0,
+                        to_watch: r.get(1)?,
+                        watched: r.get(2)?,
+                        downloaded: r.get(3)?,
+                        hidden: r.get(4)?,
+                        runtime_secs: r.get(5)?,
+                        runtime_unknown: r.get::<_, i64>(6)? != 0,
+                        new_this_week: r.get(7)?,
+                        today: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                        days: Vec::new(),
+                    },
+                )
+            })?;
+
+            // The four segments are exclusive by construction -- hidden first,
+            // then watched, then on disk -- so each day adds up to its videos.
+            // Undated rows are in the totals above and on no day.
+            let by_day = format!(
+                "SELECT strftime('%Y-%m-%d', v.published_at, 'unixepoch', 'localtime') AS day,
+                        SUM(v.hidden = 0 AND v.watched <> 0),
+                        SUM(v.hidden = 0 AND v.watched = 0 AND v.download_state = 'done'),
+                        SUM(v.hidden = 0 AND v.watched = 0 AND v.download_state <> 'done'),
+                        SUM(v.hidden <> 0)
+                   FROM videos v JOIN channels c ON c.id = v.channel_id{clause}
+                    AND v.published_at IS NOT NULL
+                  GROUP BY day
+                  ORDER BY day",
+            );
+            let mut st = conn.prepare(&by_day)?;
+            let days = st
+                .query_map(bind(holes), |r| {
+                    Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .filter_map(|row| match row {
+                    // A date too far out for SQLite's calendar has no day to
+                    // be filed under; it still counts in the totals.
+                    Ok((None, ..)) => None,
+                    Ok((Some(day), watched, downloaded, unwatched, hidden)) => {
+                        Some(Ok(StatsDay { day, watched, downloaded, unwatched, hidden }))
+                    }
+                    Err(err) => Some(Err(err)),
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let rows = WalkRows::read(&conn, &filter)?;
+            (stats, days, rows)
+        };
+
+        stats.series = rows.walk().groups.iter().filter(|members| members.len() > 1).count() as i64;
+        stats.days = days;
+        Ok(stats)
     }
 
     /// Marks `ids` siblings by hand, and returns how many videos the finished
@@ -7600,5 +7788,424 @@ mod channel_meta_tests {
             "channelId": "UC1", "videos": 3, "downloaded": 1, "watched": 2, "hidden": 1,
             "runtimeSecs": 150, "latestUpload": null, "followerCount": 83_500,
         }));
+    }
+}
+
+#[cfg(test)]
+mod feed_stats_tests {
+    use super::*;
+
+    /// 2024-06-15 12:00 UTC, the moment every test here stands at unless it
+    /// says otherwise.
+    const NOW: i64 = 1_718_452_800;
+
+    /// Noon UTC on the 15th: inside the same calendar month in every time zone
+    /// there is, so the month keys below hold wherever the suite runs.
+    fn mid(year: i32, month: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(year, month, 15).unwrap()
+            .and_hms_opt(12, 0, 0).unwrap()
+            .and_utc().timestamp()
+    }
+
+    fn channel(d: &Db, id: &str, title: &str) {
+        d.upsert_channel(&Channel {
+            id: id.into(), title: title.into(), handle: None,
+            url: format!("https://www.youtube.com/channel/{id}"), thumb_path: None,
+            subscribed: true, member: false, added_at: 0, last_polled_at: None,
+            terminated: false, auto_download: false,
+        }).unwrap();
+    }
+
+    /// One row per `(id, title, published, flags)`, each ten minutes long.
+    /// `flags` holds `w` for watched, `h` hidden, `d` downloaded, and `p` for a
+    /// row that is not `ready` yet.
+    fn rows(d: &Db, ch: &str, rows: &[(&str, &str, Option<i64>, &str)]) {
+        let conn = d.conn.lock().unwrap();
+        for (id, title, published, flags) in rows {
+            conn.execute(
+                "INSERT INTO videos (id, channel_id, title, status, published_at, sort_at,
+                                     duration_secs, watched, hidden, download_state, first_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 600, ?6, ?7, ?8, 1)",
+                params![
+                    id, ch, title,
+                    if flags.contains('p') { "pending" } else { "ready" },
+                    published,
+                    flags.contains('w'),
+                    flags.contains('h'),
+                    if flags.contains('d') { "done" } else { "none" },
+                ],
+            ).unwrap();
+        }
+    }
+
+    fn sql(d: &Db, batch: &str) { d.conn.lock().unwrap().execute_batch(batch).unwrap(); }
+
+    fn stats(d: &Db, f: &StatsFilter) -> FeedStats { d.feed_stats(f, NOW).unwrap() }
+
+    fn all(d: &Db) -> FeedStats { stats(d, &StatsFilter::default()) }
+
+    fn pick(ids: &[&str]) -> StatsFilter {
+        StatsFilter { channel_ids: ids.iter().map(|s| (*s).to_string()).collect(), search: None }
+    }
+
+    fn search(term: &str) -> StatsFilter {
+        StatsFilter { channel_ids: Vec::new(), search: Some(term.into()) }
+    }
+
+    /// The local date SQLite files `ts` under, worked out apart from it: noon
+    /// UTC is the 15th almost everywhere, but the 16th east of UTC+12.
+    fn local_day(ts: i64) -> String {
+        chrono::DateTime::from_timestamp(ts, 0).unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn day(ts: i64, watched: i64, downloaded: i64, unwatched: i64, hidden: i64) -> StatsDay {
+        StatsDay { day: local_day(ts), watched, downloaded, unwatched, hidden }
+    }
+
+    fn keys(s: &FeedStats) -> Vec<&str> { s.days.iter().map(|d| d.day.as_str()).collect() }
+
+    /// Every combination of watched, hidden and downloaded, spread over three
+    /// days, beside a row that is not ready yet.
+    fn combos(d: &Db) {
+        channel(d, "UC1", "Alpha");
+        rows(d, "UC1", &[
+            ("a", "Apples and pears", Some(mid(2024, 1)), ""),
+            ("b", "Bridges of the north", Some(mid(2024, 1)), "w"),
+            ("c", "Cactus garden tour", Some(mid(2024, 2)), "h"),
+            ("dd", "Diving the reef", Some(mid(2024, 2)), "hw"),
+            ("e", "Engines explained", Some(mid(2024, 3)), "d"),
+            ("f", "Ferries at dawn", Some(mid(2024, 3)), "dw"),
+            ("g", "Glaciers retreating", Some(mid(2024, 3)), "dh"),
+            ("gw", "Gondolas of the south", Some(mid(2024, 3)), "dhw"),
+            ("p", "Premiere tonight", Some(mid(2024, 3)), "p"),
+        ]);
+    }
+
+    #[test]
+    fn the_totals_split_the_library_three_ways_and_count_downloads_across_them() {
+        let d = Db::open_in_memory().unwrap();
+        combos(&d);
+        assert_eq!(all(&d), FeedStats {
+            videos: 8,
+            series: 0,
+            to_watch: 2,   // a, e: a file on disk is still to watch
+            watched: 2,    // b, f
+            downloaded: 4, // e, f, g, gw: whatever else they are
+            hidden: 4,     // c, dd, g, gw: hidden beats watched and downloaded
+            runtime_secs: 8 * 600,
+            runtime_unknown: false,
+            new_this_week: 0,
+            today: local_day(NOW),
+            days: vec![
+                day(mid(2024, 1), 1, 0, 1, 0),
+                day(mid(2024, 2), 0, 0, 0, 2),
+                day(mid(2024, 3), 1, 1, 0, 2),
+            ],
+        }, "the pending row counts for nothing");
+    }
+
+    #[test]
+    fn each_day_adds_up_to_its_videos_and_the_days_to_every_dated_one() {
+        let d = Db::open_in_memory().unwrap();
+        channel(&d, "UC1", "Alpha");
+        // Every combination of the three flags, over five days, with every
+        // fourth row undated.
+        let mut fixture: Vec<(String, String, Option<i64>, String)> = Vec::new();
+        for i in 0..48u32 {
+            let flags: String = [(1, 'w'), (2, 'h'), (4, 'd')]
+                .iter()
+                .filter(|(bit, _)| i & bit != 0)
+                .map(|(_, f)| *f)
+                .collect();
+            let published = (i % 4 != 3).then(|| mid(2023, 1 + i % 5));
+            fixture.push((format!("v{i}"), format!("Unrelated upload number {i} {flags}"),
+                          published, flags));
+        }
+        let borrowed: Vec<(&str, &str, Option<i64>, &str)> = fixture
+            .iter()
+            .map(|(id, t, p, f)| (id.as_str(), t.as_str(), *p, f.as_str()))
+            .collect();
+        rows(&d, "UC1", &borrowed);
+
+        let s = all(&d);
+        assert_eq!(s.videos, 48);
+        assert_eq!(s.to_watch + s.watched + s.hidden, s.videos);
+        let undated = fixture.iter().filter(|r| r.2.is_none()).count() as i64;
+        let on_days: i64 =
+            s.days.iter().map(|d| d.watched + d.downloaded + d.unwatched + d.hidden).sum();
+        assert_eq!(on_days + undated, s.videos);
+
+        // Segment by segment, against the undated rows' own flags.
+        let undated_with = |test: &dyn Fn(&str) -> bool| {
+            fixture.iter().filter(|r| r.2.is_none() && test(&r.3)).count() as i64
+        };
+        let sum = |seg: fn(&StatsDay) -> i64| s.days.iter().map(seg).sum::<i64>();
+        assert_eq!(sum(|m| m.hidden) + undated_with(&|f| f.contains('h')), s.hidden);
+        assert_eq!(sum(|m| m.watched) + undated_with(&|f| f.contains('w') && !f.contains('h')),
+                   s.watched);
+        assert_eq!(sum(|m| m.downloaded + m.unwatched)
+                       + undated_with(&|f| !f.contains('w') && !f.contains('h')),
+                   s.to_watch);
+        assert_eq!(sum(|m| m.downloaded) + undated_with(&|f| f == "d"),
+                   fixture.iter().filter(|r| r.3 == "d").count() as i64,
+                   "the downloaded segment is on disk, unwatched and not hidden");
+        // Five dated days, and only those: the gaps are the page's to draw.
+        assert_eq!(keys(&s), (1..=5).map(|m| local_day(mid(2023, m))).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_days_are_only_those_with_uploads_and_today_is_the_local_date() {
+        let d = Db::open_in_memory().unwrap();
+        channel(&d, "UC1", "Alpha");
+        rows(&d, "UC1", &[
+            ("old", "From before the gap", Some(mid(2023, 11)), "w"),
+            ("new", "From after the gap", Some(mid(2024, 2)), ""),
+        ]);
+        let s = d.feed_stats(&StatsFilter::default(), mid(2024, 4)).unwrap();
+        assert_eq!(s.days, vec![day(mid(2023, 11), 1, 0, 0, 0), day(mid(2024, 2), 0, 0, 1, 0)]);
+        assert_eq!(s.today, local_day(mid(2024, 4)));
+    }
+
+    #[test]
+    fn a_video_dated_after_today_is_still_counted_on_its_day() {
+        let d = Db::open_in_memory().unwrap();
+        channel(&d, "UC1", "Alpha");
+        rows(&d, "UC1", &[
+            ("early", "An early one", Some(mid(2024, 2)), ""),
+            ("ahead", "Dated ahead of the clock", Some(mid(2024, 5)), ""),
+        ]);
+        let s = d.feed_stats(&StatsFilter::default(), mid(2024, 3)).unwrap();
+        assert_eq!(keys(&s), [local_day(mid(2024, 2)), local_day(mid(2024, 5))]);
+        assert_eq!(s.today, local_day(mid(2024, 3)));
+    }
+
+    #[test]
+    fn an_undated_video_counts_in_the_totals_and_on_no_day() {
+        let d = Db::open_in_memory().unwrap();
+        channel(&d, "UC1", "Alpha");
+        rows(&d, "UC1", &[("undated", "Backfilled without a date", None, "w")]);
+        let s = all(&d);
+        assert_eq!((s.videos, s.watched), (1, 1));
+        assert!(s.days.is_empty(), "no dated video, no day: {:?}", s.days);
+
+        rows(&d, "UC1", &[("dated", "Dated this month", Some(NOW), "")]);
+        let s = all(&d);
+        assert_eq!((s.videos, s.watched, s.to_watch), (2, 1, 1));
+        assert_eq!(s.days, vec![day(NOW, 0, 0, 1, 0)]);
+    }
+
+    #[test]
+    fn the_channel_pick_narrows_every_number() {
+        let d = Db::open_in_memory().unwrap();
+        combos(&d);
+        channel(&d, "UC2", "Beta");
+        channel(&d, "UC3", "Gamma");
+        rows(&d, "UC2", &[("b1", "Boats", Some(mid(2023, 6)), "w")]);
+        rows(&d, "UC3", &[("c1", "Canals", Some(NOW), "d")]);
+
+        let beta = stats(&d, &pick(&["UC2"]));
+        assert_eq!((beta.videos, beta.watched, beta.to_watch), (1, 1, 0));
+        assert_eq!(keys(&beta), [local_day(mid(2023, 6))], "only Beta's one upload");
+
+        let two = stats(&d, &pick(&["UC1", "UC3"]));
+        assert_eq!((two.videos, two.downloaded, two.to_watch, two.new_this_week), (9, 5, 3, 1));
+        assert_eq!(two.days.first().unwrap().day, local_day(mid(2024, 1)));
+
+        assert_eq!(all(&d).videos, 10, "an empty pick is every channel");
+        let gone = stats(&d, &pick(&["UC-gone"]));
+        assert_eq!(gone, FeedStats { today: local_day(NOW), ..FeedStats::default() },
+                   "a channel that is gone narrows to nothing");
+    }
+
+    #[test]
+    fn the_search_narrows_every_number_exactly_as_it_narrows_the_feed() {
+        let d = Db::open_in_memory().unwrap();
+        combos(&d);
+        channel(&d, "UC2", "Beta");
+        rows(&d, "UC2", &[
+            ("b1", "Boats of the north", Some(mid(2024, 5)), "h"),
+            ("b2", "Boats at dawn", Some(mid(2024, 5)), ""),
+        ]);
+
+        let north = stats(&d, &search("north"));
+        assert_eq!((north.videos, north.watched, north.hidden), (2, 1, 1));
+        assert_eq!(keys(&north), [local_day(mid(2024, 1)), local_day(mid(2024, 5))]);
+
+        // A term reaches the channel's name, and an exclusion does too.
+        assert_eq!(stats(&d, &search("beta")).videos, 2);
+        assert_eq!(stats(&d, &search("-beta")).videos, 8);
+        assert_eq!(stats(&d, &search("(north|dawn) -boats")).videos, 2, "b, f");
+        assert_eq!(stats(&d, &search("   ")).videos, 10, "a blank search is no search");
+
+        // The same rows the feed keeps for the same search, hidden ones shown.
+        for term in ["north", "beta", "-beta", "(north|dawn) -boats", "zzz"] {
+            let f = VideoFilter { search: Some(term.into()), show_hidden: true,
+                                  limit: 1000, ..Default::default() };
+            assert_eq!(stats(&d, &search(term)).videos,
+                       d.list_videos(&f).unwrap().len() as i64, "{term}");
+        }
+        assert_eq!(stats(&d, &search("zzz")), FeedStats { today: local_day(NOW), ..FeedStats::default() });
+    }
+
+    #[test]
+    fn the_show_toggles_never_reach_the_numbers() {
+        let d = Db::open_in_memory().unwrap();
+        combos(&d);
+        // The feed's own filter, every toggle as tight as it goes: the payload
+        // type has no field for any of them, so they are never read.
+        let wearing: StatsFilter = serde_json::from_value(serde_json::json!({
+            "channelIds": [], "search": null, "showHidden": false, "hideWatched": true,
+            "downloadedOnly": true, "groupsOnly": true, "inProgress": true,
+            "siblingOf": "a", "sort": "oldest",
+        })).unwrap();
+        assert_eq!(stats(&d, &wearing), all(&d));
+        // And the leanest payload there is reads as every channel, no search.
+        let bare: StatsFilter = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(stats(&d, &bare), all(&d));
+        // Hidden, watched and never-downloaded rows are all in.
+        let s = all(&d);
+        assert_eq!((s.hidden, s.watched, s.videos - s.downloaded), (4, 2, 4));
+    }
+
+    #[test]
+    fn new_this_week_reaches_back_exactly_seven_days() {
+        let d = Db::open_in_memory().unwrap();
+        channel(&d, "UC1", "Alpha");
+        rows(&d, "UC1", &[
+            ("edge", "On the boundary", Some(NOW - 7 * 86_400), ""),
+            ("before", "A second too old", Some(NOW - 7 * 86_400 - 1), ""),
+            ("today", "Today", Some(NOW), "h"),
+            ("undated", "No date", None, ""),
+        ]);
+        assert_eq!(all(&d).new_this_week, 2, "the boundary and a hidden one count");
+    }
+
+    #[test]
+    fn an_unknown_duration_adds_nothing_and_is_owned_up_to() {
+        let d = Db::open_in_memory().unwrap();
+        channel(&d, "UC1", "Alpha");
+        rows(&d, "UC1", &[
+            ("a", "Known length", Some(NOW), ""),
+            ("b", "Another one", Some(NOW), ""),
+        ]);
+        let s = all(&d);
+        assert_eq!((s.runtime_secs, s.runtime_unknown), (1200, false));
+
+        sql(&d, "UPDATE videos SET duration_secs = NULL WHERE id = 'b'");
+        let s = all(&d);
+        assert_eq!((s.runtime_secs, s.runtime_unknown), (600, true));
+
+        sql(&d, "UPDATE videos SET duration_secs = 0 WHERE id = 'b'");
+        let s = all(&d);
+        assert_eq!((s.runtime_secs, s.runtime_unknown), (600, true),
+                   "a zero is a listing that had none");
+
+        // Narrowed away from the unknown one, the runtime is whole again.
+        assert!(!stats(&d, &search("known")).runtime_unknown);
+    }
+
+    #[test]
+    fn an_empty_library_is_all_zeros_and_no_days() {
+        let d = Db::open_in_memory().unwrap();
+        let empty = FeedStats { today: local_day(NOW), ..FeedStats::default() };
+        assert_eq!(all(&d), empty);
+        channel(&d, "UC1", "Alpha");
+        rows(&d, "UC1", &[("p", "Not ready yet", Some(NOW), "p")]);
+        assert_eq!(all(&d), empty, "only ready rows count");
+    }
+
+    /// Three series -- one matched by title, one marked by hand, one wholly
+    /// hidden -- beside lone uploads, on two channels.
+    fn series_library(d: &Db) {
+        channel(d, "UC1", "Alpha");
+        channel(d, "UC2", "Beta");
+        rows(d, "UC1", &[
+            ("t1", "The Blackwood Tapes", Some(mid(2024, 1)), "h"),
+            ("t2", "(2) The Blackwood Tapes", Some(mid(2024, 2)), "w"),
+            ("t3", "(3) The Blackwood Tapes", Some(mid(2024, 3)), ""),
+            ("ns", "Night Shift Pt 3", Some(mid(2024, 3)), ""),
+            ("ec", "EVERYTHING CHANGED", Some(mid(2024, 4)), "d"),
+            ("l1", "A Completely Different Story", Some(mid(2024, 4)), ""),
+            ("l2", "Cooking With Gas", Some(mid(2024, 5)), "w"),
+        ]);
+        rows(d, "UC2", &[
+            ("r1", "Road Trip Part 1", Some(mid(2024, 2)), "h"),
+            ("r2", "Road Trip Part 2", Some(mid(2024, 3)), "h"),
+            ("l3", "Unrelated Vlog", Some(mid(2024, 5)), ""),
+        ]);
+        d.mark_siblings(&["ns".to_string(), "ec".to_string()]).unwrap();
+    }
+
+    /// What the grouped feed shows for the same pick with every toggle open:
+    /// its cards of two or more parts.
+    fn grouped_series(d: &Db, f: &StatsFilter) -> i64 {
+        let feed = VideoFilter {
+            channel_ids: f.channel_ids.clone(),
+            search: f.search.clone(),
+            show_hidden: true,
+            limit: 100_000,
+            ..Default::default()
+        };
+        d.list_video_groups(&feed).unwrap().iter().filter(|g| g.videos.len() >= 2).count() as i64
+    }
+
+    #[test]
+    fn series_counts_the_grouped_feeds_cards_of_two_or_more() {
+        let d = Db::open_in_memory().unwrap();
+        series_library(&d);
+        let cases = [
+            (StatsFilter::default(), 3),
+            (pick(&["UC1"]), 2),
+            (pick(&["UC2"]), 1),
+            (pick(&["UC1", "UC2"]), 3),
+            // A search that one part alone matches still finds its series.
+            (search("\"(2)\""), 1),
+            (search("-tapes"), 2),
+            (search("completely"), 0),
+            (search("everything"), 1),
+        ];
+        for (f, want) in cases {
+            let got = stats(&d, &f);
+            assert_eq!(got.series, want, "{f:?}");
+            assert_eq!(got.series, grouped_series(&d, &f), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn a_series_part_way_into_the_search_counts_whole_and_its_other_parts_do_not() {
+        let d = Db::open_in_memory().unwrap();
+        series_library(&d);
+        let s = stats(&d, &search("\"(2)\""));
+        // One video matches. The card it leads holds all three parts, so it is
+        // a series; the totals are only ever the matching rows.
+        assert_eq!((s.videos, s.series, s.watched), (1, 1, 1));
+        let feed = VideoFilter { search: Some("\"(2)\"".into()), show_hidden: true,
+                                 ..Default::default() };
+        assert_eq!(d.list_video_groups(&feed).unwrap()[0].videos.len(), 3);
+    }
+
+    #[test]
+    fn the_stats_serialise_in_camel_case() {
+        let s = FeedStats {
+            videos: 3, series: 1, to_watch: 1, watched: 1, downloaded: 2, hidden: 1,
+            runtime_secs: 1800, runtime_unknown: true, new_this_week: 1,
+            today: "2024-03-20".into(),
+            days: vec![StatsDay { day: "2024-03-14".into(), watched: 1, downloaded: 1,
+                                  unwatched: 0, hidden: 1 }],
+        };
+        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!({
+            "videos": 3, "series": 1, "toWatch": 1, "watched": 1, "downloaded": 2,
+            "hidden": 1, "runtimeSecs": 1800, "runtimeUnknown": true, "newThisWeek": 1,
+            "today": "2024-03-20",
+            "days": [{ "day": "2024-03-14", "watched": 1, "downloaded": 1,
+                       "unwatched": 0, "hidden": 1 }],
+        }));
+        let f: StatsFilter = serde_json::from_value(serde_json::json!({
+            "channelIds": ["UC1"], "search": "tapes",
+        })).unwrap();
+        assert_eq!((f.channel_ids, f.search), (vec!["UC1".to_string()], Some("tapes".into())));
     }
 }

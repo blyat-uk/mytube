@@ -1,8 +1,33 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, act, getByRole } from "@testing-library/react";
-import type { Video, VideoFilter, VideoGroup } from "../types";
+import type { FeedStats, StatsFilter, Video, VideoFilter, VideoGroup } from "../types";
 
-vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
+// Every listener the view registers, by event name, so a test can deliver a
+// download's state change the way the backend does.
+const listeners = new Map<string, (e: { payload: unknown }) => void>();
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => {
+    listeners.set(name, cb);
+    return Promise.resolve(() => {});
+  },
+}));
+
+// The stats' own components are drawn by their own tests; here they only say
+// what they were handed.
+const waveformProps = vi.fn<(p: { stats: FeedStats }) => void>();
+const bandsProps = vi.fn<(p: { parts: Video[] }) => void>();
+vi.mock("./stats/FeedWaveform", () => ({
+  default: (p: { stats: FeedStats }) => {
+    waveformProps(p);
+    return <div data-testid="waveform">{p.stats.videos} videos</div>;
+  },
+}));
+vi.mock("./stats/SeriesBands", () => ({
+  default: (p: { parts: Video[] }) => {
+    bandsProps(p);
+    return <div data-testid="bands">{p.parts.length} parts</div>;
+  },
+}));
 
 // jsdom ships no IntersectionObserver, and the grid's infinite scroll wants one.
 // This one keeps its callbacks, so `pageIn()` below can reach the sentinel the
@@ -35,6 +60,7 @@ const enqueueDownloads = vi.fn((_ids: string[]) => Promise.resolve(0));
 // Typed with the filter so a test can page through a library with it.
 const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn<(f: VideoFilter) => Promise<VideoGroup[]>>(() => Promise.resolve(groups));
+const feedStats = vi.fn<(f: StatsFilter) => Promise<FeedStats>>(() => Promise.resolve(STATS));
 
 vi.mock("../api", () => ({
   api: {
@@ -50,6 +76,7 @@ vi.mock("../api", () => ({
     setVideoHidden: (id: string, hidden: boolean) => setVideoHidden(id, hidden),
     setSeriesHidden: (leader: string, hidden: boolean) => setSeriesHidden(leader, hidden),
     enqueueDownloads: (ids: string[]) => enqueueDownloads(ids),
+    feedStats: (filter: StatsFilter) => feedStats(filter),
     getSettings: () => Promise.resolve({ quality: DEFAULT_QUALITY }),
   },
   thumbSrc: () => "",
@@ -57,6 +84,7 @@ vi.mock("../api", () => ({
 }));
 
 import SubscriptionsView from "./SubscriptionsView";
+import { BUMP_DELAY } from "./stats/useFeedStats";
 import { DEFAULT_QUALITY } from "../quality";
 import { rickroll } from "../quality.fixture";
 import { ToastProvider } from "./Toast";
@@ -76,11 +104,30 @@ function video(over: Partial<Video> = {}): Video {
 let videos: Video[] = [];
 let groups: VideoGroup[] = [];
 
+/** The feed's stats as the backend would answer, `videos` set to tell answers apart. */
+function stats(videos = 42): FeedStats {
+  return {
+    videos, series: 3, toWatch: videos - 12, watched: 10, downloaded: 5, hidden: 2,
+    runtimeSecs: 36_000, runtimeUnknown: false, newThisWeek: 1,
+    today: "2026-10-19", days: [{ day: "2026-10-12", watched: 10, downloaded: 4, unwatched: 26, hidden: 2 }],
+  };
+}
+const STATS = stats();
+
 type ViewProps = Partial<React.ComponentProps<typeof SubscriptionsView>>;
+
+/** No channel can be picked: the menu then offers no way to one, which keeps
+ *  every other test's menu exactly what it was before that item existed. */
+const NO_CHANNELS: ReadonlySet<string> = new Set();
+
+/** No channel picked, held once as the shell holds its pick: a fresh array per
+ *  render would be a new pick each time, and ask for the stats again. */
+const EVERY_CHANNEL: string[] = [];
 
 function renderView(over: ViewProps = {}) {
   const onFindSiblings = vi.fn();
   const onSeriesTally = vi.fn();
+  const onSeeChannel = vi.fn();
   // Stands in for the shell's `.content`: a real element, so a test can move
   // its offset and read back where the view put it.
   const scroller = document.createElement("div");
@@ -89,19 +136,20 @@ function renderView(over: ViewProps = {}) {
   const view = (props: ViewProps) => (
     <ToastProvider>
       <SubscriptionsView
-        channelIds={[]} search="" hideWatched={false} downloadedOnly={false}
+        channelIds={EVERY_CHANNEL} search="" hideWatched={false} downloadedOnly={false}
         sort="newest" showHidden={false} grouped={false} groupsOnly={false} inProgress={false}
         siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
         channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
+        pickableChannels={NO_CHANNELS} onSeeChannel={onSeeChannel} showStats={false}
         {...props}
       />
     </ToastProvider>
   );
   const { rerender } = render(view(over));
   return {
-    onFindSiblings, onSeriesTally, scroller,
+    onFindSiblings, onSeriesTally, onSeeChannel, scroller,
     /** Re-renders with the props changed, the rest of them as they were. */
     rerender: (next: ViewProps) => rerender(view({ ...over, ...next })),
   };
@@ -118,7 +166,9 @@ beforeEach(() => {
   videos = [video()];
   groups = [];
   sentinels.length = 0;
+  listeners.clear();
   vi.clearAllMocks();
+  feedStats.mockImplementation(() => Promise.resolve(STATS));
   listVideos.mockImplementation(() => Promise.resolve(videos));
   listVideoGroups.mockImplementation(() => Promise.resolve(groups));
   probeFormats.mockImplementation(() => Promise.resolve(rickroll()));
@@ -419,6 +469,127 @@ describe("Download (custom)…", () => {
   });
 });
 
+/**
+ * Grouped, the grid has already gathered every match behind a series card, so
+ * on a lone card "Find siblings" could only ever open a series of one -- and
+ * inside a series opened from that feed, the series already on screen.
+ */
+describe("Find siblings while grouped", () => {
+  it("is not offered on a lone card in the grouped feed", async () => {
+    groups = [{ videos: [video()], stem: null }];
+    renderView({ grouped: true });
+    expect(menuLabels(await openMenu())).not.toContain("Find siblings");
+  });
+
+  it("is not offered on a part of a series opened from the grouped feed", async () => {
+    renderView({ grouped: true, siblingOf: video() });
+    expect(menuLabels(await openMenu())).not.toContain("Find siblings");
+  });
+
+  it("is offered ungrouped, in the feed and inside a series alike", async () => {
+    for (const siblingOf of [null, video()]) {
+      renderView({ grouped: false, siblingOf });
+      expect(menuLabels(await openMenu())).toContain("Find siblings");
+      cleanup();
+    }
+  });
+
+  it("leaves Unlink from siblings offered", async () => {
+    groups = [{ videos: [video({ sibling_group: "g1" })], stem: null }];
+    renderView({ grouped: true });
+    expect(menuLabels(await openMenu())).toContain("Unlink from siblings");
+  });
+});
+
+/**
+ * "See all videos from <channel>" narrows the feed to the card's channel. The
+ * shell does the narrowing; the view offers it only where the pick can hold
+ * the channel and where taking it would change what is on screen.
+ */
+describe("See all videos from a card's channel", () => {
+  const PICKABLE: ReadonlySet<string> = new Set(["UC1"]);
+  const offered = (labels: string[]) => labels.some((l) => l.startsWith("See all videos from"));
+  const seriesCard = () => document.querySelector<HTMLElement>(".series-card");
+  async function openSeriesMenu() {
+    await waitFor(() => expect(seriesCard()).not.toBeNull());
+    fireEvent.contextMenu(seriesCard()!);
+    return screen.getByRole("menu");
+  }
+  const twoParts = (over: Partial<Video> = {}): VideoGroup => ({
+    videos: [
+      video({ id: "p2", title: "Tapes 2", download_state: "none", file_path: null, ...over }),
+      video({ id: "p1", title: "Tapes 1", download_state: "none", file_path: null, ...over }),
+    ],
+    stem: "Tapes",
+  });
+
+  it("names the channel and hands its id to the shell", async () => {
+    const { onSeeChannel } = renderView({ pickableChannels: PICKABLE });
+    fireEvent.click(within(await openMenu(), "See all videos from Veritasium"));
+    expect(onSeeChannel).toHaveBeenCalledTimes(1);
+    expect(onSeeChannel).toHaveBeenCalledWith("UC1");
+  });
+
+  it("says this channel when the channel has no name", async () => {
+    videos = [video({ channel_title: "" })];
+    renderView({ pickableChannels: PICKABLE });
+    expect(menuLabels(await openMenu())).toContain("See all videos from this channel");
+  });
+
+  // Only subscriptions can be picked: the shell prunes any other id from the
+  // pick the moment it lands, so the item would show every channel instead.
+  it("is not offered on an uploader you do not subscribe to", async () => {
+    videos = [video({ channel_id: "UCadhoc", added_manually: true })];
+    renderView({ pickableChannels: PICKABLE });
+    expect(offered(menuLabels(await openMenu()))).toBe(false);
+  });
+
+  it("is not offered when that channel alone is already the feed", async () => {
+    renderView({ pickableChannels: PICKABLE, channelIds: ["UC1"] });
+    expect(offered(menuLabels(await openMenu()))).toBe(false);
+  });
+
+  it("is offered while a search, a wider pick or an open series stands in the way", async () => {
+    const cases: ViewProps[] = [
+      { channelIds: [] },
+      { channelIds: ["UC1", "UC2"] },
+      { channelIds: ["UC1"], search: "tapes" },
+      { channelIds: ["UC1"], siblingOf: video() },
+    ];
+    for (const over of cases) {
+      renderView({ pickableChannels: PICKABLE, ...over });
+      expect(menuLabels(await openMenu())).toContain("See all videos from Veritasium");
+      cleanup();
+    }
+  });
+
+  it("sits with the other ways to navigate, ahead of the hide", async () => {
+    videos = [video({ sibling_group: "g1" })];
+    renderView({ pickableChannels: PICKABLE });
+    const labels = menuLabels(await openMenu());
+    expect(labels.slice(labels.indexOf("See all videos from Veritasium"))).toEqual([
+      "See all videos from Veritasium", "Find siblings", "Unlink from siblings", "Hide from feed",
+    ]);
+  });
+
+  it("is offered on a series card, ahead of its hide, for the whole series' channel", async () => {
+    groups = [twoParts()];
+    const { onSeeChannel } = renderView({ grouped: true, pickableChannels: PICKABLE });
+    const menu = await openSeriesMenu();
+    expect(menuLabels(menu))
+      .toEqual(["Download 2 parts", "See all videos from Veritasium", "Hide from feed"]);
+    fireEvent.click(within(menu, "See all videos from Veritasium"));
+    expect(onSeeChannel).toHaveBeenCalledWith("UC1");
+  });
+
+  it("comes ahead of Un-hide series as well", async () => {
+    groups = [twoParts({ hidden: true, series_hidden: true })];
+    renderView({ grouped: true, showHidden: true, pickableChannels: PICKABLE });
+    expect(menuLabels(await openSeriesMenu()))
+      .toEqual(["Download 2 parts", "See all videos from Veritasium", "Un-hide series"]);
+  });
+});
+
 function menuLabels(menu: HTMLElement): string[] {
   return Array.from(menu.querySelectorAll("[role=menuitem]")).map((n) => n.textContent ?? "");
 }
@@ -470,7 +641,7 @@ describe("the grouped feed", () => {
   it("leaves a lone video as an ordinary card, right-click menu and all", async () => {
     groups = [{ videos: [video()], stem: null }];
     renderView({ grouped: true });
-    expect(menuLabels(await openMenu())).toContain("Find siblings");
+    expect(menuLabels(await openMenu())).toContain("Mark as watched");
   });
 
   it("asks for only groups when that filter is on", async () => {
@@ -546,6 +717,232 @@ describe("what an open series reports to the breadcrumb", () => {
     const { onSeriesTally } = renderView();
     await waitFor(() => expect(listVideos).toHaveBeenCalled());
     expect(onSeriesTally).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The crumb of an open series offers what the series card's menu offers, and
+ * this view runs it exactly as it runs the menu: the same calls under the same
+ * keys, the same marks shown before the answer -- and the series stays open.
+ */
+describe("what an open series offers the breadcrumb", () => {
+  type Actions = Parameters<NonNullable<ViewProps["onSeriesActions"]>>[0];
+
+  /** Three parts, newest first as the default sort hands them over. */
+  function parts(...over: Partial<Video>[]): Video[] {
+    return ["p3", "p2", "p1"].map((id, i) => video({
+      id, title: `The Blackwood Tapes - Part ${3 - i}`, download_state: "none", file_path: null,
+      ...over[i],
+    }));
+  }
+  /** Opened on the middle part, so the anchor is not the first the list holds. */
+  const anchor = () => video({ id: "p2", title: "The Blackwood Tapes - Part 2" });
+
+  function openSeries(over: ViewProps = {}) {
+    const onSeriesActions = vi.fn<(a: Actions) => void>();
+    const view = renderView({
+      siblingOf: anchor(), seriesName: "The Blackwood Tapes", onSeriesActions, ...over,
+    });
+    const last = (): Actions => {
+      const calls = onSeriesActions.mock.calls;
+      return calls.length > 0 ? calls[calls.length - 1][0] : null;
+    };
+    /** The actions, once the parts are in and there is something to offer. */
+    const offered = async () => {
+      await waitFor(() => expect(last()).not.toBeNull());
+      return last()!;
+    };
+    return { ...view, onSeriesActions, last, offered };
+  }
+
+  /** Whether the view has offered anything at all. */
+  const offeredAny = (spy: { mock: { calls: [Actions][] } }) => spy.mock.calls.some(([a]) => a !== null);
+
+  // jsdom has no Web Animations, which the grid uses for cards coming and going.
+  beforeEach(() => {
+    Element.prototype.animate = vi.fn() as unknown as Element["animate"];
+  });
+  afterEach(() => {
+    delete (Element.prototype as Partial<Element>).animate;
+  });
+
+  it("counts what Download would take as the card menu does, and says whether it is marked", async () => {
+    videos = parts(
+      { download_state: "failed", download_error: "HTTP Error 403" },
+      { download_state: "done", file_path: "/videos/p2.mkv" },
+      {},
+    );
+    const { offered } = openSeries();
+    expect(await offered()).toMatchObject({
+      due: 2, marked: false, downloading: "idle", hiding: "idle",
+    });
+  });
+
+  it("reads the mark off any part, as the menu does", async () => {
+    videos = parts({}, {}, { series_hidden: true });
+    const { offered } = openSeries();
+    expect((await offered()).marked).toBe(true);
+  });
+
+  /** A lone card's own menu already covers a series of one. */
+  it("offers nothing for a series of one", async () => {
+    videos = [anchor()];
+    const { onSeriesActions, onSeriesTally } = openSeries();
+    await waitFor(() => expect(onSeriesTally).toHaveBeenCalled());
+    expect(offeredAny(onSeriesActions)).toBe(false);
+  });
+
+  it("offers nothing in the ordinary feed", async () => {
+    videos = parts();
+    const { onSeriesActions } = openSeries({ siblingOf: null });
+    await cardsReady(3);
+    expect(offeredAny(onSeriesActions)).toBe(false);
+  });
+
+  /**
+   * Until the series' first page lands, the grid is still the feed it was
+   * opened from. A Download offered from that would queue the whole feed, and
+   * a tally of it would count the wrong list.
+   */
+  it("says nothing about the feed behind it while the series loads", async () => {
+    videos = shelf(5);
+    const { onSeriesActions, onSeriesTally, rerender } = openSeries({ siblingOf: null });
+    await cardsReady(5);
+
+    let land = (_: Video[]) => {};
+    listVideos.mockImplementation(() => new Promise<Video[]>((res) => { land = res; }));
+    rerender({ siblingOf: anchor() });
+    await waitFor(() => expect(lastFilter().siblingOf).toBe("p2"));
+    expect(onSeriesTally).not.toHaveBeenCalled();
+    expect(offeredAny(onSeriesActions)).toBe(false);
+
+    await act(async () => { land(parts()); });
+    await waitFor(() => expect(onSeriesTally).toHaveBeenLastCalledWith(
+      expect.objectContaining({ parts: 3 }),
+    ));
+    await waitFor(() => expect(offeredAny(onSeriesActions)).toBe(true));
+  });
+
+  it("downloads through the menu's call, anchor first, and shows the parts queued", async () => {
+    videos = parts({}, { download_state: "done", file_path: "/videos/p2.mkv" }, {});
+    enqueueDownloads.mockImplementation(() => Promise.resolve(2));
+    const { offered, last } = openSeries();
+    const a = await offered();
+    act(() => a.onDownload());
+
+    // The anchor leads, as a card's leader would; the backend picks out what
+    // it can queue and orders it oldest first.
+    await waitFor(() => expect(enqueueDownloads).toHaveBeenCalledWith(["p2", "p3", "p1"]));
+    expect(await screen.findByText("Queued 2 parts of “The Blackwood Tapes”.")).toBeTruthy();
+    expect(cards().map((c) => c.dataset.state)).toEqual(["queued", "done", "queued"]);
+    // Nothing left to take, so the crumb stops offering it.
+    await waitFor(() => expect(last()!.due).toBe(0));
+  });
+
+  it("hides through the menu's call and stays in the series, its parts shown hidden", async () => {
+    videos = parts();
+    let answer = () => {};
+    setSeriesHidden.mockImplementation(() => new Promise<string[]>((res) => {
+      answer = () => res(["p2", "p3", "p1"]);
+    }));
+    const { offered, last } = openSeries();
+    const a = await offered();
+    act(() => a.onHide());
+
+    // Hidden by the anchor, which leads the group the backend works out.
+    expect(setSeriesHidden).toHaveBeenCalledWith("p2", true);
+    // Shown at once, and held while the call is out.
+    expect(last()).toMatchObject({ marked: true, hiding: "busy" });
+    expect(cards()).toHaveLength(3);
+    expect(cards().every((c) => c.className.includes("is-hidden-video"))).toBe(true);
+
+    await act(async () => { answer(); });
+    await waitFor(() => expect(last()!.hiding).toBe("idle"));
+    expect(last()!.marked).toBe(true);
+    expect(cards()).toHaveLength(3);
+  });
+
+  it("asks first when a part has a file, and removes every part's file when told to", async () => {
+    videos = parts(
+      { download_state: "done", file_path: "/videos/p3.mkv" },
+      {},
+      { download_state: "done", file_path: "/videos/p1.mkv" },
+    );
+    const { offered } = openSeries();
+    const a = await offered();
+    act(() => a.onHide());
+
+    const dialog = await screen.findByRole("dialog", { name: "Hide this series?" });
+    expect(setSeriesHidden).not.toHaveBeenCalled();
+    // Named as the crumb names it, not by the anchor's own title.
+    expect(dialog.textContent).toContain("All 3 parts of “The Blackwood Tapes”");
+    fireEvent.click(getByRole(dialog, "button", { name: "Hide and remove files" }));
+
+    // Every part's file -- not only the anchor's, which is the card the anchor
+    // leads in a series view.
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p2", true));
+    expect(deleteDownload.mock.calls).toEqual([["p3"], ["p1"]]);
+  });
+
+  it("un-hides through the menu's call and clears the mark", async () => {
+    videos = parts(
+      { hidden: true, series_hidden: true },
+      { hidden: true, series_hidden: true },
+      { hidden: false, series_hidden: true },
+    );
+    const { offered, last } = openSeries();
+    const a = await offered();
+    act(() => a.onUnhide());
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p2", false));
+    await waitFor(() => expect(last()!.marked).toBe(false));
+    expect(cards().some((c) => c.className.includes("is-hidden-video"))).toBe(false);
+  });
+
+  it("puts the mark back when the hide fails", async () => {
+    videos = parts();
+    setSeriesHidden.mockImplementation(() => Promise.reject("database is locked"));
+    const { offered, last } = openSeries();
+    const a = await offered();
+    act(() => a.onHide());
+
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    await waitFor(() => expect(last()).toMatchObject({ marked: false, hiding: "idle" }));
+    expect(cards().some((c) => c.className.includes("is-hidden-video"))).toBe(false);
+  });
+
+  it("refuses an Un-hide while its Hide is still out, as the menu does", async () => {
+    videos = parts();
+    setSeriesHidden.mockImplementation(() => new Promise<string[]>(() => {}));
+    const { offered, last } = openSeries();
+    const a = await offered();
+    act(() => a.onHide());
+    await waitFor(() => expect(last()!.marked).toBe(true));
+    act(() => last()!.onUnhide());
+    expect(setSeriesHidden).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The crumb runs under the card menu's keys, so a download started from the
+   * series card in the feed still holds the crumb's Download once the series
+   * is opened, and the two can never both go out.
+   */
+  it("shares the card menu's keys across opening the series", async () => {
+    groups = [{ videos: parts(), stem: "The Blackwood Tapes" }];
+    enqueueDownloads.mockImplementation(() => new Promise<number>(() => {}));
+    const { rerender, last } = openSeries({ siblingOf: null, grouped: true });
+    await waitFor(() => expect(document.querySelector(".series-card")).not.toBeNull());
+    fireEvent.contextMenu(document.querySelector(".series-card")!);
+    fireEvent.click(within(screen.getByRole("menu"), "Download 3 parts"));
+    expect(enqueueDownloads).toHaveBeenCalledTimes(1);
+
+    // Opened on the card's leader; the database has not queued anything yet.
+    videos = parts();
+    rerender({ siblingOf: parts()[0] });
+    await waitFor(() => expect(last()).not.toBeNull());
+    expect(last()!.downloading).not.toBe("idle");
+    act(() => last()!.onDownload());
+    expect(enqueueDownloads).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1027,5 +1424,246 @@ describe("keeping your place in the feed", () => {
     // A different feed, so the pages the old one had mean nothing here.
     expect(lastFilter().limit).toBe(100);
     await waitFor(() => expect(scroller.scrollTop).toBe(0));
+  });
+});
+
+/* ---------------- the stats over the grid ---------------- */
+
+/**
+ * Settings → Appearance → Show stats: the feed's waveform over the grid, an
+ * open series' bands over its parts. Off, nothing is asked and nothing is
+ * drawn; on, the feed's stats follow the pick, the search and every reload,
+ * and a change made from a card asks again a beat later.
+ */
+describe("the stats over the grid", () => {
+  // jsdom has no Web Animations, which the grid uses for cards coming and going.
+  beforeEach(() => {
+    Element.prototype.animate = vi.fn() as unknown as Element["animate"];
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    delete (Element.prototype as Partial<Element>).animate;
+  });
+
+  /** The shell's pick, held once: it keeps its identity there until it changes. */
+  const PICK = ["UC1"];
+  const lastStatsFilter = () => feedStats.mock.calls[feedStats.mock.calls.length - 1][0];
+  /** What the bands were last handed. */
+  const lastParts = () => bandsProps.mock.calls[bandsProps.mock.calls.length - 1][0].parts;
+  const grid = () => document.querySelector(".video-grid");
+  /** Lets every answer already given land. */
+  const settle = () => act(async () => {});
+  /** Time moves on, past a bump's wait. */
+  const later = async (ms = BUMP_DELAY) => {
+    act(() => { vi.advanceTimersByTime(ms); });
+    await settle();
+  };
+  const fakeTimers = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const downloadState = (videoId: string, state: Video["download_state"]) =>
+    act(() => listeners.get("download://state")!({
+      payload: { videoId, state, filePath: state === "done" ? "/videos/x.mkv" : null, error: null },
+    }));
+  /** Right-click a card and pick an item from its menu. */
+  const pick = (card: HTMLElement, label: string) => {
+    fireEvent.contextMenu(card);
+    fireEvent.click(within(screen.getByRole("menu"), label));
+  };
+
+  it("asks for nothing and draws nothing while it is off, whatever happens", async () => {
+    videos = [video({ download_state: "none", file_path: null })];
+    const { rerender } = renderView({ channelIds: PICK, search: "tapes" });
+    const card = await screen.findByRole("article");
+    // Nothing stands above the grid: the view is what it was without stats.
+    expect(grid()!.previousElementSibling).toBeNull();
+
+    pick(card, "Mark as watched");
+    await waitFor(() => expect(setWatched).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(listeners.has("download://state")).toBe(true));
+    downloadState("vid1", "done");
+    rerender({ channelIds: PICK, search: "tapes", reloadToken: 1, siblingOf: video() });
+    await waitFor(() => expect(lastFilter().siblingOf).toBe("vid1"));
+    await act(() => new Promise<void>((r) => { setTimeout(r, BUMP_DELAY + 50); }));
+
+    expect(feedStats).not.toHaveBeenCalled();
+    expect(waveformProps).not.toHaveBeenCalled();
+    expect(bandsProps).not.toHaveBeenCalled();
+    expect(grid()!.previousElementSibling).toBeNull();
+  });
+
+  it("draws the waveform directly above the grid, asked with the pick and the trimmed search", async () => {
+    renderView({ showStats: true, channelIds: PICK, search: "  tapes " });
+    const wave = await screen.findByTestId("waveform");
+    expect(wave.textContent).toBe("42 videos");
+    expect(feedStats).toHaveBeenCalledTimes(1);
+    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], search: "tapes" });
+    await screen.findByRole("article");
+    expect(wave.nextElementSibling).toBe(grid());
+  });
+
+  it("asks again on a reload, a new pick and a new search", async () => {
+    const { rerender } = renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    expect(lastStatsFilter()).toEqual({ channelIds: [], search: null });
+
+    rerender({ reloadToken: 1 });
+    await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(2));
+
+    rerender({ reloadToken: 1, channelIds: PICK });
+    await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(3));
+    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], search: null });
+
+    rerender({ reloadToken: 1, channelIds: PICK, search: "tapes" });
+    await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(4));
+    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], search: "tapes" });
+  });
+
+  it("is not asked again by the Show toggles or the sort, which never move the counts", async () => {
+    const { rerender } = renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    rerender({ hideWatched: true, downloadedOnly: true, showHidden: true, sort: "oldest" });
+    await waitFor(() => expect(lastFilter()).toMatchObject({ hideWatched: true, sort: "oldest" }));
+    await settle();
+    expect(feedStats).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks again a beat after a card is marked watched", async () => {
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    const card = await screen.findByRole("article");
+
+    fakeTimers();
+    pick(card, "Mark as watched");
+    await settle();
+    expect(setWatched).toHaveBeenCalledTimes(1);
+    await later(BUMP_DELAY - 1);
+    expect(feedStats).toHaveBeenCalledTimes(1);
+    await later(1);
+    expect(feedStats).toHaveBeenCalledTimes(2);
+    expect(lastStatsFilter()).toEqual({ channelIds: [], search: null });
+  });
+
+  it("answers a burst of three toggles with one request", async () => {
+    videos = ["a", "b", "c"].map((id) =>
+      video({ id, title: `Video ${id}`, download_state: "none", file_path: null }));
+    renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    const [a, b, c] = await cardsReady(3);
+
+    fakeTimers();
+    for (const card of [a, b, c]) {
+      pick(card, "Mark as watched");
+      await settle();
+    }
+    expect(setWatched).toHaveBeenCalledTimes(3);
+    await later(BUMP_DELAY * 3);
+    expect(feedStats).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks again after a hide, and after a sibling mark", async () => {
+    threeCards();
+    renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    const [a, b, far] = await cardsReady(3);
+
+    fakeTimers();
+    pick(far, "Hide from feed");
+    await settle();
+    expect(setVideoHidden).toHaveBeenCalledWith("far", true);
+    await later();
+    expect(feedStats).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(a, { ctrlKey: true });
+    fireEvent.click(b, { ctrlKey: true });
+    pick(a, "Mark 2 videos as siblings");
+    await settle();
+    expect(markSiblings).toHaveBeenCalledTimes(1);
+    await later();
+    expect(feedStats).toHaveBeenCalledTimes(3);
+  });
+
+  it("asks again when a file lands or goes, and not for a queue or a failure", async () => {
+    renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    await waitFor(() => expect(listeners.has("download://state")).toBe(true));
+
+    fakeTimers();
+    downloadState("vid1", "queued");
+    downloadState("vid1", "downloading");
+    downloadState("vid1", "failed");
+    await later(BUMP_DELAY * 2);
+    expect(feedStats).toHaveBeenCalledTimes(1);
+
+    downloadState("vid1", "done");
+    await later();
+    expect(feedStats).toHaveBeenCalledTimes(2);
+
+    downloadState("vid1", "none");
+    await later();
+    expect(feedStats).toHaveBeenCalledTimes(3);
+  });
+
+  it("asks nothing for an open series, and hands the bands every part once its page is in", async () => {
+    videos = ["p1", "p2", "p3"].map((id) => video({ id }));
+    renderView({ showStats: true, siblingOf: video({ id: "p2" }) });
+    const bands = await screen.findByTestId("bands");
+    expect(bands.textContent).toBe("3 parts");
+    expect(lastParts().map((v) => v.id)).toEqual(["p1", "p2", "p3"]);
+    await screen.findAllByRole("article");
+    expect(bands.nextElementSibling).toBe(grid());
+    await settle();
+    expect(feedStats).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("waveform")).toBeNull();
+  });
+
+  it("hands the bands a further page's parts as it comes in", async () => {
+    const all = shelf(150);
+    listVideos.mockImplementation((f) => Promise.resolve(all.slice(f.offset, f.offset + f.limit)));
+    renderView({ showStats: true, siblingOf: all[0] });
+    expect((await screen.findByTestId("bands")).textContent).toBe("100 parts");
+    pageIn();
+    await waitFor(() => expect(screen.getByTestId("bands").textContent).toBe("150 parts"));
+    expect(lastParts()).toHaveLength(150);
+  });
+
+  it("keeps the feed's waveform up until the series' first page lands, then swaps in the bands", async () => {
+    const { rerender } = renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    await screen.findByRole("article");
+
+    let land!: (v: Video[]) => void;
+    listVideos.mockImplementationOnce(() => new Promise((res) => { land = res; }));
+    rerender({ siblingOf: video() });
+    await waitFor(() => expect(lastFilter().siblingOf).toBe("vid1"));
+    // The grid is still the feed, and so is what stands over it.
+    expect(screen.getByTestId("waveform").textContent).toBe("42 videos");
+    expect(bandsProps).not.toHaveBeenCalled();
+
+    await act(async () => land([video(), video({ id: "p2" })]));
+    expect(screen.getByTestId("bands").textContent).toBe("2 parts");
+    expect(screen.queryByTestId("waveform")).toBeNull();
+    expect(feedStats).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the bands until the feed is back under them, with the waveform it was left with", async () => {
+    const { rerender } = renderView({ showStats: true });
+    await screen.findByTestId("waveform");
+    rerender({ siblingOf: video() });
+    await screen.findByTestId("bands");
+
+    // Leaving asks for the feed's stats at once -- what was done inside the
+    // series moved them -- but this answer never comes, and the feed's first
+    // page is held.
+    feedStats.mockImplementationOnce(() => new Promise<FeedStats>(() => {}));
+    let land!: (v: Video[]) => void;
+    listVideos.mockImplementationOnce(() => new Promise((res) => { land = res; }));
+    rerender({ siblingOf: null });
+    await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("bands")).toBeTruthy();
+    expect(screen.queryByTestId("waveform")).toBeNull();
+
+    await act(async () => land([video()]));
+    expect(screen.getByTestId("waveform").textContent).toBe("42 videos");
+    expect(screen.queryByTestId("bands")).toBeNull();
   });
 });

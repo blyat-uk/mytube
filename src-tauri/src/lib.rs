@@ -189,6 +189,7 @@ pub fn run() {
             commands::set_series_hidden,
             commands::delete_video,
             commands::subscription_stats,
+            commands::feed_stats,
             commands::poll_all,
             commands::poll_channel,
             commands::set_channel_member,

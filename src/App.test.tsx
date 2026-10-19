@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, act, within } from "@testing-library/react";
 import type {
-  Channel, Settings, ToolStatus, VersionInfo, Video, ViewState, VideoFilter,
+  Channel, FeedStats, Settings, StatsFilter, ToolStatus, VersionInfo, Video, ViewState, VideoFilter,
 } from "./types";
 import { DEFAULT_QUALITY } from "./quality";
 
@@ -39,6 +39,18 @@ const toolsStatus = vi.fn<() => Promise<ToolStatus[]>>(() => Promise.resolve([])
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
 const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(VERSION));
 const syncNudge = vi.fn<() => Promise<void>>(() => Promise.resolve());
+const feedStats = vi.fn<(f: StatsFilter) => Promise<FeedStats>>(() => Promise.resolve(STATS));
+// Kept, as the backend keeps it: a second visit to Settings reads back what
+// the first one saved.
+const saveSettings = vi.fn((s: Settings) => {
+  settings = s;
+  return Promise.resolve();
+});
+
+// The waveform is drawn by its own tests; here it only says it is up.
+vi.mock("./components/stats/FeedWaveform", () => ({
+  default: ({ stats }: { stats: FeedStats }) => <div data-testid="waveform">{stats.videos} videos</div>,
+}));
 
 vi.mock("./api", () => {
   // What the Settings view reads on its way up, for the tests that open it.
@@ -58,7 +70,8 @@ vi.mock("./api", () => {
       appVersionInfo: () => appVersionInfo(),
       syncNudge: () => syncNudge(),
       subscriptionStats: () => Promise.resolve([]),
-      saveSettings: () => Promise.resolve(),
+      feedStats: (f: StatsFilter) => feedStats(f),
+      saveSettings: (s: Settings) => saveSettings(s),
       syncStatus: unanswered,
       detectBrowsers: unanswered,
       detectPlayers: unanswered,
@@ -88,7 +101,7 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
     window_width: 1280, window_height: 840, window_x: null, window_y: null,
     window_maximized: false,
     cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
-    check_app_updates: true, text_scale: 100,
+    check_app_updates: true, text_scale: 100, show_stats: false,
     ytdlp_path: "", ffmpeg_path: "", deno_path: "",
     quality: { ...DEFAULT_QUALITY },
     view: defaultView(view),
@@ -96,6 +109,12 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
 }
 
 let settings: Settings = settingsWith();
+
+const STATS: FeedStats = {
+  videos: 42, series: 3, toWatch: 30, watched: 10, downloaded: 5, hidden: 2,
+  runtimeSecs: 36_000, runtimeUnknown: false, newThisWeek: 1,
+  today: "2026-10-19", days: [{ day: "2026-10-12", watched: 10, downloaded: 4, unwatched: 26, hidden: 2 }],
+};
 
 /**
  * Waits real time, inside `act`. The shell's IPC mocks resolve on their own
@@ -118,6 +137,11 @@ beforeEach(() => {
   toolsStatus.mockImplementation(() => Promise.resolve([]));
   appVersionInfo.mockImplementation(() => Promise.resolve(VERSION));
   syncNudge.mockImplementation(() => Promise.resolve());
+  feedStats.mockImplementation(() => Promise.resolve(STATS));
+  saveSettings.mockImplementation((s: Settings) => {
+    settings = s;
+    return Promise.resolve();
+  });
   listeners.clear();
 });
 
@@ -409,6 +433,63 @@ describe("keeping the feed's place across a series visit", () => {
 });
 
 /**
+ * A card's "See all videos from <channel>" is the shell's to carry out: the
+ * channel pick, the search box and an open series all live up here.
+ */
+describe("a card's See all videos from its channel", () => {
+  const subscription = (id: string, title: string): Channel => ({
+    id, title, handle: null, url: `https://youtube.com/channel/${id}`, thumb_path: null,
+    subscribed: true, member: false, auto_download: false, added_at: 0, last_polled_at: null,
+    terminated: false,
+  });
+  const lastFilter = () => listVideos.mock.calls[listVideos.mock.calls.length - 1][0];
+
+  it("narrows the feed to that channel, empties the search box and leaves the series", async () => {
+    settings = settingsWith({
+      channel_ids: ["UC1", "UC2"], search: "some", hide_watched: true, sort: "oldest",
+    });
+    listChannels.mockImplementation(() => Promise.resolve([
+      subscription("UC1", "Veritasium"), subscription("UC2", "Chills Narrated"),
+    ]));
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find siblings" }));
+    await screen.findByRole("navigation", { name: "Breadcrumb" });
+
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "See all videos from Veritasium" }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Breadcrumb" })).toBeNull());
+    expect(screen.getByLabelText("Search videos")).toHaveProperty("value", "");
+    await waitFor(() => expect(lastFilter()).toMatchObject({
+      channelIds: ["UC1"], search: null, siblingOf: null,
+      // How the feed is read stays as it was.
+      hideWatched: true, sort: "oldest",
+    }));
+    // Past the box's debounce: the query it held is not sent back up after it.
+    await pause(350);
+    expect(lastFilter()).toMatchObject({ channelIds: ["UC1"], search: null });
+    expect(screen.getByLabelText("Search videos")).toHaveProperty("value", "");
+  });
+
+  it("is not offered on a video from a channel you do not subscribe to", async () => {
+    listChannels.mockImplementation(() => Promise.resolve([subscription("UC2", "Chills Narrated")]));
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    await waitFor(() => expect(listChannels).toHaveBeenCalled());
+    await pause(50);
+
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    expect(screen.getByRole("menuitem", { name: "Find siblings" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /^See all videos from/ })).toBeNull();
+  });
+});
+
+/**
  * `tools_status` (the seed) and `tools://status` (the events) race at launch:
  * provisioning starts before the webview does. Whichever lands first, a tool
  * that went from installing to ready while the shell was listening gets its
@@ -640,5 +721,66 @@ describe("cloud sync", () => {
     await waitFor(() => expect(listChannels.mock.calls.length).toBeGreaterThan(1));
     await pause(20);
     expect(syncNudge).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Show stats is switched in Settings, which is unmounted whenever the feed is
+ * up, and the shell reads settings.json once: so the switch reaches the feed
+ * through the saves Settings reports, never through a fresh read.
+ */
+describe("the feed's stats", () => {
+  /** Settings, opened at Appearance, and its Show stats switch. */
+  async function statsSwitch() {
+    fireEvent.click(button("Settings"));
+    const rail = await screen.findByRole("navigation", { name: "Settings sections" });
+    fireEvent.click(within(rail).getByRole("button", { name: "Appearance" }));
+    return await screen.findByRole("switch", { name: "Show stats" }) as HTMLInputElement;
+  }
+
+  it("asks for none, and draws none, while the setting is off", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    await screen.findByRole("article");
+    await pause(50);
+    expect(feedStats).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("waveform")).toBeNull();
+  });
+
+  it("draws them from launch when the setting is on", async () => {
+    settings = { ...settingsWith({ channel_ids: ["UC1"], search: "tapes" }), show_stats: true };
+    render(<App />);
+    expect((await screen.findByTestId("waveform")).textContent).toBe("42 videos");
+    expect(feedStats).toHaveBeenCalledWith({ channelIds: ["UC1"], search: "tapes" });
+  });
+
+  it("follows the switch from Settings back to the feed, without a restart", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    await screen.findByRole("article");
+
+    const on = await statsSwitch();
+    expect(on.checked).toBe(false);
+    fireEvent.click(on);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings.mock.calls[0][0]).toMatchObject({ show_stats: true });
+
+    fireEvent.click(button("Subscriptions"));
+    expect((await screen.findByTestId("waveform")).textContent).toBe("42 videos");
+    // Read once by the shell at launch and once by Settings as it opened --
+    // never again by the shell on the way back.
+    expect(getSettings).toHaveBeenCalledTimes(2);
+
+    const off = await statsSwitch();
+    expect(off.checked).toBe(true);
+    fireEvent.click(off);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
+    const asked = feedStats.mock.calls.length;
+
+    fireEvent.click(button("Subscriptions"));
+    await screen.findByRole("article");
+    await pause(50);
+    expect(screen.queryByTestId("waveform")).toBeNull();
+    expect(feedStats).toHaveBeenCalledTimes(asked);
   });
 });

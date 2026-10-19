@@ -4,7 +4,7 @@ import type {
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
   PlayerOption, BrowserScan, CookiesFileInfo, ToolStatus, Quality, VideoFormats, VersionInfo,
-  SyncStatus, ChannelStats, AddPreview, PlaylistEntry, AddPlaylistResult,
+  SyncStatus, ChannelStats, AddPreview, PlaylistEntry, AddPlaylistResult, FeedStats, StatsFilter,
 } from "./types";
 
 export const api = {
@@ -16,6 +16,9 @@ export const api = {
   /** Every subscribed channel's counts, for the Add dialog's list and panel.
    *  One grouped query; a channel with nothing ready yet comes back as zeros. */
   subscriptionStats: () => invoke<ChannelStats[]>("subscription_stats"),
+  /** The feed's stats for a channel pick and a search: totals, and one entry
+   *  per month of uploads for the waveform. */
+  feedStats: (filter: StatsFilter) => invoke<FeedStats>("feed_stats", { filter }),
   addChannel: (input: string) => invoke<Channel>("add_channel", { input }),
   /** Puts one video in the library, sorted to the top, and nothing more: it
    *  does not download. A video already there comes back untouched. */

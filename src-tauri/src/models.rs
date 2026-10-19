@@ -61,6 +61,79 @@ pub struct ChannelStats {
     pub follower_count: Option<i64>,
 }
 
+/// Which videos the stats above the feed count: the channel pick and the
+/// search box, and nothing else. There is deliberately no Show toggle here --
+/// the numbers describe the library the pick narrows to, not the slice of it
+/// the grid happens to be wearing, so hiding watched videos must not make the
+/// watched count drop to zero. A payload carrying the toggles anyway is read
+/// without them. A dialog-style payload, so camelCase.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsFilter {
+    /// The channels to count, any of them; empty is every channel.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    pub search: Option<String>,
+}
+
+/// The stats above the feed, from `Db::feed_stats`, over `ready` rows only --
+/// what the feed can show. camelCase like every payload the frontend reads.
+///
+/// `to_watch`, `watched` and `hidden` split the videos three ways with no
+/// overlap, so they always add up to `videos`; `downloaded` cuts across them,
+/// since a file on disk says nothing about whether it was watched.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedStats {
+    pub videos: i64,
+    /// Cards of two or more parts the grouped feed would show for the same
+    /// pick, each sized by its whole group -- the grouped feed's own rule.
+    pub series: i64,
+    /// Neither watched nor hidden, downloaded or not.
+    pub to_watch: i64,
+    /// Watched and not hidden: a hidden video counts as hidden whatever else
+    /// it is, so no video is in two of the three.
+    pub watched: i64,
+    /// `download_state = 'done'`, watched, hidden or neither.
+    pub downloaded: i64,
+    pub hidden: i64,
+    /// Every duration added up, an unresolved one as 0.
+    pub runtime_secs: i64,
+    /// Some video's duration is unknown (NULL, or 0 from a listing that had
+    /// none), so `runtime_secs` understates the total.
+    pub runtime_unknown: bool,
+    /// Published in the seven days before the request.
+    pub new_this_week: i64,
+    /// The local date the stats were counted on (`"2026-10-19"`): where the
+    /// waveform's right edge stands, on the same clock that dated `days`.
+    pub today: String,
+    /// One per local calendar day that had an upload, oldest first. Sparse:
+    /// the waveform decides from these how long a bar is (a day, a week, a
+    /// month or more), which stretches of nothing to draw as quiet bars and
+    /// which to cut out -- choices that need the drawn width, which only the
+    /// page knows. A video with no `published_at` is in the totals and on no
+    /// day.
+    pub days: Vec<StatsDay>,
+}
+
+/// One day of [`FeedStats::days`], in four segments that never overlap and
+/// add up to the day's videos -- drawn outwards from the waveform's axis in
+/// this order.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsDay {
+    /// `"2024-03-14"`, local time.
+    pub day: String,
+    /// Watched, not hidden.
+    pub watched: i64,
+    /// On disk and not watched, not hidden: the ones waiting to be played.
+    pub downloaded: i64,
+    /// Neither watched nor on disk, not hidden.
+    pub unwatched: i64,
+    /// Hidden, whatever else is true of it.
+    pub hidden: i64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoStatus {

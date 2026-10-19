@@ -5,6 +5,9 @@ import VideoGrid from "./VideoGrid";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
 import ConfirmDialog from "./ConfirmDialog";
 import CustomDownloadDialog from "./CustomDownloadDialog";
+import FeedWaveform from "./stats/FeedWaveform";
+import SeriesBands from "./stats/SeriesBands";
+import { useFeedStats } from "./stats/useFeedStats";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { useDownloadEvents } from "../events";
@@ -81,6 +84,26 @@ export interface SeriesTally {
   unknown: number;
 }
 
+/** Where a call stands: "busy" disables its button, "slow" spins its glyph too. */
+export type CallState = "idle" | "busy" | "slow";
+
+/**
+ * What the breadcrumb can do with the open series: exactly the series card
+ * menu's whole-series actions, run by the same calls under the same keys.
+ */
+export interface SeriesActions {
+  /** Parts Download would take, counted as the card menu counts them. */
+  due: number;
+  /** Some part carries the series mark, so Un-hide is offered in place of Hide. */
+  marked: boolean;
+  downloading: CallState;
+  /** Hide and Un-hide share one key, as they do in the menu. */
+  hiding: CallState;
+  onDownload: () => void;
+  onHide: () => void;
+  onUnhide: () => void;
+}
+
 interface Props {
   /** The channels to show, sorted; empty for every channel. Held in the
    *  shell's state, so it keeps its identity until the pick changes. */
@@ -102,6 +125,13 @@ interface Props {
   onFindSiblings: (video: Video, stem?: string | null) => void;
   /** Hands the nav's breadcrumb what the open series turned out to hold. */
   onSeriesTally: (t: SeriesTally) => void;
+  /** The open series' name as the breadcrumb wears it, so the toasts and the
+   *  confirm that name the series say what the crumb says. Without it they
+   *  fall back to the anchor's title, as the crumb itself does. */
+  seriesName?: string;
+  /** Hands the breadcrumb the open series' actions, or null while there are
+   *  none to offer. Optional: without it they stay on the card menu alone. */
+  onSeriesActions?: (a: SeriesActions | null) => void;
   cardSize: number;
   onCardSize: (px: number) => void;
   /** The shell's scroll container. The view needs it to put the feed back where
@@ -112,6 +142,16 @@ interface Props {
   reloadToken: number;
   channelCount: number;
   onAdd: () => void;
+  /** The channels the feed can be narrowed to: the subscribed ones. An ad-hoc
+   *  uploader is not among them, since the shell prunes its id from the pick
+   *  the moment it lands. Memoised there, so it changes only with the list. */
+  pickableChannels: ReadonlySet<string>;
+  /** Narrows the feed to one channel, with the search cleared and any open
+   *  series left. */
+  onSeeChannel: (channelId: string) => void;
+  /** Settings → Appearance → Show stats: the waveform over the feed, the
+   *  bands over an open series. Off, the view is exactly what it was without. */
+  showStats: boolean;
 }
 
 export default function SubscriptionsView(p: Props) {
@@ -138,6 +178,13 @@ export default function SubscriptionsView(p: Props) {
   const groupsOnly = grouped && p.groupsOnly;
   const inProgress = grouped && p.inProgress;
 
+  // The feed's counts follow the pick and the search alone, never the Show
+  // toggles. Paused, not off, while a series is open: the feed's grid stays up
+  // until the series' first page lands, and so does its waveform.
+  const { stats, bump } = useFeedStats({
+    enabled: p.showStats, paused: siblingOf !== null, channelIds, search, reloadToken,
+  });
+
   // What makes this list this list. A series, a filter, a sort and a search
   // each make a different one; `grouped` is the derived value above, so opening
   // a series out of the grouped feed counts as one change of list, not two.
@@ -152,6 +199,10 @@ export default function SubscriptionsView(p: Props) {
   const places = useRef(new Map<string, Place>());
   /** The list the grid holds, "" until its first page has landed. */
   const shown = useRef("");
+  /** Whether that list is a series, so the stats over the grid are the ones
+   *  for the rows under them -- not for the list asked for, which a moment
+   *  after any change of list is still on its way. */
+  const shownSeries = useRef(false);
   /** Where the next landed page zero puts the grid. */
   const restore = useRef(0);
   /** Bumped by each landed page zero, so the restore below runs in the commit
@@ -218,6 +269,7 @@ export default function SubscriptionsView(p: Props) {
       setHasMore(page.length === limit);
       if (from === 0) {
         shown.current = listKey;
+        shownSeries.current = siblingOf !== null;
         setPageEpoch((n) => n + 1);
       }
     } catch (err) {
@@ -240,6 +292,27 @@ export default function SubscriptionsView(p: Props) {
     if (el) el.scrollTop = restore.current;
   }, [pageEpoch, scrollRef]);
 
+  /**
+   * The grid holds the list asked for. Not so for a moment after any change of
+   * list: the outgoing one stays up until the new page zero lands -- and when a
+   * series has just been opened, that is the feed it was opened from. Read in
+   * render, which is safe because `shown` is set in the same breath as the
+   * state that renders those rows.
+   */
+  const showing = shown.current === listKey;
+  /** The grid holds a series' parts, which is what decides between the bands
+   *  and the waveform: a series just opened is still the feed on screen, and
+   *  one just left is still its parts, until the next page zero lands. */
+  const seriesOnScreen = shownSeries.current;
+
+  // Every loaded part, for the bands. Kept while the grid is unchanged -- a
+  // progress tick or a state event that moved nothing hands back the same
+  // groups -- so the bands, memoised, skip those renders.
+  const seriesParts = useMemo(
+    () => (p.showStats && seriesOnScreen ? groups.flatMap((g) => g.videos) : null),
+    [p.showStats, seriesOnScreen, groups],
+  );
+
   // The breadcrumb names the open series and says what it holds -- which this
   // view knows and the nav does not -- so every settled page hands the count
   // and the runtime up. Taken from the loaded list rather than from the page
@@ -247,12 +320,13 @@ export default function SubscriptionsView(p: Props) {
   // it.
   useEffect(() => {
     if (!siblingOf) return;
-    // Mid-first-load the grid holds nothing yet, and "no other parts found" is
-    // an answer, not a placeholder -- so nothing is said until one page is in.
-    if (loading && groups.length === 0) return;
+    // Until the series' first page is in, the grid holds nothing or the feed
+    // behind it, and "no other parts found" is an answer, not a placeholder --
+    // so nothing is said until it is.
+    if (!showing) return;
     const videos = groups.flatMap((g) => g.videos);
     onSeriesTally({ parts: videos.length, ...seriesRuntime(videos) });
-  }, [siblingOf, groups, loading, onSeriesTally]);
+  }, [siblingOf, groups, showing, onSeriesTally]);
 
   /**
    * Rewrites every video in place, wherever in the grouping it sits. A group
@@ -292,6 +366,10 @@ export default function SubscriptionsView(p: Props) {
           : v
       ));
       if (s.state !== "downloading") progress.clear(s.videoId);
+      // A file landing or going is the one download change the stats count;
+      // queued and failed are neither. Any video, on screen or not: a series'
+      // parts finish off the grid as readily as on it.
+      if (s.state === "done" || s.state === "none") bump();
     },
   });
 
@@ -414,6 +492,7 @@ export default function SubscriptionsView(p: Props) {
     // card saying the opposite of the database.
     void run(`watched:${video.id}`, async () => {
       await api.setWatched(video.id, next);
+      bump();
       // With "hide watched" on, a freshly watched card no longer belongs here --
       // except in a series, which shows every part whatever the filters say.
       if (next && hideWatched && !siblingOf) drop(video.id);
@@ -430,16 +509,19 @@ export default function SubscriptionsView(p: Props) {
         return () => patch(video.id, { watched: video.watched, watched_at: video.watched_at });
       },
     });
-  }, [patch, drop, hideWatched, siblingOf, run]);
+  }, [patch, drop, hideWatched, siblingOf, run, bump]);
 
   const unhideVideo = useCallback((video: Video) => {
-    void run(video.id, () => api.setVideoHidden(video.id, false), {
+    void run(video.id, async () => {
+      await api.setVideoHidden(video.id, false);
+      bump();
+    }, {
       optimistic: () => {
         patch(video.id, { hidden: false });
         return () => patch(video.id, { hidden: true });
       },
     });
-  }, [patch, run]);
+  }, [patch, run, bump]);
 
   /** Records what the titles could not say: these are parts of one series. */
   const markSiblings = useCallback((ids: string[]) => {
@@ -447,18 +529,21 @@ export default function SubscriptionsView(p: Props) {
       // The answer can exceed what was sent -- marking across two hand-built
       // groups merges both -- so the toast reports what actually happened.
       const n = await api.markSiblings(ids);
+      // The series count moves with the cards.
+      bump();
       toast.success(`Marked ${n} videos as siblings.`);
       await fetchPage(0);
     });
-  }, [fetchPage, run, toast]);
+  }, [fetchPage, run, toast, bump]);
 
   const unlinkSiblings = useCallback((video: Video) => {
     void run(`${SIBLINGS}unlink:${video.id}`, async () => {
       await api.unlinkSiblings(video.id);
+      bump();
       toast.success(`Unlinked “${video.title}”.`);
       await fetchPage(0);
     });
-  }, [fetchPage, run, toast]);
+  }, [fetchPage, run, toast, bump]);
 
   // A dropped card waits here for its confirmation; see `confirmDrop`.
   const [dropped, setDropped] = useState<Video[] | null>(null);
@@ -496,6 +581,7 @@ export default function SubscriptionsView(p: Props) {
       }
       if (deleting) await api.deleteVideo(video.id);
       else await api.setVideoHidden(video.id, true);
+      bump();
       toast.success(deleting ? `Deleted "${video.title}".` : `Hidden "${video.title}".`);
     }, {
       optimistic: () => {
@@ -512,7 +598,7 @@ export default function SubscriptionsView(p: Props) {
         return () => patch(video.id, { hidden: false, ...(fileGone ? {} : fileOf(video)) });
       },
     });
-  }, [drop, patch, run, showHidden, siblingOf, toast]);
+  }, [drop, patch, run, showHidden, siblingOf, toast, bump]);
 
   const requestRemove = useCallback((video: Video) => {
     if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video });
@@ -576,6 +662,7 @@ export default function SubscriptionsView(p: Props) {
         gone.add(id);
       }
       const changed = await api.setSeriesHidden(leader.id, true);
+      bump();
       toast.success(`Hidden “${name}”. Parts that join it later stay hidden too.`);
       // The hide sweeps the channel too, and can reach parts on another card --
       // one led by a part whose title drifted from this one's. Only a refetch
@@ -609,7 +696,7 @@ export default function SubscriptionsView(p: Props) {
         });
       },
     });
-  }, [dropCard, fetchPage, mapVideos, run, showHidden, siblingOf, toast]);
+  }, [dropCard, fetchPage, mapVideos, run, showHidden, siblingOf, toast, bump]);
 
   const requestHideSeries = useCallback((group: VideoGroup) => {
     if (group.videos.some(hasDownloadedFile)) setConfirm({ kind: "series", group });
@@ -621,7 +708,10 @@ export default function SubscriptionsView(p: Props) {
   const unhideSeries = useCallback((group: VideoGroup) => {
     const leader = group.videos[0];
     const was = new Map(group.videos.map((v) => [v.id, v]));
-    void run(`series-hidden:${leader.id}`, () => api.setSeriesHidden(leader.id, false), {
+    void run(`series-hidden:${leader.id}`, async () => {
+      await api.setSeriesHidden(leader.id, false);
+      bump();
+    }, {
       optimistic: () => {
         mapVideos((v) => (was.has(v.id) ? { ...v, hidden: false, series_hidden: false } : v));
         return () => mapVideos((v) => {
@@ -630,13 +720,27 @@ export default function SubscriptionsView(p: Props) {
         });
       },
     });
-  }, [mapVideos, run]);
+  }, [mapVideos, run, bump]);
 
   const menuItems = useCallback((video: Video): MenuItem[] => {
     const picked = marking.selected.size;
     const markItem: MenuItem[] =
       picked >= 2 && marking.selected.has(video.id)
         ? [{ label: `Mark ${picked} videos as siblings`, onSelect: marking.markSelected }]
+        : [];
+
+    // The card's channel on its own, as picking it in the channel list would
+    // show it. Left out where it would change nothing -- that channel alone is
+    // already the feed -- and for a channel the pick cannot hold.
+    const alreadyThere = siblingOf === null && search.trim() === "" &&
+      channelIds.length === 1 && channelIds[0] === video.channel_id;
+    const channelName = video.channel_title.trim();
+    const seeChannel: MenuItem[] =
+      p.pickableChannels.has(video.channel_id) && !alreadyThere
+        ? [{
+            label: channelName ? `See all videos from ${channelName}` : "See all videos from this channel",
+            onSelect: () => p.onSeeChannel(video.channel_id),
+          }]
         : [];
 
     // A series card stands for every one of its parts, so it gets a menu of its
@@ -655,6 +759,9 @@ export default function SubscriptionsView(p: Props) {
           onSelect: () => void downloadSeries(card),
         });
       }
+      // Every part comes from one channel -- the walk that built the card is
+      // per channel -- so the leader's is the series'.
+      series.push(...seeChannel);
       // Offered wherever the mark is, even on a part brought back by hand: the
       // mark is what hides the parts still to come, and this is how it goes.
       if (card.videos.some((v) => v.series_hidden)) {
@@ -692,10 +799,17 @@ export default function SubscriptionsView(p: Props) {
         onSelect: () => setConfirm({ kind: "file", video }),
       });
     }
-    items.push({
-      label: "Find siblings",
-      onSelect: () => p.onFindSiblings(video),
-    });
+    items.push(...seeChannel);
+    // Grouped, the grid has already gathered every match behind a series
+    // card, so a lone card's siblings are by construction only itself: the
+    // item could open nothing but a series of one. Inside a series opened from
+    // that feed, the series it would open is the one already on screen.
+    if (!p.grouped) {
+      items.push({
+        label: "Find siblings",
+        onSelect: () => p.onFindSiblings(video),
+      });
+    }
     if (video.sibling_group) {
       items.push({
         label: "Unlink from siblings",
@@ -714,7 +828,8 @@ export default function SubscriptionsView(p: Props) {
     return items;
   }, [onToggleWatched, onAction, unhideVideo, requestRemove, unlinkSiblings, groups,
       downloadSeries, unhideSeries, requestHideSeries,
-      marking.selected, marking.markSelected, p.onFindSiblings]);
+      marking.selected, marking.markSelected, p.onFindSiblings, p.grouped,
+      p.pickableChannels, p.onSeeChannel, siblingOf, search, channelIds]);
 
   const openMenu = useCallback((video: Video, x: number, y: number) => {
     // Every card has something to offer -- a series at least its Hide or
@@ -732,6 +847,61 @@ export default function SubscriptionsView(p: Props) {
     openMenuRef.current(video, x, y);
   }, []);
 
+  /**
+   * The open series as the card it would be, for the breadcrumb's actions: the
+   * anchor leads, as a card's leader does, since `set_series_hidden` works on
+   * `group_led_by(leader)` -- which is by construction what this view lists.
+   * Null until the series is the list on screen: a moment after it opens the
+   * grid is still the feed, and a Download built from that would queue it all.
+   */
+  const { seriesName } = p;
+  const openGroup = useMemo<VideoGroup | null>(() => {
+    if (!siblingOf || !showing) return null;
+    const parts = groups.flatMap((g) => g.videos);
+    // The anchor is in the list unless a series of more than a page has it on
+    // a page not yet fetched; then its id still keys the calls.
+    const anchor = parts.find((v) => v.id === siblingOf.id) ?? siblingOf;
+    return {
+      videos: [anchor, ...parts.filter((v) => v.id !== anchor.id)],
+      stem: seriesName?.trim() || null,
+    };
+  }, [siblingOf, showing, groups, seriesName]);
+
+  // Read at the click rather than captured, so the crumb's handlers keep their
+  // identity across every state event that touches a part -- and still act on
+  // the series as it is now, the way the series confirm does.
+  const openGroupRef = useRef(openGroup);
+  openGroupRef.current = openGroup;
+  const crumbDownload = useCallback(() => {
+    if (openGroupRef.current) downloadSeries(openGroupRef.current);
+  }, [downloadSeries]);
+  const crumbHide = useCallback(() => {
+    if (openGroupRef.current) requestHideSeries(openGroupRef.current);
+  }, [requestHideSeries]);
+  const crumbUnhide = useCallback(() => {
+    if (openGroupRef.current) unhideSeries(openGroupRef.current);
+  }, [unhideSeries]);
+
+  // A series of one has nothing a lone card's menu does not already offer.
+  const leaderId = openGroup && openGroup.videos.length > 1 ? openGroup.videos[0].id : null;
+  const callState = (key: string): CallState =>
+    slow.has(key) ? "slow" : pending.has(key) ? "busy" : "idle";
+  // Primitives first, so the object handed up -- and the shell's render that
+  // follows -- changes only when something the crumb shows has.
+  const due = openGroup?.videos.filter(downloadable).length ?? 0;
+  const marked = openGroup?.videos.some((v) => v.series_hidden) ?? false;
+  const downloading = leaderId ? callState(`series-download:${leaderId}`) : "idle";
+  const hiding = leaderId ? callState(`series-hidden:${leaderId}`) : "idle";
+  const seriesActions = useMemo<SeriesActions | null>(
+    () => (leaderId === null ? null : {
+      due, marked, downloading, hiding,
+      onDownload: crumbDownload, onHide: crumbHide, onUnhide: crumbUnhide,
+    }),
+    [leaderId, due, marked, downloading, hiding, crumbDownload, crumbHide, crumbUnhide],
+  );
+  const { onSeriesActions } = p;
+  useEffect(() => { onSeriesActions?.(seriesActions); }, [seriesActions, onSeriesActions]);
+
   const filtered =
     channelIds.length > 0 || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
     inProgress;
@@ -744,6 +914,12 @@ export default function SubscriptionsView(p: Props) {
 
   return (
     <>
+    {/* Decided by the rows on screen and swapped in the commit that puts the
+        next ones there, so the layout effect that restores a list's offset
+        finds the block it was filed under already in place above the grid. */}
+    {seriesParts
+      ? <SeriesBands parts={seriesParts} />
+      : p.showStats && stats && <FeedWaveform stats={stats} />}
     <VideoGrid
       groups={groups}
       progress={progress}
@@ -897,8 +1073,12 @@ export default function SubscriptionsView(p: Props) {
         onChoose={(choice) => {
           // The card as it is now rather than when the dialog opened: a part
           // that finished downloading meanwhile has a file to remove as well.
+          // Asked from the breadcrumb, the series is the whole grid, and the
+          // card the anchor leads there is the anchor alone.
           const leader = confirm.group.videos[0].id;
-          const target = groupsRef.current.find((g) => g.videos[0].id === leader) ?? confirm.group;
+          const open = openGroupRef.current;
+          const target = (open?.videos[0].id === leader ? open : null)
+            ?? groupsRef.current.find((g) => g.videos[0].id === leader) ?? confirm.group;
           setConfirm(null);
           void hideSeries(target, choice === "delete");
         }}

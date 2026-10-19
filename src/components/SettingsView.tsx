@@ -7,6 +7,7 @@ import {
 } from "./settings/live";
 import SettingsRail from "./settings/SettingsRail";
 import { SECTIONS } from "./settings/sections";
+import type { Settings } from "../types";
 
 /* The section left open, kept for the session: leaving for Subscriptions and
    coming back lands where you were. Deliberately not persisted. */
@@ -38,8 +39,12 @@ export function openSettingsSection(id: SectionId) {
  * summarises all of it at once; the pages read the same copies through the
  * context, so the rail and the open page can never disagree.
  */
-export default function SettingsView({ initialSection }: { initialSection?: SectionId } = {}) {
-  const doc = useSettingsDoc();
+export default function SettingsView({ initialSection, onSaved }: {
+  initialSection?: SectionId;
+  /** Every save that landed, for the settings the shell follows too. */
+  onSaved?: (settings: Settings) => void;
+} = {}) {
+  const doc = useSettingsDoc({ onSaved });
   const tools = useToolsLive();
   const sync = useSyncLive();
   const browsers = useBrowserScan();

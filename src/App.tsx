@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CARD_DEFAULT, clampCardSize } from "./format";
 import { normalizeIds, pruneIds } from "./channelPick";
 import TopNav, { type Tab } from "./components/TopNav";
-import SubscriptionsView, { type SeriesTally } from "./components/SubscriptionsView";
+import SubscriptionsView, { type SeriesActions, type SeriesTally } from "./components/SubscriptionsView";
 import DownloadsView from "./components/DownloadsView";
 import SettingsView, { openSettingsSection } from "./components/SettingsView";
 import AddChannelDialog from "./components/AddChannelDialog";
@@ -14,7 +14,7 @@ import {
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
 import type {
-  Channel, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
+  Channel, Settings, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
 } from "./types";
 import "./App.css";
 
@@ -72,6 +72,10 @@ function Shell() {
   // too, so it goes wherever groupsOnly goes.
   const [inProgress, setInProgress] = useState(false);
   const [cardSize, setCardSize] = useState(CARD_DEFAULT);
+  // Settings → Appearance → Show stats. Read with the rest at startup, then
+  // followed through every save Settings lands -- never by reading the file
+  // again on each visit to the tab.
+  const [showStats, setShowStats] = useState(false);
   const [sort, setSort] = useState<SortOrder>("newest");
   // The video whose series the grid is pinned to, or null for the normal feed.
   const [siblingOf, setSiblingOf] = useState<Video | null>(null);
@@ -81,6 +85,9 @@ function Shell() {
   // What the series turned out to hold. Only the view can count it, so it is
   // reported back up once each page settles.
   const [tally, setTally] = useState<SeriesTally | null>(null);
+  // What the crumb can do with the series: its card menu's actions, which only
+  // the view can run, reported up whenever what they show changes.
+  const [seriesActions, setSeriesActions] = useState<SeriesActions | null>(null);
   const [polling, setPolling] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   // The Add dialog's subscription list, folded away. Not a filter, but
@@ -117,6 +124,16 @@ function Shell() {
     setTally(null);
   }, []);
 
+  // A card's "See all videos from …": that channel alone, with nothing left
+  // narrowing it that would have to be noticed and cleared by hand -- a search,
+  // an open series. The toggles, grouping and sort are how this feed is read,
+  // not what it is about, so they stay as they are.
+  const seeChannel = useCallback((channelId: string) => {
+    pickChannels([channelId]);
+    setSearch("");
+    closeSeries();
+  }, [pickChannels, closeSeries]);
+
   // Escape leaves a series. It is bound last on purpose: a dialog or the card
   // menu closes on Escape too, and whichever is on top should get it first --
   // both of those sit above the grid, so they are checked for in the DOM.
@@ -151,6 +168,12 @@ function Shell() {
   }, [toast]);
 
   useEffect(() => { void loadChannels(); }, [loadChannels]);
+
+  // The channels a card can narrow the feed to. `channels` holds only
+  // subscriptions, and the prune below drops any other id from the pick at
+  // once, so an ad-hoc uploader's card is not offered it. A set kept with the
+  // list, so the feed's menu is rebuilt only when the list changes.
+  const pickableChannels = useMemo(() => new Set(channels.map((c) => c.id)), [channels]);
 
   // An import rewrites channels and videos underneath every view, so the shell
   // refetches exactly as it does after a poll. Deliberately its own event
@@ -326,6 +349,8 @@ function Shell() {
     api.getSettings()
       .then((s) => {
         setCardSize(clampCardSize(s.card_size ?? CARD_DEFAULT));
+        // `=== true`: a backend older than the switch sends no key at all.
+        setShowStats(s.show_stats === true);
         const v = s.view;
         const restored = normalizeIds(v.channel_ids);
         setChannelIds(restored);
@@ -363,6 +388,11 @@ function Shell() {
       })
       .finally(() => setHydrated(true));
   }, []);
+
+  // Settings is unmounted whenever another tab is up, so what it saved is
+  // handed over as it lands; the feed shows or drops its stats the moment the
+  // tab is back. Stable, so the doc's verbs keep their identity.
+  const onSettingsSaved = useCallback((s: Settings) => setShowStats(s.show_stats === true), []);
 
   // The feed's scroll container, handed to SubscriptionsView so leaving a series
   // -- or riding out a poll's refetch -- can put the grid back where it was.
@@ -430,6 +460,7 @@ function Shell() {
         sort={sort}
         onSort={setSort}
         series={siblingOf ? { name: seriesName, parts: 0, runtime: "", unknown: 0, ...tally } : null}
+        seriesActions={seriesActions}
         onExitSeries={closeSeries}
         polling={polling}
         onRefresh={() => void refresh()}
@@ -456,15 +487,20 @@ function Shell() {
             siblingOf={siblingOf}
             onFindSiblings={openSeries}
             onSeriesTally={setTally}
+            seriesName={seriesName}
+            onSeriesActions={setSeriesActions}
             reloadToken={reloadToken}
             channelCount={channels.length}
             onAdd={() => setAddOpen(true)}
+            pickableChannels={pickableChannels}
+            onSeeChannel={seeChannel}
+            showStats={showStats}
           />
         )}
         {tab === "downloads" && (
           <DownloadsView reloadToken={reloadToken} cardSize={cardSize} scrollRef={contentRef} />
         )}
-        {tab === "settings" && <SettingsView />}
+        {tab === "settings" && <SettingsView onSaved={onSettingsSaved} />}
       </main>
 
       <AddChannelDialog

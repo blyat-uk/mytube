@@ -2,11 +2,12 @@ import { useEffect, useId, useRef, type CSSProperties, type KeyboardEvent } from
 import { IconSectionAppearance } from "../Icons";
 import { TEXT_SCALE, applyTextScale, normalizeTextScale } from "../../textScale";
 import { useSettingsCtx, type RailLine, type SettingsCtx } from "./context";
-import { Block, Cap, SettingsPage } from "./parts";
+import { Block, Cap, SettingsPage, Switch } from "./parts";
 
-/** "Text size 125%". */
+/** "Text size 125%", and "· stats on" while they are. */
 export function summary({ settings: s }: SettingsCtx): RailLine {
-  return { text: `Text size ${normalizeTextScale(s.text_scale)}%` };
+  const size = `Text size ${normalizeTextScale(s.text_scale)}%`;
+  return { text: s.show_stats ? `${size} · stats on` : size };
 }
 
 /**
@@ -98,6 +99,10 @@ function ScaleSlider({ value, labelledBy, describedBy, onInput, onRelease }: {
  * as it goes -- the app is its own preview -- and the slider has a row to
  * itself, so text growing around it can push it down but never sideways under
  * the pointer.
+ *
+ * Then whether the feed shows its stats: a pick, saved at once, which the
+ * shell hears through the doc's `onSaved` -- this view is gone by the time
+ * Subscriptions is back on screen.
  */
 export default function AppearancePage() {
   const { settings: s, set, save, flush } = useSettingsCtx();
@@ -121,7 +126,7 @@ export default function AppearancePage() {
     <SettingsPage
       icon={<IconSectionAppearance />}
       title="Appearance"
-      intro="How big MyTube's text is on this screen. The size stays on this computer: an export does not carry it."
+      intro="How MyTube looks on this screen. Both settings stay on this computer: an export carries neither."
     >
       <Block>
         <Cap id={capId}>Text size</Cap>
@@ -154,6 +159,15 @@ export default function AppearancePage() {
           Text only: icons, thumbnails and spacing stay as they are. Card titles also follow
           the card zoom (Ctrl+scroll).
         </p>
+      </Block>
+
+      <Block>
+        <Switch
+          label="Show stats"
+          hint="A month-by-month wave of uploads above the Subscriptions feed, and a part-by-part strip inside a series."
+          checked={s.show_stats === true}
+          onChange={(on) => save("show_stats", on)}
+        />
       </Block>
     </SettingsPage>
   );

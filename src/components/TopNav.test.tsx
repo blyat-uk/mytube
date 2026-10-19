@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { act, render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import TopNav, { type Tab } from "./TopNav";
+import type { SeriesActions } from "./SubscriptionsView";
 import type { Channel } from "../types";
 
 const CHANNELS: Channel[] = [
@@ -155,6 +156,106 @@ describe("the series breadcrumb", () => {
     renderNav();
     expect(screen.queryByRole("button", { name: "Leave this series" })).toBeNull();
     expect(screen.getByLabelText("Sections")).not.toBeNull();
+  });
+});
+
+/**
+ * An open series offers on its crumb what its card's menu offers: download
+ * what is left of it, and hide it (or bring it back). The view runs them; the
+ * nav only draws them from what it is handed.
+ */
+describe("the series actions on the crumb", () => {
+  function actions(over: Partial<SeriesActions> = {}): SeriesActions {
+    return {
+      due: 3, marked: false, downloading: "idle", hiding: "idle",
+      onDownload: vi.fn(), onHide: vi.fn(), onUnhide: vi.fn(),
+      ...over,
+    };
+  }
+  const group = () => screen.queryByRole("group", { name: "Series actions" });
+  const names = () =>
+    Array.from(group()!.querySelectorAll("button")).map((b) => b.getAttribute("aria-label"));
+
+  it("offers the card menu's two, hide first, right after the crumb", () => {
+    renderNav({ series: SERIES, seriesActions: actions() });
+    expect(names()).toEqual(["Hide series", "Download 3 parts"]);
+    // Beside the breadcrumb rather than inside it: the crumb is navigation.
+    expect(screen.getByLabelText("Breadcrumb").nextElementSibling).toBe(group());
+  });
+
+  it("counts a single part left as one part, and offers no download once none is", () => {
+    renderNav({ series: SERIES, seriesActions: actions({ due: 1 }) });
+    expect(names()).toEqual(["Hide series", "Download 1 part"]);
+    cleanup();
+
+    renderNav({ series: SERIES, seriesActions: actions({ due: 0 }) });
+    expect(names()).toEqual(["Hide series"]);
+  });
+
+  it("wears the menu's danger tone on Hide, and offers Un-hide instead while marked", () => {
+    renderNav({ series: SERIES, seriesActions: actions() });
+    expect(button("Hide series").classList.contains("is-danger")).toBe(true);
+    cleanup();
+
+    const a = actions({ marked: true });
+    renderNav({ series: SERIES, seriesActions: a });
+    expect(names()).toEqual(["Un-hide series", "Download 3 parts"]);
+    expect(button("Un-hide series").classList.contains("is-danger")).toBe(false);
+    fireEvent.click(button("Un-hide series"));
+    expect(a.onUnhide).toHaveBeenCalledTimes(1);
+    expect(a.onHide).not.toHaveBeenCalled();
+  });
+
+  it("hands each press to the view", () => {
+    const a = actions();
+    renderNav({ series: SERIES, seriesActions: a });
+    fireEvent.click(button("Download 3 parts"));
+    fireEvent.click(button("Hide series"));
+    expect(a.onDownload).toHaveBeenCalledTimes(1);
+    expect(a.onHide).toHaveBeenCalledTimes(1);
+  });
+
+  /* Download takes itself away once nothing is left, so a double-click's
+     second half would land on whatever slid into its place. */
+  it("ignores the second half of a double-click", () => {
+    const a = actions();
+    renderNav({ series: SERIES, seriesActions: a });
+    fireEvent.click(button("Hide series"), { detail: 1 });
+    fireEvent.click(button("Hide series"), { detail: 2 });
+    expect(a.onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables a button while its call is out, and spins it only once slow", () => {
+    renderNav({ series: SERIES, seriesActions: actions({ downloading: "busy", hiding: "slow" }) });
+    const download = button("Download 3 parts");
+    expect(download.disabled).toBe(true);
+    expect(download.classList.contains("is-spinning")).toBe(false);
+    const hide = button("Hide series");
+    expect(hide.disabled).toBe(true);
+    expect(hide.classList.contains("is-spinning")).toBe(true);
+    expect(hide.getAttribute("aria-busy")).toBe("true");
+  });
+
+  it("keeps its names and says what each does when the words fold away", () => {
+    renderNav({ series: SERIES, seriesActions: actions() });
+    // The words are there however narrow the window: CSS folds them, it never
+    // removes them, and the name does not depend on them anyway.
+    expect(button("Download 3 parts").textContent).toBe("Download 3 parts");
+    expect(button("Download 3 parts").title).toBe("Download the 3 parts not downloaded yet, oldest first");
+    expect(button("Hide series").title).toContain("any part that joins the series later");
+  });
+
+  it("offers nothing until the view has something to offer", () => {
+    renderNav({ series: SERIES });
+    expect(group()).toBeNull();
+    cleanup();
+    renderNav({ series: SERIES, seriesActions: null });
+    expect(group()).toBeNull();
+  });
+
+  it("goes with the crumb in the ordinary feed", () => {
+    renderNav({ series: null, seriesActions: actions() });
+    expect(group()).toBeNull();
   });
 });
 
