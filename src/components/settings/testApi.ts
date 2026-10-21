@@ -33,7 +33,7 @@ export const SETTINGS: Settings = {
   quality: { ...DEFAULT_QUALITY },
   view: {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
-    show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
+    show_hidden: false, grouped: false, groups_only: false, in_progress: false, auto_downloading: false, sort: "newest",
     subs_folded: false,
   },
 };

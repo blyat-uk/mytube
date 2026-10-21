@@ -21,7 +21,8 @@ function renderNav(over: Partial<Props> = {}) {
     search: "", onSearch: vi.fn(), hideWatched: false, onHideWatched: vi.fn(),
     downloadedOnly: false, onDownloadedOnly: vi.fn(), showHidden: false, onShowHidden: vi.fn(),
     grouped: false, onGrouped: vi.fn(), groupsOnly: false, onGroupsOnly: vi.fn(),
-    inProgress: false, onInProgress: vi.fn(), sort: "newest", onSort: vi.fn(),
+    inProgress: false, onInProgress: vi.fn(), autoDownloading: false, onAutoDownloading: vi.fn(),
+    sort: "newest", onSort: vi.fn(),
     series: null, onExitSeries: vi.fn(), polling: false, onRefresh: vi.fn(), onAdd: vi.fn(),
     update: null, onOpenAbout: vi.fn(),
     ...over,
@@ -71,6 +72,7 @@ describe("the folded filter row", () => {
     expect(heads).toEqual(["Show", "Arrange", "Sort", "Channels"]);
     const cols = panel.querySelectorAll(".pop-col");
     expect(cols[0].textContent).toContain("Continue watching");
+    expect(cols[0].textContent).toContain("Auto-downloading");
     expect(cols[0].textContent).toContain("Group siblings");
     expect(cols[0].textContent).toContain("Most parts first");
     // The left column sets the height; the list fills what it leaves (CSS).
@@ -108,6 +110,7 @@ describe("the folded filter row", () => {
     renderNav({ grouped: false });
     openPanel();
     expect(screen.queryByRole("button", { name: "Only groups" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Auto-downloading" })).toBeNull();
     expect(screen.queryByRole("radio", { name: "Most parts first" })).toBeNull();
   });
 

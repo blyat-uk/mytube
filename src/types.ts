@@ -46,6 +46,9 @@ export interface Video {
   /** Unlinked by hand: no description link, and no title, puts it on a card
    *  again. Only marking it places it. */
   part_links_refused: boolean;
+  /** Its series is set to auto-download: a part that joins this video's card
+   *  later is queued the poll it arrives. Per machine, never synced. */
+  series_auto_download: boolean;
   /** A description link of its own put it on its card, so "Unlink from
    *  siblings" applies though nothing was marked by hand. Computed by the
    *  feed's reads; false everywhere else. */
@@ -76,6 +79,9 @@ export interface VideoFilter {
   /** Grouped feed only: keep just the series you have started and not
    *  finished -- at least one part watched and one not. */
   inProgress: boolean;
+  /** Grouped feed only: keep just the cards whose series is set to
+   *  auto-download, a lone card still carrying the mark included. */
+  autoDownloading: boolean;
   search: string | null;
   /** Id of the video whose siblings to show; overrides every filter above. */
   siblingOf: string | null;
@@ -234,7 +240,8 @@ export interface ViewState {
   /** Sorted channel ids; empty for every channel. */
   channel_ids: string[]; search: string;
   hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
-  grouped: boolean; groups_only: boolean; in_progress: boolean; sort: SortOrder;
+  grouped: boolean; groups_only: boolean; in_progress: boolean; auto_downloading: boolean;
+  sort: SortOrder;
   /** The Add dialog's subscription list, folded away. Not a filter: it rides
    *  in this block because it is remembered the same way, per machine. */
   subs_folded: boolean;

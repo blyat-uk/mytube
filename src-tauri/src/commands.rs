@@ -417,6 +417,20 @@ pub async fn set_series_hidden(
     .await
 }
 
+/// Switches a series' auto-download on or off, returning the parts whose mark
+/// changed. Switching on queues nothing: only parts that join the series from
+/// now on are downloaded, each by the poll it arrives in. Switching off can
+/// reach parts on another card (see `Db::set_series_auto_download`), which is
+/// what the returned ids let the view notice.
+#[tauri::command]
+pub async fn set_series_auto_download(
+    leader_id: String,
+    enabled: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<Vec<String>> {
+    db_blocking(&state, move |db| db.set_series_auto_download(&leader_id, enabled)).await
+}
+
 /// Removes a manually added video outright. Refuses subscription videos, which
 /// would simply reappear on the next poll — those must be hidden instead.
 #[tauri::command]

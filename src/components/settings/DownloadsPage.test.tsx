@@ -35,6 +35,7 @@ const VIDEO: Video = {
   series_hidden: false,
   part_links_refused: false,
   part_linked: false,
+  series_auto_download: false,
 };
 
 describe("the page", () => {
@@ -158,8 +159,8 @@ describe("Each video is saved as", () => {
     await waitFor(() => expect(api.listVideos).toHaveBeenCalledTimes(1));
     expect(api.listVideos).toHaveBeenCalledWith({
       channelIds: [], hideWatched: false, downloadedOnly: false, showHidden: false,
-      groupsOnly: false, inProgress: false, search: null, siblingOf: null, sort: "newest",
-      limit: 1, offset: 0,
+      groupsOnly: false, inProgress: false, autoDownloading: false, search: null, siblingOf: null,
+      sort: "newest", limit: 1, offset: 0,
     });
   });
 

@@ -1,7 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { thumbSrc } from "../api";
 import { formatDate, formatRelative, seriesRuntime } from "../format";
-import { IconSeries } from "./Icons";
+import { IconAutoDownload, IconSeries } from "./Icons";
 import type { CardMark } from "../marking";
 import type { Video, VideoGroup } from "../types";
 
@@ -47,6 +47,9 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
   // (`.card.is-hidden-video`). Every part again: a series with one part back
   // in the feed is not out of it.
   const hidden = group.videos.every((v) => v.hidden);
+  // Set to auto-download. Any part, as the menu reads it: the mark is what
+  // queues the parts still to come, and Stop is offered wherever it is.
+  const auto = group.videos.some((v) => v.series_auto_download);
 
   // The series' runtime, not the leading part's. A part whose duration has not
   // resolved yet contributes nothing, which would silently understate the
@@ -82,6 +85,7 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
         (runtime ? `${runtime} total, ` : "") +
         `${watched} watched, ${unwatched} unwatched` +
         (resumable ? ", in progress" : "") +
+        (auto ? ", new parts download automatically" : "") +
         (hidden ? ", hidden" : "")
       }
       onClick={(e) => {
@@ -110,6 +114,15 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
           />
         ) : (
           <div className="card-img card-img-blank" aria-hidden="true" />
+        )}
+
+        {/* Nothing else on the card says a setting is quietly queueing its
+            new parts, and the parts panel holds the right-hand side. */}
+        {auto && (
+          <span className="pill pill-auto" title="New parts download on their own">
+            <IconAutoDownload on />
+            Auto
+          </span>
         )}
 
         {/* Read out by the card's own aria-label above, so the panel itself is

@@ -196,8 +196,8 @@ function FolderPath({ dir }: { dir: string }) {
 /** The one newest video in the library, whatever the feed is filtered to. */
 const NEWEST: VideoFilter = {
   channelIds: [], hideWatched: false, downloadedOnly: false, showHidden: false,
-  groupsOnly: false, inProgress: false, search: null, siblingOf: null, sort: "newest",
-  limit: 1, offset: 0,
+  groupsOnly: false, inProgress: false, autoDownloading: false, search: null, siblingOf: null,
+  sort: "newest", limit: 1, offset: 0,
 };
 
 /** Null until it lands, and for good when the library is empty or unreadable:

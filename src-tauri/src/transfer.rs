@@ -371,6 +371,7 @@ impl ArchiveVideo {
             sibling_group: self.sibling_group,
             series_hidden: self.series_hidden,
             part_links_refused: self.part_links_refused,
+            series_auto_download: false,
             part_linked: false,
         }
     }
@@ -897,6 +898,7 @@ mod tests {
             sibling_group: Some("grp-1".into()),
             series_hidden: true,
             part_links_refused: false,
+            series_auto_download: false,
             part_linked: false,
         }
     }

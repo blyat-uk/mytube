@@ -107,6 +107,10 @@ pub struct ViewState {
     pub groups_only: bool,
     #[serde(default)]
     pub in_progress: bool,
+    /// "Auto-downloading": only the series set to auto-download. A series-only
+    /// chip like the two above it, so it is cleared with them.
+    #[serde(default)]
+    pub auto_downloading: bool,
     #[serde(default = "d_sort")]
     pub sort: SortOrder,
     /// The Add dialog's subscription list, folded away. Remembered because the
@@ -128,6 +132,7 @@ impl Default for ViewState {
             grouped: true,
             groups_only: false,
             in_progress: false,
+            auto_downloading: false,
             sort: SortOrder::Newest,
             subs_folded: false,
         }
@@ -146,11 +151,12 @@ impl ViewState {
         if self.sort == SortOrder::Downloaded || (self.sort == SortOrder::Parts && !self.grouped) {
             self.sort = SortOrder::Newest;
         }
-        // Likewise "Only groups" and "Continue watching": neither chip is on
-        // screen while ungrouped.
+        // Likewise "Only groups", "Continue watching" and "Auto-downloading":
+        // none of those chips is on screen while ungrouped.
         if !self.grouped {
             self.groups_only = false;
             self.in_progress = false;
+            self.auto_downloading = false;
         }
         let trimmed = self.search.trim();
         self.search = if trimmed.chars().count() > 200 {
@@ -579,6 +585,7 @@ mod tests {
             grouped: true,
             groups_only: true,
             in_progress: true,
+            auto_downloading: true,
             sort: SortOrder::Length,
             subs_folded: true,
         };
@@ -656,6 +663,16 @@ mod tests {
         assert!(!off.view.in_progress);
         let on = Settings::from_json_str(r#"{"view":{"in_progress":true,"grouped":true}}"#).unwrap();
         assert!(on.view.in_progress);
+    }
+
+    #[test]
+    fn auto_downloading_survives_only_while_grouped() {
+        let off = Settings::from_json_str(r#"{"view":{"auto_downloading":true,"grouped":false}}"#)
+            .unwrap();
+        assert!(!off.view.auto_downloading);
+        let on = Settings::from_json_str(r#"{"view":{"auto_downloading":true,"grouped":true}}"#)
+            .unwrap();
+        assert!(on.view.auto_downloading);
     }
 
     #[test]

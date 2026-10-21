@@ -35,12 +35,13 @@ export default function App() {
 function buildViewState(
   channelIds: string[], search: string, hideWatched: boolean,
   downloadedOnly: boolean, showHidden: boolean, grouped: boolean, groupsOnly: boolean,
-  inProgress: boolean, sort: SortOrder, subsFolded: boolean,
+  inProgress: boolean, autoDownloading: boolean, sort: SortOrder, subsFolded: boolean,
 ): ViewState {
   return {
     channel_ids: channelIds, search,
     hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
-    grouped, groups_only: groupsOnly, in_progress: inProgress, sort, subs_folded: subsFolded,
+    grouped, groups_only: groupsOnly, in_progress: inProgress, auto_downloading: autoDownloading,
+    sort, subs_folded: subsFolded,
   };
 }
 
@@ -71,6 +72,9 @@ function Shell() {
   // Only the series you have started and not finished. A filter over groups
   // too, so it goes wherever groupsOnly goes.
   const [inProgress, setInProgress] = useState(false);
+  // Only the series set to auto-download -- the one place they can all be
+  // seen at once. Another filter over groups, gone with the other two.
+  const [autoDownloading, setAutoDownloading] = useState(false);
   const [cardSize, setCardSize] = useState(CARD_DEFAULT);
   // Settings → Appearance → Show stats. Read with the rest at startup, then
   // followed through every save Settings lands -- never by reading the file
@@ -98,8 +102,9 @@ function Shell() {
 
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
 
-  // "Most parts first", "Only groups" and "Continue watching" only exist while
-  // the cards are groups, so ungrouping has to take them back with it -- otherwise the nav
+  // "Most parts first", "Only groups", "Continue watching" and "Auto-downloading"
+  // only exist while the cards are groups, so ungrouping has to take them back
+  // with it -- otherwise the nav
   // is left holding a value it no longer offers, and the next time Grouped
   // goes on the feed would come back filtered by a chip nobody just pressed.
   const setGroupedAndSort = useCallback((on: boolean) => {
@@ -108,6 +113,7 @@ function Shell() {
       setSort((s) => (s === "parts" ? "newest" : s));
       setGroupsOnly(false);
       setInProgress(false);
+      setAutoDownloading(false);
     }
   }, []);
 
@@ -361,6 +367,9 @@ function Shell() {
         setGrouped(v.grouped);
         setGroupsOnly(v.groups_only);
         setInProgress(v.in_progress);
+        // `=== true`, like `subs_folded`: a view saved before the chip has no key.
+        const autoDl = v.auto_downloading === true;
+        setAutoDownloading(autoDl);
         setSort(v.sort);
         // `=== true`: a view saved by an older build has no key at all.
         const folded = v.subs_folded === true;
@@ -368,7 +377,7 @@ function Shell() {
         persistedView.current = JSON.stringify(
           buildViewState(
             restored, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
-            v.groups_only, v.in_progress, v.sort, folded,
+            v.groups_only, v.in_progress, autoDl, v.sort, folded,
           ),
         );
       })
@@ -382,7 +391,7 @@ function Shell() {
         persistedView.current = JSON.stringify(
           buildViewState(
             channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-            inProgress, sort, subsFolded,
+            inProgress, autoDownloading, sort, subsFolded,
           ),
         );
       })
@@ -412,12 +421,12 @@ function Shell() {
 
   // Debounced like saveCardSize, but there is no explicit call site for a
   // filter change -- every setter above is reachable straight from TopNav --
-  // so this watches the ten values instead of wrapping each setter.
+  // so this watches the eleven values instead of wrapping each setter.
   useEffect(() => {
     if (!hydrated) return;
     const view = buildViewState(
       channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, sort, subsFolded,
+      inProgress, autoDownloading, sort, subsFolded,
     );
     const serialised = JSON.stringify(view);
     if (serialised === persistedView.current) return;
@@ -428,7 +437,7 @@ function Shell() {
     }, 400);
     return () => window.clearTimeout(t);
   }, [hydrated, channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, sort, subsFolded]);
+      inProgress, autoDownloading, sort, subsFolded]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
   // rendering before the saved view lands would spend a query on the
@@ -457,6 +466,8 @@ function Shell() {
         onGroupsOnly={setGroupsOnly}
         inProgress={inProgress}
         onInProgress={setInProgress}
+        autoDownloading={autoDownloading}
+        onAutoDownloading={setAutoDownloading}
         sort={sort}
         onSort={setSort}
         series={siblingOf ? { name: seriesName, parts: 0, runtime: "", unknown: 0, ...tally } : null}
@@ -480,6 +491,7 @@ function Shell() {
             grouped={grouped}
             groupsOnly={groupsOnly}
             inProgress={inProgress}
+            autoDownloading={autoDownloading}
             cardSize={cardSize}
             onCardSize={saveCardSize}
             scrollRef={contentRef}

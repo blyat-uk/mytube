@@ -173,6 +173,7 @@ mod tests {
             sibling_group: None,
             series_hidden: false,
             part_links_refused: false,
+            series_auto_download: false,
             part_linked: false,
         }
     }

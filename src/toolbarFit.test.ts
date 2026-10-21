@@ -38,7 +38,8 @@ describe("pickFit", () => {
 describe("activeFilterCount", () => {
   const none = {
     hideWatched: false, downloadedOnly: false, showHidden: false,
-    grouped: false, groupsOnly: false, inProgress: false, channelIds: [] as string[],
+    grouped: false, groupsOnly: false, inProgress: false, autoDownloading: false,
+    channelIds: [] as string[],
   };
 
   it("counts what narrows the list, and the channel pick as one however many it holds", () => {
@@ -52,7 +53,8 @@ describe("activeFilterCount", () => {
   });
 
   it("counts the series-only filters only while grouped, when they apply", () => {
-    expect(activeFilterCount({ ...none, groupsOnly: true, inProgress: true })).toBe(0);
-    expect(activeFilterCount({ ...none, grouped: true, groupsOnly: true, inProgress: true })).toBe(2);
+    const series = { groupsOnly: true, inProgress: true, autoDownloading: true };
+    expect(activeFilterCount({ ...none, ...series })).toBe(0);
+    expect(activeFilterCount({ ...none, ...series, grouped: true })).toBe(3);
   });
 });

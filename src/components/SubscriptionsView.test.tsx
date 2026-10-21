@@ -57,6 +57,8 @@ const cancelDownload = vi.fn((_id: string) => Promise.resolve());
 const setVideoHidden = vi.fn((_id: string, _hidden: boolean) => Promise.resolve());
 const setSeriesHidden = vi.fn((_leader: string, _hidden: boolean) => Promise.resolve<string[]>([]));
 const enqueueDownloads = vi.fn((_ids: string[]) => Promise.resolve(0));
+const setSeriesAutoDownload =
+  vi.fn((_leader: string, _enabled: boolean) => Promise.resolve<string[]>([]));
 // Typed with the filter so a test can page through a library with it.
 const listVideos = vi.fn<(f: VideoFilter) => Promise<Video[]>>(() => Promise.resolve(videos));
 const listVideoGroups = vi.fn<(f: VideoFilter) => Promise<VideoGroup[]>>(() => Promise.resolve(groups));
@@ -76,6 +78,8 @@ vi.mock("../api", () => ({
     setVideoHidden: (id: string, hidden: boolean) => setVideoHidden(id, hidden),
     setSeriesHidden: (leader: string, hidden: boolean) => setSeriesHidden(leader, hidden),
     enqueueDownloads: (ids: string[]) => enqueueDownloads(ids),
+    setSeriesAutoDownload: (leader: string, enabled: boolean) =>
+      setSeriesAutoDownload(leader, enabled),
     feedStats: (filter: StatsFilter) => feedStats(filter),
     getSettings: () => Promise.resolve({ quality: DEFAULT_QUALITY }),
   },
@@ -97,7 +101,7 @@ function video(over: Partial<Video> = {}): Video {
     view_count: 1500, status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "done", download_error: null, file_path: "/videos/some.mkv",
     downloaded_at: null, first_seen_at: 0, sibling_group: null, series_hidden: false,
-    part_links_refused: false, part_linked: false,
+    part_links_refused: false, part_linked: false, series_auto_download: false,
     ...over,
   };
 }
@@ -139,7 +143,7 @@ function renderView(over: ViewProps = {}) {
       <SubscriptionsView
         channelIds={EVERY_CHANNEL} search="" hideWatched={false} downloadedOnly={false}
         sort="newest" showHidden={false} grouped={false} groupsOnly={false} inProgress={false}
-        siblingOf={null}
+        autoDownloading={false} siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
         channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
@@ -176,6 +180,7 @@ beforeEach(() => {
   cancelDownload.mockImplementation(() => Promise.resolve());
   setVideoHidden.mockImplementation(() => Promise.resolve());
   setSeriesHidden.mockImplementation(() => Promise.resolve([]));
+  setSeriesAutoDownload.mockImplementation(() => Promise.resolve([]));
   enqueueDownloads.mockImplementation((ids) => Promise.resolve(ids.length));
   deleteDownload.mockImplementation(() => Promise.resolve());
   enqueueDownload.mockImplementation(() => Promise.resolve());
@@ -577,8 +582,10 @@ describe("See all videos from a card's channel", () => {
     groups = [twoParts()];
     const { onSeeChannel } = renderView({ grouped: true, pickableChannels: PICKABLE });
     const menu = await openSeriesMenu();
-    expect(menuLabels(menu))
-      .toEqual(["Download 2 parts", "See all videos from Veritasium", "Hide from feed"]);
+    expect(menuLabels(menu)).toEqual([
+      "Download 2 parts", "Auto-download new parts", "See all videos from Veritasium",
+      "Hide from feed",
+    ]);
     fireEvent.click(within(menu, "See all videos from Veritasium"));
     expect(onSeeChannel).toHaveBeenCalledWith("UC1");
   });
@@ -586,8 +593,10 @@ describe("See all videos from a card's channel", () => {
   it("comes ahead of Un-hide series as well", async () => {
     groups = [twoParts({ hidden: true, series_hidden: true })];
     renderView({ grouped: true, showHidden: true, pickableChannels: PICKABLE });
-    expect(menuLabels(await openSeriesMenu()))
-      .toEqual(["Download 2 parts", "See all videos from Veritasium", "Un-hide series"]);
+    expect(menuLabels(await openSeriesMenu())).toEqual([
+      "Download 2 parts", "Auto-download new parts", "See all videos from Veritasium",
+      "Un-hide series",
+    ]);
   });
 });
 
@@ -783,6 +792,31 @@ describe("what an open series offers the breadcrumb", () => {
     videos = parts({}, {}, { series_hidden: true });
     const { offered } = openSeries();
     expect((await offered()).marked).toBe(true);
+  });
+
+  it("offers to switch auto-download on only for a subscribed channel", async () => {
+    videos = parts();
+    const { offered } = openSeries();
+    expect((await offered()).autoAvailable).toBe(false);
+    cleanup();
+
+    const subscribed = openSeries({ pickableChannels: new Set(["UC1"]) });
+    expect((await subscribed.offered()).autoAvailable).toBe(true);
+  });
+
+  it("switches auto-download by the anchor and stays in the series", async () => {
+    videos = parts({}, {}, { series_auto_download: true });
+    const { offered, last } = openSeries();
+    const a = await offered();
+    expect(a).toMatchObject({ autoDownload: true, autoing: "idle" });
+    act(() => a.onStopAutoDownload());
+
+    expect(setSeriesAutoDownload).toHaveBeenCalledWith("p2", false);
+    await waitFor(() => expect(last()!.autoDownload).toBe(false));
+    expect(cards()).toHaveLength(3);
+    act(() => last()!.onAutoDownload());
+    expect(setSeriesAutoDownload).toHaveBeenLastCalledWith("p2", true);
+    await waitFor(() => expect(last()!.autoDownload).toBe(true));
   });
 
   /** A lone card's own menu already covers a series of one. */
@@ -1368,6 +1402,118 @@ describe("a series card's right-click menu", () => {
   });
 });
 
+/**
+ * A series set to auto-download queues each part that joins it later, in the
+ * poll that brings it in. The view only flips the switch and shows it: on the
+ * card's menu, the card itself, the open series' crumb, and the filter.
+ */
+describe("auto-downloading a series", () => {
+  function series(...parts: Partial<Video>[]): VideoGroup {
+    return {
+      videos: parts.map((over, i) => video({
+        id: `p${parts.length - i}`, title: `The Blackwood Tapes - Part ${parts.length - i}`,
+        download_state: "none", file_path: null, ...over,
+      })),
+      stem: "The Blackwood Tapes",
+    };
+  }
+  const seriesCard = () => document.querySelector<HTMLElement>(".series-card");
+  async function openSeriesMenu() {
+    await waitFor(() => expect(seriesCard()).not.toBeNull());
+    fireEvent.contextMenu(seriesCard()!);
+    return screen.getByRole("menu");
+  }
+  const pill = () => seriesCard()?.querySelector(".pill-auto") ?? null;
+  /** The series' channel is a subscription, so a new part can arrive. */
+  const SUBSCRIBED: ReadonlySet<string> = new Set(["UC1"]);
+
+  beforeEach(() => {
+    Element.prototype.animate = vi.fn() as unknown as Element["animate"];
+  });
+  afterEach(() => {
+    delete (Element.prototype as Partial<Element>).animate;
+  });
+
+  it("switches on from the card's menu by its leader, and the card wears it at once", async () => {
+    groups = [series({}, {})];
+    let answer = () => {};
+    setSeriesAutoDownload.mockImplementation(() => new Promise<string[]>((res) => {
+      answer = () => res(["p2", "p1"]);
+    }));
+    renderView({ grouped: true, pickableChannels: SUBSCRIBED });
+    expect(pill()).toBeNull();
+    fireEvent.click(within(await openSeriesMenu(), "Auto-download new parts"));
+
+    expect(setSeriesAutoDownload).toHaveBeenCalledWith("p2", true);
+    expect(pill()).not.toBeNull();
+    await act(async () => { answer(); });
+    expect(await screen.findByText("New parts of “The Blackwood Tapes” will download as they arrive."))
+      .toBeTruthy();
+    // Nothing already here is queued by it.
+    expect(enqueueDownloads).not.toHaveBeenCalled();
+    fireEvent.contextMenu(seriesCard()!);
+    expect(menuLabels(screen.getByRole("menu"))).toContain("Stop auto-downloading new parts");
+  });
+
+  it("is not offered for a channel you do not follow, where no part can arrive", async () => {
+    // A playlist added from the Add box: its uploader is never polled.
+    groups = [series({}, {})];
+    renderView({ grouped: true });
+    expect(menuLabels(await openSeriesMenu())).not.toContain("Auto-download new parts");
+  });
+
+  it("offers Stop wherever the mark is, and the card comes back as it was if it fails", async () => {
+    groups = [series({}, { series_auto_download: true })];
+    setSeriesAutoDownload.mockImplementation(() => Promise.reject("database is locked"));
+    renderView({ grouped: true });
+    await waitFor(() => expect(pill()).not.toBeNull());
+    fireEvent.click(within(await openSeriesMenu(), "Stop auto-downloading new parts"));
+
+    expect(setSeriesAutoDownload).toHaveBeenCalledWith("p2", false);
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(pill()).not.toBeNull();
+  });
+
+  it("takes the card out of the Auto-downloading list once it is stopped", async () => {
+    groups = [series({ series_auto_download: true }, { series_auto_download: true })];
+    renderView({ grouped: true, autoDownloading: true });
+    await waitFor(() => expect(lastGroupsFilter().autoDownloading).toBe(true));
+    fireEvent.click(within(await openSeriesMenu(), "Stop auto-downloading new parts"));
+    await waitFor(() => expect(seriesCard()).toBeNull());
+  });
+
+  it("reads the feed again when Stop reached a part on another card", async () => {
+    groups = [series({ series_auto_download: true }, { series_auto_download: true })];
+    setSeriesAutoDownload.mockImplementation(() => Promise.resolve(["p2", "p1", "drifted"]));
+    renderView({ grouped: true });
+    await cardsReady(1);
+    const fetched = listVideoGroups.mock.calls.length;
+    fireEvent.click(within(await openSeriesMenu(), "Stop auto-downloading new parts"));
+    await waitFor(() => expect(listVideoGroups.mock.calls.length).toBe(fetched + 1));
+  });
+
+  it("lets a lone card still carrying the mark stop it, and offers nothing on one without", async () => {
+    videos = [video({ id: "a", series_auto_download: true }), video({ id: "b" })];
+    renderView();
+    const [a, b] = await cardsReady(2);
+    fireEvent.contextMenu(b);
+    expect(menuLabels(screen.getByRole("menu"))).not.toContain("Stop auto-downloading new parts");
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    fireEvent.contextMenu(a);
+    fireEvent.click(within(screen.getByRole("menu"), "Stop auto-downloading new parts"));
+    await waitFor(() => expect(setSeriesAutoDownload).toHaveBeenCalledWith("a", false));
+  });
+
+  it("asks the backend for the auto-downloading cards only while grouped", async () => {
+    groups = [series({}, {})];
+    const { rerender } = renderView({ grouped: true, autoDownloading: true });
+    await waitFor(() => expect(lastGroupsFilter().autoDownloading).toBe(true));
+    rerender({ grouped: false, autoDownloading: true });
+    await waitFor(() => expect(lastFilter().autoDownloading).toBe(false));
+  });
+});
+
 /* ---------------- keeping your place in the feed ---------------- */
 
 /** A library big enough to page, so "the pages it had" means more than one. */
@@ -1379,6 +1525,12 @@ function shelf(n: number): Video[] {
 /** The filter the most recent fetch went out with. */
 function lastFilter(): VideoFilter {
   const calls = listVideos.mock.calls;
+  return calls[calls.length - 1][0];
+}
+
+/** The same, for the grouped feed's fetch. */
+function lastGroupsFilter(): VideoFilter {
+  const calls = listVideoGroups.mock.calls;
   return calls[calls.length - 1][0];
 }
 

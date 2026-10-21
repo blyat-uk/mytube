@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconBusy, IconCaret, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly,
-  IconHidden, IconNewRelease, IconSearch, IconSeries, IconSettings, IconShow, IconSubscriptions,
-  IconUnwatched,
+  IconAutoDownload, IconBusy, IconCaret, IconClose, IconContinue, IconDownload, IconFilters,
+  IconGroupsOnly, IconHidden, IconNewRelease, IconSearch, IconSeries, IconSettings, IconShow,
+  IconSubscriptions, IconUnwatched,
 } from "./Icons";
 import FiltersPanel, { activeFilterCount, SORTS } from "./FiltersPanel";
 import { ChannelButton, ChannelPopover } from "./ChannelPicker";
@@ -80,9 +80,10 @@ function CrumbAction({ glyph, label, title, state, danger, onClick }: {
 
 /**
  * What the series card's menu offers, on the crumb of the series it stands
- * for. Hide (or Un-hide) leads because it is always there; Download comes and
- * goes with what is left to fetch, and last in the row its going moves
- * nothing. Ahead of Hide it would slide Hide under the pointer that had just
+ * for. Hide (or Un-hide) leads because it is always there, and the
+ * auto-download switch, always there too, follows it; Download comes and goes
+ * with what is left to fetch, and last in the row its going moves nothing.
+ * Ahead of the other two it would slide them under the pointer that had just
  * pressed Download.
  */
 function SeriesActionButtons({ a }: { a: SeriesActions }) {
@@ -105,6 +106,23 @@ function SeriesActionButtons({ a }: { a: SeriesActions }) {
           state={a.hiding}
           danger
           onClick={a.onHide}
+        />
+      )}
+      {a.autoDownload ? (
+        <CrumbAction
+          glyph={<IconAutoDownload on />}
+          label="Stop auto-download"
+          title="New parts stop downloading on their own. Nothing already downloaded or queued is touched"
+          state={a.autoing}
+          onClick={a.onStopAutoDownload}
+        />
+      ) : a.autoAvailable && (
+        <CrumbAction
+          glyph={<IconAutoDownload />}
+          label="Auto-download"
+          title="Download every part that joins this series from now on, as soon as it arrives"
+          state={a.autoing}
+          onClick={a.onAutoDownload}
         />
       )}
       {a.due > 0 && (
@@ -143,6 +161,8 @@ interface Props {
   onGroupsOnly: (v: boolean) => void;
   inProgress: boolean;
   onInProgress: (v: boolean) => void;
+  autoDownloading: boolean;
+  onAutoDownloading: (v: boolean) => void;
   /** The open series, or null for the ordinary feed. Replaces the tab strip. */
   series: SeriesCrumb | null;
   /** What the crumb can do with the open series, once its parts are in. Absent
@@ -488,6 +508,18 @@ export default function TopNav(p: Props) {
                       <span className="seg-glyph" aria-hidden="true"><IconContinue /></span>
                       <span className="seg-label">Continue watching</span>
                     </button>
+                    <button
+                      type="button"
+                      className={`seg-btn${p.autoDownloading ? " is-on" : ""}`}
+                      aria-pressed={p.autoDownloading}
+                      aria-label="Auto-downloading"
+                      disabled={off}
+                      title={offHint ?? "Show only series whose new parts download on their own"}
+                      onClick={() => p.onAutoDownloading(!p.autoDownloading)}
+                    >
+                      <span className="seg-glyph" aria-hidden="true"><IconAutoDownload /></span>
+                      <span className="seg-label">Auto-downloading</span>
+                    </button>
                     </>
                   )}
                 </div>
@@ -644,6 +676,8 @@ export default function TopNav(p: Props) {
           onGroupsOnly={p.onGroupsOnly}
           inProgress={p.inProgress}
           onInProgress={p.onInProgress}
+          autoDownloading={p.autoDownloading}
+          onAutoDownloading={p.onAutoDownloading}
           sort={p.sort}
           onSort={p.onSort}
         />

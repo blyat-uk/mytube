@@ -1,6 +1,7 @@
 import { useRef, type ReactElement, type RefObject } from "react";
 import {
-  IconContinue, IconDownload, IconGroupsOnly, IconHidden, IconSeries, IconUnwatched, IconCheck,
+  IconAutoDownload, IconContinue, IconDownload, IconGroupsOnly, IconHidden, IconSeries,
+  IconUnwatched, IconCheck,
 } from "./Icons";
 import ChannelList from "./ChannelList";
 import { usePopover } from "./usePopover";
@@ -14,17 +15,19 @@ export const SORTS: { value: SortOrder; label: string }[] = [
   { value: "parts", label: "Most parts first" },
 ];
 
-/** How many things narrow the list: the five filters and the channel pick,
+/** How many things narrow the list: the six filters and the channel pick,
  *  which is one filter however many channels it holds. Grouping and the sort
- *  only arrange it, so they do not count. The two series-only filters count
+ *  only arrange it, so they do not count. The three series-only filters count
  *  only while grouped, which is when they apply. */
 export function activeFilterCount(f: {
   hideWatched: boolean; downloadedOnly: boolean; showHidden: boolean;
-  grouped: boolean; groupsOnly: boolean; inProgress: boolean; channelIds: readonly string[];
+  grouped: boolean; groupsOnly: boolean; inProgress: boolean; autoDownloading: boolean;
+  channelIds: readonly string[];
 }): number {
   return [
     f.hideWatched, f.downloadedOnly, f.showHidden,
-    f.grouped && f.groupsOnly, f.grouped && f.inProgress, f.channelIds.length > 0,
+    f.grouped && f.groupsOnly, f.grouped && f.inProgress, f.grouped && f.autoDownloading,
+    f.channelIds.length > 0,
   ].filter(Boolean).length;
 }
 
@@ -50,9 +53,15 @@ interface Props {
   onGroupsOnly: (b: boolean) => void;
   inProgress: boolean;
   onInProgress: (b: boolean) => void;
+  autoDownloading: boolean;
+  onAutoDownloading: (b: boolean) => void;
   sort: SortOrder;
   onSort: (s: SortOrder) => void;
 }
+
+/** The channel switch's glyph, outlined, for a Toggle -- which takes a glyph
+ *  with no props of its own. */
+const IconAutoSeries = () => <IconAutoDownload />;
 
 function Toggle({ label, icon: Icon, on, disabled, title, onChange }: {
   label: string; icon: () => ReactElement; on: boolean; disabled: boolean; title?: string;
@@ -106,6 +115,8 @@ export default function FiltersPanel(p: Props) {
                 title={hint} onChange={p.onGroupsOnly} />
               <Toggle label="Continue watching" icon={IconContinue} on={p.inProgress} disabled={p.off}
                 title={hint} onChange={p.onInProgress} />
+              <Toggle label="Auto-downloading" icon={IconAutoSeries} on={p.autoDownloading}
+                disabled={p.off} title={hint} onChange={p.onAutoDownloading} />
             </>
           )}
         </div>

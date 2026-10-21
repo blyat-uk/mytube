@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -255,6 +255,19 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
         }
         conn.execute_batch(PART_LINKS_REFUSED_TRIGGERS)?;
+    }
+
+    // v15: a series set to auto-download. NULL (off, every row) or the instant
+    // it was switched on, which is what tells a new part from the ones already
+    // here -- the series counterpart of `channels.auto_download_since`. Like
+    // `series_hidden` it lives on the parts, since a series has no row, and a
+    // part that joins a marked card later is marked in turn
+    // (`Db::mark_series_auto_download_arrivals`). Machine-local like the
+    // channel switch: never synced, never exported, no trigger.
+    if version < 15 {
+        if !column_exists(conn, "videos", "series_auto_download_since")? {
+            conn.execute("ALTER TABLE videos ADD COLUMN series_auto_download_since INTEGER", [])?;
+        }
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -543,7 +556,8 @@ fn register_search(conn: &Connection) -> rusqlite::Result<()> {
 /// query because [`SortOrder::Length`] has to total a group up while all it
 /// holds is ids, and the rows are already in hand. `watched` rides along for the
 /// same reason: "Continue watching" asks it of every part of a group, hidden and
-/// filtered-out parts included.
+/// filtered-out parts included -- and so does the series auto-download mark, for
+/// "Auto-downloading".
 ///
 /// Only the reading happens here. Building [`siblings::Atoms`] from the entries
 /// -- a regex pass over every title, then a match per candidate pair -- is left
@@ -556,7 +570,8 @@ fn channel_rows(
 ) -> Result<(Vec<siblings::Entry>, HashMap<String, PartFacts>)> {
     let mut former = former_titles(conn, channel_id)?;
     let mut st = conn.prepare_cached(
-        "SELECT id, title, duration_secs, sibling_group, watched, part_links, part_links_refused
+        "SELECT id, title, duration_secs, sibling_group, watched, part_links, part_links_refused,
+                series_auto_download_since IS NOT NULL
          FROM videos WHERE channel_id=?1 AND status='ready'",
     )?;
     let rows = st.query_map(params![channel_id], |r| {
@@ -568,16 +583,17 @@ fn channel_rows(
             r.get::<_, bool>(4)?,
             part_links::decode(r.get::<_, Option<String>>(5)?.as_deref()),
             r.get::<_, bool>(6)?,
+            r.get::<_, bool>(7)?,
         ))
     })?;
 
     let mut entries = Vec::new();
     let mut facts = HashMap::new();
     for row in rows {
-        let (id, title, secs, group, watched, links, refused) = row?;
+        let (id, title, secs, group, watched, links, refused, auto) = row?;
         // A row whose duration has not resolved yet contributes nothing to its
         // series rather than dropping the series out of the ordering.
-        facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched });
+        facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched, auto });
         let former_titles = former.remove(&id).unwrap_or_default();
         entries.push(siblings::Entry { id, title, former_titles, group, links, refused });
     }
@@ -633,11 +649,13 @@ fn former_titles(conn: &Connection, channel_id: &str) -> Result<HashMap<String, 
 }
 
 /// What the grouped walk needs to know about one part once its card is built,
-/// beyond the id: its share of the card's runtime, and whether it was watched.
+/// beyond the id: its share of the card's runtime, whether it was watched, and
+/// whether it carries the series auto-download mark.
 #[derive(Clone, Copy)]
 struct PartFacts {
     secs: i64,
     watched: bool,
+    auto: bool,
 }
 
 /// The feed query, ordered but unpaged: `list_videos` bolts `LIMIT`/`OFFSET`
@@ -874,6 +892,7 @@ fn stats_filter(f: &StatsFilter) -> VideoFilter {
         downloaded_only: false,
         groups_only: false,
         in_progress: false,
+        auto_downloading: false,
         sibling_of: None,
         sort: SortOrder::Newest,
         ..VideoFilter::default()
@@ -1164,8 +1183,9 @@ impl Db {
         Ok(())
     }
 
-    /// Videos the post-poll sweep should queue: new uploads, on channels with
-    /// auto-download on, never queued automatically before.
+    /// Videos the post-poll sweep should queue: new uploads on channels with
+    /// auto-download on, and new parts of series with auto-download on, never
+    /// queued automatically before.
     ///
     /// "New" takes both clocks. `first_seen_at` after the switch keeps out
     /// what was already in the library; `published_at` near or after it keeps
@@ -1173,16 +1193,29 @@ impl Db {
     /// aired long ago. The day of slack absorbs a listing-ingested row still
     /// wearing its midnight-UTC bucket (see `upload_date::is_bucketed`), which
     /// can sit up to a day before the real instant.
+    ///
+    /// A series counts its switch-on from the part's own mark, which the
+    /// arrivals sweep copies from the card it joined
+    /// ([`Db::mark_series_auto_download_arrivals`]). It also takes a part
+    /// *published* after the switch though first seen before it: an upcoming
+    /// premiere already in the library is the next part, and the poll after it
+    /// goes live is when it arrives. A video added by hand is never taken by
+    /// the series rule -- the Add box asked whether to download it.
     pub fn auto_download_candidates(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
             "SELECT v.id FROM videos v JOIN channels c ON c.id = v.channel_id
-              WHERE c.auto_download_since IS NOT NULL AND c.subscribed=1
-                AND c.terminated_at IS NULL
-                AND v.status='ready' AND v.hidden=0 AND v.watched=0 AND v.auto_queued=0
+              WHERE v.status='ready' AND v.hidden=0 AND v.watched=0 AND v.auto_queued=0
                 AND v.download_state='none'
-                AND v.first_seen_at >= c.auto_download_since
-                AND COALESCE(v.published_at, v.first_seen_at) >= c.auto_download_since - 86400
+                AND ((c.auto_download_since IS NOT NULL AND c.subscribed=1
+                      AND c.terminated_at IS NULL
+                      AND v.first_seen_at >= c.auto_download_since
+                      AND COALESCE(v.published_at, v.first_seen_at) >= c.auto_download_since - 86400)
+                  OR (v.series_auto_download_since IS NOT NULL AND v.added_manually=0
+                      AND (v.first_seen_at >= v.series_auto_download_since
+                           OR COALESCE(v.published_at, v.first_seen_at) >= v.series_auto_download_since)
+                      AND COALESCE(v.published_at, v.first_seen_at)
+                          >= v.series_auto_download_since - 86400))
               ORDER BY COALESCE(v.published_at, v.first_seen_at) ASC, v.id ASC")?;
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1689,6 +1722,15 @@ impl Db {
                 members.iter().any(watched) && !members.iter().all(watched)
             });
         }
+        // "Auto-downloading" keeps every card a series mark is on, asked of the
+        // whole group like the two above. A card of one counts as well: the
+        // mark outlives a series coming apart (an unlink, a retitle), and a
+        // lone part still carrying it is still queueing what joins it, so it
+        // must be findable here to be switched off.
+        if f.auto_downloading {
+            let auto = |id: &String| parts.get(id).is_some_and(|p| p.auto);
+            groups.retain(|members| members.iter().any(auto));
+        }
 
         // Two of the sort orders rank a card by something only the finished
         // group knows -- how many parts it holds, or how long they run in
@@ -1982,6 +2024,13 @@ impl Db {
     /// sweep followed a wrong link to hide it. Its `series_hidden_changed_at`
     /// is stamped so the sweep counts it as decided and never hides it again.
     ///
+    /// Its series auto-download mark goes, whatever held it on the card: the
+    /// mark spreads to whatever joins a marked part's card, so one left on a
+    /// part dragged into a series by mistake would go on downloading the show
+    /// it really belongs to. Clearing never downloads anything, and if its
+    /// titles put it back on the series, the parts still marked there carry
+    /// the series on.
+    ///
     /// The claims are read and matched before the write's lock is taken, as in
     /// [`Db::sibling_ids`].
     pub fn unlink_siblings(&self, id: &str) -> Result<()> {
@@ -2002,6 +2051,7 @@ impl Db {
             .optional()?;
         let Some(key) = key else { return Ok(()) };
 
+        tx.execute("UPDATE videos SET series_auto_download_since=NULL WHERE id=?1", params![id])?;
         if let Some(key) = key {
             tx.execute("UPDATE videos SET sibling_group=NULL WHERE id=?1", params![id])?;
             let left: i64 = tx.query_row(
@@ -2220,6 +2270,198 @@ impl Db {
         Ok(changed)
     }
 
+    /// Switches auto-download on (or off) for the series `leader_id` leads, and
+    /// returns the ids of the parts whose mark changed.
+    ///
+    /// On writes now onto every part of the card as the instant new parts are
+    /// counted from -- over [`Db::series_entries`], so an upcoming premiere is
+    /// marked with the rest -- and a part already marked keeps its own instant.
+    /// Nothing already here is queued: a part that aired before the switch is
+    /// backlog, which Download N parts on the same menu is for (see
+    /// [`Db::auto_download_candidates`]).
+    ///
+    /// Off clears the card, and every marked part that a card of a cleared part
+    /// reaches, to a fixpoint. Cards are not symmetric -- the part that leads
+    /// decides what joins -- so a series whose titles drift can show as two
+    /// cards, the newer led by a part the arrivals sweep marked through the
+    /// older. Clearing only the card asked about would leave a mark on the
+    /// other, and the next poll's sweep would mark the cleared parts back
+    /// through it. Reaching wider is the safe direction: switching off never
+    /// downloads anything.
+    ///
+    /// The lock is released for the matching, as in [`Db::sibling_ids`]. An
+    /// unknown leader changes nothing.
+    pub fn set_series_auto_download(&self, leader_id: &str, on: bool) -> Result<Vec<String>> {
+        let (entries, marked) = {
+            let conn = self.conn.lock().unwrap();
+            let channel_id: Option<String> = conn
+                .query_row("SELECT channel_id FROM videos WHERE id=?1", params![leader_id],
+                           |r| r.get(0))
+                .optional()?;
+            let Some(channel_id) = channel_id else { return Ok(Vec::new()) };
+            let mut st = conn.prepare_cached(
+                "SELECT id FROM videos
+                 WHERE channel_id=?1 AND series_auto_download_since IS NOT NULL")?;
+            let marked: HashSet<String> = st
+                .query_map(params![channel_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            (Self::series_entries(&conn, &channel_id)?, marked)
+        };
+        let atoms = siblings::Atoms::new(entries);
+        let mut parts: Vec<String> =
+            atoms.group_led_by(leader_id).into_iter().map(String::from).collect();
+        if !on {
+            let mut seen: HashSet<String> = parts.iter().cloned().collect();
+            let mut todo = parts.clone();
+            while let Some(id) = todo.pop() {
+                for m in atoms.group_led_by(&id) {
+                    if marked.contains(m) && seen.insert(m.to_string()) {
+                        parts.push(m.to_string());
+                        todo.push(m.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = Vec::new();
+        {
+            let at = now();
+            let mut set = tx.prepare(
+                "UPDATE videos SET series_auto_download_since=?2
+                 WHERE id=?1 AND series_auto_download_since IS NULL")?;
+            let mut clear = tx.prepare(
+                "UPDATE videos SET series_auto_download_since=NULL
+                 WHERE id=?1 AND series_auto_download_since IS NOT NULL")?;
+            for id in parts {
+                let n = if on { set.execute(params![id, at])? } else { clear.execute(params![id])? };
+                if n > 0 { changed.push(id); }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Marks every part that has joined a card holding a series auto-download
+    /// mark since that mark was set, so the poll's sweep queues it
+    /// ([`Db::auto_download_candidates`]) and the part after it follows in turn,
+    /// and returns the ids.
+    ///
+    /// Run by a poll before its auto-download sweep: a new part arrives
+    /// unmarked, and this is what puts it on its series' clock. The mark it
+    /// takes is the series' own instant, never now, so "published no more than
+    /// a day before the switch" still keeps out a back-catalogue part a
+    /// deepened listing inserts today -- marked, which costs nothing, but never
+    /// queued.
+    ///
+    /// A candidate is a row with no mark, not added by hand (pasting it into
+    /// the Add box was the moment to choose), first seen at or after the
+    /// earliest mark on its channel. It is marked when the card it would lead
+    /// holds a part marked no later than it was first seen -- a part already
+    /// here when the switch went on is not new to the series, whichever card
+    /// it sits on -- and takes the earliest such instant. Each one marked
+    /// counts as marked for the rest, repeated until nothing changes, as in
+    /// [`Db::hide_series_arrivals`]: that chaining is what follows a series
+    /// whose titles drift.
+    ///
+    /// A part that arrives hidden -- the hide sweep runs first, so that is a
+    /// part of a series also hidden as a whole -- is marked and flagged
+    /// `auto_queued` in the same write: the approved rule is that such a part
+    /// is never downloaded, and without the flag un-hiding the series would
+    /// queue every part that came in while it was hidden, all at once.
+    ///
+    /// Only channels holding a mark are read, with the lock released for the
+    /// matching. The write takes only rows still unmarked, and only while the
+    /// part the mark was copied from still carries one -- a Stop landing in
+    /// the gap must not be undone by a mark taken from before it -- so two
+    /// callers racing over one part never both report it.
+    pub fn mark_series_auto_download_arrivals(&self) -> Result<Vec<String>> {
+        // Per channel holding a mark: every row on it, the marked ones with
+        // their instants, and the candidates with when each was first seen.
+        type ChannelScan = (Vec<siblings::Entry>, HashMap<String, i64>, Vec<(String, i64)>);
+        let channels: Vec<ChannelScan> = {
+            let conn = self.conn.lock().unwrap();
+            let ids: Vec<String> = {
+                let mut st = conn.prepare(
+                    "SELECT DISTINCT channel_id FROM videos
+                     WHERE series_auto_download_since IS NOT NULL")?;
+                let rows = st.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut out = Vec::new();
+            for channel_id in ids {
+                let mut st = conn.prepare_cached(
+                    "SELECT id, series_auto_download_since, first_seen_at FROM videos
+                     WHERE channel_id=?1
+                       AND (series_auto_download_since IS NOT NULL OR added_manually=0)")?;
+                let rows = st.query_map(params![channel_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, i64>(2)?))
+                })?;
+                let (mut marked, mut unmarked) = (HashMap::new(), Vec::new());
+                for row in rows {
+                    let (id, since, seen) = row?;
+                    match since {
+                        Some(since) => { marked.insert(id, since); }
+                        None => unmarked.push((id, seen)),
+                    }
+                }
+                let Some(&earliest) = marked.values().min() else { continue };
+                unmarked.retain(|(_, seen)| *seen >= earliest);
+                if unmarked.is_empty() { continue; }
+                out.push((Self::series_entries(&conn, &channel_id)?, marked, unmarked));
+            }
+            out
+        };
+
+        // Each part to mark, its instant, and the marked part it came from.
+        let mut mark: Vec<(String, i64, String)> = Vec::new();
+        for (entries, mut marked, candidates) in channels {
+            let atoms = siblings::Atoms::new(entries);
+            // Each candidate's card once, up front, as in the hide sweep. A
+            // card of one holds nothing but the candidate, which is unmarked.
+            let mut pending: Vec<(&str, i64, Vec<&str>)> = candidates
+                .iter()
+                .map(|(id, seen)| (id.as_str(), *seen, atoms.group_led_by(id)))
+                .filter(|(_, _, card)| card.len() > 1)
+                .collect();
+            loop {
+                let before = pending.len();
+                pending.retain(|(id, seen, card)| {
+                    let from = card.iter()
+                        .filter_map(|m| marked.get(*m).map(|since| (*since, *m)))
+                        .filter(|(since, _)| since <= seen)
+                        .min();
+                    let Some((since, from)) = from else { return true };
+                    mark.push((id.to_string(), since, from.to_string()));
+                    marked.insert(id.to_string(), since);
+                    false
+                });
+                if pending.len() == before { break; }
+            }
+        }
+        if mark.is_empty() { return Ok(Vec::new()); }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = Vec::new();
+        {
+            // In the order they were found, so a part marked through another
+            // arrival finds that one already written.
+            let mut st = tx.prepare(
+                "UPDATE videos SET series_auto_download_since=?2,
+                                   auto_queued=MAX(auto_queued, hidden)
+                 WHERE id=?1 AND series_auto_download_since IS NULL
+                   AND EXISTS (SELECT 1 FROM videos
+                               WHERE id=?3 AND series_auto_download_since IS NOT NULL)")?;
+            for (id, since, from) in mark {
+                if st.execute(params![id, since, from])? > 0 { changed.push(id); }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn set_watched(&self, id: &str, watched: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET watched=?2, watched_at=?3 WHERE id=?1",
@@ -2393,7 +2635,7 @@ SELECT v.id, v.channel_id, c.title, v.title, v.description, v.thumb_url, v.thumb
        v.duration_secs, v.view_count, v.status, v.hidden,
        v.watched, v.watched_at, v.download_state, v.download_error, v.file_path,
        v.downloaded_at, v.first_seen_at, v.sibling_group, v.series_hidden,
-       v.part_links_refused
+       v.part_links_refused, v.series_auto_download_since IS NOT NULL
 FROM videos v JOIN channels c ON c.id = v.channel_id";
 
 /// The same shape as `SELECT_VIDEO` -- the join stays, since `By channel`
@@ -2417,6 +2659,7 @@ fn map_video(r: &Row) -> rusqlite::Result<Video> {
         sibling_group: r.get(22)?,
         series_hidden: r.get::<_, i64>(23)? != 0,
         part_links_refused: r.get::<_, i64>(24)? != 0,
+        series_auto_download: r.get::<_, i64>(25)? != 0,
         part_linked: false,
     })
 }
@@ -4638,7 +4881,8 @@ mod import_tests {
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
                 first_seen_at: 500, sibling_group: None, series_hidden: false,
-                part_links_refused: false, part_linked: false }
+                part_links_refused: false, series_auto_download: false,
+                part_linked: false }
     }
 
     /// Every user-owned column set to something distinguishable, so a round
@@ -5435,7 +5679,8 @@ mod auto_download_tests {
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
                 first_seen_at: SINCE + 60, sibling_group: None, series_hidden: false,
-                part_links_refused: false, part_linked: false }
+                part_links_refused: false, series_auto_download: false,
+                part_linked: false }
     }
 
     #[test]
@@ -6316,6 +6561,393 @@ mod series_tests {
 }
 
 #[cfg(test)]
+mod series_auto_download_tests {
+    use super::*;
+
+    const CH: &str = "UC1";
+
+    /// The switch-on instant, rewritten to something fixed so a test can place
+    /// rows either side of it without racing the clock.
+    const SINCE: i64 = 1_000_000;
+    /// First seen (and published) well before the switch: already here.
+    const BEFORE: i64 = 500_000;
+    /// First seen (and published) after it: a new arrival.
+    const AFTER: i64 = SINCE + 60;
+
+    fn db() -> Db {
+        let d = Db::open_in_memory().unwrap();
+        d.upsert_channel(&Channel {
+            id: CH.into(), title: "One".into(), handle: None, url: "u".into(), thumb_path: None,
+            subscribed: true, member: false, added_at: 0, last_polled_at: None,
+            terminated: false, auto_download: false,
+        }).unwrap();
+        d
+    }
+
+    /// A ready, unwatched, visible, undownloaded row on `CH`, first seen and
+    /// published at `at`.
+    fn part(d: &Db, id: &str, title: &str, at: i64) {
+        d.conn.lock().unwrap().execute(
+            "INSERT INTO videos (id,channel_id,title,published_at,sort_at,status,first_seen_at)
+             VALUES (?1,?2,?3,?4,?4,'ready',?4)",
+            params![id, CH, title, at]).unwrap();
+    }
+
+    fn sql(d: &Db, s: &str) { d.conn.lock().unwrap().execute_batch(s).unwrap(); }
+
+    /// Switches `leader`'s series on and pins every mark to `SINCE`.
+    fn switch_on(d: &Db, leader: &str) -> Vec<String> {
+        let changed = d.set_series_auto_download(leader, true).unwrap();
+        d.conn.lock().unwrap().execute(
+            "UPDATE videos SET series_auto_download_since=?1
+             WHERE series_auto_download_since IS NOT NULL", params![SINCE]).unwrap();
+        sorted(changed)
+    }
+
+    fn since(d: &Db, id: &str) -> Option<i64> {
+        d.conn.lock().unwrap().query_row(
+            "SELECT series_auto_download_since FROM videos WHERE id=?1", params![id],
+            |r| r.get(0)).unwrap()
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> { ids.sort(); ids }
+
+    /// The Blackwood Tapes, parts 1 and 2, already in the library, and an
+    /// unrelated upload beside them.
+    fn tapes(d: &Db) {
+        part(d, "p1", "The Blackwood Tapes Pt 1", BEFORE);
+        part(d, "p2", "The Blackwood Tapes Pt 2", BEFORE + 1);
+        part(d, "other", "Cooking With Gas", BEFORE + 2);
+    }
+
+    // ---- switching on and off ----
+
+    #[test]
+    fn switching_on_marks_every_part_including_one_not_ready_yet() {
+        let d = db();
+        tapes(&d);
+        part(&d, "p3", "The Blackwood Tapes Pt 3", SINCE + 86_400);
+        sql(&d, "UPDATE videos SET status='upcoming' WHERE id='p3'");
+
+        let before = now();
+        let changed = sorted(d.set_series_auto_download("p1", true).unwrap());
+        assert_eq!(changed, vec!["p1", "p2", "p3"]);
+        assert!(since(&d, "p2").is_some_and(|s| (before..=now()).contains(&s)), "stamped now");
+        assert_eq!(since(&d, "other"), None, "not a part, not touched");
+        assert!(d.get_video("p1").unwrap().unwrap().series_auto_download);
+        assert!(!d.get_video("other").unwrap().unwrap().series_auto_download);
+
+        assert!(d.set_series_auto_download("p2", true).unwrap().is_empty(),
+                "led from another part, the same series is already on");
+    }
+
+    #[test]
+    fn switching_on_queues_nothing_already_here() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        assert!(d.auto_download_candidates().unwrap().is_empty(),
+                "Download N parts is for the backlog; the switch is for what comes next");
+    }
+
+    #[test]
+    fn switching_off_clears_every_part_and_new_parts_are_just_new_parts() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        assert_eq!(sorted(d.set_series_auto_download("p2", false).unwrap()), vec!["p1", "p2"]);
+        assert_eq!(since(&d, "p1"), None);
+        assert_eq!(since(&d, "p2"), None);
+
+        part(&d, "p3", "The Blackwood Tapes Pt 3", AFTER);
+        assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
+        assert!(d.auto_download_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_leader_changes_nothing() {
+        let d = db();
+        tapes(&d);
+        assert!(d.set_series_auto_download("no such video", true).unwrap().is_empty());
+        assert!(d.set_series_auto_download("no such video", false).unwrap().is_empty());
+    }
+
+    // ---- arrivals ----
+
+    #[test]
+    fn a_part_arriving_after_the_switch_is_marked_with_the_series_instant_and_queued() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+
+        part(&d, "p3", "The Blackwood Tapes Pt 3", AFTER);
+        part(&d, "stranger", "A Quiet Walk", AFTER);
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p3"]);
+        assert_eq!(since(&d, "p3"), Some(SINCE), "the series' clock, not the sweep's");
+        assert_eq!(since(&d, "stranger"), None);
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["p3"]);
+
+        assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty(), "nothing to do twice");
+        d.mark_auto_queued(&["p3".to_string()]).unwrap();
+        assert!(d.auto_download_candidates().unwrap().is_empty(),
+                "queued once: a cancelled or deleted download never comes back by itself");
+    }
+
+    #[test]
+    fn a_drifting_series_is_followed_one_part_at_a_time() {
+        let d = db();
+        part(&d, "p5", "The Long Road", BEFORE);
+        part(&d, "p6", "The Long Road Part 6", BEFORE + 1);
+        switch_on(&d, "p6");
+
+        // p7 shares nothing with p5; it joins through p6.
+        part(&d, "p7", "The Long Road Home", AFTER);
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p7"]);
+        // And whatever p7's own name reaches next follows through p7.
+        part(&d, "p8", "The Long Road Home Part 2", AFTER + 1);
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p8"]);
+        assert_eq!(sorted(d.auto_download_candidates().unwrap()), vec!["p7", "p8"]);
+    }
+
+    #[test]
+    fn two_arrivals_in_one_sweep_where_the_second_matches_only_the_first() {
+        let d = db();
+        part(&d, "p5", "The Long Road", BEFORE);
+        switch_on(&d, "p5");
+        // p7 first, so a single pass in insertion order would reach it before
+        // p6 was marked and leave it out.
+        part(&d, "p7", "The Long Road Home", AFTER);
+        part(&d, "p6", "The Long Road Part 6", AFTER + 1);
+        assert_eq!(sorted(d.mark_series_auto_download_arrivals().unwrap()), vec!["p6", "p7"]);
+    }
+
+    #[test]
+    fn a_part_already_here_at_the_switch_is_not_new_to_the_series() {
+        let d = db();
+        part(&d, "p5", "The Long Road", BEFORE);
+        part(&d, "p6", "The Long Road Part 6", BEFORE + 1);
+        part(&d, "p7", "The Long Road Home", BEFORE + 2);
+        // p5's card is p5 and p6; p7, on p6's other card, was here all along.
+        assert_eq!(switch_on(&d, "p5"), vec!["p5", "p6"]);
+        assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
+        assert_eq!(since(&d, "p7"), None);
+    }
+
+    #[test]
+    fn switching_off_reaches_the_parts_a_drift_marked_on_another_card() {
+        let d = db();
+        part(&d, "p5", "The Long Road", BEFORE);
+        part(&d, "p6", "The Long Road Part 6", BEFORE + 1);
+        switch_on(&d, "p5");
+        part(&d, "p7", "The Long Road Home", AFTER);
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p7"]);
+
+        // Off from p7's card (p7 and p6): p5, on p6's other card, goes too, or
+        // the next sweep would mark p6 and p7 straight back through it.
+        assert_eq!(sorted(d.set_series_auto_download("p7", false).unwrap()),
+                   vec!["p5", "p6", "p7"]);
+        part(&d, "p8", "The Long Road Home Part 2", AFTER + 1);
+        assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
+        for id in ["p5", "p6", "p7", "p8"] {
+            assert_eq!(since(&d, id), None, "{id}");
+        }
+    }
+
+    // ---- what gets queued ----
+
+    #[test]
+    fn only_a_new_part_you_could_want_is_queued() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        for (id, n) in [("ok", 3), ("watched", 4), ("hidden", 5), ("done", 6), ("failed", 7),
+                        ("queued_before", 8), ("pasted", 9), ("not_ready", 10)] {
+            part(&d, id, &format!("The Blackwood Tapes Pt {n}"), AFTER + n);
+        }
+        sql(&d, "UPDATE videos SET watched=1 WHERE id='watched';
+                 UPDATE videos SET hidden=1 WHERE id='hidden';
+                 UPDATE videos SET download_state='done' WHERE id='done';
+                 UPDATE videos SET download_state='failed' WHERE id='failed';
+                 UPDATE videos SET auto_queued=1 WHERE id='queued_before';
+                 UPDATE videos SET added_manually=1 WHERE id='pasted';
+                 UPDATE videos SET status='upcoming' WHERE id='not_ready';");
+        let marked = sorted(d.mark_series_auto_download_arrivals().unwrap());
+        assert!(!marked.contains(&"pasted".to_string()), "the Add box asked about that one");
+        assert!(marked.contains(&"not_ready".to_string()), "the next part, marked for when it airs");
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["ok"]);
+    }
+
+    #[test]
+    fn a_back_catalogue_part_inserted_now_is_marked_but_never_queued() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        // What a deepened listing inserts: first seen now, aired long ago.
+        part(&d, "p0", "The Blackwood Tapes Pt 0", AFTER);
+        sql(&d, &format!("UPDATE videos SET published_at={BEFORE} WHERE id='p0'"));
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p0"]);
+        assert!(d.auto_download_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_premiere_already_here_at_the_switch_is_queued_once_it_airs() {
+        let d = db();
+        tapes(&d);
+        part(&d, "p3", "The Blackwood Tapes Pt 3", BEFORE + 3);
+        sql(&d, &format!("UPDATE videos SET status='upcoming', published_at={AFTER} WHERE id='p3'"));
+        switch_on(&d, "p1");
+        assert_eq!(since(&d, "p3"), Some(SINCE), "marked with the rest");
+        assert!(d.auto_download_candidates().unwrap().is_empty(), "not live yet");
+
+        sql(&d, "UPDATE videos SET status='ready' WHERE id='p3'");
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["p3"]);
+    }
+
+    #[test]
+    fn a_part_of_a_series_also_hidden_arrives_hidden_and_is_never_queued() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        d.set_series_hidden("p1", true).unwrap();
+        part(&d, "p3", "The Blackwood Tapes Pt 3", AFTER);
+        // The poll's order: the hide sweep, then the auto-download sweep.
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p3"]);
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p3"]);
+        assert!(d.auto_download_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn un_hiding_the_series_does_not_download_what_arrived_while_it_was_hidden() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        d.set_series_hidden("p1", true).unwrap();
+        part(&d, "p3", "The Blackwood Tapes Pt 3", AFTER);
+        d.hide_series_arrivals().unwrap();
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["p3"]);
+
+        d.set_series_hidden("p1", false).unwrap();
+        assert!(d.auto_download_candidates().unwrap().is_empty(),
+                "a part that arrived hidden was never going to download");
+        // The series itself is still on: the next part comes down as usual.
+        part(&d, "p4", "The Blackwood Tapes Pt 4", AFTER + 1);
+        d.mark_series_auto_download_arrivals().unwrap();
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["p4"]);
+    }
+
+    #[test]
+    fn unlinking_a_part_dragged_in_by_mistake_takes_its_mark_with_it() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        // A new episode of another show, dropped on the series by a slip.
+        part(&d, "r1", "Night Shift Diaries Episode 1", AFTER);
+        d.mark_siblings(&["r1".to_string(), "p1".to_string()]).unwrap();
+        assert_eq!(d.mark_series_auto_download_arrivals().unwrap(), vec!["r1"]);
+
+        d.unlink_siblings("r1").unwrap();
+        assert_eq!(since(&d, "r1"), None);
+        // Otherwise every later episode of that show would join r1's card,
+        // find it marked, and download.
+        part(&d, "r2", "Night Shift Diaries Episode 2", AFTER + 1);
+        assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
+        assert_eq!(since(&d, "p1"), Some(SINCE), "the series it was dropped on stays on");
+    }
+
+    #[test]
+    fn an_import_leaves_the_mark_alone() {
+        for mode in [ImportMode::Merge, ImportMode::Replace] {
+            let d = db();
+            tapes(&d);
+            switch_on(&d, "p1");
+            let mut incoming = d.get_video("p1").unwrap().unwrap();
+            incoming.series_auto_download = false;
+            let channel = d.get_channel(CH).unwrap().unwrap();
+            d.apply_import(&[channel], &[incoming], &HashMap::new(), mode, &[CH.to_string()])
+                .unwrap();
+            assert_eq!(since(&d, "p1"), Some(SINCE), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_part_is_queued_once_whichever_switch_took_it() {
+        let d = db();
+        tapes(&d);
+        switch_on(&d, "p1");
+        d.set_channel_auto_download(CH, true).unwrap();
+        sql(&d, &format!("UPDATE channels SET auto_download_since={SINCE}"));
+        part(&d, "p3", "The Blackwood Tapes Pt 3", AFTER);
+        d.mark_series_auto_download_arrivals().unwrap();
+        assert_eq!(d.auto_download_candidates().unwrap(), vec!["p3"]);
+    }
+
+    // ---- the filter ----
+
+    #[test]
+    fn auto_downloading_keeps_only_the_cards_a_mark_is_on_lone_ones_included() {
+        let d = db();
+        tapes(&d);
+        part(&d, "q1", "Night Shift Diaries Episode 1", BEFORE + 3);
+        part(&d, "q2", "Night Shift Diaries Episode 2", BEFORE + 4);
+        part(&d, "lone", "Something Else Entirely", BEFORE + 5);
+        switch_on(&d, "p1");
+        // A part left carrying a mark after its series came apart.
+        sql(&d, &format!("UPDATE videos SET series_auto_download_since={SINCE} WHERE id='lone'"));
+
+        let f = VideoFilter { auto_downloading: true, ..Default::default() };
+        let cards: Vec<Vec<String>> = d.list_video_groups(&f).unwrap()
+            .into_iter()
+            .map(|g| sorted(g.videos.into_iter().map(|v| v.id).collect()))
+            .collect();
+        assert_eq!(cards.len(), 2, "{cards:?}");
+        assert!(cards.contains(&vec!["p1".to_string(), "p2".to_string()]));
+        assert!(cards.contains(&vec!["lone".to_string()]));
+
+        let all = d.list_video_groups(&VideoFilter::default()).unwrap();
+        assert_eq!(all.len(), 4, "off, every card");
+        assert_eq!(d.list_videos(&f).unwrap().len(), 6, "ungrouped ignores it");
+    }
+
+    // ---- what it is not ----
+
+    #[test]
+    fn the_mark_is_not_synced() {
+        let d = db();
+        tapes(&d);
+        d.set_hidden("p1", true).unwrap(); // so the snapshot carries the row
+        let before = d.sync_snapshot("m").unwrap();
+        switch_on(&d, "p1");
+        assert_eq!(d.sync_snapshot("m").unwrap(), before, "nothing to push, nothing dirty");
+    }
+
+    #[test]
+    fn migrating_a_v14_database_adds_the_column_and_marks_nothing() {
+        let conn = super::part_links_tests::v13();
+        conn.execute_batch(
+            "ALTER TABLE videos ADD COLUMN part_links TEXT;
+             ALTER TABLE videos ADD COLUMN description_tried_at INTEGER;
+             ALTER TABLE videos ADD COLUMN part_links_refused INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE videos ADD COLUMN part_links_refused_changed_at INTEGER;",
+        ).unwrap();
+        conn.execute_batch(PART_LINKS_REFUSED_TRIGGERS).unwrap();
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        conn.execute_batch(
+            "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7);
+             INSERT INTO videos (id,channel_id,title,status,first_seen_at)
+               VALUES ('a','UC1','A','ready',1);",
+        ).unwrap();
+
+        let d = Db::init(conn).unwrap();
+        let version: i64 = d.conn.lock().unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(since(&d, "a"), None);
+        assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod sync_tests {
     use super::*;
     use std::ops::RangeInclusive;
@@ -6350,7 +6982,8 @@ mod sync_tests {
                 watched: false, watched_at: None, download_state: DownloadState::None,
                 download_error: None, file_path: None, downloaded_at: None,
                 first_seen_at: 500, sibling_group: None, series_hidden: false,
-                part_links_refused: false, part_linked: false }
+                part_links_refused: false, series_auto_download: false,
+                part_linked: false }
     }
 
     /// Raw SQL, for what only a migration, the clock or another machine
@@ -8584,7 +9217,7 @@ mod part_links_tests {
     }
 
     /// A database exactly as v13 left it.
-    fn v13() -> Connection {
+    pub(super) fn v13() -> Connection {
         let conn = super::channel_meta_tests::v12();
         conn.execute_batch(
             "ALTER TABLE channels ADD COLUMN avatar_url TEXT;
@@ -8618,7 +9251,6 @@ mod part_links_tests {
         let version: i64 = d.conn.lock().unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 14);
         assert_eq!(column::<Option<String>>(&d, "p2", "part_links"), None, "derived later");
         assert_eq!(column::<i64>(&d, "p2", "part_links_refused"), 0);
         assert_eq!(column::<Option<i64>>(&d, "p2", "description_tried_at"), None);
@@ -8722,7 +9354,8 @@ mod part_links_tests {
                 download_state: DownloadState::None, download_error: None, file_path: None,
                 downloaded_at: None, first_seen_at: 500, sibling_group: None,
                 series_hidden: false,
-                part_links_refused: false, part_linked: false }
+                part_links_refused: false, series_auto_download: false,
+                part_linked: false }
     }
 
     fn import(d: &Db, videos: &[Video], mode: ImportMode) {

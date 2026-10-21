@@ -43,6 +43,8 @@ function props(over: Partial<Props> = {}): Props {
     onGroupsOnly: vi.fn(),
     inProgress: false,
     onInProgress: vi.fn(),
+    autoDownloading: false,
+    onAutoDownloading: vi.fn(),
     sort: "newest",
     onSort: vi.fn(),
     series: null,
@@ -167,8 +169,10 @@ describe("the series breadcrumb", () => {
 describe("the series actions on the crumb", () => {
   function actions(over: Partial<SeriesActions> = {}): SeriesActions {
     return {
-      due: 3, marked: false, downloading: "idle", hiding: "idle",
-      onDownload: vi.fn(), onHide: vi.fn(), onUnhide: vi.fn(),
+      due: 3, marked: false, downloading: "idle", hiding: "idle", autoDownload: false,
+      autoAvailable: true, autoing: "idle",
+      onDownload: vi.fn(), onHide: vi.fn(), onUnhide: vi.fn(), onAutoDownload: vi.fn(),
+      onStopAutoDownload: vi.fn(),
       ...over,
     };
   }
@@ -176,20 +180,20 @@ describe("the series actions on the crumb", () => {
   const names = () =>
     Array.from(group()!.querySelectorAll("button")).map((b) => b.getAttribute("aria-label"));
 
-  it("offers the card menu's two, hide first, right after the crumb", () => {
+  it("offers the card menu's three, hide first, right after the crumb", () => {
     renderNav({ series: SERIES, seriesActions: actions() });
-    expect(names()).toEqual(["Hide series", "Download 3 parts"]);
+    expect(names()).toEqual(["Hide series", "Auto-download", "Download 3 parts"]);
     // Beside the breadcrumb rather than inside it: the crumb is navigation.
     expect(screen.getByLabelText("Breadcrumb").nextElementSibling).toBe(group());
   });
 
   it("counts a single part left as one part, and offers no download once none is", () => {
     renderNav({ series: SERIES, seriesActions: actions({ due: 1 }) });
-    expect(names()).toEqual(["Hide series", "Download 1 part"]);
+    expect(names()).toEqual(["Hide series", "Auto-download", "Download 1 part"]);
     cleanup();
 
     renderNav({ series: SERIES, seriesActions: actions({ due: 0 }) });
-    expect(names()).toEqual(["Hide series"]);
+    expect(names()).toEqual(["Hide series", "Auto-download"]);
   });
 
   it("wears the menu's danger tone on Hide, and offers Un-hide instead while marked", () => {
@@ -199,7 +203,7 @@ describe("the series actions on the crumb", () => {
 
     const a = actions({ marked: true });
     renderNav({ series: SERIES, seriesActions: a });
-    expect(names()).toEqual(["Un-hide series", "Download 3 parts"]);
+    expect(names()).toEqual(["Un-hide series", "Auto-download", "Download 3 parts"]);
     expect(button("Un-hide series").classList.contains("is-danger")).toBe(false);
     fireEvent.click(button("Un-hide series"));
     expect(a.onUnhide).toHaveBeenCalledTimes(1);
@@ -213,6 +217,37 @@ describe("the series actions on the crumb", () => {
     fireEvent.click(button("Hide series"));
     expect(a.onDownload).toHaveBeenCalledTimes(1);
     expect(a.onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches auto-download on, and offers Stop in its place while it is on", () => {
+    const a = actions();
+    renderNav({ series: SERIES, seriesActions: a });
+    fireEvent.click(button("Auto-download"));
+    expect(a.onAutoDownload).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    const on = actions({ autoDownload: true, autoing: "slow" });
+    renderNav({ series: SERIES, seriesActions: on });
+    expect(names()).toEqual(["Hide series", "Stop auto-download", "Download 3 parts"]);
+    const stop = button("Stop auto-download");
+    expect(stop.disabled).toBe(true);
+    expect(stop.classList.contains("is-spinning")).toBe(true);
+    cleanup();
+
+    const idle = actions({ autoDownload: true });
+    renderNav({ series: SERIES, seriesActions: idle });
+    fireEvent.click(button("Stop auto-download"));
+    expect(idle.onStopAutoDownload).toHaveBeenCalledTimes(1);
+    expect(idle.onAutoDownload).not.toHaveBeenCalled();
+  });
+
+  it("leaves auto-download out where no part can arrive, but always offers Stop", () => {
+    renderNav({ series: SERIES, seriesActions: actions({ autoAvailable: false }) });
+    expect(names()).toEqual(["Hide series", "Download 3 parts"]);
+    cleanup();
+
+    renderNav({ series: SERIES, seriesActions: actions({ autoAvailable: false, autoDownload: true }) });
+    expect(names()).toEqual(["Hide series", "Stop auto-download", "Download 3 parts"]);
   });
 
   /* Download takes itself away once nothing is left, so a double-click's
@@ -528,6 +563,37 @@ describe("the continue-watching filter", () => {
   it("is switched off while a series is open, like the other filters", () => {
     renderNav({ grouped: true, inProgress: true, series: SERIES });
     expect(button("Continue watching").disabled).toBe(true);
+  });
+});
+
+/** "Auto-downloading" narrows to series set to auto-download: grouped only too. */
+describe("the auto-downloading filter", () => {
+  it("is absent until siblings are grouped", () => {
+    renderNav();
+    expect(screen.queryByRole("button", { name: "Auto-downloading" })).toBeNull();
+  });
+
+  it("joins the filters once they are, after Continue watching, and toggles", () => {
+    const p = renderNav({ grouped: true });
+    const seg = screen.getByRole("group", { name: "Filters" });
+    const labels = Array.from(seg.querySelectorAll("button")).map((b) => b.getAttribute("aria-label"));
+    expect(labels.slice(-2)).toEqual(["Continue watching", "Auto-downloading"]);
+    const chip = screen.getByRole("button", { name: "Auto-downloading" });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(p.onAutoDownloading).toHaveBeenCalledWith(true);
+  });
+
+  it("shows itself pressed while on, and is switched off while a series is open", () => {
+    const p = renderNav({ grouped: true, autoDownloading: true });
+    const chip = screen.getByRole("button", { name: "Auto-downloading" });
+    expect(chip.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(chip);
+    expect(p.onAutoDownloading).toHaveBeenCalledWith(false);
+    cleanup();
+
+    renderNav({ grouped: true, autoDownloading: true, series: SERIES });
+    expect(button("Auto-downloading").disabled).toBe(true);
   });
 });
 

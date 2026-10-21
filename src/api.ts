@@ -44,6 +44,12 @@ export const api = {
    *  which can include parts not on screen yet, such as a coming premiere. */
   setSeriesHidden: (leaderId: string, hidden: boolean) =>
     invoke<string[]>("set_series_hidden", { leaderId, hidden }),
+  /** Switches a series' auto-download, named by the part leading its card.
+   *  On queues nothing: only parts that join the series from now on download,
+   *  each in the poll that brings it in. Resolves with the ids of every part
+   *  whose mark changed -- switching off can reach parts on another card. */
+  setSeriesAutoDownload: (leaderId: string, enabled: boolean) =>
+    invoke<string[]>("set_series_auto_download", { leaderId, enabled }),
   deleteVideo: (videoId: string) => invoke<void>("delete_video", { videoId }),
   pollAll: () => invoke<PollSummary>("poll_all"),
   pollChannel: (channelId: string) => invoke<PollSummary>("poll_channel", { channelId }),

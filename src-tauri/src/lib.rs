@@ -193,6 +193,7 @@ pub fn run() {
             commands::preview_takeout_csv,
             commands::set_video_hidden,
             commands::set_series_hidden,
+            commands::set_series_auto_download,
             commands::delete_video,
             commands::subscription_stats,
             commands::feed_stats,

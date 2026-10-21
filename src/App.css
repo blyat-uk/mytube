@@ -1227,6 +1227,17 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 /* Its top is the Added pill's: 7px in, 4px of padding, a 1.15rem line at 1.5,
    and 3.75px of air -- 32px at 100%, lower as the text grows. */
 .pill-added ~ .pill-linked { top: calc(14.75px + 1.725rem); }
+/* A series whose new parts download on their own, in the downloaded green. A
+   series card wears neither Added nor Linked, so the corner is its own. */
+.pill-auto {
+  left: 7px; top: 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(86, 211, 100, 0.92);
+  color: #0d2a12;
+}
+.pill-auto .icon { width: 1.2em; height: 1.2em; }
 .card-overlay {
   position: absolute;
   z-index: 2;

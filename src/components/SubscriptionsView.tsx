@@ -99,9 +99,19 @@ export interface SeriesActions {
   downloading: CallState;
   /** Hide and Un-hide share one key, as they do in the menu. */
   hiding: CallState;
+  /** Some part carries the auto-download mark, so Stop is offered in place of
+   *  switching it on. */
+  autoDownload: boolean;
+  /** The series' channel is polled, so a new part can arrive at all: switching
+   *  on is offered only then. Stop is offered wherever the mark is. */
+  autoAvailable: boolean;
+  /** On and Stop share one key, as Hide and Un-hide do. */
+  autoing: CallState;
   onDownload: () => void;
   onHide: () => void;
   onUnhide: () => void;
+  onAutoDownload: () => void;
+  onStopAutoDownload: () => void;
 }
 
 interface Props {
@@ -119,6 +129,8 @@ interface Props {
   groupsOnly: boolean;
   /** Grouped only: just the series with some parts watched and some not. */
   inProgress: boolean;
+  /** Grouped only: just the series set to auto-download. */
+  autoDownloading: boolean;
   /** When set, the grid shows this video's series instead of the feed. */
   siblingOf: Video | null;
   /** The stem comes from a series card; a lone card has only its title. */
@@ -177,6 +189,7 @@ export default function SubscriptionsView(p: Props) {
   const grouped = p.grouped && siblingOf === null;
   const groupsOnly = grouped && p.groupsOnly;
   const inProgress = grouped && p.inProgress;
+  const autoDownloading = grouped && p.autoDownloading;
 
   // The feed's counts follow the pick and the search alone, never the Show
   // toggles. Paused, not off, while a series is open: the feed's grid stays up
@@ -190,7 +203,7 @@ export default function SubscriptionsView(p: Props) {
   // a series out of the grouped feed counts as one change of list, not two.
   const listKey = JSON.stringify([
     channelIds, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped, groupsOnly,
-    inProgress, siblingOf?.id ?? null,
+    inProgress, autoDownloading, siblingOf?.id ?? null,
   ]);
   // Where each list this view has shown was left. Coming back to one -- leaving
   // a series, clearing a search -- comes back to your place in it; a list never
@@ -253,6 +266,7 @@ export default function SubscriptionsView(p: Props) {
       showHidden,
       groupsOnly,
       inProgress,
+      autoDownloading,
       search: search.trim() ? search.trim() : null,
       siblingOf: siblingOf?.id ?? null,
       sort,
@@ -280,7 +294,7 @@ export default function SubscriptionsView(p: Props) {
       if (id === request.current) setLoading(false);
     }
   }, [channelIds, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, groupsOnly,
-      inProgress, listKey, scrollRef, toast]);
+      inProgress, autoDownloading, listKey, scrollRef, toast]);
 
   useEffect(() => { void fetchPage(0); }, [fetchPage, reloadToken]);
 
@@ -722,6 +736,38 @@ export default function SubscriptionsView(p: Props) {
     });
   }, [mapVideos, run, bump]);
 
+  /**
+   * Switches a series' auto-download on or off. Nothing is queued either way:
+   * on, a part that joins the series later is downloaded by the poll that
+   * brings it in. The card wears its new state at once and goes back if the
+   * call fails -- or, switched off with Auto-downloading on, leaves the grid,
+   * as a hidden card does with hidden videos off.
+   */
+  const setSeriesAutoDownload = useCallback((group: VideoGroup, on: boolean) => {
+    const leader = group.videos[0];
+    const name = group.stem ?? leader.title;
+    const was = new Map(group.videos.map((v) => [v.id, v.series_auto_download]));
+    // Shared by On and Stop, so the two never land out of order.
+    void run(`series-auto:${leader.id}`, async () => {
+      const changed = await api.setSeriesAutoDownload(leader.id, on);
+      toast.success(on
+        ? `New parts of “${name}” will download as they arrive.`
+        : `New parts of “${name}” will no longer download on their own.`);
+      // Stop reaches past the card when the series drifted onto a second one
+      // led by a newer part; only a refetch shows that card switched off too.
+      const shown = new Set(group.videos.map((v) => v.id));
+      if (changed.some((id) => !shown.has(id))) await fetchPage(0);
+    }, {
+      optimistic: () => {
+        if (!on && autoDownloading) return dropCard(leader.id);
+        mapVideos((v) => (was.has(v.id) ? { ...v, series_auto_download: on } : v));
+        return () => mapVideos((v) => (
+          was.has(v.id) ? { ...v, series_auto_download: was.get(v.id) ?? false } : v
+        ));
+      },
+    });
+  }, [autoDownloading, dropCard, fetchPage, mapVideos, run, toast]);
+
   const menuItems = useCallback((video: Video): MenuItem[] => {
     const picked = marking.selected.size;
     const markItem: MenuItem[] =
@@ -757,6 +803,21 @@ export default function SubscriptionsView(p: Props) {
         series.push({
           label: `Download ${due} ${due === 1 ? "part" : "parts"}`,
           onSelect: () => void downloadSeries(card),
+        });
+      }
+      // Stop is offered wherever the mark is, like Un-hide series: it is what
+      // takes the parts still to come. Switching on only where a part can
+      // still come -- a subscribed channel, the ones a poll reads; a playlist
+      // added from an uploader you do not follow never gains another.
+      if (card.videos.some((v) => v.series_auto_download)) {
+        series.push({
+          label: "Stop auto-downloading new parts",
+          onSelect: () => setSeriesAutoDownload(card, false),
+        });
+      } else if (p.pickableChannels.has(video.channel_id)) {
+        series.push({
+          label: "Auto-download new parts",
+          onSelect: () => setSeriesAutoDownload(card, true),
         });
       }
       // Every part comes from one channel -- the walk that built the card is
@@ -818,6 +879,16 @@ export default function SubscriptionsView(p: Props) {
         onSelect: () => void unlinkSiblings(video),
       });
     }
+    // A lone card still carrying the mark -- every part, ungrouped; a part left
+    // over when a series came apart, grouped -- is still queueing whatever
+    // joins it, so it can be stopped from here. Inside a series the crumb has
+    // it, and on every part it would only be the same switch again.
+    if (video.series_auto_download && siblingOf === null) {
+      items.push({
+        label: "Stop auto-downloading new parts",
+        onSelect: () => setSeriesAutoDownload({ videos: [video], stem: null }, false),
+      });
+    }
     if (video.hidden) {
       items.push({ label: "Un-hide", onSelect: () => void unhideVideo(video) });
     } else {
@@ -829,7 +900,7 @@ export default function SubscriptionsView(p: Props) {
     }
     return items;
   }, [onToggleWatched, onAction, unhideVideo, requestRemove, unlinkSiblings, groups,
-      downloadSeries, unhideSeries, requestHideSeries,
+      downloadSeries, unhideSeries, requestHideSeries, setSeriesAutoDownload,
       marking.selected, marking.markSelected, p.onFindSiblings, p.grouped,
       p.pickableChannels, p.onSeeChannel, siblingOf, search, channelIds]);
 
@@ -883,6 +954,12 @@ export default function SubscriptionsView(p: Props) {
   const crumbUnhide = useCallback(() => {
     if (openGroupRef.current) unhideSeries(openGroupRef.current);
   }, [unhideSeries]);
+  const crumbAuto = useCallback(() => {
+    if (openGroupRef.current) setSeriesAutoDownload(openGroupRef.current, true);
+  }, [setSeriesAutoDownload]);
+  const crumbStopAuto = useCallback(() => {
+    if (openGroupRef.current) setSeriesAutoDownload(openGroupRef.current, false);
+  }, [setSeriesAutoDownload]);
 
   // A series of one has nothing a lone card's menu does not already offer.
   const leaderId = openGroup && openGroup.videos.length > 1 ? openGroup.videos[0].id : null;
@@ -892,21 +969,27 @@ export default function SubscriptionsView(p: Props) {
   // follows -- changes only when something the crumb shows has.
   const due = openGroup?.videos.filter(downloadable).length ?? 0;
   const marked = openGroup?.videos.some((v) => v.series_hidden) ?? false;
+  const autoDownload = openGroup?.videos.some((v) => v.series_auto_download) ?? false;
+  const autoAvailable = openGroup ? p.pickableChannels.has(openGroup.videos[0].channel_id) : false;
   const downloading = leaderId ? callState(`series-download:${leaderId}`) : "idle";
   const hiding = leaderId ? callState(`series-hidden:${leaderId}`) : "idle";
+  const autoing = leaderId ? callState(`series-auto:${leaderId}`) : "idle";
   const seriesActions = useMemo<SeriesActions | null>(
     () => (leaderId === null ? null : {
-      due, marked, downloading, hiding,
+      due, marked, downloading, hiding, autoDownload, autoAvailable, autoing,
       onDownload: crumbDownload, onHide: crumbHide, onUnhide: crumbUnhide,
+      onAutoDownload: crumbAuto, onStopAutoDownload: crumbStopAuto,
     }),
-    [leaderId, due, marked, downloading, hiding, crumbDownload, crumbHide, crumbUnhide],
+    [leaderId, due, marked, downloading, hiding, autoDownload, autoAvailable, autoing,
+     crumbDownload, crumbHide,
+     crumbUnhide, crumbAuto, crumbStopAuto],
   );
   const { onSeriesActions } = p;
   useEffect(() => { onSeriesActions?.(seriesActions); }, [seriesActions, onSeriesActions]);
 
   const filtered =
     channelIds.length > 0 || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
-    inProgress;
+    inProgress || autoDownloading;
   /** Any mark or unlink slow enough to show; see `SIBLINGS`. */
   const refreshing = useMemo(() => [...slow].some((k) => k.startsWith(SIBLINGS)), [slow]);
   /** How many parts of the series being asked about have a file, which the

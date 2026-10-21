@@ -87,8 +87,8 @@ import App from "./App";
 function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
-    show_hidden: false, grouped: false, groups_only: false, in_progress: false, sort: "newest",
-    subs_folded: false,
+    show_hidden: false, grouped: false, groups_only: false, in_progress: false,
+    auto_downloading: false, sort: "newest", subs_folded: false,
     ...over,
   };
 }
@@ -347,6 +347,50 @@ describe("the continue-watching filter", () => {
   });
 });
 
+/** "Auto-downloading" is a filter over series too, kept and cleared the same way. */
+describe("the auto-downloading filter", () => {
+  it("restores from the saved view and is sent to the grouped feed", async () => {
+    settings = settingsWith({ grouped: true, auto_downloading: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(button("Auto-downloading").getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
+    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({ autoDownloading: true });
+  });
+
+  it("is saved into the view when switched on", async () => {
+    settings = settingsWith({ grouped: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+
+    fireEvent.click(button("Auto-downloading"));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView({ grouped: true, auto_downloading: true }));
+  });
+
+  it("is cleared when Group siblings goes off", async () => {
+    settings = settingsWith({ grouped: true, auto_downloading: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+
+    fireEvent.click(button("Grouped"));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView());
+    await act(async () => { fireEvent.click(button("Grouped")); });
+    expect(button("Auto-downloading").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("reads a view saved before the chip existed as off, and writes nothing back", async () => {
+    settings = settingsWith({ grouped: true });
+    delete (settings.view as Partial<ViewState>).auto_downloading;
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(button("Auto-downloading").getAttribute("aria-pressed")).toBe("false");
+    await act(async () => { await new Promise((r) => setTimeout(r, 500)); });
+    expect(saveViewState).not.toHaveBeenCalled();
+  });
+});
+
 /**
  * Group siblings is on for someone who has never saved a view. The backend's
  * ViewState default says so too; this is the shell's own fallback, the one a
@@ -399,7 +443,7 @@ function feedVideo(): Video {
     view_count: 1500, status: "ready", hidden: false, watched: false, watched_at: null,
     download_state: "none", download_error: null, file_path: null,
     downloaded_at: null, first_seen_at: 0, sibling_group: null, series_hidden: false,
-    part_links_refused: false, part_linked: false,
+    part_links_refused: false, part_linked: false, series_auto_download: false,
   };
 }
 

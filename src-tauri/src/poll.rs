@@ -703,12 +703,17 @@ pub async fn poll_channels(
 /// Queues every auto-download candidate (see `Db::auto_download_candidates`)
 /// into the ordinary download queue, and returns how many.
 ///
+/// The parts that joined a series set to auto-download are marked first
+/// (`mark_series_arrivals`), since a new part arrives unmarked and only the
+/// mark makes it a candidate.
+///
 /// Rows are flagged `auto_queued` *before* they are handed to the queue: the
 /// flag is the promise that a video is taken automatically at most once, so a
 /// download that fails, is cancelled, or whose file is later deleted is never
 /// silently fetched again. A sweep that fails is logged and costs nothing but
 /// this poll's auto-downloads; the next poll retries whatever it missed.
 pub async fn auto_download(state: &AppState) -> usize {
+    mark_series_arrivals(&state.db).await;
     let ids = match state.db.auto_download_candidates() {
         Ok(ids) if ids.is_empty() => return 0,
         Ok(ids) => ids,
@@ -725,6 +730,22 @@ pub async fn auto_download(state: &AppState) -> usize {
         }
     };
     queue_auto(state, ids, &s.download_dir, &s.filename_template).await
+}
+
+/// [`Db::mark_series_auto_download_arrivals`] on the blocking pool, its error
+/// logged and swallowed: it matches every new title on a channel holding a
+/// mark against the rest, which is not work for a runtime worker, and a sweep
+/// that fails only leaves this poll's new parts unmarked for the next one to
+/// find -- they stay new to their series either way.
+async fn mark_series_arrivals(db: &Arc<Db>) {
+    let db = db.clone();
+    let marked = tokio::task::spawn_blocking(move || db.mark_series_auto_download_arrivals())
+        .await;
+    match marked {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => eprintln!("mytube: series auto-download sweep failed: {err}"),
+        Err(err) => eprintln!("mytube: series auto-download sweep panicked: {err}"),
+    }
 }
 
 /// Flags `ids` auto-queued and enqueues each, returning how many made it into

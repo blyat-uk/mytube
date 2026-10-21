@@ -236,6 +236,12 @@ pub struct Video {
     /// places it. See `siblings::Atoms`.
     #[serde(default)]
     pub part_links_refused: bool,
+    /// Its series is set to auto-download (v15): a part that joins this
+    /// video's card later is queued the poll it arrives. Read from
+    /// `series_auto_download_since`; machine-local, so no archive or sync
+    /// snapshot carries it. See `Db::set_series_auto_download`.
+    #[serde(default)]
+    pub series_auto_download: bool,
     /// Computed, never stored: a description link of its own put it on its
     /// card, so "Unlink from siblings" applies though nothing was marked by
     /// hand. Filled by the feed's readers (`list_videos`,
@@ -306,6 +312,12 @@ pub struct VideoFilter {
     /// group like `groups_only`. `list_videos` ignores it, for the same reason.
     #[serde(default)]
     pub in_progress: bool,
+    /// Grouped feed only: keep just the cards whose series is set to
+    /// auto-download -- any part carrying the mark, counted over the whole
+    /// group like `groups_only`. A lone card still carrying one counts too, so
+    /// no mark can go on downloading out of sight. `list_videos` ignores it.
+    #[serde(default)]
+    pub auto_downloading: bool,
     pub search: Option<String>,
     /// Id of the video whose siblings to show. When set it replaces every other
     /// filter above: the point of the view is the whole series, so a watched,
@@ -325,6 +337,7 @@ impl Default for VideoFilter {
             show_hidden: false,
             groups_only: false,
             in_progress: false,
+            auto_downloading: false,
             search: None,
             sibling_of: None,
             sort: SortOrder::Newest,
