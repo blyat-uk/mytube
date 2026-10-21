@@ -2069,6 +2069,13 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   justify-content: flex-end;
 }
 .dl-actions .icon { width: 17px; height: 17px; }
+/* Every action is the same 34px circle, but a plain one's edge (--line on a
+   --card row) all but vanished, so it read smaller than the red-ringed Delete
+   beside it. A ring that shows makes them read alike. Play alone is bigger:
+   it is what a finished download is for. */
+.dl-actions .icon-btn:not(.is-primary, .is-on, .is-danger) { border-color: #484848; }
+.dl-actions .icon-btn.is-primary { width: 42px; height: 42px; }
+.dl-actions .icon-btn.is-primary .icon { width: 21px; height: 21px; }
 
 .row-progress { display: flex; flex-direction: column; gap: 5px; }
 

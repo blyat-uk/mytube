@@ -234,7 +234,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
   };
   /** What a row's action buttons need to know about a call in flight. */
   const state = (key: string) => ({ busy: pending.has(key), spinning: slow.has(key) });
-  /** Last in every row, so the right-aligned actions line it up in one column. */
+  /** Last in every row but a completed one, where Delete file sits after it. */
   const openAction = (v: Video) => (
     <RowAction label={cardActionLabel("open")} {...state(`open:${v.id}`)} onClick={() => void openOnYouTube(v)}>
       <IconExternal />
@@ -288,10 +288,10 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
             >
               <IconWatched done={v.watched} />
             </RowAction>
+            {openAction(v)}
             <RowAction label="Delete file" tone="is-danger" {...state(v.id)} onClick={() => void remove(v)}>
               <IconDelete />
             </RowAction>
-            {openAction(v)}
           </Row>
         ))}
       </Section>

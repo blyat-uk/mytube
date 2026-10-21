@@ -142,7 +142,7 @@ describe("Downloads row actions", () => {
     }
   });
 
-  it("offers every row, in every section, a way to its YouTube page as the last action", async () => {
+  it("offers every row, in every section, a way to its YouTube page, last but for Delete file", async () => {
     videos = [
       video({ id: "a", title: "Running", download_state: "downloading" }),
       video({ id: "b", title: "Finished", download_state: "done" }),
@@ -153,10 +153,14 @@ describe("Downloads row actions", () => {
     await screen.findByText("Finished");
     const rows = [...document.querySelectorAll(".dl-row")];
     expect(rows).toHaveLength(3);
+    const finished = within(rows.find((r) => r.textContent?.includes("Finished")) as HTMLElement);
+    const finishedButtons = finished.getAllByRole("button");
+    expect(finishedButtons[finishedButtons.length - 1].textContent).toBe("Delete file");
     for (const row of rows) {
       const buttons = within(row as HTMLElement).getAllByRole("button");
-      // Last in every row, so the rows' right-aligned actions put it in one column.
-      const open = buttons[buttons.length - 1];
+      // Last in every row, except that a completed one ends on Delete file.
+      const last = buttons[buttons.length - 1];
+      const open = last.textContent === "Delete file" ? buttons[buttons.length - 2] : last;
       expect(open.textContent).toBe("Open on YouTube");
       expect(open.classList.contains("icon-btn")).toBe(true);
       expect(open.getAttribute("title")).toBeTruthy();
