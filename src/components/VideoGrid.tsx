@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import VideoCard from "./VideoCard";
 import SeriesCard from "./SeriesCard";
-import { nextCardSize, type CardAction } from "../format";
+import { cardZoom, nextCardSize, type CardAction } from "../format";
 import type { Marking } from "../marking";
 import type { ProgressStore } from "../progress";
 import type { Video, VideoGroup } from "../types";
@@ -182,7 +182,10 @@ export default function VideoGrid({
       <div
         ref={gridRef}
         className={`video-grid${refreshing ? " is-refreshing" : ""}`}
-        style={{ ["--card-w" as string]: `${cardSize}px` }}
+        style={{
+          ["--card-w" as string]: `${cardSize}px`,
+          ["--card-zoom" as string]: String(cardZoom(cardSize)),
+        }}
         aria-busy={refreshing || undefined}
       >
         {/* Every prop below is either a primitive or holds its identity across

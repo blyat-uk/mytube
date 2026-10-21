@@ -167,7 +167,7 @@ describe("cardAction", () => {
 });
 
 import {
-  clampCardSize, nextCardSize, insertToken, popoutPlacement, TEMPLATE_PRESETS, TOKEN_CHIPS,
+  cardZoom, clampCardSize, nextCardSize, insertToken, popoutPlacement, TEMPLATE_PRESETS, TOKEN_CHIPS,
 } from "./format";
 
 describe("hasDownloadedFile", () => {
@@ -205,6 +205,13 @@ describe("card size zoom", () => {
   it("cannot step outside the range", () => {
     expect(nextCardSize(160, 1)).toBe(160);
     expect(nextCardSize(640, -1)).toBe(640);
+  });
+  it("places a size along the range for CSS: 0 at the smallest card, 1 at the largest", () => {
+    expect(cardZoom(160)).toBe(0);
+    expect(cardZoom(640)).toBe(1);
+    expect(cardZoom(400)).toBe(0.5);
+    expect(cardZoom(10)).toBe(0);
+    expect(cardZoom(9999)).toBe(1);
   });
 });
 

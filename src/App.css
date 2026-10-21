@@ -924,7 +924,16 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
      `min(…, 100%)` keeps a card wider than the pane from overflowing it. */
   grid-template-columns: repeat(auto-fit, min(var(--card-w, 260px), 100%));
   justify-content: center;
+  /* How tall each of a series card's two sheets stands (see .series-card). It
+     lives on the grid because the top padding below has to hold both of them.
+     The 26px row gap holds them at every zoom: 14px of sheets at the largest
+     leaves 12px between the far sheet and the card above it. */
+  --sheet-step: clamp(2px, calc(var(--card-w, 260px) * 0.012), 5px);
   gap: 26px 18px;
+  /* The first row's sheets stand in .content's top padding, which is the
+     scroll area's edge and clips them: 16px at its narrowest, 14px of sheets
+     at the largest zoom. This tops it up to keep 4px clear above them. */
+  padding-top: max(0px, calc(var(--sheet-step) * 2 - 8px));
 }
 
 .card {
@@ -982,47 +991,63 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .card.is-downloaded .card-meta,
 .card.is-downloaded .dot { color: var(--ok-text-dim); }
 
-/* A series reads as a stack: two sheet edges peek out above the card, the way a
-   pile of them does. They sit strictly *above* the card's own box rather than
-   behind it, so no z-index juggling is needed to keep them out of its face —
-   and the row gap is deep enough to hold them. */
-.series-card { position: relative; }
+/* A series reads as a stack, the way YouTube draws a playlist: two sheets stand
+   above the card's top edge, each narrower than the one in front, with a sliver
+   of page between them. Always two, whatever the part count, so every series
+   card wears the same silhouette. They sit strictly *above* the card's own box
+   rather than behind it, so no z-index juggling is needed to keep them out of
+   its face, and the grid's row gap grows to hold them. Both measures follow the
+   zoom: --sheet-step (set on the grid) is a sheet's height, --sheet-inset how
+   much narrower it is than the one in front on each side.
+
+   `.card`'s overflow: hidden clipped these from the day they were written, so
+   nothing showed. A series card lets its overflow show and rounds its
+   thumbnail's top corners itself instead; nothing else in it reaches outside
+   the card, and the part-count panel is clipped by .card-thumb. */
+.series-card {
+  --sheet-inset: clamp(8px, calc(var(--card-w, 260px) * 0.04), 22px);
+  position: relative;
+  overflow: visible;
+}
+.series-card .card-thumb {
+  border-radius: calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0;
+}
 .series-card::before,
 .series-card::after {
   content: "";
   position: absolute;
-  bottom: 100%;
-  margin-bottom: -1px;
-  border: 1px solid var(--line-soft);
-  border-bottom: none;
+  height: var(--sheet-step, 6px);
   border-radius: 7px 7px 0 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
   pointer-events: none;
 }
-/* The near sheet, painted over the far one. */
+/* The near sheet. */
 .series-card::before {
-  z-index: 1;
-  left: 8px; right: 8px;
-  height: 9px;
-  background: var(--card);
+  bottom: calc(100% + 2px);
+  left: var(--sheet-inset); right: var(--sheet-inset);
+  background: #3a3a3a;
 }
-/* The far sheet: narrower, taller, dimmer — the stack recedes. */
+/* The far sheet: narrower and dimmer, so the stack recedes. */
 .series-card::after {
-  left: 17px; right: 17px;
-  height: 15px;
-  background: var(--surface-2);
+  bottom: calc(100% + 4px + var(--sheet-step, 6px));
+  left: calc(var(--sheet-inset) * 2); right: calc(var(--sheet-inset) * 2);
+  background: #2a2a2a;
 }
-.series-card:hover::before { background: var(--card-hover); }
+.series-card:hover::before { background: #464646; }
 
 /* The part count, standing in the same place a YouTube playlist puts it. Wide
    enough that "unwatched" still fits on one line at the smallest card size the
    zoom allows (160px), which is what sets the 42% -- of a card at 100% text.
-   The words grow with the text size and so must the panel, or they would run
-   out of its sides. */
+   A bigger card needs a smaller share for the same words, whose sizes stop
+   growing at about 400px, so the share falls with the zoom (--card-zoom, 0 at
+   the smallest card and 1 at the largest) to 20%, which leaves a 640px card's
+   picture clear instead of a 270px slab over it. The words grow with the text
+   size and so must the panel, or they would run out of its sides. */
 .series-count {
   position: absolute;
   z-index: 1;
   top: 0; right: 0; bottom: 0;
-  width: min(100%, calc(42% * var(--text-scale, 1)));
+  width: min(100%, calc((42% - 22% * var(--card-zoom, 0)) * var(--text-scale, 1)));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1133,9 +1158,10 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-color: var(--resume);
   box-shadow: 0 0 0 1px var(--resume) inset;
 }
-/* The near sheet edge is part of the face, hovered or not. */
+/* The sheets go amber with it, hovered or not. */
 .series-card.is-resumable::before,
-.series-card.is-resumable:hover::before { background: var(--resume-face); }
+.series-card.is-resumable:hover::before { background: #6a5428; }
+.series-card.is-resumable::after { background: #4a3b1d; }
 .series-card.is-resumable .series-count {
   background: linear-gradient(180deg, rgba(91, 63, 11, 0.86), rgba(63, 44, 8, 0.9));
 }

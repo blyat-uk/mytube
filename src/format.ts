@@ -294,6 +294,14 @@ export function clampCardSize(px: number): number {
   return Math.min(CARD_MAX, Math.max(CARD_MIN, Math.round(px)));
 }
 
+/** Where a card size sits in the zoom range, 0 at CARD_MIN and 1 at CARD_MAX,
+ *  handed to CSS as `--card-zoom`. CSS cannot divide one length by another,
+ *  so a rule that wants a share of the card that changes with the zoom (the
+ *  series panel) needs this number, not `--card-w`. */
+export function cardZoom(px: number): number {
+  return (clampCardSize(px) - CARD_MIN) / (CARD_MAX - CARD_MIN);
+}
+
 /** `deltaY` follows wheel convention: negative scrolls up, which zooms in. */
 export function nextCardSize(current: number, deltaY: number): number {
   const dir = deltaY < 0 ? 1 : -1;
