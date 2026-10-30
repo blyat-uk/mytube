@@ -557,7 +557,8 @@ fn register_search(conn: &Connection) -> rusqlite::Result<()> {
 /// holds is ids, and the rows are already in hand. `watched` rides along for the
 /// same reason: "Continue watching" asks it of every part of a group, hidden and
 /// filtered-out parts included -- and so does the series auto-download mark, for
-/// "Auto-downloading".
+/// "Auto-downloading". `sort_at` rides along because a card is dated by its newest
+/// part, which the filters may have taken out of the feed's own rows.
 ///
 /// Only the reading happens here. Building [`siblings::Atoms`] from the entries
 /// -- a regex pass over every title, then a match per candidate pair -- is left
@@ -571,7 +572,7 @@ fn channel_rows(
     let mut former = former_titles(conn, channel_id)?;
     let mut st = conn.prepare_cached(
         "SELECT id, title, duration_secs, sibling_group, watched, part_links, part_links_refused,
-                series_auto_download_since IS NOT NULL
+                series_auto_download_since IS NOT NULL, sort_at
          FROM videos WHERE channel_id=?1 AND status='ready'",
     )?;
     let rows = st.query_map(params![channel_id], |r| {
@@ -584,16 +585,17 @@ fn channel_rows(
             part_links::decode(r.get::<_, Option<String>>(5)?.as_deref()),
             r.get::<_, bool>(6)?,
             r.get::<_, bool>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
 
     let mut entries = Vec::new();
     let mut facts = HashMap::new();
     for row in rows {
-        let (id, title, secs, group, watched, links, refused, auto) = row?;
+        let (id, title, secs, group, watched, links, refused, auto, sort_at) = row?;
         // A row whose duration has not resolved yet contributes nothing to its
         // series rather than dropping the series out of the ordering.
-        facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched, auto });
+        facts.insert(id.clone(), PartFacts { secs: secs.unwrap_or(0), watched, auto, sort_at });
         let former_titles = former.remove(&id).unwrap_or_default();
         entries.push(siblings::Entry { id, title, former_titles, group, links, refused });
     }
@@ -649,13 +651,15 @@ fn former_titles(conn: &Connection, channel_id: &str) -> Result<HashMap<String, 
 }
 
 /// What the grouped walk needs to know about one part once its card is built,
-/// beyond the id: its share of the card's runtime, whether it was watched, and
-/// whether it carries the series auto-download mark.
+/// beyond the id: its share of the card's runtime, whether it was watched,
+/// whether it carries the series auto-download mark, and its place in the feed's
+/// date order.
 #[derive(Clone, Copy)]
 struct PartFacts {
     secs: i64,
     watched: bool,
     auto: bool,
+    sort_at: Option<i64>,
 }
 
 /// The feed query, ordered but unpaged: `list_videos` bolts `LIMIT`/`OFFSET`
@@ -737,8 +741,7 @@ fn order_by(sort: SortOrder) -> &'static str {
         SortOrder::Length  => " ORDER BY v.duration_secs DESC NULLS LAST, v.sort_at DESC NULLS LAST, v.id ASC",
         // Group size is not a column: `list_video_groups` ranks the finished
         // groups itself. What SQL still owns here is the order the walk sees
-        // rows in -- which decides each group's leader, its parts' order, and
-        // how ties between equal-length series break.
+        // rows in -- which decides each group's leader and its parts' order.
         SortOrder::Parts => order_by(SortOrder::Newest),
     }
 }
@@ -825,6 +828,20 @@ impl WalkRows {
             by_channel.insert(channel.clone(), channel_rows(conn, channel)?);
         }
         Ok(Self { seeds, by_channel })
+    }
+
+    /// Each seed's channel's place in the feed, by seed id: the order
+    /// [`SortOrder::Channel`] holds the channels in once the cards inside them
+    /// are ranked. Two channels sharing a name interleave in SQL, and come apart
+    /// here into one block each.
+    fn channel_places(&self) -> HashMap<String, usize> {
+        let mut places: HashMap<&str, usize> = HashMap::new();
+        let mut out = HashMap::with_capacity(self.seeds.len());
+        for (id, channel) in &self.seeds {
+            let next = places.len();
+            out.insert(id.clone(), *places.entry(channel).or_insert(next));
+        }
+        out
     }
 
     /// The matching half, which is where the time goes -- a regex pass over
@@ -1702,6 +1719,12 @@ impl Db {
             let conn = self.conn.lock().unwrap();
             WalkRows::read(&conn, f)?
         };
+        // Read here because the walk consumes the seeds it comes from.
+        let channel_places = if f.sort == SortOrder::Channel {
+            rows.channel_places()
+        } else {
+            HashMap::new()
+        };
         let Walk { mut groups, parts, former, linked } = rows.walk();
 
         // After the walk, not in it: a lone video must still strike itself off
@@ -1732,21 +1755,44 @@ impl Db {
             groups.retain(|members| members.iter().any(auto));
         }
 
-        // Two of the sort orders rank a card by something only the finished
-        // group knows -- how many parts it holds, or how long they run in
-        // total. Both have to be applied before the page is cut, or
-        // `limit`/`offset` would page through the underlying order and then
-        // reshuffle each page on its own. `sort_by_key` is stable, so a tie
-        // keeps the order the feed's own sort gave it.
+        // A card is ranked by something only the finished group knows, and it
+        // has to happen before the page is cut, or `limit`/`offset` would page
+        // through the underlying order and then reshuffle each page on its own.
+        // The sorts are stable, so a tie keeps the order the feed's own sort gave.
         //
-        // `Length` is ranked here even though SQL already ordered the seeds by
-        // duration: that ordering settled each group's leader and its parts'
-        // order, but a series is worth the sum of its parts, which no single
-        // row's `duration_secs` can express.
+        // The date orders go by the card's newest part, over the whole group:
+        // the leader is only the newest part to survive the filters, so ranking
+        // by it would drop a series whose new part you have not downloaded yet
+        // below everything since the part you have. A manually added part's
+        // `sort_at` is its add time, so it pins its series as it pins a lone video.
+        let latest = |members: &Vec<String>| -> Option<i64> {
+            members.iter().filter_map(|id| parts.get(id)?.sort_at).max()
+        };
         match f.sort {
-            SortOrder::Parts => {
-                groups.sort_by_key(|members| std::cmp::Reverse(members.len()));
+            SortOrder::Newest => {
+                groups.sort_by_cached_key(|members| std::cmp::Reverse(latest(members)));
             }
+            // The same ranking reversed, undated cards still last.
+            SortOrder::Oldest => {
+                groups.sort_by_cached_key(|members| {
+                    let at = latest(members);
+                    (at.is_none(), at)
+                });
+            }
+            SortOrder::Channel => {
+                groups.sort_by_cached_key(|members| {
+                    let place = channel_places.get(&members[0]).copied().unwrap_or(usize::MAX);
+                    (place, std::cmp::Reverse(latest(members)))
+                });
+            }
+            SortOrder::Parts => {
+                groups.sort_by_cached_key(|members| {
+                    (std::cmp::Reverse(members.len()), std::cmp::Reverse(latest(members)))
+                });
+            }
+            // SQL ordered the seeds by duration, which settled each group's
+            // leader and its parts' order, but a series is worth the sum of its
+            // parts, which no single row's `duration_secs` can express.
             SortOrder::Length => {
                 groups.sort_by_key(|members| {
                     let total: i64 = members.iter()
@@ -1755,7 +1801,8 @@ impl Db {
                     std::cmp::Reverse(total)
                 });
             }
-            _ => {}
+            // Only the Downloads tab asks for this, and it reads the flat feed.
+            SortOrder::Downloaded => {}
         }
 
         let page: Vec<Vec<String>> = groups
@@ -3329,6 +3376,95 @@ mod tests {
         // Ranking happens before the page is cut, so page two is the second
         // longest series and not whatever date order would have put there.
         assert_eq!(grouped(&d, &f), vec![("m2".to_string(), 2)]);
+    }
+
+    /// A series whose two parts straddle a lone upload: `p1` at 100, `lone` at
+    /// 200, `p2` at 300.
+    fn straddling_series(d: &Db) {
+        titled(d, "UC1", &[("p1", "The Blackwood Tapes")]);
+        d.insert_video_if_new(&NewVideo { title: "A Completely Different Story".into(),
+                                          ..vid("lone", "UC1", Some(200)) }).unwrap();
+        d.insert_video_if_new(&NewVideo { title: "(2) The Blackwood Tapes".into(),
+                                          ..vid("p2", "UC1", Some(300)) }).unwrap();
+    }
+
+    #[test]
+    fn a_card_ranks_by_its_newest_part_even_when_the_filters_left_an_older_one() {
+        let d = db();
+        straddling_series(&d);
+        d.set_download_state("p1", DownloadState::Done, Some("/tmp/p1.mkv"), None).unwrap();
+        d.set_download_state("lone", DownloadState::Done, Some("/tmp/lone.mkv"), None).unwrap();
+        let f = VideoFilter { downloaded_only: true, ..Default::default() };
+        // `p1` still leads, being the part that passed the filter, but the
+        // series was last added to at 300, which is ahead of the lone upload.
+        assert_eq!(grouped(&d, &f), vec![("p1".to_string(), 2), ("lone".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_filtered_out_watched_part_still_dates_its_card() {
+        let d = db();
+        straddling_series(&d);
+        d.set_watched("p2", true).unwrap();
+        let f = VideoFilter { hide_watched: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("p1".to_string(), 2), ("lone".to_string(), 1)]);
+    }
+
+    #[test]
+    fn oldest_first_is_the_same_ranking_reversed() {
+        let d = db();
+        straddling_series(&d);
+        let f = VideoFilter { sort: SortOrder::Oldest, ..Default::default() };
+        // The series' oldest part predates the lone upload, its newest does not.
+        assert_eq!(grouped(&d, &f), vec![("lone".to_string(), 1), ("p1".to_string(), 2)]);
+    }
+
+    #[test]
+    fn by_channel_ranks_a_channels_cards_by_their_newest_parts() {
+        let d = db();
+        straddling_series(&d);
+        d.upsert_channel(&chan("UC0", "A Channel First By Name")).unwrap();
+        d.insert_video_if_new(&vid("elsewhere", "UC0", Some(50))).unwrap();
+        d.upsert_channel(&chan("UC1", "Z Channel Last By Name")).unwrap();
+        d.set_download_state("p1", DownloadState::Done, Some("/tmp/p1.mkv"), None).unwrap();
+        d.set_download_state("lone", DownloadState::Done, Some("/tmp/lone.mkv"), None).unwrap();
+        d.set_download_state("elsewhere", DownloadState::Done, Some("/tmp/e.mkv"), None).unwrap();
+        let f = VideoFilter { sort: SortOrder::Channel, downloaded_only: true, ..Default::default() };
+        // Channels stay in name order, however new the other channel's parts are.
+        assert_eq!(
+            grouped(&d, &f),
+            vec![("elsewhere".to_string(), 1), ("p1".to_string(), 2), ("lone".to_string(), 1)],
+        );
+    }
+
+    #[test]
+    fn most_parts_breaks_a_tie_on_the_newest_part() {
+        let d = db();
+        titled(&d, "UC1", &[("a1", "Alpha Chronicle")]);
+        d.insert_video_if_new(&NewVideo { title: "Zephyr Diaries".into(),
+                                          ..vid("z1", "UC1", Some(200)) }).unwrap();
+        d.insert_video_if_new(&NewVideo { title: "Zephyr Diaries - Part 2".into(),
+                                          ..vid("z2", "UC1", Some(210)) }).unwrap();
+        d.insert_video_if_new(&NewVideo { title: "Alpha Chronicle - Part 2".into(),
+                                          ..vid("a2", "UC1", Some(300)) }).unwrap();
+        d.set_download_state("a1", DownloadState::Done, Some("/tmp/a.mkv"), None).unwrap();
+        d.set_download_state("z1", DownloadState::Done, Some("/tmp/z.mkv"), None).unwrap();
+        let f = VideoFilter { sort: SortOrder::Parts, downloaded_only: true, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("a1".to_string(), 2), ("z1".to_string(), 2)]);
+    }
+
+    #[test]
+    fn an_undated_series_ranks_last_in_both_directions() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_video_if_new(&NewVideo { title: "The Blackwood Tapes".into(),
+                                          ..vid("undated", "UC1", None) }).unwrap();
+        d.insert_video_if_new(&NewVideo { title: "A Completely Different Story".into(),
+                                          ..vid("dated", "UC1", Some(100)) }).unwrap();
+        for sort in [SortOrder::Newest, SortOrder::Oldest] {
+            let f = VideoFilter { sort, ..Default::default() };
+            assert_eq!(grouped(&d, &f),
+                       vec![("dated".to_string(), 1), ("undated".to_string(), 1)]);
+        }
     }
 
     #[test]
@@ -8518,8 +8654,9 @@ mod former_titles_tests {
         assert_eq!(newest[0][0], "p4");
         assert_eq!(sorted(newest[0].clone()), owned(&FOUR));
         let oldest = cards(&d, SortOrder::Oldest);
-        assert_eq!(oldest[0][0], "p1");
-        assert_eq!(sorted(oldest[0].clone()), owned(&FOUR));
+        let series_card = oldest.iter().find(|m| m.len() > 1).expect("a series card");
+        assert_eq!(series_card[0], "p1");
+        assert_eq!(sorted(series_card.clone()), owned(&FOUR));
         for id in FOUR {
             assert_eq!(series(&d, id), owned(&FOUR), "{id}");
         }

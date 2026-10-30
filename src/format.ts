@@ -48,6 +48,17 @@ export function seriesRuntime(
   return { runtime: formatTotalRuntime(total), unknown };
 }
 
+/** The newest part's release date, which is the one a series card is ranked by. */
+export function latestPublished(videos: { published_at: number | null }[]): number | null {
+  let latest: number | null = null;
+  for (const v of videos) {
+    if (v.published_at !== null && (latest === null || v.published_at > latest)) {
+      latest = v.published_at;
+    }
+  }
+  return latest;
+}
+
 const DAY_MS = 86_400_000;
 
 function daysInMonth(y: number, m: number): number {

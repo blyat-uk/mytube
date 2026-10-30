@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
 import SeriesCard from "./SeriesCard";
+import { formatRelative } from "../format";
 import type { Video, VideoGroup } from "../types";
 
 afterEach(cleanup);
@@ -53,6 +54,19 @@ describe("SeriesCard", () => {
     renderCard();
     expect(screen.getByText("3")).toBeTruthy();
     expect(screen.getByText("parts")).toBeTruthy();
+  });
+
+  it("dates the card by its newest part, not the part leading it", () => {
+    const old = 1_600_000_000;
+    const newest = 1_700_000_000;
+    renderCard({
+      videos: [
+        video({ id: "p1", published_at: old }),
+        video({ id: "p2", published_at: newest }),
+        video({ id: "p3", published_at: null }),
+      ],
+    });
+    expect(screen.getByText(/^latest /).textContent).toBe(`latest ${formatRelative(newest)}`);
   });
 
   it("opens the series on the leader, which is the anchor the view expects", () => {

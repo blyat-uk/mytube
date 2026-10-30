@@ -1,6 +1,6 @@
 import { memo, useMemo, useState } from "react";
 import { thumbSrc } from "../api";
-import { formatDate, formatRelative, seriesRuntime } from "../format";
+import { formatDate, formatRelative, latestPublished, seriesRuntime } from "../format";
 import { IconAutoDownload, IconSeries } from "./Icons";
 import type { CardMark } from "../marking";
 import type { Video, VideoGroup } from "../types";
@@ -73,6 +73,7 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
   const src = sources[srcIndex];
 
   const title = group.stem ?? leader.title;
+  const latest = latestPublished(group.videos);
   const open = () => onOpen(leader, group.stem);
 
   return (
@@ -165,10 +166,11 @@ export default memo(function SeriesCard({ group, onOpen, onContextMenu, mark }: 
             {leader.channel_title}
           </span>
           <span className="dot" aria-hidden="true">·</span>
-          {/* The leader's date, not the series': it is the part that put this
-              card where it is in the feed. */}
-          <span className="card-date" title={formatDate(leader.published_at)}>
-            latest {formatRelative(leader.published_at)}
+          {/* The newest part's date, not the leader's: it is the part that put
+              this card where it is in the feed, and the leader is only the
+              newest part to survive the filters. */}
+          <span className="card-date" title={formatDate(latest)}>
+            latest {formatRelative(latest)}
           </span>
         </div>
       </div>
