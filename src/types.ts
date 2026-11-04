@@ -72,10 +72,17 @@ export interface VideoGroup {
 
 export interface VideoFilter {
   /** The channels to show, any of them; empty is every channel. */
-  channelIds: string[]; hideWatched: boolean; downloadedOnly: boolean;
+  channelIds: string[];
+  /** `channelIds` are the channels to leave out: every channel but these. */
+  channelsExcept: boolean;
+  hideWatched: boolean; downloadedOnly: boolean;
   showHidden: boolean;
-  /** Grouped feed only: drop lone videos, keeping multi-part series. */
-  groupsOnly: boolean;
+  /** Grouped feed only: cards of at least this many parts, the whole group
+   *  counted; 0 is any, 2 is "only series". */
+  minParts: number;
+  /** Cards at least this long in seconds, a series as all its parts added up;
+   *  0 is any. */
+  minLength: number;
   /** Grouped feed only: keep just the series you have started and not
    *  finished -- at least one part watched and one not. */
   inProgress: boolean;
@@ -123,6 +130,8 @@ export interface ChannelStats {
 export interface StatsFilter {
   /** Any of these channels; empty is every channel. */
   channelIds: string[];
+  /** `channelIds` are the channels left out, as on `VideoFilter`. */
+  channelsExcept: boolean;
   search: string | null;
 }
 
@@ -242,14 +251,41 @@ export interface ImportProgress { done: number; total: number; current: string; 
  */
 export type QuickFilter =
   | "hide_watched" | "downloaded_only" | "show_hidden"
-  | "grouped" | "groups_only" | "in_progress" | "auto_downloading"
-  | "sort" | "channel_ids";
+  | "grouped" | "in_progress" | "auto_downloading"
+  | "length" | "sort" | "channel_ids";
+
+/** Every filter the All filters sidebar holds: what a saved view sets.
+ *  snake_case, since it is stored in settings.json's view block. */
+export interface ViewFilters {
+  hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
+  grouped: boolean; in_progress: boolean; auto_downloading: boolean;
+  /** At least this long, in seconds; 0 is any. */
+  min_length: number;
+  /** At least this many parts, grouped only; 0 is any. */
+  min_parts: number;
+  sort: SortOrder;
+  /** Sorted channel ids; empty for every channel. */
+  channel_ids: string[];
+  /** `channel_ids` are the channels left out rather than the ones shown. */
+  channels_except: boolean;
+}
+
+/** A named set of filters, picked from the sidebar or starred into the bar. */
+export interface SavedView {
+  id: string;
+  name: string;
+  /** In the top bar as a chip, ahead of the starred filters. */
+  starred: boolean;
+  filters: ViewFilters;
+  /** The search it sets; null leaves the search box as it is. */
+  search: string | null;
+}
 
 export interface ViewState {
   /** Sorted channel ids; empty for every channel. */
   channel_ids: string[]; search: string;
   hide_watched: boolean; downloaded_only: boolean; show_hidden: boolean;
-  grouped: boolean; groups_only: boolean; in_progress: boolean; auto_downloading: boolean;
+  grouped: boolean; in_progress: boolean; auto_downloading: boolean;
   sort: SortOrder;
   /** The Add dialog's subscription list, folded away. Not a filter: it rides
    *  in this block because it is remembered the same way, per machine. */
@@ -257,6 +293,28 @@ export interface ViewState {
   /** The filters starred into the top bar, in `QUICK_ORDER`. The rest live in
    *  the All filters sidebar alone. Per machine, like the rest of the block. */
   starred_filters: QuickFilter[];
+  /** The Length filter: at least this long in seconds, and (grouped) at least
+   *  this many parts. 0 is any for both. */
+  min_length: number;
+  min_parts: number;
+  /** `channel_ids` are the channels left out: every channel but these, so a
+   *  channel subscribed to later is shown. */
+  channels_except: boolean;
+  /** Named filter sets, in the order they were saved. */
+  saved_views: SavedView[];
+}
+
+/** The series a download belongs to, for its link on the Downloads tab: the
+ *  card "Find siblings" on it opens. camelCase like every dialog payload. */
+export interface DownloadSeries {
+  videoId: string;
+  /** The series' name as its card wears it; null when the parts share none. */
+  stem: string | null;
+  /** Which part this is, by upload date, from 1. */
+  position: number;
+  parts: number;
+  /** Parts uploaded after the newest one held, still not downloaded or watched. */
+  fresh: number;
 }
 
 export interface Settings {

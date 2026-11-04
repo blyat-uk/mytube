@@ -21,6 +21,10 @@ export function useDismiss(
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // A form or menu inside that closes on Esc itself (a view being renamed
+      // or saved) has the key first; this closes only from outside one.
+      const t = e.target as Element | null;
+      if (t && typeof t.closest === "function" && t.closest("[data-own-escape]")) return;
       e.stopPropagation();
       onClose(true);
     };

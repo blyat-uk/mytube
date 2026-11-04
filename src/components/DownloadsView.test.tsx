@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, within, act } from "@testing-library/react";
-import type { Video } from "../types";
+import type { DownloadSeries, Video } from "../types";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
 
@@ -11,6 +11,7 @@ const cancelDownload = vi.fn((_id: string) => Promise.resolve());
 const enqueueDownload = vi.fn((_id: string) => Promise.resolve());
 const openInPlayer = vi.fn((_id: string) => Promise.resolve());
 const openExternal = vi.fn((_url: string) => Promise.resolve());
+const downloadSeries = vi.fn((_ids: string[]): Promise<DownloadSeries[]> => Promise.resolve([]));
 
 vi.mock("../api", () => ({
   api: {
@@ -21,6 +22,7 @@ vi.mock("../api", () => ({
     enqueueDownload: (id: string) => enqueueDownload(id),
     openInPlayer: (id: string) => openInPlayer(id),
     openExternal: (url: string) => openExternal(url),
+    downloadSeries: (ids: string[]) => downloadSeries(ids),
   },
   thumbSrc: (v: { thumb_path: string | null }) => v.thumb_path ?? "",
   errText: (e: unknown) => String(e),
@@ -61,19 +63,25 @@ beforeEach(() => {
   enqueueDownload.mockImplementation(() => Promise.resolve());
   openInPlayer.mockImplementation(() => Promise.resolve());
   openExternal.mockImplementation(() => Promise.resolve());
+  downloadSeries.mockImplementation(() => Promise.resolve([]));
 });
 afterEach(cleanup);
 
 /** Stands in for the shell's `.content`, the area a popped-out thumbnail must stay inside. */
 let scrollArea: HTMLElement;
 
-function renderView(cardSize = 260) {
+function renderView(cardSize = 260, search = "", onOpenSeries = vi.fn()) {
   scrollArea = document.createElement("main");
-  render(
+  const tree = (q: string) => (
     <ToastProvider>
-      <DownloadsView reloadToken={0} cardSize={cardSize} scrollRef={{ current: scrollArea }} />
-    </ToastProvider>,
+      <DownloadsView
+        reloadToken={0} cardSize={cardSize} scrollRef={{ current: scrollArea }}
+        search={q} onOpenSeries={onOpenSeries}
+      />
+    </ToastProvider>
   );
+  const r = render(tree(search));
+  return { onOpenSeries, search: (q: string) => r.rerender(tree(q)) };
 }
 
 describe("Downloads ordering", () => {
@@ -356,5 +364,74 @@ describe("Downloads thumbnail pop-out", () => {
 
     await screen.findByText("Blank");
     expect(document.querySelector(".dl-thumb")!.classList.contains("can-pop")).toBe(false);
+  });
+});
+
+/**
+ * A download in a series links into it: which series, which part, what has
+ * come out since that is not downloaded yet, and Open series.
+ */
+describe("a download's series", () => {
+  const SERIES: DownloadSeries = { videoId: "p2", stem: "The Lighthouse Files", position: 2, parts: 12, fresh: 3 };
+
+  it("wears its series on rows that belong to one, and no link on the rest", async () => {
+    videos = [video({ id: "p2", title: "Episode 2" }), video({ id: "lone", title: "A lone video" })];
+    downloadSeries.mockImplementation(() => Promise.resolve([SERIES]));
+    renderView();
+    const link = await screen.findByRole("button", {
+      name: "Open the series The Lighthouse Files: part 2 of 12, 3 new parts",
+    });
+    expect(link.textContent).toBe("The Lighthouse Filespart 2 of 12+3 newOpen series");
+    expect(downloadSeries).toHaveBeenCalledWith(["lone", "p2"]);
+    expect(screen.getAllByRole("button", { name: /^Open the series/ })).toHaveLength(1);
+  });
+
+  it("opens the series, led by that download", async () => {
+    videos = [video({ id: "p2", title: "Episode 2" })];
+    downloadSeries.mockImplementation(() => Promise.resolve([{ ...SERIES, fresh: 0 }]));
+    const { onOpenSeries } = renderView();
+    const link = await screen.findByRole("button", { name: "Open the series The Lighthouse Files: part 2 of 12" });
+    expect(link.textContent).not.toContain("new");
+    fireEvent.click(link);
+    expect(onOpenSeries).toHaveBeenCalledWith(expect.objectContaining({ id: "p2" }), "The Lighthouse Files");
+  });
+
+  it("leaves the links off when they cannot be had", async () => {
+    videos = [video({ id: "p2", title: "Episode 2" })];
+    downloadSeries.mockImplementation(() => Promise.reject("no"));
+    renderView();
+    await screen.findByText("Episode 2");
+    expect(screen.queryByRole("button", { name: /^Open the series/ })).toBeNull();
+  });
+});
+
+/** The search over this tab: the feed's language, over titles, channels and series names. */
+describe("searching downloads", () => {
+  it("keeps the rows that match, by title, channel or series name, and marks the match", async () => {
+    videos = [
+      video({ id: "a", title: "Episode 4", channel_title: "Night Shift Radio" }),
+      video({ id: "b", title: "Cooking with fire", channel_title: "Kitchen Basics" }),
+      video({ id: "c", title: "Lighthouse at dawn", channel_title: "Kitchen Basics" }),
+    ];
+    downloadSeries.mockImplementation(() => Promise.resolve([
+      { videoId: "a", stem: "The Lighthouse Files", position: 4, parts: 12, fresh: 0 },
+    ]));
+    const view = renderView();
+    await screen.findByRole("button", { name: /^Open the series/ });
+
+    view.search("lighthouse");
+    expect(titlesUnder("Completed")).toEqual(["Episode 4", "Lighthouse at dawn"]);
+    expect([...document.querySelectorAll(".dl-hit")].map((m) => m.textContent)).toEqual(["Lighthouse", "Lighthouse"]);
+
+    view.search("kitchen -fire");
+    expect(titlesUnder("Completed")).toEqual(["Lighthouse at dawn"]);
+  });
+
+  it("says when nothing matches", async () => {
+    videos = [video({ id: "a", title: "Episode 4" })];
+    const view = renderView();
+    await screen.findByText("Episode 4");
+    view.search("zzz");
+    expect(screen.getByText("No download matches “zzz”")).toBeDefined();
   });
 });

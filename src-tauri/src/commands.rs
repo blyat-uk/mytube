@@ -674,6 +674,17 @@ pub async fn enqueue_downloads(
     Ok(queued)
 }
 
+/// The series each of these downloads belongs to, for the Downloads tab's
+/// link into it (see `Db::download_series`). Only downloads on a card of two
+/// or more come back.
+#[tauri::command]
+pub async fn download_series(
+    video_ids: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> R<Vec<crate::models::DownloadSeries>> {
+    db_blocking(&state, move |db| db.download_series(&video_ids)).await
+}
+
 /// Every format one video offers, for the "Download (custom)…" dialog, and
 /// which of them the Settings default would pick. Runs with the same cookies,
 /// deno and ffmpeg a download would, under a tools lease.

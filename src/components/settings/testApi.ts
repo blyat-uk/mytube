@@ -33,8 +33,9 @@ export const SETTINGS: Settings = {
   quality: { ...DEFAULT_QUALITY },
   view: {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
-    show_hidden: false, grouped: false, groups_only: false, in_progress: false, auto_downloading: false, sort: "newest",
+    show_hidden: false, grouped: false, in_progress: false, auto_downloading: false, sort: "newest",
     subs_folded: false, starred_filters: ["hide_watched", "grouped", "sort"],
+    min_length: 0, min_parts: 0, channels_except: false, saved_views: [],
   },
 };
 

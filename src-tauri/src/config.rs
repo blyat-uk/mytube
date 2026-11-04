@@ -78,12 +78,121 @@ pub const QUICK_FILTERS: [&str; 9] = [
     "downloaded_only",
     "show_hidden",
     "grouped",
-    "groups_only",
     "in_progress",
     "auto_downloading",
+    "length",
     "sort",
     "channel_ids",
 ];
+
+/// Ceilings for values only a hand-edited file can push past what the
+/// controls offer: 100 hours, 1000 parts, and the saved views' own.
+const MAX_MIN_LENGTH: u32 = 100 * 3600;
+const MAX_MIN_PARTS: u32 = 1000;
+const MAX_VIEW_NAME: usize = 60;
+const MAX_SAVED_VIEWS: usize = 100;
+const MAX_SEARCH: usize = 200;
+
+/// `s` trimmed and cut to `max` characters.
+fn clip(s: &str, max: usize) -> String {
+    s.trim().chars().take(max).collect()
+}
+
+/// Every filter the All filters sidebar holds -- what a saved view sets. The
+/// search is not here (a view carries it only if it was saved with one), and
+/// nor is anything about the bar: the stars stay where they are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewFilters {
+    #[serde(default)]
+    pub hide_watched: bool,
+    #[serde(default)]
+    pub downloaded_only: bool,
+    #[serde(default)]
+    pub show_hidden: bool,
+    #[serde(default = "d_true")]
+    pub grouped: bool,
+    #[serde(default)]
+    pub in_progress: bool,
+    #[serde(default)]
+    pub auto_downloading: bool,
+    /// At least this long, in seconds; 0 is any. A series counts all its parts.
+    #[serde(default)]
+    pub min_length: u32,
+    /// At least this many parts; 0 is any, and 2 is "only series". Grouped only.
+    #[serde(default)]
+    pub min_parts: u32,
+    #[serde(default = "d_sort")]
+    pub sort: SortOrder,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    /// `channel_ids` are the channels left out: every channel but these.
+    #[serde(default)]
+    pub channels_except: bool,
+}
+
+impl Default for ViewFilters {
+    fn default() -> Self {
+        Self {
+            hide_watched: false,
+            downloaded_only: false,
+            show_hidden: false,
+            grouped: true,
+            in_progress: false,
+            auto_downloading: false,
+            min_length: 0,
+            min_parts: 0,
+            sort: SortOrder::Newest,
+            channel_ids: Vec::new(),
+            channels_except: false,
+        }
+    }
+}
+
+impl ViewFilters {
+    /// Repairs what the controls can never produce, so the sidebar always lands
+    /// on something it offers. Shared by the live view and every saved one.
+    fn sanitize(&mut self) {
+        // `Downloaded` belongs to the Downloads tab's own ordering, and
+        // `Parts` only exists in the picker while Group siblings is on.
+        if self.sort == SortOrder::Downloaded || (self.sort == SortOrder::Parts && !self.grouped) {
+            self.sort = SortOrder::Newest;
+        }
+        // Likewise "Continue watching", "Auto-downloading" and the parts count:
+        // none of them is offered while ungrouped.
+        if !self.grouped {
+            self.in_progress = false;
+            self.auto_downloading = false;
+            self.min_parts = 0;
+        }
+        // One part is every card.
+        if self.min_parts == 1 { self.min_parts = 0; }
+        self.min_parts = self.min_parts.min(MAX_MIN_PARTS);
+        self.min_length = self.min_length.min(MAX_MIN_LENGTH);
+        self.channel_ids.retain(|id| !id.is_empty());
+        self.channel_ids.sort();
+        self.channel_ids.dedup();
+        // Leaving nothing out is every channel, which has one shape only.
+        if self.channel_ids.is_empty() { self.channels_except = false; }
+    }
+}
+
+/// A named set of filters, picked from the sidebar or starred into the bar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedView {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// In the top bar as a chip, ahead of the starred filters.
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub filters: ViewFilters,
+    /// The search it sets. None -- a view saved without one -- leaves the box
+    /// as it is, so applying a view never wipes what was just typed.
+    #[serde(default)]
+    pub search: Option<String>,
+}
 
 /// What a first run pins, and what a view saved before stars existed reads as.
 /// Mirrors `DEFAULT_STARRED` in `src/filters.ts`.
@@ -125,8 +234,11 @@ pub struct ViewState {
     /// or a view block without the key, picks the default up.
     #[serde(default = "d_true")]
     pub grouped: bool,
-    #[serde(default)]
-    pub groups_only: bool,
+    /// "Only groups", which 6.0 folded into the parts count: read so that an
+    /// upgrade keeps the feed it had (it becomes `min_parts: 2`), and never
+    /// written back.
+    #[serde(default, skip_serializing)]
+    groups_only: bool,
     #[serde(default)]
     pub in_progress: bool,
     /// "Auto-downloading": only the series set to auto-download. A series-only
@@ -148,6 +260,21 @@ pub struct ViewState {
     /// without the key picks the default up.
     #[serde(default = "d_starred_filters")]
     pub starred_filters: Vec<String>,
+    /// The Length filter: at least this long in seconds (0 any), and while
+    /// grouped at least this many parts (0 any; 2 is what Only groups was).
+    #[serde(default)]
+    pub min_length: u32,
+    #[serde(default)]
+    pub min_parts: u32,
+    /// `channel_ids` are the channels left out rather than the ones shown --
+    /// what unticking one or two from all of them makes, so a channel
+    /// subscribed to later is shown.
+    #[serde(default)]
+    pub channels_except: bool,
+    /// The named filter sets, in the order they were saved. Per machine like
+    /// the rest of this block.
+    #[serde(default)]
+    pub saved_views: Vec<SavedView>,
 }
 
 impl Default for ViewState {
@@ -165,6 +292,10 @@ impl Default for ViewState {
             sort: SortOrder::Newest,
             subs_folded: false,
             starred_filters: d_starred_filters(),
+            min_length: 0,
+            min_parts: 0,
+            channels_except: false,
+            saved_views: Vec::new(),
         }
     }
 }
@@ -176,27 +307,28 @@ impl ViewState {
     /// so the 200-character search cap (and the rest) bounds what gets
     /// *stored*, not just what `Settings::from_json_str` later *reads*.
     pub(crate) fn sanitize(&mut self) {
-        // `Downloaded` belongs to the Downloads tab's own ordering, and
-        // `Parts` only exists in the picker while Group siblings is on.
-        if self.sort == SortOrder::Downloaded || (self.sort == SortOrder::Parts && !self.grouped) {
-            self.sort = SortOrder::Newest;
+        // Only groups was a card of at least two parts.
+        if std::mem::take(&mut self.groups_only) && self.min_parts < 2 {
+            self.min_parts = 2;
         }
-        // Likewise "Only groups", "Continue watching" and "Auto-downloading":
-        // none of those chips is on screen while ungrouped.
-        if !self.grouped {
-            self.groups_only = false;
-            self.in_progress = false;
-            self.auto_downloading = false;
-        }
-        let trimmed = self.search.trim();
-        self.search = if trimmed.chars().count() > 200 {
-            trimmed.chars().take(200).collect()
-        } else {
-            trimmed.to_string()
-        };
-        self.channel_ids.retain(|id| !id.is_empty());
-        self.channel_ids.sort();
-        self.channel_ids.dedup();
+        let mut filters = self.filters();
+        filters.sanitize();
+        self.set_filters(filters);
+        self.search = clip(&self.search, MAX_SEARCH);
+        // A view with no id or no name cannot be picked or told apart; one
+        // whose id is taken would act on the other.
+        let mut ids = std::collections::HashSet::new();
+        self.saved_views.retain_mut(|v| {
+            v.id = clip(&v.id, 64);
+            v.name = clip(&v.name, MAX_VIEW_NAME);
+            if v.id.is_empty() || v.name.is_empty() || !ids.insert(v.id.clone()) {
+                return false;
+            }
+            v.filters.sanitize();
+            v.search = v.search.as_deref().map(|q| clip(q, MAX_SEARCH)).filter(|q| !q.is_empty());
+            true
+        });
+        self.saved_views.truncate(MAX_SAVED_VIEWS);
         // Known ids only, each once, in the bar's order: `App.tsx` compares the
         // serialised view to decide whether to write, and an id a later build
         // added would otherwise be carried by this one without meaning anything.
@@ -206,6 +338,37 @@ impl ViewState {
             .filter(|id| starred.iter().any(|s| s == *id))
             .map(|id| id.to_string())
             .collect();
+    }
+
+    /// The filters on screen, in the shape a saved view holds them.
+    pub fn filters(&self) -> ViewFilters {
+        ViewFilters {
+            hide_watched: self.hide_watched,
+            downloaded_only: self.downloaded_only,
+            show_hidden: self.show_hidden,
+            grouped: self.grouped,
+            in_progress: self.in_progress,
+            auto_downloading: self.auto_downloading,
+            min_length: self.min_length,
+            min_parts: self.min_parts,
+            sort: self.sort,
+            channel_ids: self.channel_ids.clone(),
+            channels_except: self.channels_except,
+        }
+    }
+
+    fn set_filters(&mut self, f: ViewFilters) {
+        self.hide_watched = f.hide_watched;
+        self.downloaded_only = f.downloaded_only;
+        self.show_hidden = f.show_hidden;
+        self.grouped = f.grouped;
+        self.in_progress = f.in_progress;
+        self.auto_downloading = f.auto_downloading;
+        self.min_length = f.min_length;
+        self.min_parts = f.min_parts;
+        self.sort = f.sort;
+        self.channel_ids = f.channel_ids;
+        self.channels_except = f.channels_except;
     }
 }
 
@@ -622,12 +785,22 @@ mod tests {
             downloaded_only: true,
             show_hidden: true,
             grouped: true,
-            groups_only: true,
+            groups_only: false,
             in_progress: true,
             auto_downloading: true,
             sort: SortOrder::Length,
             subs_folded: true,
             starred_filters: vec!["downloaded_only".into(), "channel_ids".into()],
+            min_length: 18000,
+            min_parts: 5,
+            channels_except: true,
+            saved_views: vec![SavedView {
+                id: "v1".into(),
+                name: "Long shows".into(),
+                starred: true,
+                filters: ViewFilters { min_length: 18000, min_parts: 5, ..ViewFilters::default() },
+                search: Some("tapes".into()),
+            }],
         };
         let json = s.to_json_string().unwrap();
         let back = Settings::from_json_str(&json).unwrap();
@@ -690,11 +863,71 @@ mod tests {
     }
 
     #[test]
-    fn groups_only_survives_only_while_grouped() {
-        let off = Settings::from_json_str(r#"{"view":{"groups_only":true,"grouped":false}}"#).unwrap();
-        assert!(!off.view.groups_only);
+    fn only_groups_from_before_6_0_becomes_two_parts_at_least() {
         let on = Settings::from_json_str(r#"{"view":{"groups_only":true,"grouped":true}}"#).unwrap();
-        assert!(on.view.groups_only);
+        assert_eq!(on.view.min_parts, 2);
+        // Never written back under its old name.
+        let json = on.to_json_string().unwrap();
+        assert!(!json.contains("groups_only"), "{json}");
+        // A larger count already set is kept.
+        let five = Settings::from_json_str(
+            r#"{"view":{"groups_only":true,"grouped":true,"min_parts":5}}"#).unwrap();
+        assert_eq!(five.view.min_parts, 5);
+        // Ungrouped, it means nothing, as it did.
+        let off = Settings::from_json_str(r#"{"view":{"groups_only":true,"grouped":false}}"#).unwrap();
+        assert_eq!(off.view.min_parts, 0);
+    }
+
+    #[test]
+    fn the_length_filter_is_kept_and_bounded() {
+        let s = Settings::from_json_str(
+            r#"{"view":{"grouped":true,"min_length":18000,"min_parts":10}}"#).unwrap();
+        assert_eq!((s.view.min_length, s.view.min_parts), (18000, 10));
+        let wild = Settings::from_json_str(
+            r#"{"view":{"grouped":true,"min_length":4000000000,"min_parts":1}}"#).unwrap();
+        assert_eq!((wild.view.min_length, wild.view.min_parts), (MAX_MIN_LENGTH, 0));
+        // The parts count is a series filter, gone with grouping like the others.
+        let flat = Settings::from_json_str(
+            r#"{"view":{"grouped":false,"min_length":3600,"min_parts":5}}"#).unwrap();
+        assert_eq!((flat.view.min_length, flat.view.min_parts), (3600, 0));
+    }
+
+    #[test]
+    fn leaving_no_channel_out_is_every_channel() {
+        let s = Settings::from_json_str(r#"{"view":{"channels_except":true}}"#).unwrap();
+        assert!(!s.view.channels_except);
+        let some = Settings::from_json_str(
+            r#"{"view":{"channels_except":true,"channel_ids":["UC2","UC1"]}}"#).unwrap();
+        assert!(some.view.channels_except);
+        assert_eq!(some.view.channel_ids, ["UC1", "UC2"]);
+    }
+
+    #[test]
+    fn saved_views_keep_their_order_and_lose_what_cannot_be_used() {
+        let s = Settings::from_json_str(r#"{"view":{"saved_views":[
+            {"id":"a","name":"  Long shows  ","starred":true,
+             "filters":{"grouped":false,"min_parts":5,"in_progress":true,"sort":"parts",
+                        "channel_ids":["UC2","UC1","UC2"]},
+             "search":"   "},
+            {"id":"","name":"No id"},
+            {"id":"b","name":""},
+            {"id":"a","name":"Same id"},
+            {"id":"c","name":"Ready","search":" tapes "}
+        ]}}"#).unwrap();
+        let v = &s.view.saved_views;
+        assert_eq!(v.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(v[0].name, "Long shows");
+        assert!(v[0].starred);
+        // Its filters are repaired like the live ones.
+        assert_eq!(v[0].filters.min_parts, 0);
+        assert!(!v[0].filters.in_progress);
+        assert_eq!(v[0].filters.sort, SortOrder::Newest);
+        assert_eq!(v[0].filters.channel_ids, ["UC1", "UC2"]);
+        // An empty search is no search; a real one is trimmed.
+        assert_eq!(v[0].search, None);
+        assert_eq!(v[1].search.as_deref(), Some("tapes"));
+        // A view saved with defaults it never wrote reads as the defaults.
+        assert_eq!(v[1].filters, ViewFilters::default());
     }
 
     #[test]
@@ -759,6 +992,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.view.starred_filters, ["hide_watched", "sort", "channel_ids"]);
+    }
+
+    #[test]
+    fn the_length_star_replaces_only_groups() {
+        let s = Settings::from_json_str(
+            r#"{"view":{"starred_filters":["groups_only","length","sort"]}}"#).unwrap();
+        assert_eq!(s.view.starred_filters, ["length", "sort"]);
     }
 
     #[test]

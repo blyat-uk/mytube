@@ -1,12 +1,15 @@
 import { useEffect, useId, useRef, type ReactElement, type ReactNode, type RefObject } from "react";
 import {
-  IconAutoDownload, IconClose, IconContinue, IconDownload, IconFilters, IconGroupsOnly, IconHidden,
-  IconSeries, IconStar, IconUnwatched,
+  IconAutoDownload, IconClose, IconContinue, IconDownload, IconFilters, IconHidden, IconSeries,
+  IconStar, IconUnwatched,
 } from "./Icons";
 import ChannelList from "./ChannelList";
+import { LengthRows } from "./LengthPicker";
+import SavedViews from "./SavedViews";
 import { useDismiss } from "./usePopover";
 import { sortsFor, TOGGLES, type ToggleDef, type ToggleId } from "../filters";
-import type { Channel, QuickFilter, SortOrder } from "../types";
+import type { ChannelPick } from "../channelPick";
+import type { Channel, QuickFilter, SavedView, SortOrder, ViewFilters } from "../types";
 
 /** Each toggle's glyph, worn by its bar chip and its sidebar row alike, so a
  *  filter is recognisable in both. */
@@ -15,7 +18,6 @@ export const TOGGLE_ICON: Record<ToggleId, () => ReactElement> = {
   downloaded_only: IconDownload,
   show_hidden: IconHidden,
   grouped: IconSeries,
-  groups_only: IconGroupsOnly,
   in_progress: IconContinue,
   // The channel switch's glyph, outlined: a component with no props of its own.
   auto_downloading: () => <IconAutoDownload />,
@@ -37,13 +39,24 @@ interface Props {
   off: boolean;
   toggles: Toggles;
   grouped: boolean;
+  minLength: number;
+  onMinLength: (secs: number) => void;
+  minParts: number;
+  onMinParts: (parts: number) => void;
   sort: SortOrder;
   onSort: (s: SortOrder) => void;
   channels: Channel[];
-  channelIds: string[];
-  onChannelIds: (ids: string[]) => void;
+  pick: ChannelPick;
+  onPick: (pick: ChannelPick) => void;
   starred: readonly QuickFilter[];
   onStar: (id: QuickFilter) => void;
+  views: SavedView[];
+  onViews: (views: SavedView[]) => void;
+  onApplyView: (view: SavedView) => void;
+  /** The filters on screen and the search box, which a view is held up against. */
+  current: ViewFilters;
+  search: string;
+  channelsLabel: (f: ViewFilters) => string;
   /** Something narrows the list, so Clear has work to do. */
   canClear: boolean;
   onClear: () => void;
@@ -117,15 +130,16 @@ function ToggleRow({ def, on, disabled, title, sub, starred, onStar, onChange }:
 }
 
 /**
- * Every filter in one place, floating over the right of the feed: what is in
- * the list, the series filters, the order, then which channels. Changes apply
- * as they are made, like the bar's own chips, so it stays open until Esc, ✕,
- * All filters again, or a press outside the nav. It floats rather than taking
- * room from the grid: a grid that reflowed every time it opened would move the
- * very cards the filters are being judged against.
+ * Every filter in one place, floating over the right of the feed: saved views,
+ * what is in the list, the series filters, length, the order, then which
+ * channels. Changes apply as they are made, like the bar's own chips, so it
+ * stays open until Esc, ✕, All filters again, or a press outside the nav. It
+ * floats rather than taking room from the grid: a grid that reflowed every
+ * time it opened would move the very cards the filters are being judged
+ * against.
  *
- * Each filter has a star. A starred filter sits in the top bar as well, which
- * is how the bar comes to hold exactly what this person reaches for.
+ * Each filter and each view has a star. A starred one sits in the top bar as
+ * well, which is how the bar comes to hold exactly what this person reaches for.
  */
 export default function FiltersSidebar(p: Props) {
   const ref = useRef<HTMLElement>(null);
@@ -201,6 +215,18 @@ export default function FiltersSidebar(p: Props) {
           </p>
         )}
 
+        <Section title="Views">
+          <SavedViews
+            views={p.views}
+            current={p.current}
+            search={p.search}
+            channelsLabel={p.channelsLabel}
+            onApply={p.onApplyView}
+            onViews={p.onViews}
+            off={p.off}
+          />
+        </Section>
+
         <Section title="Show" dim={p.off}>
           {show.map((d) => row(d))}
         </Section>
@@ -208,6 +234,25 @@ export default function FiltersSidebar(p: Props) {
         <Section title="Series" dim={p.off} note={p.grouped ? undefined : "The rest need Group siblings"}>
           {row(groupedDef)}
           {seriesOnly.map((d) => row(d, true))}
+        </Section>
+
+        <Section
+          title="Length"
+          dim={p.off}
+          star={<Star id="length" label="Length" starred={starred.has("length")} onStar={p.onStar} />}
+        >
+          <div className="side-length">
+            <LengthRows
+              minLength={p.minLength}
+              onMinLength={p.onMinLength}
+              minParts={p.minParts}
+              onMinParts={p.onMinParts}
+              grouped={p.grouped}
+              disabled={p.off}
+              title={hint}
+            />
+            <p className="side-hint">A series counts all its parts added up; a lone video, its own length.</p>
+          </div>
         </Section>
 
         <Section
@@ -234,14 +279,13 @@ export default function FiltersSidebar(p: Props) {
         <Section
           title="Channels"
           dim={p.off}
-          note={p.channelIds.length > 0 ? `${p.channelIds.length} picked` : undefined}
           star={<Star id="channel_ids" label="Channels" starred={starred.has("channel_ids")} onStar={p.onStar} />}
         >
           <div className="side-channels">
             <ChannelList
               channels={p.channels}
-              picked={p.channelIds}
-              onPick={p.onChannelIds}
+              pick={p.pick}
+              onPick={p.onPick}
               disabled={p.off}
               title={hint}
             />
@@ -251,7 +295,7 @@ export default function FiltersSidebar(p: Props) {
 
       <p className="side-foot">
         <span className="side-foot-glyph" aria-hidden="true"><IconStar on /></span>
-        Starred filters stay in the top bar. Everything else lives here.
+        Starred views and filters stay in the top bar.
       </p>
     </aside>
   );

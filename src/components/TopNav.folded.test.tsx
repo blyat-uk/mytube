@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { act, render, screen, cleanup, fireEvent } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import type { Fit } from "../toolbarFit";
+import { EVERY_CHANNEL } from "../channelPick";
 import type { Channel } from "../types";
 
 // jsdom has no layout to measure, so the row is simply told how much fits.
@@ -19,13 +20,14 @@ type Props = ComponentProps<typeof TopNav>;
 
 function props(over: Partial<Props> = {}): Props {
   return {
-    tab: "subscriptions", onTab: vi.fn(), channels: CHANNELS, channelIds: [], onChannelIds: vi.fn(),
+    tab: "subscriptions", onTab: vi.fn(), channels: CHANNELS, channelPick: EVERY_CHANNEL, onChannelPick: vi.fn(),
     search: "", onSearch: vi.fn(), hideWatched: false, onHideWatched: vi.fn(),
     downloadedOnly: false, onDownloadedOnly: vi.fn(), showHidden: false, onShowHidden: vi.fn(),
-    grouped: false, onGrouped: vi.fn(), groupsOnly: false, onGroupsOnly: vi.fn(),
+    grouped: false, onGrouped: vi.fn(), minLength: 0, onMinLength: vi.fn(), minParts: 0, onMinParts: vi.fn(),
     inProgress: false, onInProgress: vi.fn(), autoDownloading: false, onAutoDownloading: vi.fn(),
     sort: "newest", onSort: vi.fn(),
     starred: ["hide_watched", "downloaded_only", "sort", "channel_ids"], onStarred: vi.fn(),
+    savedViews: [], onSavedViews: vi.fn(), onApplyView: vi.fn(), downloadSearch: "", onDownloadSearch: vi.fn(),
     series: null, onExitSeries: vi.fn(), polling: false, onRefresh: vi.fn(), onAdd: vi.fn(),
     update: null, onOpenAbout: vi.fn(),
     ...over,
@@ -71,7 +73,7 @@ describe("a row short of room", () => {
 
   it("counts a folded filter that is on, as it does one never starred", () => {
     fit.current = { words: false, shown: 2, folded: false, tight: false };
-    renderNav({ hideWatched: true, channelIds: ["UC1"], showHidden: true });
+    renderNav({ hideWatched: true, channelPick: { ids: ["UC1"], except: false }, showHidden: true });
     // Unwatched is in sight; Channels is folded away and Include hidden was
     // never starred.
     expect(allFilters().getAttribute("aria-label")).toBe("All filters, 2 more on");
@@ -101,7 +103,7 @@ describe("a row short of room", () => {
 
   it("counts every filter that is on once all of them have folded", () => {
     fit.current = FOLDED;
-    renderNav({ hideWatched: true, downloadedOnly: true, channelIds: ["UC1"] });
+    renderNav({ hideWatched: true, downloadedOnly: true, channelPick: { ids: ["UC1"], except: false } });
     expect(allFilters().getAttribute("aria-label")).toBe("All filters, 3 more on");
     expect(allFilters().querySelector(".count")?.textContent).toBe("3");
   });

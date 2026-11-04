@@ -209,6 +209,7 @@ pub fn run() {
             commands::set_watched,
             commands::enqueue_download,
             commands::enqueue_downloads,
+            commands::download_series,
             commands::probe_formats,
             commands::cancel_download,
             commands::open_in_player,

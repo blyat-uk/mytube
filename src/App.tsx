@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CARD_DEFAULT, clampCardSize } from "./format";
-import { normalizeIds, pruneIds } from "./channelPick";
-import { DEFAULT_STARRED, normalizeStarred } from "./filters";
+import { EVERY_CHANNEL, normalizeIds, pruneIds, type ChannelPick } from "./channelPick";
+import {
+  DEFAULT_STARRED, normalizeStarred, normalizeViewFilters, normalizeViews,
+} from "./filters";
 import TopNav, { type Tab } from "./components/TopNav";
 import SubscriptionsView, { type SeriesActions, type SeriesTally } from "./components/SubscriptionsView";
 import DownloadsView from "./components/DownloadsView";
@@ -15,7 +17,8 @@ import {
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
 import type {
-  Channel, QuickFilter, Settings, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
+  Channel, QuickFilter, SavedView, Settings, SortOrder, ToolKind, ToolState, ToolStatus, Video,
+  ViewState,
 } from "./types";
 import "./App.css";
 
@@ -33,18 +36,27 @@ export default function App() {
 // serialise in -- `JSON.stringify` order follows a JS object's own key
 // insertion order, and that order now comes from this literal, not from
 // whatever order the IPC payload's keys arrived in.
-function buildViewState(
-  channelIds: string[], search: string, hideWatched: boolean,
-  downloadedOnly: boolean, showHidden: boolean, grouped: boolean, groupsOnly: boolean,
-  inProgress: boolean, autoDownloading: boolean, sort: SortOrder, subsFolded: boolean,
-  starred: QuickFilter[],
-): ViewState {
+function buildViewState(v: {
+  channelPick: ChannelPick; search: string; hideWatched: boolean;
+  downloadedOnly: boolean; showHidden: boolean; grouped: boolean;
+  inProgress: boolean; autoDownloading: boolean; sort: SortOrder; subsFolded: boolean;
+  starred: QuickFilter[]; minLength: number; minParts: number; savedViews: SavedView[];
+}): ViewState {
   return {
-    channel_ids: channelIds, search,
-    hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
-    grouped, groups_only: groupsOnly, in_progress: inProgress, auto_downloading: autoDownloading,
-    sort, subs_folded: subsFolded, starred_filters: starred,
+    channel_ids: v.channelPick.ids, search: v.search,
+    hide_watched: v.hideWatched, downloaded_only: v.downloadedOnly, show_hidden: v.showHidden,
+    grouped: v.grouped, in_progress: v.inProgress, auto_downloading: v.autoDownloading,
+    sort: v.sort, subs_folded: v.subsFolded, starred_filters: v.starred,
+    min_length: v.minLength, min_parts: v.minParts, channels_except: v.channelPick.except,
+    saved_views: v.savedViews,
   };
+}
+
+/** A channel pick in its one shape: ids sorted, and nothing left out read as
+ *  every channel rather than as an exclusion of nothing. */
+function normalizePick(pick: ChannelPick): ChannelPick {
+  const ids = normalizeIds(pick.ids);
+  return ids.length === 0 ? EVERY_CHANNEL : { ids, except: pick.except };
 }
 
 function Shell() {
@@ -52,12 +64,12 @@ function Shell() {
 
   const [tab, setTab] = useState<Tab>("subscriptions");
   const [channels, setChannels] = useState<Channel[]>([]);
-  // The channels the feed is narrowed to; empty is every channel. Always held
-  // normalised (sorted, no duplicates), so the same pick is the same JSON to
-  // the view writer below and the same list to SubscriptionsView's scroll
-  // memory, however it was ticked.
-  const [channelIds, setChannelIds] = useState<string[]>([]);
-  const pickChannels = useCallback((ids: string[]) => setChannelIds(normalizeIds(ids)), []);
+  // The channels the feed shows -- or, unticked from all of them, leaves out;
+  // empty is every channel. Always held normalised (sorted, no duplicates), so
+  // the same pick is the same JSON to the view writer below and the same list
+  // to SubscriptionsView's scroll memory, however it was ticked.
+  const [channelPick, setChannelPick] = useState<ChannelPick>(EVERY_CHANNEL);
+  const pickChannels = useCallback((pick: ChannelPick) => setChannelPick(normalizePick(pick)), []);
   const [search, setSearch] = useState("");
   const [hideWatched, setHideWatched] = useState(false);
   const [downloadedOnly, setDownloadedOnly] = useState(false);
@@ -68,11 +80,13 @@ function Shell() {
   // saved one would, and the hydration guard below is seeded from this same
   // value, so the default is not mistaken for a change and written back.
   const [grouped, setGrouped] = useState(true);
-  // Only the multi-part series. A filter over groups, so it lives and dies
-  // with the Grouped chip.
-  const [groupsOnly, setGroupsOnly] = useState(false);
+  // The Length filter: cards at least this long (seconds), and while grouped
+  // of at least this many parts -- 2 is what "Only groups" was. The parts
+  // count is a filter over groups, so it lives and dies with the Grouped chip.
+  const [minLength, setMinLength] = useState(0);
+  const [minParts, setMinParts] = useState(0);
   // Only the series you have started and not finished. A filter over groups
-  // too, so it goes wherever groupsOnly goes.
+  // too, so it goes wherever the parts count goes.
   const [inProgress, setInProgress] = useState(false);
   // Only the series set to auto-download -- the one place they can all be
   // seen at once. Another filter over groups, gone with the other two.
@@ -103,21 +117,25 @@ function Shell() {
   // sidebar alone. Always held in `QUICK_ORDER`, like the channel pick is held
   // sorted, so the same stars are the same JSON to the view writer.
   const [starred, setStarred] = useState<QuickFilter[]>(() => [...DEFAULT_STARRED]);
+  // Named filter sets, kept with the view and per machine like it.
+  const [savedViews, setSavedViews] = useState<SavedView[]>([]);
+  // The Downloads tab's search. Not remembered: it is for finding a file now.
+  const [downloadSearch, setDownloadSearch] = useState("");
   // Every bump forces the mounted views to refetch.
   const [reloadToken, setReloadToken] = useState(0);
 
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
 
-  // "Most parts first", "Only groups", "Continue watching" and "Auto-downloading"
-  // only exist while the cards are groups, so ungrouping has to take them back
-  // with it -- otherwise the nav
+  // "Most parts first", the parts count, "Continue watching" and
+  // "Auto-downloading" only exist while the cards are groups, so ungrouping
+  // has to take them back with it -- otherwise the nav
   // is left holding a value it no longer offers, and the next time Grouped
   // goes on the feed would come back filtered by a chip nobody just pressed.
   const setGroupedAndSort = useCallback((on: boolean) => {
     setGrouped(on);
     if (!on) {
       setSort((s) => (s === "parts" ? "newest" : s));
-      setGroupsOnly(false);
+      setMinParts(0);
       setInProgress(false);
       setAutoDownloading(false);
     }
@@ -141,7 +159,7 @@ function Shell() {
   // an open series. The toggles, grouping and sort are how this feed is read,
   // not what it is about, so they stay as they are.
   const seeChannel = useCallback((channelId: string) => {
-    pickChannels([channelId]);
+    pickChannels({ ids: [channelId], except: false });
     setSearch("");
     closeSeries();
   }, [pickChannels, closeSeries]);
@@ -346,9 +364,33 @@ function Shell() {
   // went, so a channel refresh is not a new filter.
   useEffect(() => {
     if (!channelsFetched.current) return;
-    const kept = pruneIds(channelIds, channels);
-    if (kept !== channelIds) setChannelIds(kept);
-  }, [channels, channelIds]);
+    const kept = pruneIds(channelPick.ids, channels);
+    if (kept !== channelPick.ids) setChannelPick(normalizePick({ ids: kept, except: channelPick.except }));
+  }, [channels, channelPick]);
+
+  // A saved view sets every filter at once -- and the search too, if it was
+  // saved with one; otherwise the box keeps what is in it.
+  const applyView = useCallback((view: SavedView) => {
+    const f = normalizeViewFilters(view.filters);
+    setHideWatched(f.hide_watched);
+    setDownloadedOnly(f.downloaded_only);
+    setShowHidden(f.show_hidden);
+    setGrouped(f.grouped);
+    setInProgress(f.in_progress);
+    setAutoDownloading(f.auto_downloading);
+    setMinLength(f.min_length);
+    setMinParts(f.min_parts);
+    setSort(f.sort);
+    setChannelPick(normalizePick({ ids: f.channel_ids, except: f.channels_except }));
+    if (view.search !== null) setSearch(view.search);
+  }, []);
+
+  // A download's link into its series: the series opens on Subscriptions, led
+  // by that download, where its new parts can be fetched or set to arrive.
+  const openFromDownloads = useCallback((video: Video, stem: string | null) => {
+    openSeries(video, stem);
+    setTab("subscriptions");
+  }, [openSeries]);
 
   // Card size and the feed's filters both live in settings.json, so both are
   // read up front and rendering waits for them -- see the early return below.
@@ -364,14 +406,17 @@ function Shell() {
         // `=== true`: a backend older than the switch sends no key at all.
         setShowStats(s.show_stats === true);
         const v = s.view;
-        const restored = normalizeIds(v.channel_ids);
-        setChannelIds(restored);
+        const restored = normalizePick({ ids: v.channel_ids, except: v.channels_except === true });
+        setChannelPick(restored);
         setSearch(v.search);
         setHideWatched(v.hide_watched);
         setDownloadedOnly(v.downloaded_only);
         setShowHidden(v.show_hidden);
         setGrouped(v.grouped);
-        setGroupsOnly(v.groups_only);
+        // `?? 0`, like the `=== true`s here: a view saved before Length has no key.
+        const lengths = normalizeViewFilters({ ...v, min_length: v.min_length ?? 0, min_parts: v.min_parts ?? 0 });
+        setMinLength(lengths.min_length);
+        setMinParts(lengths.min_parts);
         setInProgress(v.in_progress);
         // `=== true`, like `subs_folded`: a view saved before the chip has no key.
         const autoDl = v.auto_downloading === true;
@@ -384,12 +429,15 @@ function Shell() {
         // default set, which the backend fills in the same way.
         const stars = normalizeStarred(v.starred_filters);
         setStarred(stars);
-        persistedView.current = JSON.stringify(
-          buildViewState(
-            restored, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
-            v.groups_only, v.in_progress, autoDl, v.sort, folded, stars,
-          ),
-        );
+        const views = normalizeViews(v.saved_views);
+        setSavedViews(views);
+        persistedView.current = JSON.stringify(buildViewState({
+          channelPick: restored, search: v.search, hideWatched: v.hide_watched,
+          downloadedOnly: v.downloaded_only, showHidden: v.show_hidden, grouped: v.grouped,
+          inProgress: v.in_progress, autoDownloading: autoDl, sort: v.sort, subsFolded: folded,
+          starred: stars, minLength: lengths.min_length, minParts: lengths.min_parts,
+          savedViews: views,
+        }));
       })
       .catch(() => {
         // get_settings failed -- or threw on a malformed `s.view` dereferenced
@@ -398,12 +446,10 @@ function Shell() {
         // default state, not from "", so the writer effect below sees
         // nothing has changed and does not write the defaults over a view it
         // never actually managed to read.
-        persistedView.current = JSON.stringify(
-          buildViewState(
-            channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-            inProgress, autoDownloading, sort, subsFolded, starred,
-          ),
-        );
+        persistedView.current = JSON.stringify(buildViewState({
+          channelPick, search, hideWatched, downloadedOnly, showHidden, grouped, inProgress,
+          autoDownloading, sort, subsFolded, starred, minLength, minParts, savedViews,
+        }));
       })
       .finally(() => setHydrated(true));
   }, []);
@@ -431,13 +477,13 @@ function Shell() {
 
   // Debounced like saveCardSize, but there is no explicit call site for a
   // filter change -- every setter above is reachable straight from TopNav --
-  // so this watches the twelve values instead of wrapping each setter.
+  // so this watches every value instead of wrapping each setter.
   useEffect(() => {
     if (!hydrated) return;
-    const view = buildViewState(
-      channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, autoDownloading, sort, subsFolded, starred,
-    );
+    const view = buildViewState({
+      channelPick, search, hideWatched, downloadedOnly, showHidden, grouped, inProgress,
+      autoDownloading, sort, subsFolded, starred, minLength, minParts, savedViews,
+    });
     const serialised = JSON.stringify(view);
     if (serialised === persistedView.current) return;
     const t = window.setTimeout(() => {
@@ -446,8 +492,8 @@ function Shell() {
         .catch(() => {});
     }, 400);
     return () => window.clearTimeout(t);
-  }, [hydrated, channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, autoDownloading, sort, subsFolded, starred]);
+  }, [hydrated, channelPick, search, hideWatched, downloadedOnly, showHidden, grouped, inProgress,
+      autoDownloading, sort, subsFolded, starred, minLength, minParts, savedViews]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
   // rendering before the saved view lands would spend a query on the
@@ -460,8 +506,8 @@ function Shell() {
         tab={tab}
         onTab={setTab}
         channels={channels}
-        channelIds={channelIds}
-        onChannelIds={pickChannels}
+        channelPick={channelPick}
+        onChannelPick={pickChannels}
         search={search}
         onSearch={setSearch}
         hideWatched={hideWatched}
@@ -472,8 +518,10 @@ function Shell() {
         onShowHidden={setShowHidden}
         grouped={grouped}
         onGrouped={setGroupedAndSort}
-        groupsOnly={groupsOnly}
-        onGroupsOnly={setGroupsOnly}
+        minLength={minLength}
+        onMinLength={setMinLength}
+        minParts={minParts}
+        onMinParts={setMinParts}
         inProgress={inProgress}
         onInProgress={setInProgress}
         autoDownloading={autoDownloading}
@@ -482,6 +530,11 @@ function Shell() {
         onSort={setSort}
         starred={starred}
         onStarred={setStarred}
+        savedViews={savedViews}
+        onSavedViews={setSavedViews}
+        onApplyView={applyView}
+        downloadSearch={downloadSearch}
+        onDownloadSearch={setDownloadSearch}
         series={siblingOf
           ? { name: seriesName, parts: 0, runtime: "", unknown: 0, channel: siblingOf.channel_title, ...tally }
           : null}
@@ -497,13 +550,15 @@ function Shell() {
       <main className="content" ref={contentRef}>
         {tab === "subscriptions" && (
           <SubscriptionsView
-            channelIds={channelIds}
+            channelIds={channelPick.ids}
+            channelsExcept={channelPick.except}
             search={search}
             hideWatched={hideWatched}
             downloadedOnly={downloadedOnly}
             showHidden={showHidden}
             grouped={grouped}
-            groupsOnly={groupsOnly}
+            minLength={minLength}
+            minParts={minParts}
             inProgress={inProgress}
             autoDownloading={autoDownloading}
             cardSize={cardSize}
@@ -524,7 +579,13 @@ function Shell() {
           />
         )}
         {tab === "downloads" && (
-          <DownloadsView reloadToken={reloadToken} cardSize={cardSize} scrollRef={contentRef} />
+          <DownloadsView
+            reloadToken={reloadToken}
+            cardSize={cardSize}
+            scrollRef={contentRef}
+            search={downloadSearch}
+            onOpenSeries={openFromDownloads}
+          />
         )}
         {tab === "settings" && <SettingsView onSaved={onSettingsSaved} />}
       </main>

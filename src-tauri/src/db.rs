@@ -716,11 +716,20 @@ fn feed_where(
                 .map(|id| { args.push(Box::new(id.clone())); format!("?{}", args.len()) })
                 .collect::<Vec<_>>()
                 .join(",");
-            sql.push_str(&format!(" AND v.channel_id IN ({holes})"));
+            // Every channel but these, or these alone.
+            let op = if f.channels_except { "NOT IN" } else { "IN" };
+            sql.push_str(&format!(" AND v.channel_id {op} ({holes})"));
         }
         if !f.show_hidden { sql.push_str(" AND v.hidden=0"); }
         if f.hide_watched { sql.push_str(" AND v.watched=0"); }
         if f.downloaded_only { sql.push_str(" AND v.download_state='done'"); }
+        // A lone video's own length. The grouped walk measures a whole card
+        // instead, so it reads its seeds with this at 0 (`WalkRows::read`) and
+        // applies it to the finished groups.
+        if f.min_length > 0 {
+            args.push(Box::new(f.min_length));
+            sql.push_str(&format!(" AND COALESCE(v.duration_secs, 0) >= ?{}", args.len()));
+        }
         if let Some(term) = f.search.as_ref().filter(|s| !s.trim().is_empty()) {
             args.push(Box::new(term.clone()));
             sql.push_str(&format!(" AND search_match(?{}, v.title, c.title)", args.len()));
@@ -812,7 +821,9 @@ impl WalkRows {
     /// Takes the connection rather than the lock, so a caller with more to
     /// read can do it all under one acquisition.
     fn read(conn: &Connection, f: &VideoFilter) -> Result<Self> {
-        let seed_filter = VideoFilter { sibling_of: None, ..f.clone() };
+        // The length is the card's, which only the finished walk knows: a
+        // part of a long series is short on its own.
+        let seed_filter = VideoFilter { sibling_of: None, min_length: 0, ..f.clone() };
         let Some((sql, args)) = feed_query(&seed_filter, SELECT_VIDEO_IDS, Vec::new()) else {
             return Ok(Self { seeds: Vec::new(), by_channel: HashMap::new() });
         };
@@ -903,11 +914,13 @@ const WEEK_SECS: i64 = 7 * 86_400;
 fn stats_filter(f: &StatsFilter) -> VideoFilter {
     VideoFilter {
         channel_ids: f.channel_ids.clone(),
+        channels_except: f.channels_except,
         search: f.search.clone(),
         show_hidden: true,
         hide_watched: false,
         downloaded_only: false,
-        groups_only: false,
+        min_parts: 0,
+        min_length: 0,
         in_progress: false,
         auto_downloading: false,
         sibling_of: None,
@@ -1729,8 +1742,19 @@ impl Db {
 
         // After the walk, not in it: a lone video must still strike itself off
         // and claim nothing, and only the finished walk knows who is alone.
-        if f.groups_only {
-            groups.retain(|members| members.len() > 1);
+        // A card's size is its whole group, so 2 is "only series".
+        if f.min_parts > 1 {
+            let min = f.min_parts as usize;
+            groups.retain(|members| members.len() >= min);
+        }
+        // A series is as long as all its parts, filtered or not -- the same sum
+        // Longest first ranks it by -- so the card for a long show stays even
+        // when only its last short part is left unwatched.
+        if f.min_length > 0 {
+            let min = i64::from(f.min_length);
+            groups.retain(|members| {
+                members.iter().map(|id| parts.get(id).map_or(0, |p| p.secs)).sum::<i64>() >= min
+            });
         }
         // "Continue watching" is the very test the card uses for its amber
         // in-progress look -- some part watched, some part not -- so the chip and
@@ -1738,7 +1762,7 @@ impl Db {
         // parts that survived the filters, which is what lets it combine with
         // Hide watched: the series you are midway through, each card opening on
         // its next unwatched part. A lone video is never both, so it drops out.
-        // Before the cut, like `groups_only`, so every page comes back full.
+        // Before the cut, like `min_parts`, so every page comes back full.
         if f.in_progress {
             let watched = |id: &String| parts.get(id).is_some_and(|p| p.watched);
             groups.retain(|members| {
@@ -2577,6 +2601,115 @@ impl Db {
     /// parts the caller chose. An undated row goes after the dated ones;
     /// `sort_at` and then the id settle ties, so the order is the same every
     /// time. Unknown ids, and the same id twice, cost nothing.
+    /// The series each of `ids` belongs to, for the Downloads tab's link into
+    /// it: the card "Find siblings" on that video opens -- the series view the
+    /// link lands on -- counted as that view counts it, ready parts only. Ids
+    /// on a card of one, or not ready, are left out.
+    ///
+    /// Read the way [`Db::sibling_ids`] reads, a channel at a time: each
+    /// channel's rows once under the lock, the matching after it is released.
+    pub fn download_series(&self, ids: &[String]) -> Result<Vec<DownloadSeries>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        /// What a part says about following a series up.
+        struct Part { published: Option<i64>, sort_at: Option<i64>, held: bool, open: bool }
+        let (by_channel, mut rows, parts) = {
+            let conn = self.conn.lock().unwrap();
+            let mut by_channel: HashMap<String, Vec<String>> = HashMap::new();
+            for chunk in ids.chunks(HYDRATE_BATCH) {
+                let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+                let mut st = conn.prepare(
+                    &format!("SELECT id, channel_id FROM videos WHERE id IN ({holes})"))?;
+                let found = st.query_map(rusqlite::params_from_iter(chunk), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in found {
+                    let (id, channel) = row?;
+                    by_channel.entry(channel).or_default().push(id);
+                }
+            }
+            let mut rows = HashMap::new();
+            let mut parts = HashMap::new();
+            for channel in by_channel.keys() {
+                rows.insert(channel.clone(), channel_rows(&conn, channel)?.0);
+                let mut st = conn.prepare_cached(
+                    "SELECT id, published_at, sort_at, download_state, watched
+                     FROM videos WHERE channel_id=?1 AND status='ready'")?;
+                let found = st.query_map(params![channel], |r| {
+                    let state: String = r.get(3)?;
+                    let watched: bool = r.get(4)?;
+                    Ok((r.get::<_, String>(0)?, Part {
+                        published: r.get(1)?,
+                        sort_at: r.get(2)?,
+                        // On disk or on its way: what you already have.
+                        held: matches!(state.as_str(), "done" | "queued" | "downloading"),
+                        // Not fetched, not watched: still there to follow up on.
+                        open: matches!(state.as_str(), "none" | "failed") && !watched,
+                    }))
+                })?;
+                for row in found {
+                    let (id, part) = row?;
+                    parts.insert(id, part);
+                }
+            }
+            (by_channel, rows, parts)
+        };
+
+        // Download N parts' order, which is the order the series bands draw.
+        let order = |id: &str| {
+            let p = parts.get(id);
+            let published = p.and_then(|p| p.published);
+            let sort_at = p.and_then(|p| p.sort_at);
+            (published.is_none(), published, sort_at.is_none(), sort_at, id.to_string())
+        };
+        let mut out = Vec::new();
+        for (channel, wanted) in by_channel {
+            let Some(entries) = rows.remove(&channel) else { continue };
+            // Each part's names, its current title first, as the card names them.
+            let names: HashMap<String, Vec<String>> = entries
+                .iter()
+                .map(|e| {
+                    let was = e.former_titles.iter().filter(|t| **t != e.title).cloned();
+                    (e.id.clone(), std::iter::once(e.title.clone()).chain(was).collect())
+                })
+                .collect();
+            let atoms = siblings::Atoms::new(entries);
+            for id in wanted {
+                let members = atoms.group_led_by(&id);
+                if members.len() < 2 { continue; }
+                let mut ordered = members.clone();
+                ordered.sort_by_cached_key(|m| order(m));
+                let position = ordered.iter().position(|m| *m == id).map_or(0, |i| i + 1);
+                // Parts that came out after the newest one you hold: a series
+                // you are behind on in the middle is a series you chose to skip
+                // parts of, and saying so would only nag.
+                let newest_held = members.iter()
+                    .filter_map(|m| parts.get(*m))
+                    .filter(|p| p.held)
+                    .filter_map(|p| p.published)
+                    .max();
+                let fresh = match newest_held {
+                    Some(held) => members.iter()
+                        .filter_map(|m| parts.get(*m))
+                        .filter(|p| p.open && p.published.is_some_and(|at| at > held))
+                        .count(),
+                    None => 0,
+                };
+                let part_names: Vec<Vec<&str>> = members
+                    .iter()
+                    .map(|m| names.get(*m).map(|n| n.iter().map(String::as_str).collect()).unwrap_or_default())
+                    .collect();
+                out.push(DownloadSeries {
+                    video_id: id.clone(),
+                    stem: siblings::series_stem(&part_names),
+                    position: position as u32,
+                    parts: members.len() as u32,
+                    fresh: fresh as u32,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn download_order(&self, ids: &[String]) -> Result<Vec<String>> {
         if ids.is_empty() { return Ok(Vec::new()); }
         let conn = self.conn.lock().unwrap();
@@ -3114,19 +3247,19 @@ mod tests {
     }
 
     #[test]
-    fn groups_only_drops_every_lone_video() {
+    fn two_parts_at_least_drops_every_lone_video() {
         let d = db();
         titled(&d, "UC1", &[
             ("p1", "The Blackwood Tapes"),
             ("other", "A Completely Different Story"),
             ("p2", "(2) The Blackwood Tapes"),
         ]);
-        let f = VideoFilter { groups_only: true, ..Default::default() };
+        let f = VideoFilter { min_parts: 2, ..Default::default() };
         assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
     }
 
     #[test]
-    fn groups_only_counts_the_whole_series_not_the_parts_left_after_filters() {
+    fn min_parts_counts_the_whole_series_not_the_parts_left_after_filters() {
         let d = db();
         titled(&d, "UC1", &[
             ("p1", "The Blackwood Tapes"),
@@ -3134,12 +3267,121 @@ mod tests {
         ]);
         d.set_watched("p1", true).unwrap();
         // One part survives "Unwatched", but the card it leads is still a series.
-        let f = VideoFilter { hide_watched: true, groups_only: true, ..Default::default() };
+        let f = VideoFilter { hide_watched: true, min_parts: 2, ..Default::default() };
         assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
     }
 
     #[test]
-    fn groups_only_is_applied_before_the_page_is_cut() {
+    fn min_parts_keeps_only_series_that_long() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("a1", "Alpha Chronicle"), ("a2", "Alpha Chronicle - Part 2"),
+            ("a3", "Alpha Chronicle - Part 3"),
+            ("b1", "Beta Saga"), ("b2", "Beta Saga - Part 2"),
+            ("lone", "A Completely Different Story"),
+        ]);
+        let f = VideoFilter { min_parts: 3, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("a3".to_string(), 3)]);
+    }
+
+    #[test]
+    fn min_length_measures_a_series_by_all_its_parts() {
+        let d = db();
+        timed(&d, "UC1", &[
+            // Three 50-minute parts: 2h30 as a show, though no part is an hour.
+            ("a1", "Alpha Chronicle", Some(3000)),
+            ("a2", "Alpha Chronicle - Part 2", Some(3000)),
+            ("a3", "Alpha Chronicle - Part 3", Some(3000)),
+            ("long", "A Completely Different Story", Some(7300)),
+            ("short", "Yet Another Unrelated Upload", Some(600)),
+            ("unknown", "Something Nobody Has Timed", None),
+        ]);
+        let two_hours = VideoFilter { min_length: 7200, ..Default::default() };
+        assert_eq!(grouped(&d, &two_hours), vec![("long".to_string(), 1), ("a3".to_string(), 3)]);
+        // Watched parts still count towards the show's length: the filter
+        // chooses which cards appear, never what is inside them.
+        d.set_watched("a1", true).unwrap();
+        d.set_watched("a2", true).unwrap();
+        let unwatched = VideoFilter { hide_watched: true, min_length: 7200, ..Default::default() };
+        assert_eq!(grouped(&d, &unwatched), vec![("long".to_string(), 1), ("a3".to_string(), 3)]);
+    }
+
+    #[test]
+    fn min_length_ungrouped_is_each_videos_own() {
+        let d = db();
+        timed(&d, "UC1", &[
+            ("a1", "Alpha Chronicle", Some(3000)),
+            ("a2", "Alpha Chronicle - Part 2", Some(3000)),
+            ("long", "A Completely Different Story", Some(7300)),
+            ("unknown", "Something Nobody Has Timed", None),
+        ]);
+        let f = VideoFilter { min_length: 3600, ..Default::default() };
+        let ids: Vec<String> = d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec!["long"]);
+    }
+
+    #[test]
+    fn length_and_parts_are_applied_before_the_page_is_cut() {
+        let d = db();
+        timed(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes", Some(4000)),
+            ("p2", "(2) The Blackwood Tapes", Some(4000)),
+            ("lone1", "A Completely Different Story", Some(100)),
+            ("lone2", "Yet Another Unrelated Upload", Some(100)),
+        ]);
+        let f = VideoFilter { min_length: 7200, min_parts: 2, limit: 1, ..Default::default() };
+        assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
+    }
+
+    #[test]
+    fn a_download_knows_its_series_its_place_and_what_came_after() {
+        let d = db();
+        titled(&d, "UC1", &[
+            ("p1", "The Blackwood Tapes"),
+            ("p2", "(2) The Blackwood Tapes"),
+            ("p3", "(3) The Blackwood Tapes"),
+            ("p4", "(4) The Blackwood Tapes"),
+            ("lone", "A Completely Different Story"),
+        ]);
+        d.set_download_state("p1", DownloadState::Done, None, None).unwrap();
+        d.set_download_state("p2", DownloadState::Done, None, None).unwrap();
+        d.set_download_state("lone", DownloadState::Done, None, None).unwrap();
+        // Watched without a file: seen, so not something left to follow up on.
+        d.set_watched("p4", true).unwrap();
+
+        let got = d.download_series(&["p2".into(), "lone".into(), "gone".into()]).unwrap();
+        assert_eq!(got, vec![DownloadSeries {
+            video_id: "p2".into(),
+            stem: Some("The Blackwood Tapes".into()),
+            position: 2,
+            parts: 4,
+            fresh: 1,
+        }]);
+        // Once the newest part is held, nothing after it is left.
+        d.set_download_state("p3", DownloadState::Queued, None, None).unwrap();
+        assert_eq!(d.download_series(&["p1".into()]).unwrap()[0].fresh, 0);
+        assert!(d.download_series(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn channels_except_shows_every_channel_but_those() {
+        let d = db();
+        titled(&d, "UC1", &[("a", "Alpha Chronicle")]);
+        titled(&d, "UC2", &[("b", "Beta Saga")]);
+        titled(&d, "UC3", &[("c", "Gamma Ray Burst")]);
+        let f = VideoFilter {
+            channel_ids: vec!["UC2".into()], channels_except: true, ..Default::default()
+        };
+        let mut ids: Vec<String> = d.list_videos(&f).unwrap().into_iter().map(|v| v.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"]);
+        let mut cards: Vec<String> = grouped(&d, &f).into_iter().map(|(id, _)| id).collect();
+        cards.sort();
+        assert_eq!(cards, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn min_parts_is_applied_before_the_page_is_cut() {
         let d = db();
         titled(&d, "UC1", &[
             ("p1", "The Blackwood Tapes"),
@@ -3149,7 +3391,7 @@ mod tests {
         ]);
         // Newest first puts both lone videos ahead of the series. Filtering
         // after the cut would return an empty first page and hide the series.
-        let f = VideoFilter { groups_only: true, limit: 1, ..Default::default() };
+        let f = VideoFilter { min_parts: 2, limit: 1, ..Default::default() };
         assert_eq!(grouped(&d, &f), vec![("p2".to_string(), 2)]);
     }
 
@@ -8955,11 +9197,11 @@ mod feed_stats_tests {
     fn all(d: &Db) -> FeedStats { stats(d, &StatsFilter::default()) }
 
     fn pick(ids: &[&str]) -> StatsFilter {
-        StatsFilter { channel_ids: ids.iter().map(|s| (*s).to_string()).collect(), search: None }
+        StatsFilter { channel_ids: ids.iter().map(|s| (*s).to_string()).collect(), ..Default::default() }
     }
 
     fn search(term: &str) -> StatsFilter {
-        StatsFilter { channel_ids: Vec::new(), search: Some(term.into()) }
+        StatsFilter { search: Some(term.into()), ..Default::default() }
     }
 
     /// The local date SQLite files `ts` under, worked out apart from it: noon

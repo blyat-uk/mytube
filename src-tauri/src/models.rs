@@ -73,6 +73,10 @@ pub struct StatsFilter {
     /// The channels to count, any of them; empty is every channel.
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    /// `channel_ids` are the channels to leave out rather than the ones to
+    /// count, as on [`VideoFilter`].
+    #[serde(default)]
+    pub channels_except: bool,
     pub search: Option<String>,
 }
 
@@ -298,23 +302,35 @@ pub struct VideoFilter {
     /// The channels to show, any of them; empty is every channel.
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    /// `channel_ids` are the channels to leave out: every channel but these.
+    /// That is what unticking a channel or two from all of them makes, and why
+    /// it is not simply the rest listed -- a channel subscribed to later is in.
+    #[serde(default)]
+    pub channels_except: bool,
     pub hide_watched: bool,
     pub downloaded_only: bool,
     pub show_hidden: bool,
-    /// Grouped feed only: drop every card that is a lone video, leaving the
-    /// multi-part series. A card's size is its whole group, not the parts that
-    /// survived the other filters, so a series with one unwatched part left
-    /// still counts. `list_videos` ignores it -- ungrouped, every card is one.
+    /// Grouped feed only: keep cards of at least this many parts; 0 is any. A
+    /// card's size is its whole group, not the parts that survived the other
+    /// filters, so a series with one unwatched part left still counts. 2 is
+    /// what "Only groups" was. `list_videos` ignores it -- ungrouped, every
+    /// card is one.
     #[serde(default)]
-    pub groups_only: bool,
+    pub min_parts: u32,
+    /// Keep cards at least this long, in seconds; 0 is any. A grouped card is
+    /// as long as all its parts added up -- the whole group, as for
+    /// `min_parts`, and the same sum "Longest first" ranks by -- and a lone
+    /// video as its own length. A duration not known yet counts as 0.
+    #[serde(default)]
+    pub min_length: u32,
     /// Grouped feed only: keep just the series you are midway through -- at
     /// least one part watched and at least one not, counted over the whole
-    /// group like `groups_only`. `list_videos` ignores it, for the same reason.
+    /// group like `min_parts`. `list_videos` ignores it, for the same reason.
     #[serde(default)]
     pub in_progress: bool,
     /// Grouped feed only: keep just the cards whose series is set to
     /// auto-download -- any part carrying the mark, counted over the whole
-    /// group like `groups_only`. A lone card still carrying one counts too, so
+    /// group like `min_parts`. A lone card still carrying one counts too, so
     /// no mark can go on downloading out of sight. `list_videos` ignores it.
     #[serde(default)]
     pub auto_downloading: bool,
@@ -332,10 +348,12 @@ impl Default for VideoFilter {
     fn default() -> Self {
         Self {
             channel_ids: Vec::new(),
+            channels_except: false,
             hide_watched: false,
             downloaded_only: false,
             show_hidden: false,
-            groups_only: false,
+            min_parts: 0,
+            min_length: 0,
             in_progress: false,
             auto_downloading: false,
             search: None,
@@ -345,6 +363,26 @@ impl Default for VideoFilter {
             offset: 0,
         }
     }
+}
+
+/// The series a download belongs to, for the Downloads tab's link into it:
+/// the card that "Find siblings" on this video opens, counted the way the
+/// series view counts it (ready parts only). Only videos on a card of two or
+/// more come back. camelCase like every other dialog-style payload.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadSeries {
+    pub video_id: String,
+    /// The series' name, as the card would wear it; None when the parts share
+    /// nothing showable.
+    pub stem: Option<String>,
+    /// Which part this is, counted in the order Download N parts takes them
+    /// (by upload date), from 1.
+    pub position: u32,
+    pub parts: u32,
+    /// Parts uploaded after the newest one you have downloaded or queued that
+    /// are still not downloaded and not watched: what there is to follow up on.
+    pub fresh: u32,
 }
 
 /// One card in the grouped feed: either a lone video, or a whole multi-part

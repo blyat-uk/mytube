@@ -126,7 +126,12 @@ interface Props {
   /** Collapse each channel's multi-part uploads behind one card. */
   grouped: boolean;
   /** Grouped only: leave out lone videos, keeping the multi-part series. */
-  groupsOnly: boolean;
+  /** `channelIds` are the channels left out: every channel but these. */
+  channelsExcept: boolean;
+  /** The Length filter: at least this long in seconds, and (grouped) at least
+   *  this many parts. 0 is any. */
+  minLength: number;
+  minParts: number;
   /** Grouped only: just the series with some parts watched and some not. */
   inProgress: boolean;
   /** Grouped only: just the series set to auto-download. */
@@ -181,13 +186,13 @@ export default function SubscriptionsView(p: Props) {
   const request = useRef(0);
 
   const {
-    channelIds, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken, siblingOf,
-    onSeriesTally, scrollRef,
+    channelIds, channelsExcept, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken,
+    siblingOf, onSeriesTally, scrollRef, minLength,
   } = p;
   // A series view is a flat list of parts on purpose, so grouping stands down
   // while one is open rather than collapsing the very series being shown.
   const grouped = p.grouped && siblingOf === null;
-  const groupsOnly = grouped && p.groupsOnly;
+  const minParts = grouped ? p.minParts : 0;
   const inProgress = grouped && p.inProgress;
   const autoDownloading = grouped && p.autoDownloading;
 
@@ -195,15 +200,15 @@ export default function SubscriptionsView(p: Props) {
   // toggles. Paused, not off, while a series is open: the feed's grid stays up
   // until the series' first page lands, and so does its waveform.
   const { stats, bump } = useFeedStats({
-    enabled: p.showStats, paused: siblingOf !== null, channelIds, search, reloadToken,
+    enabled: p.showStats, paused: siblingOf !== null, channelIds, channelsExcept, search, reloadToken,
   });
 
   // What makes this list this list. A series, a filter, a sort and a search
   // each make a different one; `grouped` is the derived value above, so opening
   // a series out of the grouped feed counts as one change of list, not two.
   const listKey = JSON.stringify([
-    channelIds, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped, groupsOnly,
-    inProgress, autoDownloading, siblingOf?.id ?? null,
+    channelIds, channelsExcept, search.trim(), hideWatched, downloadedOnly, showHidden, sort, grouped,
+    minParts, minLength, inProgress, autoDownloading, siblingOf?.id ?? null,
   ]);
   // Where each list this view has shown was left. Coming back to one -- leaving
   // a series, clearing a search -- comes back to your place in it; a list never
@@ -261,10 +266,12 @@ export default function SubscriptionsView(p: Props) {
     // The limit counts cards either way, which for the grouped feed means groups.
     const filter = {
       channelIds,
+      channelsExcept,
       hideWatched,
       downloadedOnly,
       showHidden,
-      groupsOnly,
+      minParts,
+      minLength,
       inProgress,
       autoDownloading,
       search: search.trim() ? search.trim() : null,
@@ -293,8 +300,8 @@ export default function SubscriptionsView(p: Props) {
     } finally {
       if (id === request.current) setLoading(false);
     }
-  }, [channelIds, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort, grouped, groupsOnly,
-      inProgress, autoDownloading, listKey, scrollRef, toast]);
+  }, [channelIds, channelsExcept, search, hideWatched, downloadedOnly, showHidden, siblingOf, sort,
+      grouped, minParts, minLength, inProgress, autoDownloading, listKey, scrollRef, toast]);
 
   useEffect(() => { void fetchPage(0); }, [fetchPage, reloadToken]);
 
@@ -988,8 +995,8 @@ export default function SubscriptionsView(p: Props) {
   useEffect(() => { onSeriesActions?.(seriesActions); }, [seriesActions, onSeriesActions]);
 
   const filtered =
-    channelIds.length > 0 || search.trim() !== "" || hideWatched || downloadedOnly || groupsOnly ||
-    inProgress || autoDownloading;
+    channelIds.length > 0 || search.trim() !== "" || hideWatched || downloadedOnly || minParts > 1 ||
+    minLength > 0 || inProgress || autoDownloading;
   /** Any mark or unlink slow enough to show; see `SIBLINGS`. */
   const refreshing = useMemo(() => [...slow].some((k) => k.startsWith(SIBLINGS)), [slow]);
   /** How many parts of the series being asked about have a file, which the

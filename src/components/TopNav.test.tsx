@@ -3,7 +3,8 @@ import { act, render, screen, cleanup, fireEvent, within } from "@testing-librar
 import { useState, type ComponentProps } from "react";
 import TopNav, { type Tab } from "./TopNav";
 import type { SeriesActions } from "./SubscriptionsView";
-import type { Channel, QuickFilter } from "../types";
+import { EVERY_CHANNEL } from "../channelPick";
+import type { Channel, QuickFilter, SavedView } from "../types";
 
 const CHANNELS: Channel[] = [
   {
@@ -24,17 +25,18 @@ const SERIES = { name: "Building a CNC Router", parts: 7, runtime: "4h 10m", unk
 
 /** Every filter starred, so each one has its control in the bar. */
 const ALL_STARRED: QuickFilter[] = [
-  "hide_watched", "downloaded_only", "show_hidden", "grouped", "groups_only", "in_progress",
-  "auto_downloading", "sort", "channel_ids",
+  "hide_watched", "downloaded_only", "show_hidden", "grouped", "in_progress",
+  "auto_downloading", "length", "sort", "channel_ids",
 ];
+const only = (...ids: string[]) => ({ ids, except: false });
 
 function props(over: Partial<Props> = {}): Props {
   return {
     tab: "subscriptions",
     onTab: vi.fn(),
     channels: CHANNELS,
-    channelIds: [],
-    onChannelIds: vi.fn(),
+    channelPick: EVERY_CHANNEL,
+    onChannelPick: vi.fn(),
     search: "",
     onSearch: vi.fn(),
     hideWatched: false,
@@ -45,8 +47,10 @@ function props(over: Partial<Props> = {}): Props {
     onShowHidden: vi.fn(),
     grouped: false,
     onGrouped: vi.fn(),
-    groupsOnly: false,
-    onGroupsOnly: vi.fn(),
+    minLength: 0,
+    onMinLength: vi.fn(),
+    minParts: 0,
+    onMinParts: vi.fn(),
     inProgress: false,
     onInProgress: vi.fn(),
     autoDownloading: false,
@@ -55,6 +59,11 @@ function props(over: Partial<Props> = {}): Props {
     onSort: vi.fn(),
     starred: ALL_STARRED,
     onStarred: vi.fn(),
+    savedViews: [],
+    onSavedViews: vi.fn(),
+    onApplyView: vi.fn(),
+    downloadSearch: "",
+    onDownloadSearch: vi.fn(),
     series: null,
     onExitSeries: vi.fn(),
     polling: false,
@@ -339,8 +348,15 @@ describe("the filters on the row", () => {
     expect(channelButton().classList.contains("is-on")).toBe(false);
   });
 
+  it("says which channel is left out, tinted like any filter that narrows", () => {
+    renderNav({ channelPick: { ids: ["UC2"], except: true } });
+    expect(channelButton().textContent).toBe("All but Nexpo");
+    expect(channelButton().getAttribute("aria-label")).toBe("Filter by channel: all channels except Nexpo");
+    expect(channelButton().classList.contains("is-on")).toBe(true);
+  });
+
   it("wears the first picked name and how many more, every name in its tooltip", () => {
-    renderNav({ channelIds: ["UC1", "UC2"] });
+    renderNav({ channelPick: only("UC1", "UC2") });
     const btn = channelButton();
     expect(btn.querySelector(".channel-picker-name")?.textContent).toBe("Chills Narrated");
     expect(btn.querySelector(".channel-picker-more")?.textContent).toBe("+1");
@@ -352,22 +368,22 @@ describe("the filters on the row", () => {
   it("opens a checklist of every subscription plus an all-channels reset", () => {
     renderNav();
     const pop = openChannels();
-    const rows = Array.from(pop.querySelectorAll(".chan-row")).map((r) => r.textContent);
+    const rows = Array.from(pop.querySelectorAll(".chan-row .chan-name")).map((r) => r.textContent);
     expect(rows).toEqual(["All channels", "Chills Narrated", "Nexpo"]);
     expect(channelButton().getAttribute("aria-expanded")).toBe("true");
     // It opens to pick, so typing goes straight into the filter box.
     expect(document.activeElement).toBe(screen.getByRole("searchbox", { name: "Filter channels" }));
   });
 
-  it("adds to the pick, switches to one with Only, and resets with All channels", () => {
-    const p = renderNav({ channelIds: ["UC1"] });
+  it("leaves a channel out, switches to one with Only, and resets with All channels", () => {
+    const p = renderNav();
     openChannels();
     fireEvent.click(button("Nexpo"));
-    expect(p.onChannelIds).toHaveBeenLastCalledWith(["UC1", "UC2"]);
+    expect(p.onChannelPick).toHaveBeenLastCalledWith({ ids: ["UC2"], except: true });
     fireEvent.click(button("Show only Nexpo"));
-    expect(p.onChannelIds).toHaveBeenLastCalledWith(["UC2"]);
+    expect(p.onChannelPick).toHaveBeenLastCalledWith(only("UC2"));
     fireEvent.click(button("All channels"));
-    expect(p.onChannelIds).toHaveBeenLastCalledWith([]);
+    expect(p.onChannelPick).toHaveBeenLastCalledWith(EVERY_CHANNEL);
     // Ticks apply as they are made, so the list stays open for the next one.
     expect(screen.getByRole("dialog", { name: "Channels" })).toBeDefined();
   });
@@ -451,13 +467,13 @@ describe("the Ctrl+F shortcut", () => {
   });
 
   /**
-   * The box only exists on Subscriptions now. Rather than have the shortcut do
-   * nothing on the other two tabs, it means "find a video" everywhere and goes
-   * to the tab that can answer.
+   * Settings has no search box. Rather than have the shortcut do nothing
+   * there, it means "find a video" and goes to the tab that can answer.
+   * (Downloads has a box of its own, which takes it; see "the Downloads search".)
    */
   it("switches to Subscriptions from a tab that has no search box", () => {
     function Harness() {
-      const [tab, setTab] = useState<Tab>("downloads");
+      const [tab, setTab] = useState<Tab>("settings");
       return <TopNav {...props({ tab, onTab: setTab, search: "cats" })} />;
     }
     render(<Harness />);
@@ -541,29 +557,72 @@ describe("the most-parts sort option", () => {
   });
 });
 
-/** "Only groups" filters cards that exist only while grouped. */
-describe("the only-groups filter", () => {
-  it("is absent until siblings are grouped", () => {
-    renderNav();
+/**
+ * Length: at least so long, and (grouped) at least so many parts -- the way
+ * to find the well-developed shows. Its chip wears its value and opens both
+ * rows; "Only groups" is the parts row at 2.
+ */
+describe("the length filter", () => {
+  const lengthChip = () => screen.getByRole("button", { name: /^Length:/ }) as HTMLButtonElement;
+  const openLength = () => {
+    fireEvent.click(lengthChip());
+    return screen.getByRole("dialog", { name: "Length" });
+  };
+
+  it("has no Only groups switch any more", () => {
+    renderNav({ grouped: true });
     expect(screen.queryByRole("button", { name: "Only groups" })).toBeNull();
   });
 
-  it("joins the filters once they are, and toggles", () => {
+  it("wears its value, or Any length while it lets everything through", () => {
+    renderNav({ grouped: true });
+    expect(lengthChip().textContent).toBe("Any length");
+    expect(lengthChip().classList.contains("is-on")).toBe(false);
+    cleanup();
+    renderNav({ grouped: true, minLength: 18000, minParts: 10 });
+    expect(lengthChip().textContent).toBe("5h+ · 10+ parts");
+    expect(lengthChip().getAttribute("aria-label")).toBe("Length: 5h+ · 10+ parts");
+    expect(lengthChip().classList.contains("is-on")).toBe(true);
+  });
+
+  it("opens both rows and sets each, at least never at most", () => {
     const p = renderNav({ grouped: true });
-    const chip = screen.getByRole("button", { name: "Only groups" });
-    expect(chip.getAttribute("aria-pressed")).toBe("false");
-    fireEvent.click(chip);
-    expect(p.onGroupsOnly).toHaveBeenCalledWith(true);
+    const pop = openLength();
+    const total = within(within(pop).getByRole("radiogroup", { name: "Total length, at least" }));
+    expect(total.getAllByRole("radio").map((r) => r.textContent)).toEqual(["Any", "1h+", "2h+", "5h+", "10h+"]);
+    fireEvent.click(total.getByRole("radio", { name: "5h+" }));
+    expect(p.onMinLength).toHaveBeenLastCalledWith(18000);
+    const parts = within(within(pop).getByRole("radiogroup", { name: "Parts, at least" }));
+    expect(parts.getAllByRole("radio").map((r) => r.textContent)).toEqual(["Any", "2+", "5+", "10+", "20+"]);
+    fireEvent.click(parts.getByRole("radio", { name: "10+" }));
+    expect(p.onMinParts).toHaveBeenLastCalledWith(10);
+    // Each press applies at once, so the popover stays for the other row.
+    expect(screen.getByRole("dialog", { name: "Length" })).toBeDefined();
+  });
+
+  it("offers the parts row only while grouped", () => {
+    renderNav({ grouped: false });
+    const pop = openLength();
+    const parts = within(within(pop).getByRole("radiogroup", { name: "Parts, at least" }));
+    for (const r of parts.getAllByRole("radio")) expect((r as HTMLButtonElement).disabled).toBe(true);
+    expect(within(pop).getByText("Needs Group siblings")).toBeDefined();
   });
 
   it("is switched off while a series is open, like the other filters", () => {
-    renderNav({ grouped: true, groupsOnly: true, series: SERIES });
-    const chip = screen.getByRole("button", { name: "Only groups" }) as HTMLButtonElement;
-    expect(chip.disabled).toBe(true);
+    renderNav({ grouped: true, minLength: 3600, series: SERIES });
+    expect(lengthChip().disabled).toBe(true);
+  });
+
+  it("closes on Esc, handing focus back", () => {
+    renderNav({ grouped: true });
+    openLength();
+    act(() => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })); });
+    expect(screen.queryByRole("dialog", { name: "Length" })).toBeNull();
+    expect(document.activeElement).toBe(lengthChip());
   });
 });
 
-/** "Continue watching" narrows to series, so like Only groups it exists only grouped. */
+/** "Continue watching" narrows to series, so it exists only grouped. */
 describe("the continue-watching filter", () => {
   it("is absent until siblings are grouped", () => {
     renderNav();
@@ -602,7 +661,7 @@ describe("the auto-downloading filter", () => {
   it("joins the filters once they are, after Continue watching, and toggles", () => {
     const p = renderNav({ grouped: true });
     const bar = screen.getByRole("group", { name: "Starred filters" });
-    const labels = Array.from(bar.querySelectorAll(".quick-chip")).map((b) => b.getAttribute("aria-label"));
+    const labels = Array.from(bar.querySelectorAll(".quick-chip:not(.length-chip)")).map((b) => b.getAttribute("aria-label"));
     expect(labels.slice(-2)).toEqual(["Continue watching", "Auto-downloading"]);
     const chip = screen.getByRole("button", { name: "Auto-downloading" });
     expect(chip.getAttribute("aria-pressed")).toBe("false");
@@ -820,7 +879,7 @@ describe("the starred filters", () => {
   });
 
   it("counts on All filters only what is on and not in the bar", () => {
-    renderNav({ starred: ["hide_watched"], hideWatched: true, downloadedOnly: true, channelIds: ["UC1"] });
+    renderNav({ starred: ["hide_watched"], hideWatched: true, downloadedOnly: true, channelPick: only("UC1") });
     const all = button("All filters, 2 more on");
     expect(all.querySelector(".count")?.textContent).toBe("2");
     expect(all.title).toBe("2 filters are on that the top bar is not showing");
@@ -849,9 +908,9 @@ describe("the All filters sidebar", () => {
     renderNav({ grouped: true });
     const panel = open();
     const heads = Array.from(panel.querySelectorAll(".side-sec-title")).map((h) => h.textContent);
-    expect(heads).toEqual(["Show", "Series", "Sort", "Channels"]);
+    expect(heads).toEqual(["Views", "Show", "Series", "Length", "Sort", "Channels"]);
     expect(screen.getByRole("button", { name: /^All filters/ }).getAttribute("aria-expanded")).toBe("true");
-    for (const name of ["Unwatched", "Downloaded", "Include hidden", "Group siblings", "Only groups",
+    for (const name of ["Unwatched", "Downloaded", "Include hidden", "Group siblings",
       "Continue watching", "Auto-downloading"]) {
       expect(side().getByRole("button", { name })).toBeDefined();
     }
@@ -874,7 +933,10 @@ describe("the All filters sidebar", () => {
     fireEvent.click(side().getByRole("radio", { name: "Longest first" }));
     expect(p.onSort).toHaveBeenCalledWith("length");
     fireEvent.click(side().getByRole("button", { name: "Chills Narrated" }));
-    expect(p.onChannelIds).toHaveBeenCalledWith(["UC1"]);
+    expect(p.onChannelPick).toHaveBeenCalledWith({ ids: ["UC1"], except: true });
+    fireEvent.click(within(side().getByRole("radiogroup", { name: "Total length, at least" }))
+      .getByRole("radio", { name: "2h+" }));
+    expect(p.onMinLength).toHaveBeenCalledWith(7200);
     expect(sidebar()).not.toBeNull();
   });
 
@@ -919,7 +981,7 @@ describe("the All filters sidebar", () => {
   it("offers the series filters disabled until grouped, with their stars still live", () => {
     const p = renderNav({ grouped: false, starred: [] });
     open();
-    expect((side().getByRole("button", { name: "Only groups" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((side().getByRole("button", { name: "Continue watching" }) as HTMLButtonElement).disabled).toBe(true);
     expect(side().getByText("The rest need Group siblings")).toBeDefined();
     expect(side().queryByRole("radio", { name: "Most parts first" })).toBeNull();
     fireEvent.click(side().getByRole("button", { name: "Star Continue watching" }));
@@ -928,13 +990,16 @@ describe("the All filters sidebar", () => {
 
   it("clears what narrows the list, leaving grouping and the order alone", () => {
     const p = renderNav({
-      starred: [], grouped: true, sort: "oldest", hideWatched: true, inProgress: true, channelIds: ["UC2"],
+      starred: [], grouped: true, sort: "oldest", hideWatched: true, inProgress: true,
+      channelPick: only("UC2"), minLength: 3600, minParts: 5,
     });
     open();
     fireEvent.click(side().getByRole("button", { name: "Clear" }));
     expect(p.onHideWatched).toHaveBeenCalledWith(false);
     expect(p.onInProgress).toHaveBeenCalledWith(false);
-    expect(p.onChannelIds).toHaveBeenCalledWith([]);
+    expect(p.onChannelPick).toHaveBeenCalledWith(EVERY_CHANNEL);
+    expect(p.onMinLength).toHaveBeenCalledWith(0);
+    expect(p.onMinParts).toHaveBeenCalledWith(0);
     expect(p.onGrouped).not.toHaveBeenCalled();
     expect(p.onSort).not.toHaveBeenCalled();
     expect(p.onDownloadedOnly).not.toHaveBeenCalled();
@@ -979,7 +1044,7 @@ describe("the All filters sidebar", () => {
   });
 
   it("keeps only the sort live while a series is open, and says why", () => {
-    renderNav({ series: SERIES, channelIds: [] });
+    renderNav({ series: SERIES });
     open();
     expect(side().getByText(/only/i, { selector: ".side-note span" })).toBeDefined();
     expect((side().getByRole("button", { name: "Unwatched" }) as HTMLButtonElement).disabled).toBe(true);
@@ -1015,5 +1080,151 @@ describe("the sections", () => {
       expect(tabs).toEqual(["Subscriptions", "Downloads", "Settings"]);
       cleanup();
     }
+  });
+});
+
+/**
+ * A saved view is a named set of filters: picked from the sidebar, or from its
+ * chip once starred. It is showing while the filters on screen are its own.
+ */
+describe("saved views", () => {
+  const LONG: SavedView = {
+    id: "v1", name: "Long shows", starred: true, search: null,
+    filters: {
+      hide_watched: true, downloaded_only: false, show_hidden: false, grouped: true,
+      in_progress: false, auto_downloading: false, min_length: 18000, min_parts: 5,
+      sort: "length", channel_ids: [], channels_except: false,
+    },
+  };
+  const READY: SavedView = {
+    ...LONG, id: "v2", name: "Ready on disk", starred: false,
+    filters: { ...LONG.filters, hide_watched: false, downloaded_only: true, min_length: 0, min_parts: 0, sort: "newest" },
+  };
+  const views = [LONG, READY];
+  const sidebar = () => within(screen.getByRole("dialog", { name: "All filters" }));
+  const openSide = () => fireEvent.click(screen.getByRole("button", { name: /^All filters/ }));
+  /** The filters LONG sets, as props. */
+  const showingLong = {
+    hideWatched: true, grouped: true, minLength: 18000, minParts: 5, sort: "length" as const,
+  };
+
+  it("puts a starred view's chip in the bar ahead of the starred filters", () => {
+    renderNav({ savedViews: views, starred: ["hide_watched"] });
+    const bar = screen.getByRole("group", { name: "Starred filters" });
+    const labels = Array.from(bar.querySelectorAll(".quick-slot > *")).map((el) => el.getAttribute("aria-label"));
+    expect(labels).toEqual(["Long shows", "Unwatched"]);
+  });
+
+  it("applies a view from its chip, and lights it while its filters are on", () => {
+    const p = renderNav({ savedViews: views, grouped: true });
+    const chip = within(screen.getByRole("group", { name: "Starred filters" })).getByRole("button", { name: "Long shows" });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(p.onApplyView).toHaveBeenCalledWith(LONG);
+    cleanup();
+    renderNav({ savedViews: views, ...showingLong });
+    expect(within(screen.getByRole("group", { name: "Starred filters" }))
+      .getByRole("button", { name: "Long shows" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("lists every view in the sidebar with what it sets, and applies one", () => {
+    const p = renderNav({ savedViews: views });
+    openSide();
+    const row = sidebar().getByRole("button", { name: "Ready on disk" });
+    expect(row.getAttribute("aria-describedby")).toBeTruthy();
+    expect(document.getElementById(row.getAttribute("aria-describedby")!)!.textContent)
+      .toBe("Downloaded · Grouped · Newest first · All channels");
+    fireEvent.click(row);
+    expect(p.onApplyView).toHaveBeenCalledWith(READY);
+  });
+
+  it("saves the filters on screen under a name, with the search only if asked", () => {
+    const p = renderNav({ savedViews: [], grouped: true, minLength: 7200, search: "tapes" });
+    openSide();
+    fireEvent.click(sidebar().getByRole("button", { name: "Save these filters as a view" }));
+    const name = sidebar().getByRole("textbox", { name: "Name this view" });
+    expect((sidebar().getByRole("button", { name: "Save view" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(name, { target: { value: "  Weekend binge " } });
+    fireEvent.click(sidebar().getByRole("checkbox", { name: /Include the search/ }));
+    fireEvent.click(sidebar().getByRole("button", { name: "Save view" }));
+    const saved = (p.onSavedViews as ReturnType<typeof vi.fn>).mock.calls[0][0] as SavedView[];
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      name: "Weekend binge", starred: false, search: "tapes",
+      filters: { grouped: true, min_length: 7200, hide_watched: false },
+    });
+  });
+
+  it("offers no save while the filters on screen are already a view", () => {
+    renderNav({ savedViews: views, ...showingLong });
+    openSide();
+    expect((sidebar().getByRole("button", { name: "Save these filters as a view" }) as HTMLButtonElement).disabled)
+      .toBe(true);
+  });
+
+  it("updates a view to the filters on screen, renames it, and deletes it", () => {
+    const p = renderNav({ savedViews: views, grouped: true, downloadedOnly: true, sort: "oldest" });
+    const changed = () => (p.onSavedViews as ReturnType<typeof vi.fn>).mock.lastCall![0] as SavedView[];
+    openSide();
+    fireEvent.click(sidebar().getByRole("button", { name: "More for Long shows" }));
+    fireEvent.click(sidebar().getByRole("menuitem", { name: "Update to these filters" }));
+    expect(changed()[0].filters).toMatchObject({ downloaded_only: true, sort: "oldest", min_length: 0 });
+
+    fireEvent.click(sidebar().getByRole("button", { name: "More for Long shows" }));
+    fireEvent.click(sidebar().getByRole("menuitem", { name: "Rename" }));
+    const box = sidebar().getByRole("textbox", { name: "Rename Long shows" });
+    fireEvent.change(box, { target: { value: "Epics" } });
+    fireEvent.blur(box);
+    expect(changed()[0].name).toBe("Epics");
+
+    fireEvent.click(sidebar().getByRole("button", { name: "More for Ready on disk" }));
+    fireEvent.click(sidebar().getByRole("menuitem", { name: "Delete view" }));
+    expect(changed().map((v) => v.id)).toEqual(["v1"]);
+  });
+
+  it("stars a view into the bar and takes the star away", () => {
+    const p = renderNav({ savedViews: views });
+    openSide();
+    fireEvent.click(sidebar().getByRole("button", { name: "Star Ready on disk" }));
+    expect((p.onSavedViews as ReturnType<typeof vi.fn>).mock.lastCall![0][1].starred).toBe(true);
+    fireEvent.click(sidebar().getByRole("button", { name: "Star Long shows" }));
+    expect((p.onSavedViews as ReturnType<typeof vi.fn>).mock.lastCall![0][0].starred).toBe(false);
+  });
+
+  it("closes a rename on Esc without closing the sidebar", () => {
+    renderNav({ savedViews: views });
+    openSide();
+    fireEvent.click(sidebar().getByRole("button", { name: "More for Long shows" }));
+    fireEvent.click(sidebar().getByRole("menuitem", { name: "Rename" }));
+    const box = sidebar().getByRole("textbox", { name: "Rename Long shows" });
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(sidebar().queryByRole("textbox", { name: "Rename Long shows" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "All filters" })).toBeDefined();
+  });
+
+  it("cannot be applied while a series is open", () => {
+    renderNav({ savedViews: views, series: SERIES });
+    expect((within(screen.getByRole("group", { name: "Starred filters" }))
+      .getByRole("button", { name: "Long shows" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+/** The Downloads tab's row holds one search box and no filters. */
+describe("the Downloads search", () => {
+  it("is the only tool on the Downloads tab, and says what it searches", () => {
+    const p = renderNav({ tab: "downloads" });
+    const box = screen.getByRole("searchbox", { name: "Search downloads" }) as HTMLInputElement;
+    expect(screen.queryByRole("button", { name: /^All filters/ })).toBeNull();
+    expect(screen.queryByLabelText("Search videos")).toBeNull();
+    fireEvent.change(box, { target: { value: "tapes" } });
+    expect(p.onDownloadSearch).toHaveBeenCalledWith("tapes");
+  });
+
+  it("takes Ctrl+F on the Downloads tab, rather than going to Subscriptions", () => {
+    const p = renderNav({ tab: "downloads", downloadSearch: "lighthouse" });
+    act(() => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, cancelable: true })); });
+    const box = screen.getByRole("searchbox", { name: "Search downloads" }) as HTMLInputElement;
+    expect(document.activeElement).toBe(box);
+    expect(p.onTab).not.toHaveBeenCalled();
   });
 });

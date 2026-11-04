@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, act, within } from "@testing-library/react";
 import type {
-  Channel, FeedStats, QuickFilter, Settings, StatsFilter, ToolStatus, VersionInfo, Video, ViewState,
-  VideoFilter,
+  Channel, DownloadSeries, FeedStats, QuickFilter, SavedView, Settings, StatsFilter, ToolStatus,
+  VersionInfo, Video, ViewState, VideoFilter,
 } from "./types";
 import { DEFAULT_QUALITY } from "./quality";
 
@@ -41,6 +41,7 @@ const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve
 const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(VERSION));
 const syncNudge = vi.fn<() => Promise<void>>(() => Promise.resolve());
 const feedStats = vi.fn<(f: StatsFilter) => Promise<FeedStats>>(() => Promise.resolve(STATS));
+const downloadSeries = vi.fn<(ids: string[]) => Promise<DownloadSeries[]>>(() => Promise.resolve([]));
 // Kept, as the backend keeps it: a second visit to Settings reads back what
 // the first one saved.
 const saveSettings = vi.fn((s: Settings) => {
@@ -72,6 +73,7 @@ vi.mock("./api", () => {
       syncNudge: () => syncNudge(),
       subscriptionStats: () => Promise.resolve([]),
       feedStats: (f: StatsFilter) => feedStats(f),
+      downloadSeries: (ids: string[]) => downloadSeries(ids),
       saveSettings: (s: Settings) => saveSettings(s),
       syncStatus: unanswered,
       detectBrowsers: unanswered,
@@ -87,15 +89,16 @@ import App from "./App";
 
 /** Every filter starred, so each one has a chip in the bar to press. */
 const ALL_STARRED: QuickFilter[] = [
-  "hide_watched", "downloaded_only", "show_hidden", "grouped", "groups_only", "in_progress",
-  "auto_downloading", "sort", "channel_ids",
+  "hide_watched", "downloaded_only", "show_hidden", "grouped", "in_progress",
+  "auto_downloading", "length", "sort", "channel_ids",
 ];
 
 function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
-    show_hidden: false, grouped: false, groups_only: false, in_progress: false,
+    show_hidden: false, grouped: false, in_progress: false,
     auto_downloading: false, sort: "newest", subs_folded: false, starred_filters: ALL_STARRED,
+    min_length: 0, min_parts: 0, channels_except: false, saved_views: [],
     ...over,
   };
 }
@@ -145,6 +148,7 @@ beforeEach(() => {
   appVersionInfo.mockImplementation(() => Promise.resolve(VERSION));
   syncNudge.mockImplementation(() => Promise.resolve());
   feedStats.mockImplementation(() => Promise.resolve(STATS));
+  downloadSeries.mockImplementation(() => Promise.resolve([]));
   saveSettings.mockImplementation((s: Settings) => {
     settings = s;
     return Promise.resolve();
@@ -337,8 +341,8 @@ describe("the continue-watching filter", () => {
     expect(saveViewState).toHaveBeenCalledWith(defaultView({ grouped: true, in_progress: true }));
   });
 
-  it("is cleared, with Only groups, when Group siblings goes off", async () => {
-    settings = settingsWith({ grouped: true, groups_only: true, in_progress: true });
+  it("is cleared, with the parts count, when Group siblings goes off", async () => {
+    settings = settingsWith({ grouped: true, min_parts: 5, in_progress: true });
     render(<App />);
     await screen.findByLabelText("Search videos");
 
@@ -544,6 +548,147 @@ describe("the open series' bar", () => {
       const calls = listVideos.mock.calls;
       expect(calls[calls.length - 1][0]).toMatchObject({ siblingOf: null });
     });
+  });
+});
+
+/**
+ * Length, the channels left out, and the saved views all live in the view
+ * block, and are sent to the feed.
+ */
+describe("the length filter and the channels left out", () => {
+  it("restores both, sends them to the grouped feed, and saves a change", async () => {
+    settings = settingsWith({
+      grouped: true, min_length: 18000, min_parts: 5, channel_ids: ["UC2"], channels_except: true,
+    });
+    const sub = (id: string, title: string): Channel => ({
+      id, title, handle: null, url: "", thumb_path: null, subscribed: true, member: false,
+      auto_download: false, added_at: 0, last_polled_at: null, terminated: false,
+    });
+    // UC2 is still subscribed, so the pick is not pruned on arrival.
+    listChannels.mockImplementation(() => Promise.resolve([sub("UC1", "Veritasium"), sub("UC2", "Nexpo")]));
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
+    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({
+      minLength: 18000, minParts: 5, channelIds: ["UC2"], channelsExcept: true,
+    });
+
+    fireEvent.click(button("Length: 5h+ · 5+ parts"));
+    fireEvent.click(within(screen.getByRole("radiogroup", { name: "Total length, at least" }))
+      .getByRole("radio", { name: "10h+" }));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView({
+      grouped: true, min_length: 36000, min_parts: 5, channel_ids: ["UC2"], channels_except: true,
+    }));
+  });
+
+  it("reads a view saved before Length as any length, and writes nothing back", async () => {
+    settings = settingsWith({ grouped: true });
+    const v = settings.view as Partial<ViewState>;
+    delete v.min_length;
+    delete v.min_parts;
+    delete v.channels_except;
+    delete v.saved_views;
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(button("Length: any")).toBeDefined();
+    await pause(500);
+    expect(saveViewState).not.toHaveBeenCalled();
+  });
+});
+
+describe("saved views", () => {
+  const LONG: SavedView = {
+    id: "v1", name: "Long shows", starred: true, search: null,
+    filters: {
+      hide_watched: true, downloaded_only: false, show_hidden: false, grouped: true,
+      in_progress: false, auto_downloading: false, min_length: 18000, min_parts: 5,
+      sort: "length", channel_ids: [], channels_except: false,
+    },
+  };
+
+  it("sets every filter at once from a starred view's chip, and lights it", async () => {
+    settings = settingsWith({ saved_views: [LONG], search: "kept" });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    const chip = () => within(screen.getByRole("group", { name: "Starred filters" }))
+      .getByRole("button", { name: "Long shows" });
+    expect(chip().getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(chip());
+    await waitFor(() => expect(chip().getAttribute("aria-pressed")).toBe("true"));
+    await waitFor(() => {
+      const last = listVideoGroups.mock.calls[listVideoGroups.mock.calls.length - 1][0];
+      expect(last).toMatchObject({ hideWatched: true, minLength: 18000, minParts: 5, sort: "length" });
+    });
+    // Saved without a search, it leaves the box alone.
+    expect(screen.getByLabelText("Search videos")).toHaveProperty("value", "kept");
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledWith(defaultView({
+      saved_views: [LONG], search: "kept", hide_watched: true, grouped: true, min_length: 18000,
+      min_parts: 5, sort: "length",
+    })));
+
+    // Change one filter and the view stops showing.
+    await act(async () => { fireEvent.click(button("Unwatched")); });
+    expect(chip().getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("sets the search too, when the view was saved with one", async () => {
+    settings = settingsWith({ saved_views: [{ ...LONG, search: "tapes" }] });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    fireEvent.click(within(screen.getByRole("group", { name: "Starred filters" }))
+      .getByRole("button", { name: "Long shows" }));
+    await waitFor(() => expect(screen.getByLabelText("Search videos")).toHaveProperty("value", "tapes"));
+  });
+});
+
+/**
+ * A download that belongs to a series links into it: the series opens on
+ * Subscriptions, led by that download, its bar there to fetch the rest.
+ */
+describe("opening a series from Downloads", () => {
+  it("goes to Subscriptions with the series open", async () => {
+    const part: Video = { ...feedVideo(), id: "p2", title: "The Tapes Part 2", download_state: "done" };
+    listVideos.mockImplementation((f: VideoFilter) => Promise.resolve(f.sort === "downloaded" ? [part] : []));
+    downloadSeries.mockImplementation(() => Promise.resolve([
+      { videoId: "p2", stem: "The Tapes", position: 2, parts: 5, fresh: 2 },
+    ]));
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    fireEvent.click(button("Downloads"));
+
+    const link = await screen.findByRole("button", { name: "Open the series The Tapes: part 2 of 5, 2 new parts" });
+    expect(link.textContent).toContain("+2 new");
+    fireEvent.click(link);
+
+    const bar = await screen.findByRole("region", { name: "Open series" });
+    expect(within(bar).getByText("The Tapes")).toBeDefined();
+    expect(button("Subscriptions").getAttribute("aria-current")).toBe("page");
+    await waitFor(() => {
+      const calls = listVideos.mock.calls;
+      expect(calls[calls.length - 1][0]).toMatchObject({ siblingOf: "p2" });
+    });
+  });
+
+  it("searches the downloads by title, channel and series name", async () => {
+    const a: Video = { ...feedVideo(), id: "a", title: "Episode 4", download_state: "done" };
+    const b: Video = { ...feedVideo(), id: "b", title: "Cooking with fire", download_state: "done" };
+    listVideos.mockImplementation((f: VideoFilter) => Promise.resolve(f.sort === "downloaded" ? [a, b] : []));
+    downloadSeries.mockImplementation(() => Promise.resolve([
+      { videoId: "a", stem: "The Lighthouse Files", position: 4, parts: 12, fresh: 0 },
+    ]));
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    fireEvent.click(button("Downloads"));
+    await screen.findByText("Cooking with fire");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search downloads" }), { target: { value: "lighthouse" } });
+    await waitFor(() => expect(screen.queryByText("Cooking with fire")).toBeNull());
+    expect(screen.getByRole("button", { name: /^Open the series The Lighthouse Files/ })).toBeDefined();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search downloads" }), { target: { value: "nothing-like-it" } });
+    expect(await screen.findByText("No download matches “nothing-like-it”")).toBeDefined();
   });
 });
 
@@ -891,7 +1036,7 @@ describe("the feed's stats", () => {
     settings = { ...settingsWith({ channel_ids: ["UC1"], search: "tapes" }), show_stats: true };
     render(<App />);
     expect((await screen.findByTestId("waveform")).textContent).toBe("42 videos");
-    expect(feedStats).toHaveBeenCalledWith({ channelIds: ["UC1"], search: "tapes" });
+    expect(feedStats).toHaveBeenCalledWith({ channelIds: ["UC1"], channelsExcept: false, search: "tapes" });
   });
 
   it("follows the switch from Settings back to the feed, without a restart", async () => {

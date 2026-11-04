@@ -74,12 +74,12 @@ describe("useFeedStats", () => {
   it("asks with the pick and the trimmed search, and none for a blank box", async () => {
     const { result, set } = mount({ channelIds: ONE, search: "  tapes " });
     await settle();
-    expect(feedStats).toHaveBeenLastCalledWith({ channelIds: ["UC1"], search: "tapes" });
+    expect(feedStats).toHaveBeenLastCalledWith({ channelIds: ["UC1"], channelsExcept: false, search: "tapes" });
     expect(result.current.stats).toEqual(stats(1));
 
     set({ channelIds: ONE, search: "   " });
     await settle();
-    expect(feedStats).toHaveBeenLastCalledWith({ channelIds: ["UC1"], search: null });
+    expect(feedStats).toHaveBeenLastCalledWith({ channelIds: ["UC1"], channelsExcept: false, search: null });
   });
 
   it("asks again on a reload, a new pick and a new search, and not for a trailing space", async () => {
@@ -98,7 +98,7 @@ describe("useFeedStats", () => {
     set({ search: "blackwood", reloadToken: 1, channelIds: ONE });
     await settle();
     expect(feedStats).toHaveBeenCalledTimes(4);
-    expect(feedStats).toHaveBeenLastCalledWith({ channelIds: ["UC1"], search: "blackwood" });
+    expect(feedStats).toHaveBeenLastCalledWith({ channelIds: ["UC1"], channelsExcept: false, search: "blackwood" });
   });
 
   it("drops an answer that a newer question overtook", async () => {

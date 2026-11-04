@@ -23,6 +23,8 @@ import { GearSix } from "@phosphor-icons/react/dist/icons/GearSix";
 import { Play } from "@phosphor-icons/react/dist/icons/Play";
 import { SquaresFour } from "@phosphor-icons/react/dist/icons/SquaresFour";
 import { Star } from "@phosphor-icons/react/dist/icons/Star";
+import { BookmarkSimple } from "@phosphor-icons/react/dist/icons/BookmarkSimple";
+import { DotsThree } from "@phosphor-icons/react/dist/icons/DotsThree";
 import { Trash } from "@phosphor-icons/react/dist/icons/Trash";
 import { Stack } from "@phosphor-icons/react/dist/icons/Stack";
 import { X } from "@phosphor-icons/react/dist/icons/X";
@@ -113,6 +115,14 @@ export const IconFilters = () => <Funnel className="icon" weight="bold" />;
 export const IconStar = ({ on = false }: { on?: boolean }) => (
   <Star className="icon" weight={on ? "fill" : "bold"} />
 );
+/** A saved view: an outline, filled while the filters on screen are its own. */
+export const IconView = ({ on = false }: { on?: boolean }) => (
+  <BookmarkSimple className="icon" weight={on ? "fill" : "bold"} />
+);
+/** The Length filter. */
+export const IconLength = () => <Timer className="icon" weight="bold" />;
+/** A row's own menu. */
+export const IconMore = () => <DotsThree className="icon" weight="bold" />;
 export const IconSearch = () => <MagnifyingGlass className="icon" weight="bold" />;
 export const IconCaret = () => <CaretDown className="icon icon-caret" weight="bold" />;
 

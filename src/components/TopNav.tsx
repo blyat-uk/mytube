@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  IconAutoDownload, IconBusy, IconClose, IconDownload, IconFilters, IconHidden, IconNewRelease,
-  IconSearch, IconSeries, IconSettings, IconShow, IconSubscriptions,
+  IconAutoDownload, IconBusy, IconCaret, IconClose, IconDownload, IconFilters, IconHidden,
+  IconLength, IconNewRelease, IconSearch, IconSeries, IconSettings, IconShow, IconSubscriptions,
+  IconView,
 } from "./Icons";
 import FiltersSidebar, { SIDEBAR_OUT_MS, TOGGLE_ICON, type Toggles } from "./FiltersSidebar";
 import { ChannelButton, ChannelPopover } from "./ChannelPicker";
+import { LengthPopover } from "./LengthPicker";
 import type { CallState, SeriesActions } from "./SubscriptionsView";
 import { useToolbarFit } from "../toolbarFit";
 import { singleClick } from "../pending";
-import { activeFilters, sortsFor, toggleDef, toggleStar, type ToggleId } from "../filters";
-import type { AppUpdate, Channel, QuickFilter, SortOrder } from "../types";
+import {
+  activeFilters, describeFilters, lengthLabel, sortsFor, toggleDef, toggleStar, viewIsShowing,
+  type ToggleId,
+} from "../filters";
+import { EVERY_CHANNEL, pickLabel, type ChannelPick } from "../channelPick";
+import type { AppUpdate, Channel, QuickFilter, SavedView, SortOrder, ViewFilters } from "../types";
 
 export type Tab = "subscriptions" | "downloads" | "settings";
 
@@ -157,15 +163,17 @@ function usePresence(open: boolean, ms: number): boolean {
   return open || lingering;
 }
 
-const isToggle = (id: QuickFilter): id is ToggleId => id !== "sort" && id !== "channel_ids";
+const isToggle = (id: QuickFilter): id is ToggleId =>
+  id !== "length" && id !== "sort" && id !== "channel_ids";
 
 interface Props {
   tab: Tab;
   onTab: (t: Tab) => void;
   channels: Channel[];
-  /** The channels the feed is narrowed to, sorted; empty for every channel. */
-  channelIds: string[];
-  onChannelIds: (ids: string[]) => void;
+  /** The channels the feed shows -- or, `except`, leaves out; sorted, empty
+   *  for every channel. */
+  channelPick: ChannelPick;
+  onChannelPick: (pick: ChannelPick) => void;
   search: string;
   onSearch: (s: string) => void;
   hideWatched: boolean;
@@ -178,8 +186,12 @@ interface Props {
   onShowHidden: (v: boolean) => void;
   grouped: boolean;
   onGrouped: (v: boolean) => void;
-  groupsOnly: boolean;
-  onGroupsOnly: (v: boolean) => void;
+  /** The Length filter: at least this long (seconds), and while grouped at
+   *  least this many parts. 0 is any. */
+  minLength: number;
+  onMinLength: (secs: number) => void;
+  minParts: number;
+  onMinParts: (parts: number) => void;
   inProgress: boolean;
   onInProgress: (v: boolean) => void;
   autoDownloading: boolean;
@@ -187,6 +199,14 @@ interface Props {
   /** The filters starred into the bar, in `QUICK_ORDER`. */
   starred: QuickFilter[];
   onStarred: (ids: QuickFilter[]) => void;
+  /** Named filter sets; a starred one has a chip in the bar, ahead of the
+   *  starred filters. */
+  savedViews: SavedView[];
+  onSavedViews: (views: SavedView[]) => void;
+  onApplyView: (view: SavedView) => void;
+  /** The Downloads tab's own search, which its box in this row holds. */
+  downloadSearch: string;
+  onDownloadSearch: (s: string) => void;
   /** The open series, or null for the ordinary feed. Opens the series bar. */
   series: SeriesInfo | null;
   /** What the series bar can do with the open series, once its parts are in.
@@ -240,23 +260,43 @@ export default function TopNav(p: Props) {
   // The starred filters that apply right now: the series-only three need
   // grouping, and ungrouped they would sit in the bar doing nothing.
   const quickIds = p.starred.filter((id) => !(isToggle(id) && toggleDef(id).seriesOnly && !p.grouped));
-  const fit = useToolbarFit(toolsRef, addRef, quickIds.length, `${p.tab}|${quickIds.join(",")}`);
+  // The bar's slots: starred views first, each by its own key, then the
+  // starred filters. A narrow row folds them from the end, so the filters go
+  // before any view does.
+  const starredViews = p.savedViews.filter((v) => v.starred);
+  const slots: string[] = [...starredViews.map((v) => `view:${v.id}`), ...quickIds];
+  const fit = useToolbarFit(
+    toolsRef, addRef, slots.length,
+    `${p.tab}|${slots.join(",")}|${starredViews.map((v) => v.name).join("\u0000")}`,
+  );
   const folded = onFeed && fit.folded;
   const foldedRef = useRef(folded);
   foldedRef.current = folded;
-  const inRow = new Set(quickIds.slice(0, fit.shown));
+  const inRow = new Set(slots.slice(0, fit.shown));
   const channelsInRow = inRow.has("channel_ids");
+  const lengthInRow = inRow.has("length");
 
   const toggles: Toggles = {
     hide_watched: { on: p.hideWatched, set: p.onHideWatched },
     downloaded_only: { on: p.downloadedOnly, set: p.onDownloadedOnly },
     show_hidden: { on: p.showHidden, set: p.onShowHidden },
     grouped: { on: p.grouped, set: p.onGrouped },
-    groups_only: { on: p.groupsOnly, set: p.onGroupsOnly },
     in_progress: { on: p.inProgress, set: p.onInProgress },
     auto_downloading: { on: p.autoDownloading, set: p.onAutoDownloading },
   };
-  const active = activeFilters(p);
+  const active = activeFilters({ ...p, channelIds: p.channelPick.ids });
+  // The filters on screen as a saved view holds them, which a view is held
+  // up against to say whether it is showing.
+  const current: ViewFilters = {
+    hide_watched: p.hideWatched, downloaded_only: p.downloadedOnly, show_hidden: p.showHidden,
+    grouped: p.grouped, in_progress: p.inProgress, auto_downloading: p.autoDownloading,
+    min_length: p.minLength, min_parts: p.minParts, sort: p.sort,
+    channel_ids: p.channelPick.ids, channels_except: p.channelPick.except,
+  };
+  const channelsLabel = (f: ViewFilters) => {
+    const { name, more } = pickLabel(p.channels, { ids: f.channel_ids, except: f.channels_except });
+    return more > 0 ? `${name} +${more}` : name;
+  };
   // What is on but out of sight: never starred, or folded out of a narrow row.
   // The badge exists so that a filter can never narrow the list unseen.
   const unseen = active.filter((id) => !inRow.has(id)).length;
@@ -285,9 +325,20 @@ export default function TopNav(p: Props) {
     if (refocus) channelBtnRef.current?.focus();
   }, []);
 
+  // The starred Length chip's popover, which goes the same way.
+  const lengthBtnRef = useRef<HTMLButtonElement | null>(null);
+  const [lengthOpen, setLengthOpen] = useState(false);
+  useEffect(() => {
+    if (!lengthInRow || p.series !== null || !onFeed) setLengthOpen(false);
+  }, [lengthInRow, p.series, onFeed]);
+  const closeLength = useCallback((refocus: boolean) => {
+    setLengthOpen(false);
+    if (refocus) lengthBtnRef.current?.focus();
+  }, []);
+
   // A filter just starred lights up as it lands in the bar, so the eye finds
   // where it went.
-  const [fresh, setFresh] = useState<QuickFilter | null>(null);
+  const [fresh, setFresh] = useState<string | null>(null);
   useEffect(() => {
     if (!fresh) return;
     const t = window.setTimeout(() => setFresh(null), 1200);
@@ -303,7 +354,9 @@ export default function TopNav(p: Props) {
   // it, so they stay.
   const clear = () => {
     for (const [id, t] of Object.entries(toggles)) if (id !== "grouped" && t.on) t.set(false);
-    if (p.channelIds.length > 0) p.onChannelIds([]);
+    if (p.minLength > 0) p.onMinLength(0);
+    if (p.minParts > 0) p.onMinParts(0);
+    if (p.channelPick.ids.length > 0) p.onChannelPick(EVERY_CHANNEL);
   };
 
   /** The folded row's search box is out: asked for, or holding a query. */
@@ -399,6 +452,32 @@ export default function TopNav(p: Props) {
     setFocusWanted(true);
   };
 
+  // A view just starred lights up as it lands in the bar, as a filter does.
+  const saveViews = (next: SavedView[]) => {
+    const was = new Set(p.savedViews.filter((v) => v.starred).map((v) => v.id));
+    const added = next.find((v) => v.starred && !was.has(v.id));
+    if (added) setFresh(`view:${added.id}`);
+    p.onSavedViews(next);
+  };
+
+  const viewChip = (v: SavedView) => {
+    const showing = viewIsShowing(v, current, p.search);
+    return (
+      <button
+        type="button"
+        className={`chip quick-chip view-chip${showing ? " is-on" : ""}`}
+        aria-pressed={showing}
+        aria-label={v.name}
+        disabled={off}
+        title={offHint ?? `${v.name}: ${describeFilters(v.filters, channelsLabel(v.filters), v.search).join(" · ")}`}
+        onClick={() => p.onApplyView(v)}
+      >
+        <span className="quick-glyph" aria-hidden="true"><IconView on={showing} /></span>
+        <span className="view-chip-name">{v.name}</span>
+      </button>
+    );
+  };
+
   const quickItem = (id: QuickFilter) => {
     if (id === "sort") {
       return (
@@ -421,16 +500,43 @@ export default function TopNav(p: Props) {
       return (
         <ChannelButton
           channels={p.channels}
-          picked={p.channelIds}
+          pick={p.channelPick}
           open={channelsOpen}
           onToggle={() => {
             setSideOpen(false);
+            setLengthOpen(false);
             setChannelsOpen((o) => !o);
           }}
           disabled={off}
           offHint={offHint}
           buttonRef={channelBtnRef}
         />
+      );
+    }
+    if (id === "length") {
+      // It wears its value, like the sort and the channels beside it, so it
+      // has no words to give up on a narrow row.
+      const value = lengthLabel(p.minLength, p.minParts, p.grouped);
+      return (
+        <button
+          ref={lengthBtnRef}
+          type="button"
+          className={`chip quick-chip length-chip${value ? " is-on" : ""}${lengthOpen ? " is-open" : ""}`}
+          aria-haspopup="dialog"
+          aria-expanded={lengthOpen}
+          aria-label={`Length: ${value || "any"}`}
+          disabled={off}
+          title={offHint ?? "Length: how long a show is, and how many parts it has"}
+          onClick={() => {
+            setSideOpen(false);
+            setChannelsOpen(false);
+            setLengthOpen((o) => !o);
+          }}
+        >
+          <span className="quick-glyph" aria-hidden="true"><IconLength /></span>
+          <span className="length-chip-text">{value || "Any length"}</span>
+          <IconCaret />
+        </button>
       );
     }
     const def = toggleDef(id);
@@ -506,7 +612,28 @@ export default function TopNav(p: Props) {
           )}
         </nav>
 
-        {onFeed ? (
+        {p.tab === "downloads" ? (
+          /* The Downloads tab's search, and nothing else: its list needs no
+             filters, only a way to find one file among hundreds. */
+          <>
+            <div className="topnav-tools">
+              <div className="search search-downloads">
+                <span className="search-glyph" aria-hidden="true">⌕</span>
+                <input
+                  ref={searchRef}
+                  className="search-input"
+                  type="search"
+                  value={p.downloadSearch}
+                  placeholder="Search downloads"
+                  aria-label="Search downloads"
+                  title="Titles, channels and series names (Ctrl+F)"
+                  onChange={(e) => p.onDownloadSearch(e.currentTarget.value)}
+                />
+              </div>
+            </div>
+            <span className="topnav-rule" aria-hidden="true" />
+          </>
+        ) : onFeed ? (
           <>
             {/* Takes whatever the row leaves and packs to the right: toolbarFit.ts
                 measures it to decide how much of it can be spelled out. */}
@@ -563,10 +690,25 @@ export default function TopNav(p: Props) {
                 </button>
               )}
 
-              {/* The starred filters. One folded out of a narrow row keeps its
-                  slot at zero width -- still measurable, no longer usable. */}
-              {quickIds.length > 0 && (
+              {/* The starred views and filters. One folded out of a narrow row
+                  keeps its slot at zero width -- still measurable, no longer
+                  usable. */}
+              {slots.length > 0 && (
                 <div className={`quick${fit.words ? "" : " is-glyphs"}`} role="group" aria-label="Starred filters">
+                  {starredViews.map((v) => {
+                    const key = `view:${v.id}`;
+                    const gone = !inRow.has(key);
+                    return (
+                      <span
+                        key={key}
+                        className={`quick-slot${gone ? " is-folded" : ""}${fresh === key ? " is-new" : ""}`}
+                        inert={gone}
+                        aria-hidden={gone || undefined}
+                      >
+                        {viewChip(v)}
+                      </span>
+                    );
+                  })}
                   {quickIds.map((id) => {
                     const gone = !inRow.has(id);
                     return (
@@ -595,6 +737,7 @@ export default function TopNav(p: Props) {
                   : "Every filter, and a star to keep any of them in the top bar"}
                 onClick={() => {
                   setChannelsOpen(false);
+                  setLengthOpen(false);
                   setSideOpen((o) => !o);
                 }}
               >
@@ -663,8 +806,20 @@ export default function TopNav(p: Props) {
           anchor={channelBtnRef}
           onClose={closeChannels}
           channels={p.channels}
-          picked={p.channelIds}
-          onPick={p.onChannelIds}
+          pick={p.channelPick}
+          onPick={p.onChannelPick}
+        />
+      )}
+
+      {onFeed && lengthInRow && lengthOpen && (
+        <LengthPopover
+          anchor={lengthBtnRef}
+          onClose={closeLength}
+          minLength={p.minLength}
+          onMinLength={p.onMinLength}
+          minParts={p.minParts}
+          onMinParts={p.onMinParts}
+          grouped={p.grouped}
         />
       )}
 
@@ -678,11 +833,21 @@ export default function TopNav(p: Props) {
           grouped={p.grouped}
           sort={p.sort}
           onSort={p.onSort}
+          minLength={p.minLength}
+          onMinLength={p.onMinLength}
+          minParts={p.minParts}
+          onMinParts={p.onMinParts}
           channels={p.channels}
-          channelIds={p.channelIds}
-          onChannelIds={p.onChannelIds}
+          pick={p.channelPick}
+          onPick={p.onChannelPick}
           starred={p.starred}
           onStar={star}
+          views={p.savedViews}
+          onViews={saveViews}
+          onApplyView={p.onApplyView}
+          current={current}
+          search={p.search}
+          channelsLabel={channelsLabel}
           canClear={active.length > 0}
           onClear={clear}
         />

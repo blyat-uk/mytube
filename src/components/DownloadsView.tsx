@@ -3,7 +3,8 @@ import {
 } from "react";
 import ConfirmDialog from "./ConfirmDialog";
 import {
-  IconBusy, IconCancel, IconDelete, IconExternal, IconPlay, IconRetry, IconWatched,
+  IconBusy, IconCancel, IconChevron, IconDelete, IconExternal, IconPlay, IconRetry, IconSeries,
+  IconWatched,
 } from "./Icons";
 import { useToast } from "./Toast";
 import { api, errText, thumbSrc } from "../api";
@@ -13,7 +14,8 @@ import {
 } from "../format";
 import { singleClick, usePending } from "../pending";
 import { createProgressStore, useProgress, type ProgressStore } from "../progress";
-import type { DownloadState, Video } from "../types";
+import { highlighter, parseSearch, type Hit } from "../search";
+import type { DownloadSeries, DownloadState, Video } from "../types";
 
 /** Downloads are rare relative to the library, so one wide sweep is enough. */
 const SWEEP = 500;
@@ -50,9 +52,14 @@ interface Props {
   cardSize: number;
   /** The shell's scroll container, which a popped-out thumbnail must stay inside. */
   scrollRef: RefObject<HTMLElement | null>;
+  /** The search box over this tab, in the feed's search language: titles,
+   *  channels and series names. */
+  search: string;
+  /** Opens the series a download belongs to on Subscriptions, led by it. */
+  onOpenSeries: (video: Video, stem: string | null) => void;
 }
 
-export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Props) {
+export default function DownloadsView({ reloadToken, cardSize, scrollRef, search, onOpenSeries }: Props) {
   const toast = useToast();
   const [items, setItems] = useState<Video[]>([]);
   // Each active row reads its own entry, so a tick renders one row, not the tab.
@@ -75,12 +82,12 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
       const [recent, done] = await Promise.all([
         api.listVideos({
           channelIds: [], hideWatched: false, downloadedOnly: false, showHidden: true,
-          groupsOnly: false, inProgress: false, autoDownloading: false, search: null, siblingOf: null,
+          channelsExcept: false, minParts: 0, minLength: 0, inProgress: false, autoDownloading: false, search: null, siblingOf: null,
           sort: "downloaded", limit: SWEEP, offset: 0,
         }),
         api.listVideos({
           channelIds: [], hideWatched: false, downloadedOnly: true, showHidden: true,
-          groupsOnly: false, inProgress: false, autoDownloading: false, search: null, siblingOf: null,
+          channelsExcept: false, minParts: 0, minLength: 0, inProgress: false, autoDownloading: false, search: null, siblingOf: null,
           sort: "downloaded", limit: SWEEP, offset: 0,
         }),
       ]);
@@ -143,13 +150,41 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
   // Completed and Failed are histories, so they read newest first. Active is a
   // queue, which runs oldest first -- reversing it there makes the list read
   // top-to-bottom in the order the downloads will actually happen.
-  const { active, completed, failed } = useMemo(() => ({
-    active: items
-      .filter((v) => v.download_state === "downloading" || v.download_state === "queued")
-      .sort((a, b) => byDownloadRecency(b, a)),
-    completed: items.filter((v) => v.download_state === "done").sort(byDownloadRecency),
-    failed: items.filter((v) => v.download_state === "failed").sort(byDownloadRecency),
-  }), [items]);
+  // Which series each download belongs to, for its link into it. Asked again
+  // whenever the list gains or loses a video, and after a poll (which can
+  // bring a series new parts); decoration, so a failure only leaves the links
+  // off.
+  const [series, setSeries] = useState<Map<string, DownloadSeries>>(() => new Map());
+  const idsKey = useMemo(() => items.map((v) => v.id).sort().join(","), [items]);
+  useEffect(() => {
+    if (!idsKey) {
+      setSeries(new Map());
+      return;
+    }
+    let live = true;
+    Promise.resolve()
+      .then(() => api.downloadSeries(idsKey.split(",")))
+      .then((list) => { if (live) setSeries(new Map(list.map((x) => [x.videoId, x]))); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [idsKey, reloadToken]);
+
+  // The search runs over what is loaded: titles, channels and series names.
+  const query = search.trim();
+  const shows = useMemo(() => parseSearch(query), [query]);
+  const mark = useMemo(() => highlighter(query), [query]);
+  const { active, completed, failed } = useMemo(() => {
+    const found = query
+      ? items.filter((v) => shows([v.title, v.channel_title, series.get(v.id)?.stem ?? ""]))
+      : items;
+    return {
+      active: found
+        .filter((v) => v.download_state === "downloading" || v.download_state === "queued")
+        .sort((a, b) => byDownloadRecency(b, a)),
+      completed: found.filter((v) => v.download_state === "done").sort(byDownloadRecency),
+      failed: found.filter((v) => v.download_state === "failed").sort(byDownloadRecency),
+    };
+  }, [items, query, shows, series]);
 
   /**
    * Settles where a thumbnail will land before `:hover` starts growing it. The
@@ -260,11 +295,20 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
     );
   }
 
+  const row = { onPopout: placePopout, mark, onOpenSeries };
+  const nothing = active.length + completed.length + failed.length === 0;
+
   return (
     <div className="page" style={{ ["--card-w" as string]: `${cardSize}px` }}>
+      {nothing && (
+        <div className="empty">
+          <h2>No download matches “{query}”</h2>
+          <p>The search looks through titles, channels and series names.</p>
+        </div>
+      )}
       <Section title="Active" count={active.length}>
         {active.map((v) => (
-          <Row key={v.id} video={v} onPopout={placePopout}>
+          <Row key={v.id} video={v} series={series.get(v.id)} {...row}>
             <RowProgress store={progress} video={v} />
             <RowAction label="Cancel download" {...state(v.id)} onClick={() => void cancel(v)}>
               <IconCancel />
@@ -276,7 +320,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
 
       <Section title="Completed" count={completed.length}>
         {completed.map((v) => (
-          <Row key={v.id} video={v} onPopout={placePopout}>
+          <Row key={v.id} video={v} series={series.get(v.id)} {...row}>
             <RowAction label="Play" tone="is-primary" {...state(v.id)} onClick={() => void play(v)}>
               <IconPlay />
             </RowAction>
@@ -298,7 +342,7 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef }: Prop
 
       <Section title="Failed" count={failed.length}>
         {failed.map((v) => (
-          <Row key={v.id} video={v} onPopout={placePopout}>
+          <Row key={v.id} video={v} series={series.get(v.id)} {...row}>
             <span className="row-error" title={v.download_error ?? ""}>
               {v.download_error ?? "Download failed"}
             </span>
@@ -399,9 +443,49 @@ function Section({ title, count, children }: {
   );
 }
 
-function Row({ video, onPopout, children }: {
+/** Text with the search's matches marked. */
+function Marked({ text, mark }: { text: string; mark: (text: string) => Hit[] }) {
+  return (
+    <>
+      {mark(text).map((h, i) => (h.hit ? <mark key={i} className="dl-hit">{h.text}</mark> : h.text))}
+    </>
+  );
+}
+
+/**
+ * A download's way into the series it belongs to: the series' name, which part
+ * this is, how many have come out since the newest one you have and are not
+ * downloaded yet -- the reason to follow up -- and Open series.
+ */
+function SeriesLink({ video, series, mark, onOpen }: {
+  video: Video; series: DownloadSeries; mark: (text: string) => Hit[];
+  onOpen: (video: Video, stem: string | null) => void;
+}) {
+  const name = series.stem ?? "Its series";
+  const fresh = series.fresh > 0 ? `, ${series.fresh} new ${series.fresh === 1 ? "part" : "parts"}` : "";
+  return (
+    <button
+      type="button"
+      className="dl-series"
+      aria-label={`Open the series ${name}: part ${series.position} of ${series.parts}${fresh}`}
+      title="Open this series on Subscriptions"
+      onClick={() => onOpen(video, series.stem)}
+    >
+      <span className="dl-series-glyph" aria-hidden="true"><IconSeries /></span>
+      <span className="dl-series-name"><Marked text={name} mark={mark} /></span>
+      <span className="dl-series-part">part {series.position} of {series.parts}</span>
+      {series.fresh > 0 && <span className="dl-series-new">+{series.fresh} new</span>}
+      <span className="dl-series-go">Open series<IconChevron /></span>
+    </button>
+  );
+}
+
+function Row({ video, series, onPopout, mark, onOpenSeries, children }: {
   video: Video;
+  series?: DownloadSeries;
   onPopout: (slot: HTMLElement) => void;
+  mark: (text: string) => Hit[];
+  onOpenSeries: (video: Video, stem: string | null) => void;
   children: ReactNode;
 }) {
   const src = thumbSrc(video);
@@ -422,12 +506,13 @@ function Row({ video, onPopout, children }: {
         </div>
       </div>
       <div className="dl-meta">
-        <div className="dl-title" title={video.title}>{video.title}</div>
+        <div className="dl-title" title={video.title}><Marked text={video.title} mark={mark} /></div>
         <div className="dl-sub">
-          {video.channel_title}
+          <Marked text={video.channel_title} mark={mark} />
           <span className="dot" aria-hidden="true">·</span>
           {formatRelative(video.published_at)}
         </div>
+        {series && <SeriesLink video={video} series={series} mark={mark} onOpen={onOpenSeries} />}
       </div>
       <div className="dl-actions">{children}</div>
     </div>

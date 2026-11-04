@@ -141,8 +141,8 @@ function renderView(over: ViewProps = {}) {
   const view = (props: ViewProps) => (
     <ToastProvider>
       <SubscriptionsView
-        channelIds={EVERY_CHANNEL} search="" hideWatched={false} downloadedOnly={false}
-        sort="newest" showHidden={false} grouped={false} groupsOnly={false} inProgress={false}
+        channelIds={EVERY_CHANNEL} channelsExcept={false} search="" hideWatched={false} downloadedOnly={false}
+        sort="newest" showHidden={false} grouped={false} minLength={0} minParts={0} inProgress={false}
         autoDownloading={false} siblingOf={null}
         onFindSiblings={onFindSiblings} onSeriesTally={onSeriesTally}
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
@@ -654,16 +654,18 @@ describe("the grouped feed", () => {
     expect(menuLabels(await openMenu())).toContain("Mark as watched");
   });
 
-  it("asks for only groups when that filter is on", async () => {
-    renderView({ grouped: true, groupsOnly: true });
+  it("asks for the length and the parts count, and the channels left out", async () => {
+    renderView({ grouped: true, minParts: 5, minLength: 18000, channelIds: ["UC2"], channelsExcept: true });
     await waitFor(() => expect(listVideoGroups).toHaveBeenCalled());
-    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({ groupsOnly: true });
+    expect(listVideoGroups.mock.calls[0][0]).toMatchObject({
+      minParts: 5, minLength: 18000, channelIds: ["UC2"], channelsExcept: true,
+    });
   });
 
-  it("drops only-groups with the grouping it filters", async () => {
-    renderView({ grouped: false, groupsOnly: true });
+  it("drops the parts count with the grouping it filters, keeping the length", async () => {
+    renderView({ grouped: false, minParts: 5, minLength: 3600 });
     await waitFor(() => expect(listVideos).toHaveBeenCalled());
-    expect(listVideos.mock.calls[0][0]).toMatchObject({ groupsOnly: false });
+    expect(listVideos.mock.calls[0][0]).toMatchObject({ minParts: 0, minLength: 3600 });
   });
 
   it("asks for only started series when continue-watching is on", async () => {
@@ -1657,7 +1659,7 @@ describe("the stats over the grid", () => {
     const wave = await screen.findByTestId("waveform");
     expect(wave.textContent).toBe("42 videos");
     expect(feedStats).toHaveBeenCalledTimes(1);
-    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], search: "tapes" });
+    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], channelsExcept: false, search: "tapes" });
     await screen.findByRole("article");
     expect(wave.nextElementSibling).toBe(grid());
   });
@@ -1665,18 +1667,18 @@ describe("the stats over the grid", () => {
   it("asks again on a reload, a new pick and a new search", async () => {
     const { rerender } = renderView({ showStats: true });
     await screen.findByTestId("waveform");
-    expect(lastStatsFilter()).toEqual({ channelIds: [], search: null });
+    expect(lastStatsFilter()).toEqual({ channelIds: [], channelsExcept: false, search: null });
 
     rerender({ reloadToken: 1 });
     await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(2));
 
     rerender({ reloadToken: 1, channelIds: PICK });
     await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(3));
-    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], search: null });
+    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], channelsExcept: false, search: null });
 
     rerender({ reloadToken: 1, channelIds: PICK, search: "tapes" });
     await waitFor(() => expect(feedStats).toHaveBeenCalledTimes(4));
-    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], search: "tapes" });
+    expect(lastStatsFilter()).toEqual({ channelIds: ["UC1"], channelsExcept: false, search: "tapes" });
   });
 
   it("is not asked again by the Show toggles or the sort, which never move the counts", async () => {
@@ -1702,7 +1704,7 @@ describe("the stats over the grid", () => {
     expect(feedStats).toHaveBeenCalledTimes(1);
     await later(1);
     expect(feedStats).toHaveBeenCalledTimes(2);
-    expect(lastStatsFilter()).toEqual({ channelIds: [], search: null });
+    expect(lastStatsFilter()).toEqual({ channelIds: [], channelsExcept: false, search: null });
   });
 
   it("answers a burst of three toggles with one request", async () => {

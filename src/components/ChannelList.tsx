@@ -1,13 +1,13 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { IconCheck } from "./Icons";
-import { pickedFirst, togglePick } from "../channelPick";
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { IconCheck, IconMinus } from "./Icons";
+import { EVERY_CHANNEL, isShown, pickedFirst, shownCount, tickChannel, type ChannelPick } from "../channelPick";
 import type { Channel } from "../types";
 
 interface Props {
   channels: Channel[];
-  /** The pick: sorted channel ids, empty for every channel. */
-  picked: string[];
-  onPick: (ids: string[]) => void;
+  /** The pick: the channels shown, or with `except` the ones left out. */
+  pick: ChannelPick;
+  onPick: (pick: ChannelPick) => void;
   /** A series is open, which shows every part whatever the channel filter. */
   disabled?: boolean;
   title?: string;
@@ -16,24 +16,30 @@ interface Props {
 }
 
 /**
- * The channel filter's checklist, the same in the toolbar's popover and the
- * folded Filters panel: a filter box, All channels, then every channel with a
- * box to tick. Ticks apply as they are made, like every other filter. Hovering
- * a row shows Only, which switches to that one channel in one click -- the job
- * the single-channel dropdown this replaced did.
+ * The channel filter's checklist, the same in the top bar's popover and the
+ * All filters sidebar: a filter box, All channels, then every channel with a
+ * box to tick. Ticks apply as they are made, like every other filter.
+ *
+ * Every box starts ticked: no channel filter is every channel shown, so seeing
+ * everything except one or two is a matter of unticking them. All channels is
+ * the Select all box over them -- ticked, half-ticked or (never) empty -- and
+ * ticks them all again. Hovering a row shows Only, which switches to that one
+ * channel in one click.
  */
 export default function ChannelList(p: Props) {
   const [query, setQuery] = useState("");
-  // What was picked on opening goes first, and stays first until the list
+  // What the pick named on opening goes first, and stays first until the list
   // closes: re-sorting on every tick would move the row under the pointer.
-  const [opened] = useState(() => new Set(p.picked));
+  const [opened] = useState(() => new Set(p.pick.ids));
   const order = useMemo(() => pickedFirst(p.channels, opened), [p.channels, opened]);
-  const pickedSet = useMemo(() => new Set(p.picked), [p.picked]);
 
   const q = query.trim().toLowerCase();
   const visible = q ? order.filter((c) => c.title.toLowerCase().includes(q)) : order;
-  // One hairline between what was picked on opening and the rest.
+  // One hairline between what the pick named on opening and the rest.
   const split = q ? -1 : visible.findIndex((c, i) => i > 0 && opened.has(visible[i - 1].id) && !opened.has(c.id));
+  const every = p.pick.ids.length === 0;
+  const shown = shownCount(p.pick, p.channels);
+  const countId = useId();
 
   const filterRef = useRef<HTMLInputElement | null>(null);
   const rowsRef = useRef<HTMLDivElement | null>(null);
@@ -80,24 +86,29 @@ export default function ChannelList(p: Props) {
       <div className="chan-rows" role="group" aria-label="Channels" ref={rowsRef} onKeyDown={onRowsKey}>
         {!q && (
           <>
-            {/* The state of having picked nothing, so a dot rather than a box. */}
+            {/* Select all: ticked while every channel is shown, half-ticked while
+                some are left out. Pressing it shows them all again. */}
             <div className="chan-all">
               <button
                 type="button"
-                className={`chan-row${p.picked.length === 0 ? " is-on" : ""}`}
-                aria-pressed={p.picked.length === 0}
+                className={`chan-row${every ? " is-on" : " is-mixed"}`}
+                aria-pressed={every ? true : "mixed"}
+                aria-label="All channels"
+                aria-describedby={countId}
                 disabled={p.disabled}
-                onClick={() => p.onPick([])}
+                title={p.title ?? (every ? "Every channel is shown" : "Show every channel again")}
+                onClick={() => p.onPick(EVERY_CHANNEL)}
               >
-                <span className="chan-dot" aria-hidden="true" />
+                <span className="chan-box" aria-hidden="true">{every ? <IconCheck /> : <IconMinus />}</span>
                 <span className="chan-name">All channels</span>
+                <span className="chan-count" id={countId}>{shown} of {p.channels.length} shown</span>
               </button>
             </div>
             <div className="pop-sep" />
           </>
         )}
         {visible.map((c, i) => {
-          const on = pickedSet.has(c.id);
+          const on = isShown(p.pick, c.id);
           return (
             <Fragment key={c.id}>
               {i === split && <div className="pop-sep" />}
@@ -109,7 +120,7 @@ export default function ChannelList(p: Props) {
                   disabled={p.disabled}
                   // A long name is cut short in the row, so the full one lives here.
                   title={p.title ?? c.title}
-                  onClick={() => p.onPick(togglePick(p.picked, c.id))}
+                  onClick={() => p.onPick(tickChannel(p.pick, c.id, p.channels))}
                 >
                   <span className="chan-box" aria-hidden="true">{on && <IconCheck />}</span>
                   <span className="chan-name">{c.title}</span>
@@ -120,7 +131,7 @@ export default function ChannelList(p: Props) {
                   aria-label={`Show only ${c.title}`}
                   title={p.title ?? `Show only ${c.title}`}
                   disabled={p.disabled}
-                  onClick={() => p.onPick([c.id])}
+                  onClick={() => p.onPick({ ids: [c.id], except: false })}
                 >
                   Only
                 </button>

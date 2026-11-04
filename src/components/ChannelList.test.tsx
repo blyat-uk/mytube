@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import ChannelList from "./ChannelList";
+import { EVERY_CHANNEL, type ChannelPick } from "../channelPick";
 import type { Channel } from "../types";
 
 const ch = (id: string, title: string): Channel => ({
@@ -11,13 +12,13 @@ const ch = (id: string, title: string): Channel => ({
 const CHANNELS = [ch("UC1", "Alpha"), ch("UC2", "Beta"), ch("UC3", "Gamma"), ch("UC4", "Delta Force")];
 
 /** Holds the pick the way the shell does, so the list sees its own changes. */
-function Harness({ start = [] as string[], onPick = vi.fn(), disabled = false, autoFocus = false }) {
-  const [picked, setPicked] = useState(start);
+function Harness({ start = EVERY_CHANNEL as ChannelPick, onPick = vi.fn(), disabled = false, autoFocus = false }) {
+  const [pick, setPick] = useState(start);
   return (
     <ChannelList
       channels={CHANNELS}
-      picked={picked}
-      onPick={(ids) => { onPick(ids); setPicked(ids); }}
+      pick={pick}
+      onPick={(next) => { onPick(next); setPick(next); }}
       disabled={disabled}
       autoFocus={autoFocus}
     />
@@ -27,49 +28,72 @@ function Harness({ start = [] as string[], onPick = vi.fn(), disabled = false, a
 const rows = () => Array.from(
   screen.getByRole("group", { name: "Channels" }).querySelectorAll<HTMLButtonElement>(".chan-row"),
 );
-const names = () => rows().map((b) => b.textContent);
+const names = () => rows().map((b) => b.querySelector(".chan-name")?.textContent);
 const row = (name: string) => screen.getByRole("button", { name }) as HTMLButtonElement;
 const filterBox = () => screen.getByRole("searchbox", { name: "Filter channels" }) as HTMLInputElement;
+const ticked = () => rows().slice(1).filter((b) => b.getAttribute("aria-pressed") === "true")
+  .map((b) => b.querySelector(".chan-name")?.textContent);
 
 afterEach(cleanup);
 
 describe("ChannelList", () => {
-  it("offers All channels, then every channel, with All channels on when nothing is picked", () => {
+  it("starts with every channel ticked, All channels the Select all box over them", () => {
     render(<Harness />);
     expect(names()).toEqual(["All channels", "Alpha", "Beta", "Gamma", "Delta Force"]);
     expect(row("All channels").getAttribute("aria-pressed")).toBe("true");
-    expect(row("Alpha").getAttribute("aria-pressed")).toBe("false");
+    expect(ticked()).toEqual(["Alpha", "Beta", "Gamma", "Delta Force"]);
+    expect(screen.getByText("4 of 4 shown")).toBeDefined();
   });
 
-  it("lists what was picked first, and leaves rows where they are while it is open", () => {
-    const onPick = vi.fn();
-    render(<Harness start={["UC3"]} onPick={onPick} />);
-    expect(names()).toEqual(["All channels", "Gamma", "Alpha", "Beta", "Delta Force"]);
-    fireEvent.click(row("Gamma"));
-    expect(onPick).toHaveBeenLastCalledWith([]);
-    // Unticked, Gamma stays at the top: the order is the one it opened with.
-    expect(names()).toEqual(["All channels", "Gamma", "Alpha", "Beta", "Delta Force"]);
-    expect(row("Gamma").getAttribute("aria-pressed")).toBe("false");
-  });
-
-  it("ticks channels into a sorted pick and unticks them again", () => {
+  it("leaves out a channel or two by unticking them, and shows the rest", () => {
     const onPick = vi.fn();
     render(<Harness onPick={onPick} />);
     fireEvent.click(row("Gamma"));
+    expect(onPick).toHaveBeenLastCalledWith({ ids: ["UC3"], except: true });
     fireEvent.click(row("Alpha"));
-    expect(onPick).toHaveBeenLastCalledWith(["UC1", "UC3"]);
-    expect(row("All channels").getAttribute("aria-pressed")).toBe("false");
-    fireEvent.click(row("Gamma"));
-    expect(onPick).toHaveBeenLastCalledWith(["UC1"]);
+    expect(onPick).toHaveBeenLastCalledWith({ ids: ["UC1", "UC3"], except: true });
+    expect(ticked()).toEqual(["Beta", "Delta Force"]);
+    // Half-ticked while some are left out, and it says how many are shown.
+    expect(row("All channels").getAttribute("aria-pressed")).toBe("mixed");
+    expect(screen.getByText("2 of 4 shown")).toBeDefined();
+    // Ticking one back leaves the other out still.
+    fireEvent.click(row("Alpha"));
+    expect(onPick).toHaveBeenLastCalledWith({ ids: ["UC3"], except: true });
   });
 
-  it("switches to one channel with Only, and back to every channel with All channels", () => {
+  it("ticks them all again from All channels", () => {
     const onPick = vi.fn();
-    render(<Harness start={["UC1", "UC2"]} onPick={onPick} />);
-    fireEvent.click(screen.getByRole("button", { name: "Show only Gamma" }));
-    expect(onPick).toHaveBeenLastCalledWith(["UC3"]);
+    render(<Harness start={{ ids: ["UC1", "UC3"], except: true }} onPick={onPick} />);
     fireEvent.click(row("All channels"));
-    expect(onPick).toHaveBeenLastCalledWith([]);
+    expect(onPick).toHaveBeenLastCalledWith(EVERY_CHANNEL);
+    // Every box ticked, the two it opened leaving out still listed first.
+    expect(ticked()).toEqual(["Alpha", "Gamma", "Beta", "Delta Force"]);
+  });
+
+  it("lists what the pick named first, and leaves rows where they are while it is open", () => {
+    render(<Harness start={{ ids: ["UC3"], except: true }} />);
+    expect(names()).toEqual(["All channels", "Gamma", "Alpha", "Beta", "Delta Force"]);
+    fireEvent.click(row("Gamma"));
+    // Ticked back, Gamma stays at the top: the order is the one it opened with.
+    expect(names()).toEqual(["All channels", "Gamma", "Alpha", "Beta", "Delta Force"]);
+  });
+
+  it("switches to one channel with Only, and ticks others in beside it", () => {
+    const onPick = vi.fn();
+    render(<Harness onPick={onPick} />);
+    fireEvent.click(screen.getByRole("button", { name: "Show only Gamma" }));
+    expect(onPick).toHaveBeenLastCalledWith({ ids: ["UC3"], except: false });
+    expect(ticked()).toEqual(["Gamma"]);
+    fireEvent.click(row("Alpha"));
+    expect(onPick).toHaveBeenLastCalledWith({ ids: ["UC1", "UC3"], except: false });
+  });
+
+  it("never unticks the last channel shown", () => {
+    const onPick = vi.fn();
+    render(<Harness start={{ ids: ["UC3"], except: false }} onPick={onPick} />);
+    fireEvent.click(row("Gamma"));
+    expect(onPick).toHaveBeenLastCalledWith({ ids: ["UC3"], except: false });
+    expect(ticked()).toEqual(["Gamma"]);
   });
 
   it("narrows to channels whose name holds the filter, in any case", () => {

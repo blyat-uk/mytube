@@ -1,6 +1,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
+  DownloadSeries,
   AddKind, Channel, Video, VideoFilter, VideoGroup, Settings, ViewState, PollSummary,
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
   PlayerOption, BrowserScan, CookiesFileInfo, ToolStatus, Quality, VideoFormats, VersionInfo,
@@ -92,6 +93,8 @@ export const api = {
    *  stored overrides are left alone. */
   enqueueDownloads: (videoIds: string[], quality?: Quality | null) =>
     invoke<number>("enqueue_downloads", { videoIds, quality: quality ?? null }),
+  /** Which series each download belongs to, for its link on the Downloads tab. */
+  downloadSeries: (videoIds: string[]) => invoke<DownloadSeries[]>("download_series", { videoIds }),
   /** Everything one video offers, and what the Settings default would pick
    *  from it. Runs yt-dlp, so it takes a few seconds. */
   probeFormats: (videoId: string) => invoke<VideoFormats>("probe_formats", { videoId }),

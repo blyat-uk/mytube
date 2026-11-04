@@ -22,6 +22,8 @@ export interface FeedStatsOptions {
   /** The channel pick, as the shell holds it (sorted, so the same pick keeps
    *  its identity). */
   channelIds: string[];
+  /** `channelIds` are the channels left out rather than the ones counted. */
+  channelsExcept?: boolean;
   /** The search box. Trimmed here, as the feed's own fetch trims it, so a
    *  trailing space is not a different question. */
   search: string;
@@ -47,7 +49,7 @@ export interface FeedStatsState {
  * stay up.
  */
 export function useFeedStats({
-  enabled, paused = false, channelIds, search, reloadToken,
+  enabled, paused = false, channelIds, channelsExcept = false, search, reloadToken,
 }: FeedStatsOptions): FeedStatsState {
   const [stats, setStats] = useState<FeedStats | null>(null);
   // Only the newest request may land: a pick's answer arriving after the next
@@ -66,10 +68,10 @@ export function useFeedStats({
     // Through `Promise.resolve()` so a missing bridge (`vite dev`) cannot
     // throw out of the effect that asked.
     Promise.resolve()
-      .then(() => api.feedStats({ channelIds, search: trimmed || null }))
+      .then(() => api.feedStats({ channelIds, channelsExcept, search: trimmed || null }))
       .then((s) => { if (id === request.current) setStats(s); })
       .catch(() => {});
-  }, [channelIds, trimmed]);
+  }, [channelIds, channelsExcept, trimmed]);
 
   // What a bump's timer reads when it fires, rather than what was current when
   // it was set: the pick may have moved on, or the switch gone off, since.
