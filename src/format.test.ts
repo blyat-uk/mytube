@@ -37,7 +37,7 @@ describe("formatTotalRuntime", () => {
 });
 
 /**
- * The series card and the nav's breadcrumb both quote a series' runtime, so
+ * The series card and the nav's series bar both quote a series' runtime, so
  * they add it up in one place -- two sums of the same parts that disagreed
  * would be worse than no number at all.
  */

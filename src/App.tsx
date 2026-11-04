@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CARD_DEFAULT, clampCardSize } from "./format";
 import { normalizeIds, pruneIds } from "./channelPick";
+import { DEFAULT_STARRED, normalizeStarred } from "./filters";
 import TopNav, { type Tab } from "./components/TopNav";
 import SubscriptionsView, { type SeriesActions, type SeriesTally } from "./components/SubscriptionsView";
 import DownloadsView from "./components/DownloadsView";
@@ -14,7 +15,7 @@ import {
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
 import type {
-  Channel, Settings, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
+  Channel, QuickFilter, Settings, SortOrder, ToolKind, ToolState, ToolStatus, Video, ViewState,
 } from "./types";
 import "./App.css";
 
@@ -36,12 +37,13 @@ function buildViewState(
   channelIds: string[], search: string, hideWatched: boolean,
   downloadedOnly: boolean, showHidden: boolean, grouped: boolean, groupsOnly: boolean,
   inProgress: boolean, autoDownloading: boolean, sort: SortOrder, subsFolded: boolean,
+  starred: QuickFilter[],
 ): ViewState {
   return {
     channel_ids: channelIds, search,
     hide_watched: hideWatched, downloaded_only: downloadedOnly, show_hidden: showHidden,
     grouped, groups_only: groupsOnly, in_progress: inProgress, auto_downloading: autoDownloading,
-    sort, subs_folded: subsFolded,
+    sort, subs_folded: subsFolded, starred_filters: starred,
   };
 }
 
@@ -89,7 +91,7 @@ function Shell() {
   // What the series turned out to hold. Only the view can count it, so it is
   // reported back up once each page settles.
   const [tally, setTally] = useState<SeriesTally | null>(null);
-  // What the crumb can do with the series: its card menu's actions, which only
+  // What the series bar can do with the series: its card menu's actions, which only
   // the view can run, reported up whenever what they show changes.
   const [seriesActions, setSeriesActions] = useState<SeriesActions | null>(null);
   const [polling, setPolling] = useState(false);
@@ -97,6 +99,10 @@ function Shell() {
   // The Add dialog's subscription list, folded away. Not a filter, but
   // remembered with them: it is how this machine's user left the dialog.
   const [subsFolded, setSubsFolded] = useState(false);
+  // The filters starred into the top bar; the rest live in the All filters
+  // sidebar alone. Always held in `QUICK_ORDER`, like the channel pick is held
+  // sorted, so the same stars are the same JSON to the view writer.
+  const [starred, setStarred] = useState<QuickFilter[]>(() => [...DEFAULT_STARRED]);
   // Every bump forces the mounted views to refetch.
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -262,9 +268,9 @@ function Shell() {
   // menu item -- leads to Settings › About, which sets the installed version
   // beside the available one and holds the way to its release page.
   //
-  // An open series is left on the way: Settings under its breadcrumb would
-  // have no tabs to come back by, and the toast and the tray can both arrive
-  // while one is open.
+  // An open series is left on the way, as any change of tab leaves one: a tab
+  // always opens at its top, and the toast and the tray can both arrive while
+  // a series is open.
   const openAbout = useCallback(() => {
     openSettingsSection("about");
     closeSeries();
@@ -374,10 +380,14 @@ function Shell() {
         // `=== true`: a view saved by an older build has no key at all.
         const folded = v.subs_folded === true;
         setSubsFolded(folded);
+        // A view with no stars at all (saved before they existed) reads as the
+        // default set, which the backend fills in the same way.
+        const stars = normalizeStarred(v.starred_filters);
+        setStarred(stars);
         persistedView.current = JSON.stringify(
           buildViewState(
             restored, v.search, v.hide_watched, v.downloaded_only, v.show_hidden, v.grouped,
-            v.groups_only, v.in_progress, autoDl, v.sort, folded,
+            v.groups_only, v.in_progress, autoDl, v.sort, folded, stars,
           ),
         );
       })
@@ -391,7 +401,7 @@ function Shell() {
         persistedView.current = JSON.stringify(
           buildViewState(
             channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-            inProgress, autoDownloading, sort, subsFolded,
+            inProgress, autoDownloading, sort, subsFolded, starred,
           ),
         );
       })
@@ -421,12 +431,12 @@ function Shell() {
 
   // Debounced like saveCardSize, but there is no explicit call site for a
   // filter change -- every setter above is reachable straight from TopNav --
-  // so this watches the eleven values instead of wrapping each setter.
+  // so this watches the twelve values instead of wrapping each setter.
   useEffect(() => {
     if (!hydrated) return;
     const view = buildViewState(
       channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, autoDownloading, sort, subsFolded,
+      inProgress, autoDownloading, sort, subsFolded, starred,
     );
     const serialised = JSON.stringify(view);
     if (serialised === persistedView.current) return;
@@ -437,7 +447,7 @@ function Shell() {
     }, 400);
     return () => window.clearTimeout(t);
   }, [hydrated, channelIds, search, hideWatched, downloadedOnly, showHidden, grouped, groupsOnly,
-      inProgress, autoDownloading, sort, subsFolded]);
+      inProgress, autoDownloading, sort, subsFolded, starred]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
   // rendering before the saved view lands would spend a query on the
@@ -470,7 +480,11 @@ function Shell() {
         onAutoDownloading={setAutoDownloading}
         sort={sort}
         onSort={setSort}
-        series={siblingOf ? { name: seriesName, parts: 0, runtime: "", unknown: 0, ...tally } : null}
+        starred={starred}
+        onStarred={setStarred}
+        series={siblingOf
+          ? { name: seriesName, parts: 0, runtime: "", unknown: 0, channel: siblingOf.channel_title, ...tally }
+          : null}
         seriesActions={seriesActions}
         onExitSeries={closeSeries}
         polling={polling}

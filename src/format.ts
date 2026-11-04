@@ -34,7 +34,7 @@ export function formatTotalRuntime(secs: number): string {
  * A part whose duration has not resolved yet contributes nothing, which would
  * silently understate the total -- so the count of those comes back with it and
  * the caller marks the number "4h 10m+" rather than letting it read as exact.
- * Shared by the series card and the nav's breadcrumb so the two never disagree.
+ * Shared by the series card and the nav's series bar so the two never disagree.
  */
 export function seriesRuntime(
   videos: { duration_secs: number | null }[],

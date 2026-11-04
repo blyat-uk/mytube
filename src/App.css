@@ -53,6 +53,11 @@
   --fold-time: 260ms;
   --fold-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --fold-stagger: 90ms;
+  /* The All filters sidebar sliding away; SIDEBAR_OUT_MS in FiltersSidebar.tsx. */
+  --side-out: 200ms;
+  /* A filter starred into the top bar: the membership star's yellow. */
+  --star: #ffd34d;
+  --star-soft: rgba(255, 211, 77, 0.12);
 
   --radius: 12px;
   --radius-sm: 8px;
@@ -166,10 +171,12 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-bottom: 1px solid var(--line);
 }
 
-/* One row, at every width. The controls shed their labels as the window
-   narrows (see "narrow windows" at the foot of this file) rather than wrapping
-   to a second row -- two rows put a cluster in each corner and left the eye
-   nowhere to start, which is the layout this replaced. */
+/* One row, at every width. The logo and the sections never change; the
+   filter tools to their right give way as the window narrows (toolbarFit.ts)
+   rather than wrapping to a second row -- two rows put a cluster in each
+   corner and left the eye nowhere to start, which is the layout this
+   replaced. The one bar that does come and go, an open series', is about
+   where you are, not a spill-over of the controls. */
 .topnav-row {
   display: flex;
   align-items: center;
@@ -213,11 +220,15 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-bottom: 4px solid transparent;
 }
 
+/* The sections: a glyph and a word each, the same at every width and in every
+   view. Nothing folds them and nothing replaces them -- an open series gets a
+   bar of its own below -- so where you are is always read in the same place. */
 .tabs {
   display: flex;
   align-items: center;
   gap: 4px;
   margin-left: 4px;
+  flex: none;
 }
 
 .tab {
@@ -230,15 +241,17 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   font-weight: 500;
   display: inline-flex;
   align-items: center;
+  gap: 7px;
   padding: 5px 2px;
   margin: 0 7px;
   cursor: pointer;
-  transition: color 120ms ease, border-color 120ms ease, margin var(--fold-time) var(--fold-ease);
+  transition: color 120ms ease, border-color 120ms ease;
   white-space: nowrap;
 }
 .tab:hover { color: var(--text); }
 .tab.is-active { color: var(--text); border-bottom-color: var(--brand); }
 .tab .icon { width: 17px; height: 17px; }
+.tab-glyph, .tab-label { display: inline-flex; align-items: center; }
 
 /* A newer release, beside the tab that leads to it: a green circle round an
    arrow that spells itself out on hover or focus. The button is a fixed slot
@@ -317,54 +330,46 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   padding-right: 3px;
 }
 
-/* --- the open series' breadcrumb ----------------------------------------- */
+/* --- the open series' bar ---------------------------------------------- */
 
-/* It stands in for the tab strip rather than adding a bar of its own: a series
-   is where you are, not a notice about where you are. */
-.crumb {
+/* Under the row while a series is open: its name, what it holds, and its card
+   menu's actions. The row above still says Subscriptions, and pressing it is
+   the way back, so this repeats nothing above it -- no breadcrumb, just the
+   series. */
+.series-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  padding: 7px 16px 7px 20px;
+  background: var(--surface);
+  border-top: 1px solid var(--line-soft);
+  animation: series-bar-in var(--fold-time) var(--fold-ease);
+}
+@keyframes series-bar-in { from { opacity: 0; transform: translateY(-6px); } }
+.series-bar-glyph { display: inline-flex; flex: none; color: var(--brand); }
+.series-bar-glyph .icon { width: 16px; height: 16px; }
+.series-bar-name {
   min-width: 0;
-  margin-left: 4px;
-}
-.crumb-parent {
-  appearance: none;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: var(--muted);
-  font: inherit;
-  font-weight: 500;
-  padding: 5px 2px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.crumb-parent:hover { color: var(--text); border-bottom-color: var(--line); }
-.crumb-sep { color: var(--faint); }
-.crumb-here {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-  padding: 5px 2px;
-  border-bottom: 2px solid var(--brand);
-  color: var(--text);
-  font-weight: 600;
-}
-.crumb-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 30ch;
+  font-size: 1.5rem;
+  font-weight: 600;
 }
-.crumb-x {
+.series-bar-meta {
+  flex: none;
+  color: var(--faint);
+  font-size: 1.25rem;
+  white-space: nowrap;
+}
+.series-bar-fill { flex: 1 1 0; }
+.series-bar-x {
   appearance: none;
   border: 0;
   flex: none;
-  width: 18px;
-  height: 18px;
+  width: 26px;
+  height: 26px;
+  margin-left: 2px;
   padding: 0;
   border-radius: 50%;
   background: var(--card);
@@ -375,26 +380,20 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease;
 }
-.crumb-x:hover { background: var(--danger-soft); color: #ffc9ca; }
-.crumb-x .icon { width: 11px; height: 11px; }
-.crumb-meta {
-  color: var(--faint);
-  font-size: 1.2rem;
-  white-space: nowrap;
-}
+.series-bar-x:hover { background: var(--danger-soft); color: #ffc9ca; }
+.series-bar-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.series-bar-x .icon { width: 12px; height: 12px; }
 
-/* The open series' own actions -- the series card menu's, beside the tally.
-   Quiet pills like the row's chips, the hide in the menu's danger red; they
-   give up their words on a narrow window ("narrow windows", below) and keep
-   their glyphs. Never shrunk: the crumb's name is what gives way. */
-.crumb-actions {
+/* The series' own actions -- the series card menu's. Quiet pills, the hide in
+   the menu's danger red; they give up their words on a narrow window ("narrow
+   windows", below) and keep their glyphs. Never shrunk: the name gives way. */
+.series-acts {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: none;
-  margin-left: 2px;
 }
-.crumb-act {
+.series-act {
   appearance: none;
   font: inherit;
   font-size: 1.3rem;
@@ -412,22 +411,22 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease,
     padding var(--fold-time) var(--fold-ease);
 }
-.crumb-act:hover:not(:disabled) { background: var(--card); color: var(--text); }
+.series-act:hover:not(:disabled) { background: var(--card); color: var(--text); }
 /* Disabled only ever means its call is out, so it is not dimmed -- a quick
    answer would flash -- and says so with the cursor until the glyph turns. */
-.crumb-act:disabled { cursor: progress; }
-.crumb-act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.crumb-act.is-danger { color: #ff8a8d; }
-.crumb-act.is-danger:hover:not(:disabled) {
+.series-act:disabled { cursor: progress; }
+.series-act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.series-act.is-danger { color: #ff8a8d; }
+.series-act.is-danger:hover:not(:disabled) {
   background: var(--danger-soft);
   border-color: rgba(255, 90, 95, 0.4);
   color: #ffc9ca;
 }
-.crumb-act-glyph { display: inline-flex; flex: none; }
-.crumb-act.is-spinning .crumb-act-glyph { animation: spin 900ms linear infinite; }
-/* Folded like a tab's label -- zero width, never `display: none` -- so a
-   resize shows the words going rather than a jump. */
-.crumb-act-label {
+.series-act-glyph { display: inline-flex; flex: none; }
+.series-act.is-spinning .series-act-glyph { animation: spin 900ms linear infinite; }
+/* Folded like every other word that comes and goes -- zero width, never
+   `display: none` -- so a resize shows the words going rather than a jump. */
+.series-act-label {
   display: inline-flex;
   overflow: hidden;
   max-width: 12em;
@@ -615,39 +614,6 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .channel-picker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .channel-picker:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* --- the filter segment -------------------------------------------------- */
-
-/* Three toggles drawn as one object. Four loose pills read as clutter; joined,
-   they read as a single "what is in this list" control. */
-.seg {
-  display: inline-flex;
-  flex: none;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-.seg-btn {
-  appearance: none;
-  border: 0;
-  border-right: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
-  font: inherit;
-  font-size: 1.3rem;
-  font-weight: 500;
-  display: inline-flex;
-  align-items: center;
-  padding: 5px 11px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 120ms ease, color 120ms ease;
-}
-.seg-btn:last-child { border-right: 0; }
-.seg-btn:hover:not(:disabled) { background: var(--card); color: var(--text); }
-.seg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.seg-btn.is-on { background: var(--accent-soft); color: #9ed3ff; }
-
 .chip {
   appearance: none;
   font: inherit;
@@ -665,7 +631,6 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   gap: 6px;
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
-.chip-glyph { display: none; align-items: center; }
 .chip:hover:not(:disabled) { background: var(--card); color: var(--text); }
 .chip:disabled { opacity: 0.4; cursor: not-allowed; }
 .chip.is-on {
@@ -674,79 +639,104 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   color: #9ed3ff;
 }
 
-/* --- the folding filter row ---------------------------------------------- */
+/* --- the filter tools --------------------------------------------------- */
 
-/* Every word or glyph that comes and goes as the window narrows stays in the
-   layout at zero width rather than going `display: none`: dragging the window
-   edge then shows each control turning into the next instead of jumping, and
-   toolbarFit.ts can still read how wide it would be (`scrollWidth`). Gaps
-   between a glyph and its word are margins on the word for the same reason --
-   a flex gap would outlive the word it spaced. */
-.tab-glyph, .tab-label, .seg-glyph, .seg-label, .btn-add-label {
-  display: inline-flex;
-  align-items: center;
-  overflow: hidden;
-  white-space: nowrap;
-  transition: max-width var(--fold-time) var(--fold-ease), opacity 200ms ease,
-    margin var(--fold-time) var(--fold-ease);
-}
-.tab-label, .seg-label, .btn-add-label { max-width: 12em; }
-.btn-add-label { margin-left: 6px; }
-.tab-glyph, .seg-glyph { max-width: 0; opacity: 0; }
-.fit-glyphs .seg-label, .fit-folded .seg-label { max-width: 0; opacity: 0; }
-.fit-glyphs .seg-glyph, .fit-folded .seg-glyph { max-width: 20px; opacity: 1; }
-/* Whatever arrives waits for whatever leaves: grown at the same time, a glyph
-   would widen the row for a moment before the word beside it had given any
-   room back. The delay belongs to the state being entered, so each rule below
-   is the arriving half. */
-.tab-label, .seg-label, .btn-add-label,
-.fit-glyphs .seg-glyph, .fit-folded .seg-glyph { transition-delay: var(--fold-stagger); }
-.fit-glyphs .seg-label, .fit-folded .seg-label { transition-delay: 0s; }
-
-/* The two clusters: the full controls and their folded stand-in. Both are
-   always in the row, one of them at zero width; toolbarFit.ts slides the width
-   between them and the hidden one fades. The vertical padding keeps a focus
-   ring from being clipped by the overflow that the slide needs. */
-.tools {
-  display: flex;
-  flex: none;
-  overflow: hidden;
-  padding-block: 3px;
-  margin-block: -3px;
-  transition: width var(--fold-time) var(--fold-ease), opacity 200ms ease;
-}
-.tools[aria-hidden="true"] { opacity: 0; }
-/* During a drag the window can outrun the fold by a frame or two; the full
-   controls give way (clipped) rather than pushing Refresh and Add off the edge. */
-.tools-full { flex: 0 1 auto; min-width: 0; }
-.tools-inner {
+/* Search, the starred filters and All filters: the part of the row that gives
+   way. It takes whatever the tabs, refresh and Add leave (a flex basis of 0)
+   and packs to the right, and toolbarFit.ts measures it to decide how much of
+   it can be spelled out. Clipped rather than spilling, for the frame or two a
+   window drag can outrun the measuring by; the padding keeps a focus ring
+   inside the clip. */
+.topnav-tools {
+  flex: 1 1 0;
+  min-width: 0;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  flex: none;
-  width: max-content;
+  overflow: hidden;
+  padding: 3px 4px;
+  margin-block: -3px;
 }
-/* A fixed width in the full row: the row folds before search would be squeezed
-   to a stub, rather than shrinking it to make room. */
-.tools-full .search { flex: none; width: 240px; min-width: 0; }
-
-.search-compact {
-  flex: none;
-  width: 240px;
+/* SEARCH_FULL wide when there is room, squeezed as far as SEARCH_MIN to keep
+   the starred filters (toolbarFit.ts), and past that folded behind its
+   magnifier rather than squeezed to a stub. */
+.topnav-tools .search { flex: 0 1 240px; width: auto; min-width: 160px; }
+/* Opened from the magnifier it takes what it can get, up to the same width. */
+.topnav-tools .search-compact {
+  flex: 0 1 240px;
+  width: auto;
+  min-width: 100px;
   animation: search-open var(--fold-time) var(--fold-ease);
 }
 @keyframes search-open { from { width: 32px; opacity: 0.4; } }
 
-.filters-btn { padding: 5px 11px; }
-.filters-btn.is-open { border-color: var(--accent); color: var(--text); }
-.filters-btn .count {
+/* Every word in the row that comes and goes. It stays in the layout at zero
+   width rather than going `display: none`: dragging the window edge then shows
+   each control turning into the next instead of jumping, and toolbarFit.ts can
+   still read how wide it would be (`scrollWidth`). The space before the word
+   is padding inside it, so it folds with the word. */
+.fold-label {
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+  max-width: 14em;
+  transition: max-width var(--fold-time) var(--fold-ease), opacity 200ms ease;
+  transition-delay: var(--fold-stagger);
+}
+.fold-text { padding-left: 6px; }
+.quick.is-glyphs .fold-label,
+.all-filters.is-tight .fold-label,
+.btn-add.is-tight .fold-label { max-width: 0; opacity: 0; transition-delay: 0s; }
+
+/* The starred filters, in sidebar order. A slot folded out of a narrow row
+   keeps its place at zero width: the filter inside keeps its own width, which
+   is what lets the row measure it back in. The space between two is a margin
+   on the second (QUICK_GAP), so a folded slot -- always one of the last --
+   takes its spacing with it. */
+.quick { display: flex; align-items: center; flex: none; min-width: 0; }
+.quick-slot {
+  display: inline-flex;
+  flex: none;
+  max-width: 40rem;
+  transition: max-width var(--fold-time) var(--fold-ease), opacity 200ms ease,
+    margin var(--fold-time) var(--fold-ease);
+}
+.quick-slot + .quick-slot { margin-left: 6px; }
+.quick-slot.is-folded {
+  max-width: 0;
+  opacity: 0;
+  margin-left: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+/* Just starred: it lands with a flash of the star's yellow, so the eye finds
+   where it went. */
+.quick-slot.is-new > * { animation: quick-new 1100ms ease; }
+@keyframes quick-new {
+  0% { transform: scale(0.6); opacity: 0; }
+  35% { transform: scale(1.06); opacity: 1; border-color: var(--star); box-shadow: 0 0 0 4px var(--star-soft); }
+  100% { transform: none; }
+}
+
+.quick-chip, .all-filters { gap: 0; }
+.quick-chip { padding: 5px 12px 5px 10px; }
+.quick.is-glyphs .quick-chip { padding: 5px 9px; }
+.quick-glyph { display: inline-flex; }
+.quick-chip .icon, .all-filters .icon { width: 14px; height: 14px; }
+
+.all-filters { padding: 5px 11px; }
+.all-filters.is-open { border-color: var(--accent); color: var(--text); }
+/* What is on but out of sight -- never starred, or folded out of the row. */
+.all-filters .count {
+  margin-left: 7px;
   font: 600 1.1rem/1 var(--font);
   color: var(--accent-ink);
   background: var(--accent);
   border-radius: 999px;
   padding: 2px 6px;
 }
-.topnav-row .icon-caret { width: 11px; height: 11px; opacity: 0.7; }
 
 /* The panel the folded row opens. It hangs from the header, not the button:
    the button's cluster clips while it slides. */
@@ -763,72 +753,12 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   transform-origin: top right;
 }
 @keyframes pop-in { from { opacity: 0; transform: translateY(-4px) scale(0.98); } }
-.filters-pop {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(210px, 1fr));
-  gap: 6px;
-}
-.pop-head {
-  font-size: 1.1rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--faint);
-  padding: 8px 10px 4px;
-}
-.pop-item, .pop-radio {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  font: inherit;
-  font-size: 1.3rem;
-  color: var(--muted);
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 10px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  text-align: left;
-  transition: background 120ms ease, color 120ms ease;
-}
-.pop-item:hover:not(:disabled), .pop-radio:hover:not(:disabled) { background: var(--card); color: var(--text); }
-.pop-item:disabled { opacity: 0.4; cursor: not-allowed; }
-.pop-item.is-on, .pop-radio.is-on { color: var(--text); }
-.pop-label { flex: 1; }
-.pop-glyph, .pop-check { display: inline-flex; }
-.pop-item .icon { width: 15px; height: 15px; }
-.pop-item.is-on .pop-glyph, .pop-check { color: var(--accent); }
-.pop-dot {
-  width: 12px;
-  height: 12px;
-  flex: none;
-  border-radius: 50%;
-  border: 1.5px solid var(--faint);
-  transition: border 120ms ease;
-}
-.pop-radio.is-on .pop-dot { border: 4px solid var(--accent); }
 .pop-sep { height: 1px; background: var(--line); margin: 6px 4px; }
-.pop-head-note {
-  float: right;
-  letter-spacing: 0;
-  text-transform: none;
-  color: #9ed3ff;
-}
-
-/* The left column alone sets the Filters panel's height. `contain: size`
-   gives the channel column no intrinsic height of its own, the grid's stretch
-   makes it as tall as the row the left column sets, and the list takes what
-   is left under its head and filter box, scrolling past that -- so a long
-   subscription list never makes the panel taller. */
-.pop-col-fill { contain: size; display: flex; flex-direction: column; }
-.pop-col-fill .chan-list { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.pop-col-fill .chan-rows { flex: 1; min-height: 0; }
 
 /* --- the channel checklist ----------------------------------------------- */
 
-/* The full row's own popover; in the Filters panel the same list fills a
-   column instead. */
+/* The starred Channels button's own popover; in the All filters sidebar the
+   same list sits in a section instead. */
 .channel-pop { width: 280px; }
 .channel-pop .chan-rows { max-height: min(360px, 60vh); }
 
@@ -911,6 +841,243 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .chan-only:hover { background: #2c3a47; }
 .chan-only:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .chan-empty { color: var(--faint); font-size: 1.3rem; padding: 10px; }
+
+/* --- the All filters sidebar -------------------------------------------- */
+
+/* Every filter, floating over the right edge of the feed under the nav. It
+   floats rather than taking room: a grid that reflowed every time it opened
+   would move the very cards the filters are being judged against. Hung from
+   the header, which is its containing block (sticky, and its backdrop-filter
+   would capture a fixed box anyway), and as tall as the window below it: the
+   header's own height is the `100%` taken away. */
+.filters-side {
+  position: absolute;
+  top: calc(100% + 1px);
+  right: 0;
+  z-index: 25;
+  width: min(38rem, 100%);
+  height: calc(100vh - 100% - 1px);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  box-shadow: -18px 0 40px rgba(0, 0, 0, 0.5);
+  animation: side-in var(--fold-time) var(--fold-ease);
+}
+.filters-side:focus { outline: none; }
+.filters-side.is-closing { animation: side-out var(--side-out) ease-in forwards; }
+@keyframes side-in { from { transform: translateX(100%); opacity: 0.6; } }
+@keyframes side-out { to { transform: translateX(100%); opacity: 0; } }
+
+.side-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 12px 12px 18px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.side-head-glyph { display: inline-flex; color: var(--muted); }
+.side-title { margin: 0; font-size: 1.5rem; font-weight: 600; }
+.side-clear {
+  appearance: none;
+  margin-left: auto;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 1.3rem;
+  color: var(--accent);
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.side-clear:hover:not(:disabled) { background: var(--accent-soft); }
+.side-clear:disabled { color: var(--faint); cursor: default; }
+.side-clear:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.side-x {
+  appearance: none;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--muted);
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+}
+.side-x .icon { width: 12px; height: 12px; }
+.side-x:hover { color: var(--text); background: var(--card); }
+.side-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.side-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-bottom: 10px; }
+.side-note {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin: 12px 14px 0;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 1.25rem;
+  line-height: 1.45;
+}
+.side-note-glyph { display: inline-flex; color: var(--brand); margin-top: 1px; }
+
+.side-sec { padding-top: 10px; }
+.side-sec + .side-sec { border-top: 1px solid var(--line-soft); margin-top: 8px; }
+.side-sec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 12px 2px 20px;
+  min-height: 32px;
+}
+.side-sec-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.side-sec-note { font-size: 1.15rem; color: var(--faint); }
+.side-sec-fill { flex: 1; }
+/* Holds the star column's place in a section with no star of its own. */
+.side-star-gap { width: 30px; flex: none; }
+
+.side-row { display: flex; align-items: center; gap: 2px; padding: 1px 12px 1px 10px; }
+.side-toggle {
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 7px 8px 7px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: background 120ms ease;
+}
+.side-toggle:hover:not(:disabled) { background: var(--surface-2); }
+.side-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.side-toggle:disabled { cursor: not-allowed; }
+.side-toggle:disabled > * { opacity: 0.38; }
+/* The series-only three sit under Group siblings, which they need. */
+.side-row.is-sub .side-toggle { padding-left: 28px; }
+.side-glyph {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  color: var(--muted);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.side-glyph .icon { width: 15px; height: 15px; }
+.side-row.is-on .side-glyph { background: var(--accent-soft); border-color: rgba(62, 166, 255, 0.45); color: #9ed3ff; }
+.side-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.side-label { font-size: 1.35rem; font-weight: 500; }
+.side-desc { font-size: 1.15rem; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.side-switch {
+  position: relative;
+  flex: none;
+  width: 30px;
+  height: 18px;
+  border-radius: 999px;
+  background: #3a3a3a;
+  transition: background 150ms ease;
+}
+.side-switch > span {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #cfcfcf;
+  transition: transform 150ms ease, background 150ms ease;
+}
+.side-row.is-on .side-switch { background: var(--accent); }
+.side-row.is-on .side-switch > span { transform: translateX(12px); background: #fff; }
+
+/* One column of stars down the right, so what the bar holds reads at a glance. */
+.side-star {
+  appearance: none;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: #5a5a5a;
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+.side-star .icon { width: 16px; height: 16px; }
+.side-star:hover { color: var(--star); background: var(--star-soft); }
+.side-star:active { transform: scale(0.85); }
+.side-star:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.side-star.is-on { color: var(--star); }
+
+.side-radios { display: flex; flex-direction: column; padding: 0 12px 0 10px; }
+.side-radio {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 1.35rem;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 8px 7px 18px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: background 120ms ease, color 120ms ease;
+}
+.side-radio:hover { background: var(--surface-2); color: var(--text); }
+.side-radio:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.side-radio.is-on { color: var(--text); }
+.side-dot {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--faint);
+  transition: border 120ms ease;
+}
+.side-radio.is-on .side-dot { border: 4.5px solid var(--accent); }
+.side-channels { padding: 2px 14px 0 14px; }
+
+.side-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  padding: 11px 18px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 1.2rem;
+  color: var(--muted);
+}
+.side-foot-glyph { display: inline-flex; color: var(--star); }
 
 /* --- video grid ---------------------------------------------------------- */
 
@@ -3101,10 +3268,10 @@ label.field-label { display: block; }
 
 /* --- narrow windows ------------------------------------------------------ */
 
-/* The top row never wraps. The filter controls step down by measurement
-   (toolbarFit.ts: words, then glyphs, then folded behind one button); what is
-   left -- the tabs and Add -- gives up its words here, once the folded row is
-   all there is beside them.
+/* The top row never wraps, and its sections never change. The filter tools
+   step down by measurement (toolbarFit.ts: words, then glyphs, then the starred
+   filters folding into All filters, then search behind its magnifier, then
+   All filters and Add as glyphs); the series bar gives up its words here.
 
    These widths are where words stop fitting, so they are in rem and move with
    the text size: 100rem is 1000px at 100% and 2000px at 200%. A media query
@@ -3113,20 +3280,9 @@ label.field-label { display: block; }
    where rem is the root's. Breakpoints that are about layout, not words, stay
    media queries in px. */
 
-@container app (max-width: 100rem) {
-  .tab-label, .btn-add-label { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
-  .tab-glyph { max-width: 20px; opacity: 1; transition-delay: var(--fold-stagger); }
-  .tab { margin: 0 4px; }
-}
-
 /* The Downloads row puts its actions (and a failure's reason) under the
    title once the title would be squeezed: words again, so rem. */
 @container app (max-width: 98rem) {
-  .crumb-name { max-width: 22ch; }
-  /* The series actions keep their glyphs, their names in the tooltip: worded,
-     beside a long name they would squeeze it well under the 22ch above. */
-  .crumb-act { padding: 5px 8px; }
-  .crumb-act-label { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
   .dl-row { grid-template-columns: 96px minmax(0, 1fr); }
   .dl-actions { grid-column: 1 / -1; justify-content: flex-start; }
   .row-error { max-width: none; }
@@ -3136,10 +3292,22 @@ label.field-label { display: block; }
   .content { padding: 16px 16px 56px; }
 }
 
+/* The series bar has the whole width to itself, so its words go later than
+   the old breadcrumb's did: the actions keep their glyphs, their names in the
+   tooltip, once a long name would be squeezed beside them... */
+@container app (max-width: 90rem) {
+  .series-act { padding: 5px 8px; }
+  .series-act-label { max-width: 0; opacity: 0; margin-left: 0; transition-delay: 0s; }
+}
+
 @container app (max-width: 86rem) {
-  .crumb-meta { display: none; }
-  .crumb-name { max-width: 16ch; }
   .topnav-row { padding: 8px 12px; }
+  .series-bar { padding-inline: 16px 12px; }
+}
+
+/* ...and the count, then, gives the name its room. */
+@container app (max-width: 72rem) {
+  .series-bar-meta { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

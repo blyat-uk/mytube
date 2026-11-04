@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { act, render, screen, cleanup, fireEvent } from "@testing-library/react";
 import type { ComponentProps } from "react";
+import type { Fit } from "../toolbarFit";
 import type { Channel } from "../types";
 
-// jsdom has no layout to measure, so the row is simply told it is folded.
-vi.mock("../toolbarFit", () => ({ useToolbarFit: () => "folded" }));
+// jsdom has no layout to measure, so the row is simply told how much fits.
+const fit = vi.hoisted(() => ({ current: { words: true, shown: 99, folded: false, tight: false } as Fit }));
+vi.mock("../toolbarFit", () => ({ useToolbarFit: () => fit.current }));
 
 import TopNav from "./TopNav";
 
@@ -15,137 +17,109 @@ const CHANNELS: Channel[] = [{
 
 type Props = ComponentProps<typeof TopNav>;
 
-function renderNav(over: Partial<Props> = {}) {
-  const p: Props = {
+function props(over: Partial<Props> = {}): Props {
+  return {
     tab: "subscriptions", onTab: vi.fn(), channels: CHANNELS, channelIds: [], onChannelIds: vi.fn(),
     search: "", onSearch: vi.fn(), hideWatched: false, onHideWatched: vi.fn(),
     downloadedOnly: false, onDownloadedOnly: vi.fn(), showHidden: false, onShowHidden: vi.fn(),
     grouped: false, onGrouped: vi.fn(), groupsOnly: false, onGroupsOnly: vi.fn(),
     inProgress: false, onInProgress: vi.fn(), autoDownloading: false, onAutoDownloading: vi.fn(),
     sort: "newest", onSort: vi.fn(),
+    starred: ["hide_watched", "downloaded_only", "sort", "channel_ids"], onStarred: vi.fn(),
     series: null, onExitSeries: vi.fn(), polling: false, onRefresh: vi.fn(), onAdd: vi.fn(),
     update: null, onOpenAbout: vi.fn(),
     ...over,
   };
-  render(<TopNav {...p} />);
-  return p;
 }
 
-const filtersButton = () => screen.getByRole("button", { name: /^Filters/ });
-const openPanel = () => {
-  fireEvent.click(filtersButton());
-  return screen.getByRole("dialog", { name: "Filters" });
-};
+function renderNav(over: Partial<Props> = {}) {
+  const p = props(over);
+  const r = render(<TopNav {...p} />);
+  return { p, rerender: (next: Partial<Props> = {}) => r.rerender(<TopNav {...p} {...next} />) };
+}
 
+const slots = () => Array.from(document.querySelectorAll(".quick-slot")) as HTMLElement[];
+const allFilters = () => screen.getByRole("button", { name: /^All filters/ });
+const FOLDED: Fit = { words: false, shown: 0, folded: true, tight: false };
+
+beforeEach(() => {
+  fit.current = { words: true, shown: 99, folded: false, tight: false };
+});
 afterEach(cleanup);
 
-describe("the folded filter row", () => {
-  it("hides the full controls from the keyboard and screen readers", () => {
+describe("a row short of room", () => {
+  it("folds the starred toggles to their glyphs, keeping their names", () => {
+    fit.current = { words: false, shown: 4, folded: false, tight: false };
     renderNav();
-    // The full controls stay in the layout (the fold animates them away) but
-    // inert, so nothing reaches them.
-    expect(screen.queryByRole("group", { name: "Filters" })).toBeNull();
+    expect(screen.getByRole("group", { name: "Starred filters" }).classList.contains("is-glyphs")).toBe(true);
+    // The words are still there for CSS to fold; the names never depended on them.
+    expect(screen.getByRole("button", { name: "Unwatched" }).textContent).toBe("Unwatched");
+  });
+
+  it("folds the last starred filters into All filters, out of reach", () => {
+    fit.current = { words: false, shown: 2, folded: false, tight: false };
+    renderNav();
+    expect(slots().map((s) => s.classList.contains("is-folded"))).toEqual([false, false, true, true]);
+    for (const s of slots().slice(2)) {
+      expect(s.hasAttribute("inert")).toBe(true);
+      expect(s.getAttribute("aria-hidden")).toBe("true");
+    }
     expect(screen.queryByRole("combobox", { name: "Sort order" })).toBeNull();
-    expect(filtersButton()).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^Filter by channel/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Downloaded" })).toBeDefined();
   });
 
-  it("wears the number of filters applied as a chip", () => {
+  it("counts a folded filter that is on, as it does one never starred", () => {
+    fit.current = { words: false, shown: 2, folded: false, tight: false };
+    renderNav({ hideWatched: true, channelIds: ["UC1"], showHidden: true });
+    // Unwatched is in sight; Channels is folded away and Include hidden was
+    // never starred.
+    expect(allFilters().getAttribute("aria-label")).toBe("All filters, 2 more on");
+  });
+
+  it("closes the channel checklist when its button folds away", () => {
+    const { rerender } = renderNav();
+    fireEvent.click(screen.getByRole("button", { name: /^Filter by channel/ }));
+    expect(screen.getByRole("dialog", { name: "Channels" })).toBeDefined();
+    fit.current = { words: false, shown: 2, folded: false, tight: false };
+    rerender();
+    expect(screen.queryByRole("dialog", { name: "Channels" })).toBeNull();
+  });
+
+  it("keeps All filters and Add spelled out until the very last step", () => {
+    fit.current = FOLDED;
+    renderNav();
+    expect(allFilters().classList.contains("is-tight")).toBe(false);
+    expect(screen.getByRole("button", { name: "Add" }).classList.contains("is-tight")).toBe(false);
+    cleanup();
+
+    fit.current = { ...FOLDED, tight: true };
+    renderNav();
+    expect(allFilters().classList.contains("is-tight")).toBe(true);
+    expect(screen.getByRole("button", { name: "Add" }).classList.contains("is-tight")).toBe(true);
+  });
+
+  it("counts every filter that is on once all of them have folded", () => {
+    fit.current = FOLDED;
     renderNav({ hideWatched: true, downloadedOnly: true, channelIds: ["UC1"] });
-    const btn = screen.getByRole("button", { name: "Filters, 3 applied" });
-    expect(btn.querySelector(".count")?.textContent).toBe("3");
+    expect(allFilters().getAttribute("aria-label")).toBe("All filters, 3 more on");
+    expect(allFilters().querySelector(".count")?.textContent).toBe("3");
   });
 
-  it("counts a pick of several channels as one filter", () => {
-    renderNav({ channelIds: ["UC1", "UC2"] });
-    expect(screen.getByRole("button", { name: "Filters, 1 applied" })).toBeDefined();
-  });
-
-  it("shows no chip when nothing is applied", () => {
-    renderNav({ grouped: true, sort: "oldest" });
-    expect(screen.getByRole("button", { name: "Filters" }).querySelector(".count")).toBeNull();
-  });
-
-  it("opens a panel with Show, Arrange and Sort, then Channels in a column of their own", () => {
-    renderNav({ grouped: true });
-    const panel = openPanel();
-    const heads = Array.from(panel.querySelectorAll(".pop-head")).map((h) => h.textContent);
-    expect(heads).toEqual(["Show", "Arrange", "Sort", "Channels"]);
-    const cols = panel.querySelectorAll(".pop-col");
-    expect(cols[0].textContent).toContain("Continue watching");
-    expect(cols[0].textContent).toContain("Auto-downloading");
-    expect(cols[0].textContent).toContain("Group siblings");
-    expect(cols[0].textContent).toContain("Most parts first");
-    // The left column sets the height; the list fills what it leaves (CSS).
-    expect(cols[1].classList.contains("pop-col-fill")).toBe(true);
-    expect(cols[1].textContent).toContain("All channels");
-    expect(cols[1].textContent).toContain("Chills Narrated");
-    expect(filtersButton().getAttribute("aria-expanded")).toBe("true");
-  });
-
-  it("says how many channels are picked beside the Channels head", () => {
-    renderNav({ channelIds: ["UC1"] });
-    const panel = openPanel();
-    expect(panel.querySelector(".pop-head-note")?.textContent).toBe("1 picked");
-  });
-
-  it("leaves the filter box alone on opening, unlike the toolbar's own list", () => {
+  it("never folds the sections", () => {
+    fit.current = { ...FOLDED, tight: true };
     renderNav();
-    openPanel();
-    expect(document.activeElement).not.toBe(screen.getByRole("searchbox", { name: "Filter channels" }));
-  });
-
-  it("applies each change as it is made and stays open", () => {
-    const p = renderNav();
-    openPanel();
-    fireEvent.click(screen.getByRole("button", { name: "Unwatched" }));
-    expect(p.onHideWatched).toHaveBeenCalledWith(true);
-    fireEvent.click(screen.getByRole("radio", { name: "Longest first" }));
-    expect(p.onSort).toHaveBeenCalledWith("length");
-    fireEvent.click(screen.getByRole("button", { name: "Chills Narrated" }));
-    expect(p.onChannelIds).toHaveBeenCalledWith(["UC1"]);
-    expect(screen.getByRole("dialog", { name: "Filters" })).toBeDefined();
-  });
-
-  it("offers the series-only filters and sort only while grouped", () => {
-    renderNav({ grouped: false });
-    openPanel();
-    expect(screen.queryByRole("button", { name: "Only groups" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Auto-downloading" })).toBeNull();
-    expect(screen.queryByRole("radio", { name: "Most parts first" })).toBeNull();
-  });
-
-  it("closes on Esc without leaving an open series, and hands focus back", () => {
-    const p = renderNav({ series: { name: "Tapes", parts: 3, runtime: "", unknown: 0 } });
-    openPanel();
-    const seriesEsc = vi.fn();
-    window.addEventListener("keydown", seriesEsc);
-    act(() => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })); });
-    window.removeEventListener("keydown", seriesEsc);
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(seriesEsc).not.toHaveBeenCalled();
-    expect(p.onExitSeries).not.toHaveBeenCalled();
-    expect(document.activeElement).toBe(filtersButton());
-  });
-
-  it("closes on a click outside it", () => {
-    renderNav();
-    openPanel();
-    act(() => { document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); });
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("keeps only the sort live while a series is open", () => {
-    renderNav({ series: { name: "Tapes", parts: 3, runtime: "", unknown: 0 } });
-    openPanel();
-    expect((screen.getByRole("button", { name: "Unwatched" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: "Chills Narrated" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("searchbox", { name: "Filter channels" }) as HTMLInputElement).disabled).toBe(true);
-    expect((screen.getByRole("radio", { name: "Oldest first" }) as HTMLButtonElement).disabled).toBe(false);
+    const tabs = Array.from(screen.getByLabelText("Sections").querySelectorAll(".tab")).map((t) => t.textContent);
+    expect(tabs).toEqual(["Subscriptions", "Downloads", "Settings"]);
   });
 });
 
 describe("the folded search", () => {
   const box = () => screen.getByRole("searchbox", { name: "Search videos" }) as HTMLInputElement;
+
+  beforeEach(() => {
+    fit.current = FOLDED;
+  });
 
   it("is a magnifier that opens into a focused box", () => {
     renderNav();
@@ -181,11 +155,9 @@ describe("the folded search", () => {
   // channel. The box keeps a copy of its own for the debounce, so it has to
   // follow -- and, empty, fold back to the magnifier.
   it("empties and folds back when the search is cleared from above", async () => {
-    const p = renderNav({ search: "blackwood" });
+    const { p, rerender } = renderNav({ search: "blackwood" });
     expect(box().value).toBe("blackwood");
-    // Into the same container, which is a re-render with the one prop changed.
-    const container = screen.getByRole("banner").parentElement!;
-    render(<TopNav {...p} search="" />, { container });
+    rerender({ search: "" });
     expect(screen.queryByRole("searchbox")).toBeNull();
     // Past the debounce: the old query is not sent back up after it.
     await act(() => new Promise<void>((resolve) => setTimeout(resolve, 300)));
@@ -193,7 +165,7 @@ describe("the folded search", () => {
   });
 
   it("leaves on Esc without leaving an open series", () => {
-    const p = renderNav({ series: null });
+    const { p } = renderNav({ series: null });
     fireEvent.click(screen.getByRole("button", { name: "Open search" }));
     fireEvent.keyDown(box(), { key: "Escape" });
     expect(screen.queryByRole("searchbox")).toBeNull();

@@ -236,6 +236,15 @@ export interface ImportProgress { done: number; total: number; current: string; 
  * The Subscriptions feed's filters, persisted between runs. The active tab is
  * deliberately absent: a launch always lands on Subscriptions.
  */
+/**
+ * A filter that can be starred into the top bar. Each id is the `ViewState`
+ * key it sets, so a starred list in settings.json says what it pins.
+ */
+export type QuickFilter =
+  | "hide_watched" | "downloaded_only" | "show_hidden"
+  | "grouped" | "groups_only" | "in_progress" | "auto_downloading"
+  | "sort" | "channel_ids";
+
 export interface ViewState {
   /** Sorted channel ids; empty for every channel. */
   channel_ids: string[]; search: string;
@@ -245,6 +254,9 @@ export interface ViewState {
   /** The Add dialog's subscription list, folded away. Not a filter: it rides
    *  in this block because it is remembered the same way, per machine. */
   subs_folded: boolean;
+  /** The filters starred into the top bar, in `QUICK_ORDER`. The rest live in
+   *  the All filters sidebar alone. Per machine, like the rest of the block. */
+  starred_filters: QuickFilter[];
 }
 
 export interface Settings {

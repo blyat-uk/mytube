@@ -77,7 +77,7 @@ function downloadable(v: Video): boolean {
  */
 const SIBLINGS = "siblings:";
 
-/** What an open series holds, for the breadcrumb that names it. */
+/** What an open series holds, for the series bar that names it. */
 export interface SeriesTally {
   parts: number;
   runtime: string;
@@ -88,7 +88,7 @@ export interface SeriesTally {
 export type CallState = "idle" | "busy" | "slow";
 
 /**
- * What the breadcrumb can do with the open series: exactly the series card
+ * What the series bar can do with the open series: exactly the series card
  * menu's whole-series actions, run by the same calls under the same keys.
  */
 export interface SeriesActions {
@@ -135,13 +135,13 @@ interface Props {
   siblingOf: Video | null;
   /** The stem comes from a series card; a lone card has only its title. */
   onFindSiblings: (video: Video, stem?: string | null) => void;
-  /** Hands the nav's breadcrumb what the open series turned out to hold. */
+  /** Hands the nav's series bar what the open series turned out to hold. */
   onSeriesTally: (t: SeriesTally) => void;
-  /** The open series' name as the breadcrumb wears it, so the toasts and the
-   *  confirm that name the series say what the crumb says. Without it they
-   *  fall back to the anchor's title, as the crumb itself does. */
+  /** The open series' name as the series bar wears it, so the toasts and the
+   *  confirm that name the series say what the bar says. Without it they
+   *  fall back to the anchor's title, as the bar itself does. */
   seriesName?: string;
-  /** Hands the breadcrumb the open series' actions, or null while there are
+  /** Hands the series bar the open series' actions, or null while there are
    *  none to offer. Optional: without it they stay on the card menu alone. */
   onSeriesActions?: (a: SeriesActions | null) => void;
   cardSize: number;
@@ -327,7 +327,7 @@ export default function SubscriptionsView(p: Props) {
     [p.showStats, seriesOnScreen, groups],
   );
 
-  // The breadcrumb names the open series and says what it holds -- which this
+  // The series bar names the open series and says what it holds -- which this
   // view knows and the nav does not -- so every settled page hands the count
   // and the runtime up. Taken from the loaded list rather than from the page
   // that just arrived, so a second page adds to the tally instead of replacing
@@ -881,7 +881,7 @@ export default function SubscriptionsView(p: Props) {
     }
     // A lone card still carrying the mark -- every part, ungrouped; a part left
     // over when a series came apart, grouped -- is still queueing whatever
-    // joins it, so it can be stopped from here. Inside a series the crumb has
+    // joins it, so it can be stopped from here. Inside a series the bar has
     // it, and on every part it would only be the same switch again.
     if (video.series_auto_download && siblingOf === null) {
       items.push({
@@ -921,7 +921,7 @@ export default function SubscriptionsView(p: Props) {
   }, []);
 
   /**
-   * The open series as the card it would be, for the breadcrumb's actions: the
+   * The open series as the card it would be, for the series bar's actions: the
    * anchor leads, as a card's leader does, since `set_series_hidden` works on
    * `group_led_by(leader)` -- which is by construction what this view lists.
    * Null until the series is the list on screen: a moment after it opens the
@@ -940,24 +940,24 @@ export default function SubscriptionsView(p: Props) {
     };
   }, [siblingOf, showing, groups, seriesName]);
 
-  // Read at the click rather than captured, so the crumb's handlers keep their
+  // Read at the click rather than captured, so the bar's handlers keep their
   // identity across every state event that touches a part -- and still act on
   // the series as it is now, the way the series confirm does.
   const openGroupRef = useRef(openGroup);
   openGroupRef.current = openGroup;
-  const crumbDownload = useCallback(() => {
+  const barDownload = useCallback(() => {
     if (openGroupRef.current) downloadSeries(openGroupRef.current);
   }, [downloadSeries]);
-  const crumbHide = useCallback(() => {
+  const barHide = useCallback(() => {
     if (openGroupRef.current) requestHideSeries(openGroupRef.current);
   }, [requestHideSeries]);
-  const crumbUnhide = useCallback(() => {
+  const barUnhide = useCallback(() => {
     if (openGroupRef.current) unhideSeries(openGroupRef.current);
   }, [unhideSeries]);
-  const crumbAuto = useCallback(() => {
+  const barAuto = useCallback(() => {
     if (openGroupRef.current) setSeriesAutoDownload(openGroupRef.current, true);
   }, [setSeriesAutoDownload]);
-  const crumbStopAuto = useCallback(() => {
+  const barStopAuto = useCallback(() => {
     if (openGroupRef.current) setSeriesAutoDownload(openGroupRef.current, false);
   }, [setSeriesAutoDownload]);
 
@@ -966,7 +966,7 @@ export default function SubscriptionsView(p: Props) {
   const callState = (key: string): CallState =>
     slow.has(key) ? "slow" : pending.has(key) ? "busy" : "idle";
   // Primitives first, so the object handed up -- and the shell's render that
-  // follows -- changes only when something the crumb shows has.
+  // follows -- changes only when something the bar shows has.
   const due = openGroup?.videos.filter(downloadable).length ?? 0;
   const marked = openGroup?.videos.some((v) => v.series_hidden) ?? false;
   const autoDownload = openGroup?.videos.some((v) => v.series_auto_download) ?? false;
@@ -977,12 +977,12 @@ export default function SubscriptionsView(p: Props) {
   const seriesActions = useMemo<SeriesActions | null>(
     () => (leaderId === null ? null : {
       due, marked, downloading, hiding, autoDownload, autoAvailable, autoing,
-      onDownload: crumbDownload, onHide: crumbHide, onUnhide: crumbUnhide,
-      onAutoDownload: crumbAuto, onStopAutoDownload: crumbStopAuto,
+      onDownload: barDownload, onHide: barHide, onUnhide: barUnhide,
+      onAutoDownload: barAuto, onStopAutoDownload: barStopAuto,
     }),
     [leaderId, due, marked, downloading, hiding, autoDownload, autoAvailable, autoing,
-     crumbDownload, crumbHide,
-     crumbUnhide, crumbAuto, crumbStopAuto],
+     barDownload, barHide,
+     barUnhide, barAuto, barStopAuto],
   );
   const { onSeriesActions } = p;
   useEffect(() => { onSeriesActions?.(seriesActions); }, [seriesActions, onSeriesActions]);
@@ -1158,7 +1158,7 @@ export default function SubscriptionsView(p: Props) {
         onChoose={(choice) => {
           // The card as it is now rather than when the dialog opened: a part
           // that finished downloading meanwhile has a file to remove as well.
-          // Asked from the breadcrumb, the series is the whole grid, and the
+          // Asked from the series bar, the series is the whole grid, and the
           // card the anchor leads there is the anchor alone.
           const leader = confirm.group.videos[0].id;
           const open = openGroupRef.current;

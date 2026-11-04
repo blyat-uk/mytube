@@ -106,8 +106,13 @@ export const IconHidden = () => <EyeSlash className="icon" weight="bold" />;
 /** Same glyph as IconCancel, named for dismissing rather than stopping. */
 export const IconCheck = () => <Check className="icon" weight="bold" />;
 export const IconClose = () => <X className="icon" weight="bold" />;
-/** The folded filter row's button, and what it opens. */
+/** All filters, and the sidebar it opens. */
 export const IconFilters = () => <Funnel className="icon" weight="bold" />;
+/** A filter starred into the top bar: an outline to offer it, filled once it
+ *  is there. The membership star's glyph, in the same yellow. */
+export const IconStar = ({ on = false }: { on?: boolean }) => (
+  <Star className="icon" weight={on ? "fill" : "bold"} />
+);
 export const IconSearch = () => <MagnifyingGlass className="icon" weight="bold" />;
 export const IconCaret = () => <CaretDown className="icon icon-caret" weight="bold" />;
 

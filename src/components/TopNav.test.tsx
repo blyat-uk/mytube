@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { act, render, screen, cleanup, fireEvent } from "@testing-library/react";
+import { act, render, screen, cleanup, fireEvent, within } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import TopNav, { type Tab } from "./TopNav";
 import type { SeriesActions } from "./SubscriptionsView";
-import type { Channel } from "../types";
+import type { Channel, QuickFilter } from "../types";
 
 const CHANNELS: Channel[] = [
   {
@@ -21,6 +21,12 @@ const CHANNELS: Channel[] = [
 type Props = ComponentProps<typeof TopNav>;
 
 const SERIES = { name: "Building a CNC Router", parts: 7, runtime: "4h 10m", unknown: 0 };
+
+/** Every filter starred, so each one has its control in the bar. */
+const ALL_STARRED: QuickFilter[] = [
+  "hide_watched", "downloaded_only", "show_hidden", "grouped", "groups_only", "in_progress",
+  "auto_downloading", "sort", "channel_ids",
+];
 
 function props(over: Partial<Props> = {}): Props {
   return {
@@ -47,6 +53,8 @@ function props(over: Partial<Props> = {}): Props {
     onAutoDownloading: vi.fn(),
     sort: "newest",
     onSort: vi.fn(),
+    starred: ALL_STARRED,
+    onStarred: vi.fn(),
     series: null,
     onExitSeries: vi.fn(),
     polling: false,
@@ -117,15 +125,25 @@ describe("TopNav while a series is open", () => {
 });
 
 /**
- * The series takes the place of the tab strip rather than adding a bar of its
- * own below the nav: it is where you are, not a notice about where you are.
+ * A series opens a bar of its own under the row. The row itself never changes:
+ * the sections stay, and the Subscriptions tab is the way back, so the bar
+ * names the series and repeats nothing above it.
  */
-describe("the series breadcrumb", () => {
-  it("replaces the sections and names the series", () => {
+describe("the series bar", () => {
+  const bar = () => screen.queryByRole("region", { name: "Open series" });
+
+  it("opens under the row and names the series, the sections still standing", () => {
     renderNav({ series: SERIES });
-    expect(screen.queryByLabelText("Sections")).toBeNull();
-    expect(screen.getByText("Building a CNC Router")).not.toBeNull();
-    expect(screen.getByText("7 parts · 4h 10m")).not.toBeNull();
+    expect(screen.getByLabelText("Sections")).not.toBeNull();
+    expect(within(bar()!).getByText("Building a CNC Router")).not.toBeNull();
+    expect(within(bar()!).getByText("7 parts · 4h 10m")).not.toBeNull();
+    // Below the row, not in it.
+    expect(document.querySelector(".topnav-row")!.contains(bar())).toBe(false);
+  });
+
+  it("says which channel the series is from, once known", () => {
+    renderNav({ series: { ...SERIES, channel: "Chills Narrated" } });
+    expect(within(bar()!).getByRole("status").textContent).toBe("7 parts · 4h 10m · Chills Narrated");
   });
 
   it("marks a runtime that is still missing a part as approximate", () => {
@@ -140,33 +158,45 @@ describe("the series breadcrumb", () => {
 
   /** Nothing is known until the first page lands; silence beats a wrong count. */
   it("holds its tongue until the parts are counted", () => {
-    renderNav({ series: { name: "Building a CNC Router", parts: 0, runtime: "", unknown: 0 } });
+    renderNav({ series: { name: "Building a CNC Router", parts: 0, runtime: "", unknown: 0, channel: "Nexpo" } });
     expect(screen.queryByText(/parts/)).toBeNull();
     expect(screen.queryByText("no other parts found")).toBeNull();
+    expect(within(bar()!).queryByRole("status")).toBeNull();
   });
 
-  it("leaves the series by the ✕ and by the section it came from", () => {
+  it("has no breadcrumb of its own: the Subscriptions tab above is the way back", () => {
+    const p = renderNav({ series: SERIES });
+    expect(within(bar()!).queryByRole("button", { name: "Subscriptions" })).toBeNull();
+    expect(button("Subscriptions").getAttribute("aria-current")).toBe("page");
+    fireEvent.click(button("Subscriptions"));
+    expect(p.onExitSeries).toHaveBeenCalledTimes(1);
+    expect(p.onTab).toHaveBeenCalledWith("subscriptions");
+  });
+
+  it("leaves the series by its ✕, and with any change of tab", () => {
     const p = renderNav({ series: SERIES });
     fireEvent.click(screen.getByRole("button", { name: "Leave this series" }));
     expect(p.onExitSeries).toHaveBeenCalledTimes(1);
-
-    fireEvent.click(screen.getByRole("button", { name: "Subscriptions" }));
+    fireEvent.click(button("Downloads"));
     expect(p.onExitSeries).toHaveBeenCalledTimes(2);
+    expect(p.onTab).toHaveBeenCalledWith("downloads");
   });
 
-  it("is absent in the ordinary feed, where the sections stand", () => {
-    renderNav();
+  it("is absent in the ordinary feed, where nothing about the row changes", () => {
+    const p = renderNav();
+    expect(bar()).toBeNull();
     expect(screen.queryByRole("button", { name: "Leave this series" })).toBeNull();
-    expect(screen.getByLabelText("Sections")).not.toBeNull();
+    fireEvent.click(button("Downloads"));
+    expect(p.onExitSeries).not.toHaveBeenCalled();
   });
 });
 
 /**
- * An open series offers on its crumb what its card's menu offers: download
- * what is left of it, and hide it (or bring it back). The view runs them; the
- * nav only draws them from what it is handed.
+ * An open series offers on its bar what its card's menu offers: download what
+ * is left of it, and hide it (or bring it back). The view runs them; the nav
+ * only draws them from what it is handed.
  */
-describe("the series actions on the crumb", () => {
+describe("the series actions on the bar", () => {
   function actions(over: Partial<SeriesActions> = {}): SeriesActions {
     return {
       due: 3, marked: false, downloading: "idle", hiding: "idle", autoDownload: false,
@@ -180,11 +210,10 @@ describe("the series actions on the crumb", () => {
   const names = () =>
     Array.from(group()!.querySelectorAll("button")).map((b) => b.getAttribute("aria-label"));
 
-  it("offers the card menu's three, hide first, right after the crumb", () => {
+  it("offers the card menu's three, hide first, on the series' own bar", () => {
     renderNav({ series: SERIES, seriesActions: actions() });
     expect(names()).toEqual(["Hide series", "Auto-download", "Download 3 parts"]);
-    // Beside the breadcrumb rather than inside it: the crumb is navigation.
-    expect(screen.getByLabelText("Breadcrumb").nextElementSibling).toBe(group());
+    expect(screen.getByRole("region", { name: "Open series" }).contains(group())).toBe(true);
   });
 
   it("counts a single part left as one part, and offers no download once none is", () => {
@@ -288,16 +317,13 @@ describe("the series actions on the crumb", () => {
     expect(group()).toBeNull();
   });
 
-  it("goes with the crumb in the ordinary feed", () => {
+  it("goes with the bar in the ordinary feed", () => {
     renderNav({ series: null, seriesActions: actions() });
     expect(group()).toBeNull();
   });
 });
 
-/**
- * Every filter now shares the one row with the sections, so the split that
- * matters is which side of the divider a control sits on — not which bar.
- */
+/** The starred filters sit in the one row with the sections. */
 describe("the filters on the row", () => {
   it("keeps the channel filter beside the sort select", () => {
     renderNav();
@@ -575,8 +601,8 @@ describe("the auto-downloading filter", () => {
 
   it("joins the filters once they are, after Continue watching, and toggles", () => {
     const p = renderNav({ grouped: true });
-    const seg = screen.getByRole("group", { name: "Filters" });
-    const labels = Array.from(seg.querySelectorAll("button")).map((b) => b.getAttribute("aria-label"));
+    const bar = screen.getByRole("group", { name: "Starred filters" });
+    const labels = Array.from(bar.querySelectorAll(".quick-chip")).map((b) => b.getAttribute("aria-label"));
     expect(labels.slice(-2)).toEqual(["Continue watching", "Auto-downloading"]);
     const chip = screen.getByRole("button", { name: "Auto-downloading" });
     expect(chip.getAttribute("aria-pressed")).toBe("false");
@@ -750,8 +776,244 @@ describe("the update chip", () => {
     expect(p.onOpenAbout).toHaveBeenCalledTimes(1);
   });
 
-  it("goes with the tabs while a series is open", () => {
+  /* The tabs no longer make way for a breadcrumb, so neither does the chip. */
+  it("stays with the tabs while a series is open", () => {
     renderNav({ update: UPDATE, series: SERIES });
-    expect(chip()).toBeNull();
+    expect(chip()!.previousElementSibling).toBe(button("Settings"));
+  });
+});
+
+/**
+ * The bar holds the filters the user starred and nothing else, in the order
+ * the sidebar lists them. Everything else is one press away, behind All
+ * filters, whose badge counts what is on there out of sight.
+ */
+describe("the starred filters", () => {
+  const bar = () => screen.queryByRole("group", { name: "Starred filters" });
+  const inBar = () =>
+    Array.from(bar()?.querySelectorAll(".quick-slot > *") ?? []).map((el) => el.getAttribute("aria-label"));
+
+  it("puts only what is starred in the bar, in the sidebar's order", () => {
+    renderNav({ starred: ["downloaded_only", "sort"] });
+    expect(inBar()).toEqual(["Downloaded", "Sort order"]);
+    expect(screen.queryByRole("button", { name: "Unwatched" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Filter by channel/ })).toBeNull();
+  });
+
+  it("leaves the series-only filters out while ungrouped, starred or not", () => {
+    renderNav({ starred: ["grouped", "in_progress"], grouped: false });
+    expect(inBar()).toEqual(["Grouped"]);
+    cleanup();
+    renderNav({ starred: ["grouped", "in_progress"], grouped: true });
+    expect(inBar()).toEqual(["Grouped", "Continue watching"]);
+  });
+
+  it("draws no group at all when nothing is starred, and keeps All filters", () => {
+    renderNav({ starred: [] });
+    expect(bar()).toBeNull();
+    expect(button("All filters")).toBeDefined();
+  });
+
+  it("names a chip and says what it does, for when it is folded to its glyph", () => {
+    renderNav({ starred: ["hide_watched"] });
+    expect(button("Unwatched").title).toBe("Unwatched. Show only videos you have not watched");
+  });
+
+  it("counts on All filters only what is on and not in the bar", () => {
+    renderNav({ starred: ["hide_watched"], hideWatched: true, downloadedOnly: true, channelIds: ["UC1"] });
+    const all = button("All filters, 2 more on");
+    expect(all.querySelector(".count")?.textContent).toBe("2");
+    expect(all.title).toBe("2 filters are on that the top bar is not showing");
+  });
+
+  it("shows no count when everything that is on is in sight", () => {
+    renderNav({ starred: ["hide_watched"], hideWatched: true, grouped: true, sort: "oldest" });
+    expect(button("All filters").querySelector(".count")).toBeNull();
+  });
+});
+
+/**
+ * Every filter, in a sidebar floating over the feed. Changes apply as they
+ * are made, a star puts a filter in the bar, and it closes on Esc, ✕, All
+ * filters again, or a press outside the nav.
+ */
+describe("the All filters sidebar", () => {
+  const sidebar = () => screen.queryByRole("dialog", { name: "All filters" });
+  const open = () => {
+    fireEvent.click(screen.getByRole("button", { name: /^All filters/ }));
+    return sidebar()!;
+  };
+  const side = () => within(sidebar()!);
+
+  it("opens from All filters with Show, Series, Sort and Channels", () => {
+    renderNav({ grouped: true });
+    const panel = open();
+    const heads = Array.from(panel.querySelectorAll(".side-sec-title")).map((h) => h.textContent);
+    expect(heads).toEqual(["Show", "Series", "Sort", "Channels"]);
+    expect(screen.getByRole("button", { name: /^All filters/ }).getAttribute("aria-expanded")).toBe("true");
+    for (const name of ["Unwatched", "Downloaded", "Include hidden", "Group siblings", "Only groups",
+      "Continue watching", "Auto-downloading"]) {
+      expect(side().getByRole("button", { name })).toBeDefined();
+    }
+    expect(side().getByRole("radio", { name: "Most parts first" })).toBeDefined();
+    expect(side().getByRole("button", { name: "Chills Narrated" })).toBeDefined();
+    // Focus moves into it, so the keyboard carries on from the button.
+    expect(document.activeElement).toBe(panel);
+  });
+
+  it("floats over the feed from the nav, rather than taking room from the grid", () => {
+    renderNav();
+    expect(screen.getByRole("banner").contains(open())).toBe(true);
+  });
+
+  it("applies each change as it is made and stays open", () => {
+    const p = renderNav({ starred: [] });
+    open();
+    fireEvent.click(side().getByRole("button", { name: "Unwatched" }));
+    expect(p.onHideWatched).toHaveBeenCalledWith(true);
+    fireEvent.click(side().getByRole("radio", { name: "Longest first" }));
+    expect(p.onSort).toHaveBeenCalledWith("length");
+    fireEvent.click(side().getByRole("button", { name: "Chills Narrated" }));
+    expect(p.onChannelIds).toHaveBeenCalledWith(["UC1"]);
+    expect(sidebar()).not.toBeNull();
+  });
+
+  it("says which switches are on", () => {
+    renderNav({ starred: [], downloadedOnly: true });
+    open();
+    expect(side().getByRole("button", { name: "Downloaded" }).getAttribute("aria-pressed")).toBe("true");
+    expect(side().getByRole("button", { name: "Unwatched" }).getAttribute("aria-pressed")).toBe("false");
+    expect(side().getByRole("radio", { name: "Newest first" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("stars a filter into the bar, and takes a star away, keeping the bar's order", () => {
+    const p = renderNav({ starred: ["sort"] });
+    open();
+    const star = side().getByRole("button", { name: "Star Unwatched" });
+    expect(star.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(star);
+    expect(p.onStarred).toHaveBeenLastCalledWith(["hide_watched", "sort"]);
+
+    const sortStar = side().getByRole("button", { name: "Star Sort" });
+    expect(sortStar.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(sortStar);
+    expect(p.onStarred).toHaveBeenLastCalledWith([]);
+
+    fireEvent.click(side().getByRole("button", { name: "Star Channels" }));
+    expect(p.onStarred).toHaveBeenLastCalledWith(["sort", "channel_ids"]);
+  });
+
+  it("lights up a filter as it lands in the bar", () => {
+    function Harness() {
+      const [starred, setStarred] = useState<QuickFilter[]>([]);
+      return <TopNav {...props({ starred, onStarred: setStarred })} />;
+    }
+    render(<Harness />);
+    open();
+    fireEvent.click(side().getByRole("button", { name: "Star Downloaded" }));
+    const chip = within(screen.getByRole("group", { name: "Starred filters" }))
+      .getByRole("button", { name: "Downloaded" });
+    expect(chip.parentElement!.classList.contains("is-new")).toBe(true);
+  });
+
+  it("offers the series filters disabled until grouped, with their stars still live", () => {
+    const p = renderNav({ grouped: false, starred: [] });
+    open();
+    expect((side().getByRole("button", { name: "Only groups" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(side().getByText("The rest need Group siblings")).toBeDefined();
+    expect(side().queryByRole("radio", { name: "Most parts first" })).toBeNull();
+    fireEvent.click(side().getByRole("button", { name: "Star Continue watching" }));
+    expect(p.onStarred).toHaveBeenLastCalledWith(["in_progress"]);
+  });
+
+  it("clears what narrows the list, leaving grouping and the order alone", () => {
+    const p = renderNav({
+      starred: [], grouped: true, sort: "oldest", hideWatched: true, inProgress: true, channelIds: ["UC2"],
+    });
+    open();
+    fireEvent.click(side().getByRole("button", { name: "Clear" }));
+    expect(p.onHideWatched).toHaveBeenCalledWith(false);
+    expect(p.onInProgress).toHaveBeenCalledWith(false);
+    expect(p.onChannelIds).toHaveBeenCalledWith([]);
+    expect(p.onGrouped).not.toHaveBeenCalled();
+    expect(p.onSort).not.toHaveBeenCalled();
+    expect(p.onDownloadedOnly).not.toHaveBeenCalled();
+  });
+
+  it("has nothing to clear when nothing narrows the list", () => {
+    renderNav({ grouped: true });
+    open();
+    expect((side().getByRole("button", { name: "Clear" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("closes on Esc without leaving an open series, and hands focus back", () => {
+    const p = renderNav({ series: SERIES });
+    open();
+    const seriesEsc = vi.fn();
+    window.addEventListener("keydown", seriesEsc);
+    act(() => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })); });
+    window.removeEventListener("keydown", seriesEsc);
+    expect(sidebar()).toBeNull();
+    expect(seriesEsc).not.toHaveBeenCalled();
+    expect(p.onExitSeries).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /^All filters/ }));
+  });
+
+  it("closes from its ✕ and from All filters again", () => {
+    renderNav();
+    open();
+    fireEvent.click(side().getByRole("button", { name: "Close all filters" }));
+    expect(sidebar()).toBeNull();
+    open();
+    fireEvent.click(screen.getByRole("button", { name: /^All filters/ }));
+    expect(sidebar()).toBeNull();
+  });
+
+  it("closes on a press outside the nav, but not on one inside it", () => {
+    renderNav();
+    open();
+    act(() => { screen.getByLabelText("Search videos").dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); });
+    expect(sidebar()).not.toBeNull();
+    act(() => { document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); });
+    expect(sidebar()).toBeNull();
+  });
+
+  it("keeps only the sort live while a series is open, and says why", () => {
+    renderNav({ series: SERIES, channelIds: [] });
+    open();
+    expect(side().getByText(/only/i, { selector: ".side-note span" })).toBeDefined();
+    expect((side().getByRole("button", { name: "Unwatched" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((side().getByRole("button", { name: "Chills Narrated" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((side().getByRole("searchbox", { name: "Filter channels" }) as HTMLInputElement).disabled).toBe(true);
+    expect((side().getByRole("radio", { name: "Oldest first" }) as HTMLButtonElement).disabled).toBe(false);
+    // A star is a choice about the bar, not this view.
+    expect((side().getByRole("button", { name: "Star Unwatched" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("closes the bar's channel checklist, and the checklist closes it", () => {
+    renderNav();
+    openChannels();
+    open();
+    expect(screen.queryByRole("dialog", { name: "Channels" })).toBeNull();
+    fireEvent.click(channelButton());
+    expect(sidebar()).toBeNull();
+  });
+
+  it("is not there on the other tabs", () => {
+    renderNav({ tab: "downloads" });
+    expect(screen.queryByRole("button", { name: /^All filters/ })).toBeNull();
+  });
+});
+
+/** The sections are the same everywhere: a glyph and a word each. */
+describe("the sections", () => {
+  it("wear their names on every tab and in a series", () => {
+    for (const over of [{ tab: "downloads" as const }, { series: SERIES }]) {
+      renderNav(over);
+      const tabs = Array.from(screen.getByLabelText("Sections").querySelectorAll(".tab"))
+        .map((t) => t.textContent);
+      expect(tabs).toEqual(["Subscriptions", "Downloads", "Settings"]);
+      cleanup();
+    }
   });
 });

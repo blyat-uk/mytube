@@ -69,6 +69,28 @@ fn d_sort() -> SortOrder {
     SortOrder::Newest
 }
 
+/// Every filter that can be starred into the top bar, in the order the bar and
+/// the All filters sidebar show them. Each id is the `ViewState` key it sets,
+/// so a starred list reads as what it pins. Mirrors `QUICK_ORDER` in
+/// `src/filters.ts`.
+pub const QUICK_FILTERS: [&str; 9] = [
+    "hide_watched",
+    "downloaded_only",
+    "show_hidden",
+    "grouped",
+    "groups_only",
+    "in_progress",
+    "auto_downloading",
+    "sort",
+    "channel_ids",
+];
+
+/// What a first run pins, and what a view saved before stars existed reads as.
+/// Mirrors `DEFAULT_STARRED` in `src/filters.ts`.
+fn d_starred_filters() -> Vec<String> {
+    ["hide_watched", "grouped", "sort"].map(String::from).to_vec()
+}
+
 /// The Subscriptions feed's filters, remembered between runs.
 ///
 /// The active tab is deliberately absent: a launch always lands on
@@ -119,6 +141,13 @@ pub struct ViewState {
     /// list shown) for a first run and for a view saved before the key.
     #[serde(default)]
     pub subs_folded: bool,
+    /// The filters starred into the top bar; every other one lives in the All
+    /// filters sidebar alone. Ids from `QUICK_FILTERS`, kept in that order by
+    /// `sanitize` so the same stars always serialise the same way. An empty
+    /// list is a choice (a bar with no filters in it) and is kept; only a view
+    /// without the key picks the default up.
+    #[serde(default = "d_starred_filters")]
+    pub starred_filters: Vec<String>,
 }
 
 impl Default for ViewState {
@@ -135,6 +164,7 @@ impl Default for ViewState {
             auto_downloading: false,
             sort: SortOrder::Newest,
             subs_folded: false,
+            starred_filters: d_starred_filters(),
         }
     }
 }
@@ -167,6 +197,15 @@ impl ViewState {
         self.channel_ids.retain(|id| !id.is_empty());
         self.channel_ids.sort();
         self.channel_ids.dedup();
+        // Known ids only, each once, in the bar's order: `App.tsx` compares the
+        // serialised view to decide whether to write, and an id a later build
+        // added would otherwise be carried by this one without meaning anything.
+        let starred = std::mem::take(&mut self.starred_filters);
+        self.starred_filters = QUICK_FILTERS
+            .iter()
+            .filter(|id| starred.iter().any(|s| s == *id))
+            .map(|id| id.to_string())
+            .collect();
     }
 }
 
@@ -588,6 +627,7 @@ mod tests {
             auto_downloading: true,
             sort: SortOrder::Length,
             subs_folded: true,
+            starred_filters: vec!["downloaded_only".into(), "channel_ids".into()],
         };
         let json = s.to_json_string().unwrap();
         let back = Settings::from_json_str(&json).unwrap();
@@ -695,6 +735,42 @@ mod tests {
         let ungrouped =
             Settings::from_json_str(r#"{"view":{"subs_folded":true,"grouped":false}}"#).unwrap();
         assert!(ungrouped.view.subs_folded);
+    }
+
+    #[test]
+    fn a_view_saved_before_stars_pins_the_default_three() {
+        let old = Settings::from_json_str(r#"{"view":{"hide_watched":true}}"#).unwrap();
+        assert_eq!(old.view.starred_filters, ["hide_watched", "grouped", "sort"]);
+        assert_eq!(ViewState::default().starred_filters, old.view.starred_filters);
+    }
+
+    #[test]
+    fn an_empty_star_list_is_a_choice_and_is_kept() {
+        let s = Settings::from_json_str(r#"{"view":{"starred_filters":[]}}"#).unwrap();
+        assert!(s.view.starred_filters.is_empty());
+    }
+
+    #[test]
+    fn stars_are_known_ids_only_once_each_in_the_bars_order() {
+        // In the bar's order so that starring A then B saves what B then A
+        // does; an unknown id (a later build's, or a typo) is dropped.
+        let s = Settings::from_json_str(
+            r#"{"view":{"starred_filters":["sort","nonsense","hide_watched","sort","channel_ids"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.view.starred_filters, ["hide_watched", "sort", "channel_ids"]);
+    }
+
+    #[test]
+    fn stars_on_series_filters_outlive_ungrouping() {
+        // Ungrouping clears the series-only filters themselves, but a star is
+        // a choice about the bar: the chip comes back with grouping.
+        let s = Settings::from_json_str(
+            r#"{"view":{"grouped":false,"in_progress":true,"starred_filters":["in_progress"]}}"#,
+        )
+        .unwrap();
+        assert!(!s.view.in_progress);
+        assert_eq!(s.view.starred_filters, ["in_progress"]);
     }
 
     #[test]

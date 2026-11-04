@@ -643,7 +643,7 @@ describe("the grouped feed", () => {
     fireEvent.click(await screen.findByRole("button", { name: /The Blackwood Tapes/ }));
     expect(onFindSiblings).toHaveBeenCalledTimes(1);
     expect(onFindSiblings.mock.calls[0][0].id).toBe("p3");
-    // The shared name travels with it: the breadcrumb wears it, and the
+    // The shared name travels with it: the series bar wears it, and the
     // leader's own title carries a part number the series as a whole has not.
     expect(onFindSiblings.mock.calls[0][1]).toBe("The Blackwood Tapes");
   });
@@ -688,11 +688,11 @@ describe("the grouped feed", () => {
 });
 
 /**
- * The nav's breadcrumb says what the open series holds. Only this view knows —
+ * The nav's series bar says what the open series holds. Only this view knows —
  * it is the one that fetched the parts — so the count and the runtime are
  * handed up as each page settles.
  */
-describe("what an open series reports to the breadcrumb", () => {
+describe("what an open series reports to the series bar", () => {
   it("counts the parts and adds up their runtimes", async () => {
     videos = [
       video({ id: "p1", duration_secs: 600 }),
@@ -731,11 +731,11 @@ describe("what an open series reports to the breadcrumb", () => {
 });
 
 /**
- * The crumb of an open series offers what the series card's menu offers, and
+ * The bar of an open series offers what the series card's menu offers, and
  * this view runs it exactly as it runs the menu: the same calls under the same
  * keys, the same marks shown before the answer -- and the series stays open.
  */
-describe("what an open series offers the breadcrumb", () => {
+describe("what an open series offers the series bar", () => {
   type Actions = Parameters<NonNullable<ViewProps["onSeriesActions"]>>[0];
 
   /** Three parts, newest first as the default sort hands them over. */
@@ -870,7 +870,7 @@ describe("what an open series offers the breadcrumb", () => {
     await waitFor(() => expect(enqueueDownloads).toHaveBeenCalledWith(["p2", "p3", "p1"]));
     expect(await screen.findByText("Queued 2 parts of “The Blackwood Tapes”.")).toBeTruthy();
     expect(cards().map((c) => c.dataset.state)).toEqual(["queued", "done", "queued"]);
-    // Nothing left to take, so the crumb stops offering it.
+    // Nothing left to take, so the bar stops offering it.
     await waitFor(() => expect(last()!.due).toBe(0));
   });
 
@@ -909,7 +909,7 @@ describe("what an open series offers the breadcrumb", () => {
 
     const dialog = await screen.findByRole("dialog", { name: "Hide this series?" });
     expect(setSeriesHidden).not.toHaveBeenCalled();
-    // Named as the crumb names it, not by the anchor's own title.
+    // Named as the bar names it, not by the anchor's own title.
     expect(dialog.textContent).toContain("All 3 parts of “The Blackwood Tapes”");
     fireEvent.click(getByRole(dialog, "button", { name: "Hide and remove files" }));
 
@@ -958,8 +958,8 @@ describe("what an open series offers the breadcrumb", () => {
   });
 
   /**
-   * The crumb runs under the card menu's keys, so a download started from the
-   * series card in the feed still holds the crumb's Download once the series
+   * The bar runs under the card menu's keys, so a download started from the
+   * series card in the feed still holds the bar's Download once the series
    * is opened, and the two can never both go out.
    */
   it("shares the card menu's keys across opening the series", async () => {
@@ -1405,7 +1405,7 @@ describe("a series card's right-click menu", () => {
 /**
  * A series set to auto-download queues each part that joins it later, in the
  * poll that brings it in. The view only flips the switch and shows it: on the
- * card's menu, the card itself, the open series' crumb, and the filter.
+ * card's menu, the card itself, the open series' bar, and the filter.
  */
 describe("auto-downloading a series", () => {
   function series(...parts: Partial<Video>[]): VideoGroup {

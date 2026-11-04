@@ -1,11 +1,46 @@
 import { useEffect, useLayoutEffect, useState, type RefObject } from "react";
 
 /**
+ * Closes something on a mouse press outside every one of `inside`, or on Esc.
+ * Off while `active` is false, so a panel on its way out answers nothing.
+ *
+ * Esc is heard in the capture phase and stopped there: it also leaves an open
+ * series (the shell listens on window), and closing this is all it should mean.
+ */
+export function useDismiss(
+  inside: RefObject<HTMLElement | null>[],
+  onClose: (refocus: boolean) => void,
+  active = true,
+) {
+  useEffect(() => {
+    if (!active) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (inside.some((r) => r.current?.contains(t))) return;
+      onClose(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose(true);
+    };
+    document.addEventListener("mousedown", onDown);
+    // Capture, so it is heard before the shell's series handler on window.
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey, true);
+    };
+    // `inside` is a fresh array each render; the refs in it are what matter,
+    // and they are stable (and as many on every render of one caller).
+  }, [...inside, onClose, active]);
+}
+
+/**
  * A `.topnav-pop` hung from the button that opened it: returns its `right`
  * offset, and closes it on a click outside it or Esc.
  *
- * Hung from the button's right edge, measured against the nav it sits in --
- * the popover lives outside the button's cluster, which clips while it slides.
+ * Hung from the button's right edge, measured against the nav it sits in.
  */
 export function usePopover(
   ref: RefObject<HTMLElement | null>,
@@ -26,26 +61,7 @@ export function usePopover(
     return () => window.removeEventListener("resize", place);
   }, [ref, anchor]);
 
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (ref.current?.contains(t) || anchor.current?.contains(t)) return;
-      onClose(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // Esc also leaves an open series; closing the popover is all this one means.
-      e.stopPropagation();
-      onClose(true);
-    };
-    document.addEventListener("mousedown", onDown);
-    // Capture, so it is heard before the shell's series handler on window.
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey, true);
-    };
-  }, [ref, anchor, onClose]);
+  useDismiss([ref, anchor], onClose);
 
   return right;
 }

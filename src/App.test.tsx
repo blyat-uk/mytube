@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, act, within } from "@testing-library/react";
 import type {
-  Channel, FeedStats, Settings, StatsFilter, ToolStatus, VersionInfo, Video, ViewState, VideoFilter,
+  Channel, FeedStats, QuickFilter, Settings, StatsFilter, ToolStatus, VersionInfo, Video, ViewState,
+  VideoFilter,
 } from "./types";
 import { DEFAULT_QUALITY } from "./quality";
 
@@ -84,11 +85,17 @@ vi.mock("./api", () => {
 
 import App from "./App";
 
+/** Every filter starred, so each one has a chip in the bar to press. */
+const ALL_STARRED: QuickFilter[] = [
+  "hide_watched", "downloaded_only", "show_hidden", "grouped", "groups_only", "in_progress",
+  "auto_downloading", "sort", "channel_ids",
+];
+
 function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, groups_only: false, in_progress: false,
-    auto_downloading: false, sort: "newest", subs_folded: false,
+    auto_downloading: false, sort: "newest", subs_folded: false, starred_filters: ALL_STARRED,
     ...over,
   };
 }
@@ -434,6 +441,59 @@ describe("the Add dialog's folded list", () => {
   });
 });
 
+/**
+ * The stars say which filters the top bar holds. They are remembered with the
+ * rest of the view, per machine, and a view saved before they existed opens on
+ * the default three.
+ */
+describe("the starred filters", () => {
+  const sidebar = () => screen.getByRole("dialog", { name: "All filters" });
+  const bar = () => screen.getByRole("group", { name: "Starred filters" });
+
+  it("puts only the starred filters in the bar, the rest behind All filters", async () => {
+    settings = settingsWith({ grouped: true, starred_filters: ["downloaded_only", "sort"] });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    const labels = Array.from(bar().querySelectorAll("button, select"))
+      .map((b) => b.getAttribute("aria-label"));
+    expect(labels).toEqual(["Downloaded", "Sort order"]);
+    expect(screen.queryByRole("button", { name: "Unwatched" })).toBeNull();
+  });
+
+  it("opens on the default three when the view has no stars at all", async () => {
+    settings = settingsWith({ grouped: true });
+    delete (settings.view as Partial<ViewState>).starred_filters;
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    const labels = Array.from(bar().querySelectorAll("button, select"))
+      .map((b) => b.getAttribute("aria-label"));
+    expect(labels).toEqual(["Unwatched", "Grouped", "Sort order"]);
+    // The default read back is not a change, so nothing is written over it.
+    await pause(500);
+    expect(saveViewState).not.toHaveBeenCalled();
+  });
+
+  it("saves a star given in the sidebar, and the chip arrives in the bar", async () => {
+    settings = settingsWith({ starred_filters: ["sort"] });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+
+    fireEvent.click(button("All filters"));
+    fireEvent.click(within(sidebar()).getByRole("button", { name: "Star Unwatched" }));
+
+    expect(within(bar()).getByRole("button", { name: "Unwatched" })).toBeDefined();
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView({ starred_filters: ["hide_watched", "sort"] }));
+  });
+
+  it("counts on All filters a filter that is on but not in the bar", async () => {
+    settings = settingsWith({ starred_filters: ["sort"], downloaded_only: true });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    expect(button("All filters, 1 more on")).toBeDefined();
+  });
+});
+
 /** One ready card, so the feed has something to open a series from. */
 function feedVideo(): Video {
   return {
@@ -452,6 +512,41 @@ function feedVideo(): Video {
  * into it is a child holding a ref to it -- so this covers the one thing the
  * view's own tests cannot: that the ref reaches `.content` itself.
  */
+/**
+ * A series opens a bar of its own under the row, and the row itself never
+ * changes: the Subscriptions tab is still there, and pressing it is the way
+ * back to the feed.
+ */
+describe("the open series' bar", () => {
+  async function openSeries() {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find siblings" }));
+    return screen.findByRole("region", { name: "Open series" });
+  }
+
+  it("names the series and its channel, with no breadcrumb above it", async () => {
+    const bar = await openSeries();
+    expect(within(bar).getByText("Some video")).toBeDefined();
+    await waitFor(() => expect(within(bar).getByRole("status").textContent)
+      .toBe("no other parts found · Veritasium"));
+    expect(within(bar).queryByRole("button", { name: "Subscriptions" })).toBeNull();
+    expect(screen.getByLabelText("Sections")).toBeDefined();
+    expect(button("Subscriptions").getAttribute("aria-current")).toBe("page");
+  });
+
+  it("closes when the Subscriptions tab is pressed, back on the feed", async () => {
+    await openSeries();
+    fireEvent.click(button("Subscriptions"));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Open series" })).toBeNull());
+    await waitFor(() => {
+      const calls = listVideos.mock.calls;
+      expect(calls[calls.length - 1][0]).toMatchObject({ siblingOf: null });
+    });
+  });
+});
+
 describe("keeping the feed's place across a series visit", () => {
   it("puts the shell's scroll container back where it was", async () => {
     listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
@@ -471,7 +566,7 @@ describe("keeping the feed's place across a series visit", () => {
     // jsdom lays nothing out, so the clamp is applied by hand.
     content.scrollTop = 0;
 
-    // Escape leaves the series, the same as the breadcrumb's own button.
+    // Escape leaves the series, the same as the series bar's own button.
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(content.scrollTop).toBe(900));
   });
@@ -501,14 +596,14 @@ describe("a card's See all videos from its channel", () => {
 
     fireEvent.contextMenu(await screen.findByRole("article"));
     fireEvent.click(screen.getByRole("menuitem", { name: "Find siblings" }));
-    await screen.findByRole("navigation", { name: "Breadcrumb" });
+    await screen.findByRole("region", { name: "Open series" });
 
     fireEvent.contextMenu(await screen.findByRole("article"));
     fireEvent.click(
       await screen.findByRole("menuitem", { name: "See all videos from Veritasium" }),
     );
 
-    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Breadcrumb" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Open series" })).toBeNull());
     expect(screen.getByLabelText("Search videos")).toHaveProperty("value", "");
     await waitFor(() => expect(lastFilter()).toMatchObject({
       channelIds: ["UC1"], search: null, siblingOf: null,
@@ -662,17 +757,17 @@ describe("a newer MyTube release", () => {
     await aboutShown();
   });
 
-  /* Settings under a series' breadcrumb would leave no tabs to get back by. */
+  /* Any change of tab leaves a series: a tab always opens at its top. */
   it("leaves an open series to show About", async () => {
     listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
     render(<App />);
     fireEvent.contextMenu(await screen.findByRole("article"));
     fireEvent.click(screen.getByRole("menuitem", { name: "Find siblings" }));
-    await screen.findByRole("navigation", { name: "Breadcrumb" });
+    await screen.findByRole("region", { name: "Open series" });
 
     act(() => listeners.get("app://open-about")!({ payload: null }));
     await aboutShown();
-    expect(screen.queryByRole("navigation", { name: "Breadcrumb" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Open series" })).toBeNull();
   });
 
   it("keeps a check that lands before the first read over that older read", async () => {

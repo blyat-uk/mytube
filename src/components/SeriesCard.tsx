@@ -8,7 +8,7 @@ import type { Video, VideoGroup } from "../types";
 interface Props {
   group: VideoGroup;
   /** Opens the series: the sibling view, anchored on the leader and carrying
-   *  the shared stem, which is the name the breadcrumb then wears. */
+   *  the shared stem, which is the name the series bar then wears. */
   onOpen: (leader: Video, stem: string | null) => void;
   /** Right-click. The view answers with a menu of its own for a series, every
    *  item acting on the whole of it -- marking, downloading its parts, hiding

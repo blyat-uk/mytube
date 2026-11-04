@@ -34,7 +34,7 @@ export const SETTINGS: Settings = {
   view: {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, groups_only: false, in_progress: false, auto_downloading: false, sort: "newest",
-    subs_folded: false,
+    subs_folded: false, starred_filters: ["hide_watched", "grouped", "sort"],
   },
 };
 
