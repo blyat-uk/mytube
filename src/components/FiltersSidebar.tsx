@@ -147,9 +147,15 @@ export default function FiltersSidebar(p: Props) {
 
   // Into the sidebar on opening, so the keyboard can carry on from where the
   // button was; the panel itself rather than a control in it, which would
-  // read as having chosen one.
+  // read as having chosen one. Without scrolling: on its first frame the
+  // slide-in has it translated past the window's right edge, and a plain
+  // focus() scrolled the window (overflow: hidden still scrolls) sideways by
+  // the sidebar's width to reveal it -- every card shifted left, the panel
+  // slid in out of the space that opened, and it all snapped back when the
+  // animation ended and the overflow went (reproduced in Chromium: 608px of
+  // scrollLeft, 0 with preventScroll).
   useEffect(() => {
-    ref.current?.focus();
+    ref.current?.focus({ preventScroll: true });
   }, []);
 
   const hint = p.off ? "Not applied while a series is open" : undefined;

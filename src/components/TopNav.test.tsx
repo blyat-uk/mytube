@@ -925,6 +925,22 @@ describe("the All filters sidebar", () => {
     expect(screen.getByRole("banner").contains(open())).toBe(true);
   });
 
+  // Its first frame is translated off the window's right edge, so a plain
+  // focus() scrolled the whole window sideways by the sidebar's width until
+  // the slide-in ended, then snapped back. jsdom has no layout, so the call
+  // itself is what is checked.
+  it("takes focus without scrolling the window", () => {
+    renderNav();
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
+    try {
+      const panel = open();
+      const calls = focus.mock.contexts.flatMap((el, i) => (el === panel ? [focus.mock.calls[i]] : []));
+      expect(calls).toEqual([[{ preventScroll: true }]]);
+    } finally {
+      focus.mockRestore();
+    }
+  });
+
   it("applies each change as it is made and stays open", () => {
     const p = renderNav({ starred: [] });
     open();
