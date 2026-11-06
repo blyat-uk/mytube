@@ -15,9 +15,11 @@ import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction } from "../
 import { useSiblingMarking } from "../marking";
 import { usePending } from "../pending";
 import { createProgressStore } from "../progress";
-import type { SortOrder, Video, VideoGroup } from "../types";
+import type { DownloadSeries, SortOrder, Video, VideoGroup } from "../types";
 
 const PAGE = 100;
+/** Enough for every part of any series, for the parts a hide asks about. */
+const EVERY_PART = 10_000;
 
 /** How many lists' places to keep: the feed, an open series, and whatever the
  *  filter row was set to before this one. Every debounced search query makes a
@@ -228,12 +230,18 @@ export default function SubscriptionsView(p: Props) {
   const [pageEpoch, setPageEpoch] = useState(0);
   const [menu, setMenu] = useState<{ video: Video; x: number; y: number } | null>(null);
   /**
-   * Three dialogs share this slot: "remove" asks how to hide or delete a video,
-   * "file" asks only whether to delete a watched video's download, and
-   * "series" asks how to hide a series with a part downloaded.
+   * Four dialogs share this slot: "remove" asks how to hide or delete a video
+   * with a file (`alone`: one that hides its series, see `removeVideo`),
+   * "file" asks only whether to delete a watched video's download, "series"
+   * asks how to hide a series with a part downloaded, and "scope" asks whether
+   * hiding a part of a series hides that part or the whole series.
    */
   const [confirm, setConfirm] = useState<
-    { kind: "remove" | "file"; video: Video } | { kind: "series"; group: VideoGroup } | null
+    | { kind: "remove"; video: Video; alone?: boolean }
+    | { kind: "file"; video: Video }
+    | { kind: "series"; group: VideoGroup }
+    | { kind: "scope"; video: Video; series: DownloadSeries; group: VideoGroup }
+    | null
   >(null);
   /** The video Download (custom)… is choosing formats for. */
   const [custom, setCustom] = useState<Video | null>(null);
@@ -589,8 +597,12 @@ export default function SubscriptionsView(p: Props) {
    * Hides a subscription video, or deletes one added by hand -- and its file
    * first, when asked. The card leaves at once (or turns hidden, with hidden
    * videos on show) and comes back as it was if anything fails.
+   *
+   * `alone`: the video has its card to itself, so the backend hides the
+   * series it grows into along with it (`Db::hide_video`) -- which the toast
+   * says, and which can reach a part on another card, read back by a refetch.
    */
-  const removeVideo = useCallback((video: Video, alsoDeleteFile: boolean) => {
+  const removeVideo = useCallback((video: Video, alsoDeleteFile: boolean, alone = false) => {
     const deleting = video.added_manually;
     // Set once the file is gone, which no undo can bring back: a hide that
     // fails after it restores the card, but not as downloaded.
@@ -600,10 +612,15 @@ export default function SubscriptionsView(p: Props) {
         await api.deleteDownload(video.id);
         fileGone = true;
       }
+      let changed: string[] = [];
       if (deleting) await api.deleteVideo(video.id);
-      else await api.setVideoHidden(video.id, true);
+      else changed = await api.setVideoHidden(video.id, true);
       bump();
-      toast.success(deleting ? `Deleted "${video.title}".` : `Hidden "${video.title}".`);
+      toast.success(deleting ? `Deleted "${video.title}".`
+        : alone ? `Hidden "${video.title}". Parts that join it later stay hidden too.`
+        : `Hidden "${video.title}".`);
+      const others = new Set(changed.filter((id) => id !== video.id));
+      if (groupsRef.current.some((g) => g.videos.some((v) => others.has(v.id)))) await fetchPage(0);
     }, {
       optimistic: () => {
         // A series keeps a part it would otherwise lose to "Include hidden"
@@ -615,16 +632,52 @@ export default function SubscriptionsView(p: Props) {
             if (fileGone) patch(video.id, NO_FILE);
           };
         }
-        patch(video.id, { hidden: true, ...(alsoDeleteFile ? NO_FILE : {}) });
-        return () => patch(video.id, { hidden: false, ...(fileGone ? {} : fileOf(video)) });
+        patch(video.id, { hidden: true, ...(alone ? { series_hidden: true } : {}),
+                          ...(alsoDeleteFile ? NO_FILE : {}) });
+        return () => patch(video.id, { hidden: false, series_hidden: video.series_hidden,
+                                       ...(fileGone ? {} : fileOf(video)) });
       },
     });
-  }, [drop, patch, run, showHidden, siblingOf, toast, bump]);
+  }, [drop, fetchPage, patch, run, showHidden, siblingOf, toast, bump]);
 
+  /**
+   * "Hide from feed" on one video. A video alone on its card goes at once --
+   * hiding the first part of a show is deciding against the show, so the
+   * backend hides whatever joins it later too. A part of a series asks first
+   * whether the whole series should go: it could as well be one bad episode.
+   * Which of the two it is, the backend says (`download_series`, the card
+   * Find siblings would open), since neither an ungrouped feed nor a series
+   * view can tell from what is on screen. A video added by hand is deleted,
+   * never hidden, so no series comes into it.
+   */
   const requestRemove = useCallback((video: Video) => {
-    if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video });
-    else removeVideo(video, false);
-  }, [removeVideo]);
+    if (video.added_manually) {
+      if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video });
+      else removeVideo(video, false);
+      return;
+    }
+    // A key apart from the hide's own, which the answer goes on to take.
+    void run(`hide-ask:${video.id}`, async () => {
+      const [series] = await api.downloadSeries([video.id]);
+      if (!series) {
+        if (hasDownloadedFile(video)) setConfirm({ kind: "remove", video, alone: true });
+        else removeVideo(video, false, true);
+        return;
+      }
+      // Every part, now, so "Hide whole series" acts at once -- and on the
+      // series as the question counted it, which in an ungrouped feed or a
+      // series view is on no single card.
+      const parts = await api.listVideos({
+        channelIds: [], channelsExcept: false, hideWatched: false, downloadedOnly: false,
+        showHidden: true, minParts: 0, minLength: 0, inProgress: false, autoDownloading: false,
+        search: null, siblingOf: video.id, sort, limit: EVERY_PART, offset: 0,
+      });
+      // The part asked about leads: `set_series_hidden` hides the card it leads.
+      const self = parts.find((v) => v.id === video.id) ?? video;
+      const group = { videos: [self, ...parts.filter((v) => v.id !== video.id)], stem: series.stem };
+      setConfirm({ kind: "scope", video: self, series, group });
+    });
+  }, [removeVideo, run, sort]);
 
   /**
    * Queues every part of a series that is not down or on its way. The whole
@@ -692,12 +745,22 @@ export default function SubscriptionsView(p: Props) {
       if (changed.some((id) => !shown.has(id))) await fetchPage(0);
     }, {
       optimistic: () => {
-        // Never in a series view in practice -- grouping stands down there, so
-        // no series card is up -- but it is the rule `removeVideo` keeps.
+        // A series view keeps every part on screen, hidden ones included: the
+        // rule `removeVideo` keeps.
         if (!showHidden && !siblingOf) {
-          const undo = dropCard(leader.id);
+          // Grouped, the series is one card. Ungrouped -- reached from a
+          // part's own Hide, see `requestRemove` -- every part is a card of
+          // its own: each goes, and comes back in screen order, so every one
+          // lands where it stood.
+          const onScreen = (id: string) =>
+            groupsRef.current.findIndex((g) => g.videos.some((v) => v.id === id));
+          const undos = grouped
+            ? [dropCard(leader.id)]
+            : group.videos.map((v) => v.id)
+              .sort((a, b) => onScreen(a) - onScreen(b))
+              .map((id) => drop(id));
           return () => {
-            undo();
+            for (const undo of undos) undo();
             if (gone.size > 0) mapVideos((v) => (gone.has(v.id) ? { ...v, ...NO_FILE } : v));
           };
         }
@@ -717,7 +780,7 @@ export default function SubscriptionsView(p: Props) {
         });
       },
     });
-  }, [dropCard, fetchPage, mapVideos, run, showHidden, siblingOf, toast, bump]);
+  }, [drop, dropCard, fetchPage, grouped, mapVideos, run, showHidden, siblingOf, toast, bump]);
 
   const requestHideSeries = useCallback((group: VideoGroup) => {
     if (group.videos.some(hasDownloadedFile)) setConfirm({ kind: "series", group });
@@ -1120,6 +1183,9 @@ export default function SubscriptionsView(p: Props) {
         body={
           confirm.video.added_manually
             ? "It will be removed from MyTube. The downloaded file is kept unless you choose otherwise."
+            : confirm.alone
+            ? "It will stay out of your feed even after future refreshes, and so will any part that" +
+              " joins it later. The downloaded file is kept unless you choose otherwise."
             : "It will stay out of your feed even after future refreshes. The downloaded file is kept unless you choose otherwise."
         }
         choices={[
@@ -1138,7 +1204,38 @@ export default function SubscriptionsView(p: Props) {
         onChoose={(choice) => {
           const target = confirm.video;
           setConfirm(null);
-          void removeVideo(target, choice === "delete");
+          void removeVideo(target, choice === "delete", confirm.alone);
+        }}
+      />
+    )}
+
+    {confirm?.kind === "scope" && (
+      <ConfirmDialog
+        title="Hide the whole series?"
+        body={
+          `“${confirm.video.title}” is part ${confirm.series.position} of ` +
+          (confirm.series.stem
+            ? `${confirm.series.parts} of “${confirm.series.stem}”. `
+            : `a ${confirm.series.parts}-part series. `) +
+          (confirm.series.parts === 2 ? "Hide both parts" : `Hide all ${confirm.series.parts} parts`) +
+          ", and any part that comes out later, or just this video?"
+        }
+        choices={[
+          { label: "Just this video", value: "one" },
+          { label: "Hide whole series", value: "series", primary: true },
+        ]}
+        onCancel={() => setConfirm(null)}
+        onChoose={(choice) => {
+          const { video, group } = confirm;
+          setConfirm(null);
+          if (choice === "series") {
+            requestHideSeries(group);
+            return;
+          }
+          // As it is now: a download that finished meanwhile has a file to ask about.
+          const now = groupsRef.current.flatMap((g) => g.videos).find((v) => v.id === video.id) ?? video;
+          if (hasDownloadedFile(now)) setConfirm({ kind: "remove", video: now });
+          else removeVideo(now, false);
         }}
       />
     )}
@@ -1166,11 +1263,16 @@ export default function SubscriptionsView(p: Props) {
           // The card as it is now rather than when the dialog opened: a part
           // that finished downloading meanwhile has a file to remove as well.
           // Asked from the series bar, the series is the whole grid, and the
-          // card the anchor leads there is the anchor alone.
+          // card the anchor leads there is the anchor alone. Asked from a
+          // part's own Hide (`requestRemove`), the parts are on no one card --
+          // a card of one there is that part alone -- so each is read back
+          // from wherever it is on screen.
           const leader = confirm.group.videos[0].id;
           const open = openGroupRef.current;
+          const onScreen = new Map(groupsRef.current.flatMap((g) => g.videos).map((v) => [v.id, v]));
           const target = (open?.videos[0].id === leader ? open : null)
-            ?? groupsRef.current.find((g) => g.videos[0].id === leader) ?? confirm.group;
+            ?? groupsRef.current.find((g) => g.videos[0].id === leader && g.videos.length > 1)
+            ?? { ...confirm.group, videos: confirm.group.videos.map((v) => onScreen.get(v.id) ?? v) };
           setConfirm(null);
           void hideSeries(target, choice === "delete");
         }}

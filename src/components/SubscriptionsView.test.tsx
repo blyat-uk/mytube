@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, act, getByRole } from "@testing-library/react";
-import type { FeedStats, StatsFilter, Video, VideoFilter, VideoGroup } from "../types";
+import type { DownloadSeries, FeedStats, StatsFilter, Video, VideoFilter, VideoGroup } from "../types";
 
 // Every listener the view registers, by event name, so a test can deliver a
 // download's state change the way the backend does.
@@ -54,7 +54,10 @@ const unlinkSiblings = vi.fn(() => Promise.resolve());
 const enqueueDownload = vi.fn((_id: string, _q?: unknown) => Promise.resolve());
 const probeFormats = vi.fn((_id: string) => Promise.resolve(rickroll()));
 const cancelDownload = vi.fn((_id: string) => Promise.resolve());
-const setVideoHidden = vi.fn((_id: string, _hidden: boolean) => Promise.resolve());
+const setVideoHidden = vi.fn((_id: string, _hidden: boolean) => Promise.resolve<string[]>([]));
+// The series a video is a part of, if any: empty is a video alone on its card.
+const downloadSeries = vi.fn<(ids: string[]) => Promise<DownloadSeries[]>>(() => Promise.resolve([]));
+const deleteVideo = vi.fn((_id: string) => Promise.resolve());
 const setSeriesHidden = vi.fn((_leader: string, _hidden: boolean) => Promise.resolve<string[]>([]));
 const enqueueDownloads = vi.fn((_ids: string[]) => Promise.resolve(0));
 const setSeriesAutoDownload =
@@ -77,6 +80,8 @@ vi.mock("../api", () => ({
     cancelDownload: (id: string) => cancelDownload(id),
     setVideoHidden: (id: string, hidden: boolean) => setVideoHidden(id, hidden),
     setSeriesHidden: (leader: string, hidden: boolean) => setSeriesHidden(leader, hidden),
+    downloadSeries: (ids: string[]) => downloadSeries(ids),
+    deleteVideo: (id: string) => deleteVideo(id),
     enqueueDownloads: (ids: string[]) => enqueueDownloads(ids),
     setSeriesAutoDownload: (leader: string, enabled: boolean) =>
       setSeriesAutoDownload(leader, enabled),
@@ -178,7 +183,9 @@ beforeEach(() => {
   listVideoGroups.mockImplementation(() => Promise.resolve(groups));
   probeFormats.mockImplementation(() => Promise.resolve(rickroll()));
   cancelDownload.mockImplementation(() => Promise.resolve());
-  setVideoHidden.mockImplementation(() => Promise.resolve());
+  setVideoHidden.mockImplementation(() => Promise.resolve([]));
+  downloadSeries.mockImplementation(() => Promise.resolve([]));
+  deleteVideo.mockImplementation(() => Promise.resolve());
   setSeriesHidden.mockImplementation(() => Promise.resolve([]));
   setSeriesAutoDownload.mockImplementation(() => Promise.resolve([]));
   enqueueDownloads.mockImplementation((ids) => Promise.resolve(ids.length));
@@ -345,6 +352,212 @@ describe("acting on a part inside a series", () => {
 
     await waitFor(() => expect(setWatched).toHaveBeenCalledWith("p2", true));
     await waitFor(() => expect(screen.queryByRole("article")).toBeNull());
+  });
+});
+
+/**
+ * Hiding the first part of a show is deciding against the show: a video alone
+ * on its card hides the series it grows into, with no question. A part of a
+ * series already there asks whether the whole series should go.
+ */
+describe("hiding one video", () => {
+  const tape = (n: number, over: Partial<Video> = {}) => video({
+    id: `p${n}`, title: `The Blackwood Tapes - Part ${n}`, download_state: "none", file_path: null,
+    ...over,
+  });
+  /** What `download_series` says of a part of the Blackwood Tapes. */
+  const partOf = (id: string, position: number, parts: number): DownloadSeries =>
+    ({ videoId: id, stem: "The Blackwood Tapes", position, parts, fresh: 0 });
+  const askedAbout = (id: string, position = 2, parts = 3) =>
+    downloadSeries.mockImplementation(() => Promise.resolve([partOf(id, position, parts)]));
+  /** Lets every answer already given land: a hide's call settles after the
+   *  toast it raises. */
+  const settle = () => act(async () => {});
+
+  /** Right-click the card of `id` and pick Hide from feed. The pick asks the
+   *  backend which series the video is in before anything else happens, so
+   *  that answer is let land here. */
+  async function hide(id: string) {
+    await waitFor(() => expect(cards().some((c) => c.dataset.videoId === id)).toBe(true));
+    fireEvent.contextMenu(cards().find((c) => c.dataset.videoId === id)!);
+    await act(async () => { fireEvent.click(within(screen.getByRole("menu"), "Hide from feed")); });
+  }
+
+  // A card put back after a failed hide is an insertion, which the grid
+  // animates in, and jsdom has no Web Animations.
+  beforeEach(() => {
+    Element.prototype.animate = vi.fn() as unknown as Element["animate"];
+  });
+  afterEach(() => {
+    delete (Element.prototype as Partial<Element>).animate;
+  });
+
+  it("hides a video alone on its card without asking, and says later parts follow it", async () => {
+    videos = [tape(1)];
+    renderView();
+    await hide("p1");
+
+    await waitFor(() => expect(setVideoHidden).toHaveBeenCalledWith("p1", true));
+    expect(downloadSeries).toHaveBeenCalledWith(["p1"]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(await screen.findByText(/Parts that join it later stay hidden too/)).toBeTruthy();
+    await waitFor(() => expect(cards()).toHaveLength(0));
+    await settle();
+  });
+
+  it("asks whether the whole series goes when the video is a part of one", async () => {
+    videos = [tape(2)];
+    askedAbout("p2");
+    renderView();
+    await hide("p2");
+
+    const dialog = await screen.findByRole("dialog", { name: "Hide the whole series?" });
+    expect(dialog.textContent)
+      .toContain("“The Blackwood Tapes - Part 2” is part 2 of 3 of “The Blackwood Tapes”");
+    expect(dialog.textContent).toContain("and any part that comes out later");
+    // Asking is not doing.
+    expect(setVideoHidden).not.toHaveBeenCalled();
+    expect(setSeriesHidden).not.toHaveBeenCalled();
+    expect(cards()).toHaveLength(1);
+    await settle();
+  });
+
+  it("names the series by its size alone when its parts share no name", async () => {
+    videos = [tape(2)];
+    downloadSeries.mockImplementation(() =>
+      Promise.resolve([{ ...partOf("p2", 2, 3), stem: null }]));
+    renderView();
+    await hide("p2");
+
+    const dialog = await screen.findByRole("dialog", { name: "Hide the whole series?" });
+    expect(dialog.textContent).toContain("“The Blackwood Tapes - Part 2” is part 2 of a 3-part series");
+    await settle();
+  });
+
+  it("hides just that video when told to", async () => {
+    videos = [tape(2)];
+    askedAbout("p2");
+    renderView();
+    await hide("p2");
+    const dialog = await screen.findByRole("dialog", { name: "Hide the whole series?" });
+    fireEvent.click(getByRole(dialog, "button", { name: "Just this video" }));
+
+    await waitFor(() => expect(setVideoHidden).toHaveBeenCalledWith("p2", true));
+    expect(setSeriesHidden).not.toHaveBeenCalled();
+    expect(await screen.findByText("Hidden \"The Blackwood Tapes - Part 2\".")).toBeTruthy();
+    await waitFor(() => expect(cards()).toHaveLength(0));
+    await settle();
+  });
+
+  it("hides the whole series led by that video, taking every part's card away", async () => {
+    videos = [tape(3), tape(2), tape(1), video({ id: "other", title: "Cooking With Gas",
+                                                  download_state: "none", file_path: null })];
+    listVideos.mockImplementation((f) =>
+      Promise.resolve(f.siblingOf === "p2" ? [tape(3), tape(2), tape(1)] : videos));
+    askedAbout("p2");
+    renderView();
+    await hide("p2");
+    const dialog = await screen.findByRole("dialog", { name: "Hide the whole series?" });
+    fireEvent.click(getByRole(dialog, "button", { name: "Hide whole series" }));
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p2", true));
+    expect(listVideos).toHaveBeenCalledWith(expect.objectContaining({ siblingOf: "p2" }));
+    expect(setVideoHidden).not.toHaveBeenCalled();
+    await waitFor(() => expect(cards().map((c) => c.dataset.videoId)).toEqual(["other"]));
+    expect(await screen.findByText(/Hidden “The Blackwood Tapes”/)).toBeTruthy();
+    await settle();
+  });
+
+  it("puts every part's card back where it stood when the series hide fails", async () => {
+    const other = video({ id: "other", title: "Cooking With Gas", download_state: "none", file_path: null });
+    videos = [tape(3), other, tape(2), tape(1)];
+    listVideos.mockImplementation((f) =>
+      Promise.resolve(f.siblingOf === "p2" ? [tape(3), tape(2), tape(1)] : videos));
+    setSeriesHidden.mockImplementation(() => Promise.reject("database is locked"));
+    askedAbout("p2");
+    renderView();
+    await hide("p2");
+    fireEvent.click(getByRole(await screen.findByRole("dialog", { name: "Hide the whole series?" }),
+                              "button", { name: "Hide whole series" }));
+
+    expect(await screen.findByText("database is locked")).toBeTruthy();
+    expect(cards().map((c) => c.dataset.videoId)).toEqual(["p3", "other", "p2", "p1"]);
+    await settle();
+  });
+
+  it("asks about the files after the whole series, when a part has one", async () => {
+    const parts = [tape(2), tape(1, { download_state: "done", file_path: "/videos/p1.mkv" })];
+    videos = parts;
+    listVideos.mockImplementation(() => Promise.resolve(parts));
+    askedAbout("p2", 2, 2);
+    renderView();
+    await hide("p2");
+    fireEvent.click(getByRole(await screen.findByRole("dialog", { name: "Hide the whole series?" }),
+                              "button", { name: "Hide whole series" }));
+
+    const files = await screen.findByRole("dialog", { name: "Hide this series?" });
+    expect(setSeriesHidden).not.toHaveBeenCalled();
+    fireEvent.click(getByRole(files, "button", { name: "Hide and remove file" }));
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p2", true));
+    expect(deleteDownload).toHaveBeenCalledWith("p1");
+    await settle();
+  });
+
+  it("asks about the file after just this video, when it has one", async () => {
+    videos = [tape(2, { download_state: "done", file_path: "/videos/p2.mkv" })];
+    askedAbout("p2");
+    renderView();
+    await hide("p2");
+    fireEvent.click(getByRole(await screen.findByRole("dialog", { name: "Hide the whole series?" }),
+                              "button", { name: "Just this video" }));
+
+    const file = await screen.findByRole("dialog", { name: "Hide this video?" });
+    expect(setVideoHidden).not.toHaveBeenCalled();
+    fireEvent.click(getByRole(file, "button", { name: "Hide, keep file" }));
+    await waitFor(() => expect(setVideoHidden).toHaveBeenCalledWith("p2", true));
+    expect(deleteDownload).not.toHaveBeenCalled();
+    await settle();
+  });
+
+  it("hides nothing when the question is cancelled", async () => {
+    videos = [tape(2)];
+    askedAbout("p2");
+    renderView();
+    await hide("p2");
+    const dialog = await screen.findByRole("dialog", { name: "Hide the whole series?" });
+    fireEvent.click(getByRole(dialog, "button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(setVideoHidden).not.toHaveBeenCalled();
+    expect(setSeriesHidden).not.toHaveBeenCalled();
+    expect(cards()).toHaveLength(1);
+    await settle();
+  });
+
+  it("asks inside an open series too, and keeps the parts on screen there", async () => {
+    videos = [tape(1), tape(2)];
+    askedAbout("p2", 2, 2);
+    renderView({ siblingOf: tape(1) });
+    await hide("p2");
+    fireEvent.click(getByRole(await screen.findByRole("dialog", { name: "Hide the whole series?" }),
+                              "button", { name: "Hide whole series" }));
+
+    await waitFor(() => expect(setSeriesHidden).toHaveBeenCalledWith("p2", true));
+    expect(cards()).toHaveLength(2);
+    await settle();
+  });
+
+  it("deletes a video added by hand without asking about any series", async () => {
+    videos = [tape(2, { added_manually: true })];
+    askedAbout("p2");
+    renderView();
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    fireEvent.click(within(screen.getByRole("menu"), "Delete"));
+
+    await waitFor(() => expect(deleteVideo).toHaveBeenCalledWith("p2"));
+    expect(downloadSeries).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await settle();
   });
 });
 

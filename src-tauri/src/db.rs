@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -270,7 +270,97 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
+    // v16: no schema, a rule applied to what came before it. Hiding a video
+    // alone on its card now hides the series it grows into (`Db::hide_video`);
+    // a hide made before only ever hid the video. See `mark_hidden_alone`.
+    if version < 16 {
+        mark_hidden_alone(conn)?;
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Gives the hides made before v16 the rule `Db::hide_video` applies now: a
+/// video that was alone on its card when it was hidden hid its series, and
+/// every part that joined that card afterwards is hidden with it -- the user's
+/// "Isekai'd as a Broke Mechanic…", hidden at part 1, whose parts 2 and 3 then
+/// walked into the feed.
+///
+/// "Alone when it was hidden" is read off the clocks: every other part of its
+/// card today was first seen after its `hidden_changed_at`. That stamp is the
+/// v10 seed for a hide older than v10, which is later than the real hide, so
+/// the test can only miss such a video, never take one wrongly; a hide with no
+/// stamp at all counts only while the video is still alone. A hide made beside
+/// a part already there was an episode and stays one, and so does every part
+/// of a series hidden part by part -- the dialog asks about those the next
+/// time.
+///
+/// Two rows are left alone: one whose `series_hidden_changed_at` says someone
+/// already decided about it as a series (an Un-hide series), and the whole card
+/// when a later part on it was hidden and then brought back by hand -- someone
+/// wanted that part. The later parts are hidden as the arrivals sweep hides
+/// them: undecided rows only, never one added by hand. Both writes go through
+/// the v11 trigger, so they are stamped and sync like any hide.
+///
+/// Reads like the feed reads (`channel_rows`), with no lock to release:
+/// migration runs before the `Db` exists.
+fn mark_hidden_alone(conn: &Connection) -> Result<()> {
+    let mut hides: HashMap<String, Vec<(String, Option<i64>)>> = HashMap::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT id, channel_id, hidden_changed_at FROM videos
+             WHERE hidden=1 AND series_hidden=0 AND series_hidden_changed_at IS NULL
+               AND status='ready'")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?))
+        })?;
+        for row in rows {
+            let (id, channel, at) = row?;
+            hides.entry(channel).or_default().push((id, at));
+        }
+    }
+
+    let (mut mark, mut follow) = (Vec::new(), Vec::new());
+    for (channel, hides) in hides {
+        let entries = channel_rows(conn, &channel)?.0;
+        // Each part's first sighting, and whether it was hidden and brought back.
+        let facts: HashMap<String, (i64, bool)> = {
+            let mut st = conn.prepare_cached(
+                "SELECT id, first_seen_at, hidden=0 AND hidden_changed_at IS NOT NULL
+                 FROM videos WHERE channel_id=?1 AND status='ready'")?;
+            let rows = st.query_map(params![channel], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, bool>(2)?)))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let atoms = siblings::Atoms::new(entries);
+        for (id, at) in hides {
+            let later: Vec<&str> =
+                atoms.group_led_by(&id).into_iter().filter(|m| *m != id).collect();
+            let alone_then = later.iter().all(|m| {
+                facts.get(*m).is_some_and(|&(seen, brought_back)| {
+                    !brought_back && at.is_some_and(|hid| seen > hid)
+                })
+            });
+            if alone_then {
+                follow.extend(later.into_iter().map(String::from));
+                mark.push(id);
+            }
+        }
+    }
+    if mark.is_empty() { return Ok(()); }
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut st = tx.prepare("UPDATE videos SET series_hidden=1 WHERE id=?1 AND series_hidden=0")?;
+        for id in &mark { st.execute(params![id])?; }
+        let mut st = tx.prepare(
+            "UPDATE videos SET hidden=1, series_hidden=1
+             WHERE id=?1 AND series_hidden_changed_at IS NULL AND added_manually=0")?;
+        for id in &follow { st.execute(params![id])?; }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2761,6 +2851,61 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE videos SET hidden=?2 WHERE id=?1", params![id, hidden as i64])?;
         Ok(())
+    }
+
+    /// Hides one video by hand -- a card's "Hide from feed" -- and returns the
+    /// ids whose flags changed.
+    ///
+    /// A video alone on its card is the whole of its series so far, so hiding
+    /// it hides that series: [`Db::set_series_hidden`] with it as the leader,
+    /// whose mark [`Db::hide_series_arrivals`] then follows to every part that
+    /// joins it later. The user's rule: hiding the first part of a show is
+    /// deciding against the show, even before there is a second part to make
+    /// it one. A part of a series already on screen is hidden as that episode
+    /// only -- the UI asks first whether the whole series should go, and if so
+    /// hides it as a series instead.
+    ///
+    /// "Alone" is the card Find siblings opens (ready rows, hidden ones
+    /// included): what the user was looking at. An upcoming premiere is not on
+    /// it, but the series hide reads every status, so one already announced
+    /// is hidden with it.
+    pub fn hide_video(&self, id: &str) -> Result<Vec<String>> {
+        if self.alone_on_card(id)? {
+            return self.set_series_hidden(id, true);
+        }
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("UPDATE videos SET hidden=1 WHERE id=?1 AND hidden=0", params![id])?;
+        Ok(if n > 0 { vec![id.to_string()] } else { Vec::new() })
+    }
+
+    /// Brings one video back -- a card's "Un-hide" -- and returns the ids whose
+    /// flags changed.
+    ///
+    /// A video still alone on its card that carries the series mark hid its
+    /// series by being hidden ([`Db::hide_video`]), so bringing it back lifts
+    /// that too, as Un-hide series would: a part that joins it later is just a
+    /// new part again. A part of a series keeps its mark, as it always has --
+    /// one episode brought back is not the show brought back.
+    pub fn unhide_video(&self, id: &str) -> Result<Vec<String>> {
+        let marked: bool = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row("SELECT series_hidden FROM videos WHERE id=?1", params![id], |r| r.get(0))
+                .optional()?
+                .unwrap_or(false)
+        };
+        if marked && self.alone_on_card(id)? {
+            return self.set_series_hidden(id, false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("UPDATE videos SET hidden=0 WHERE id=?1 AND hidden<>0", params![id])?;
+        Ok(if n > 0 { vec![id.to_string()] } else { Vec::new() })
+    }
+
+    /// Whether `id` has its card to itself: Find siblings on it would open a
+    /// series of one. Takes the lock like [`Db::sibling_ids`], so never with
+    /// it held.
+    fn alone_on_card(&self, id: &str) -> Result<bool> {
+        Ok(self.sibling_ids(id)?.0.len() <= 1)
     }
 
     /// Removes a row outright. Only safe for manually added videos: nothing polls
@@ -6936,6 +7081,222 @@ mod series_tests {
         assert_eq!(flags(&d, "ec"), (true, true), "the newcomer joins a hidden series");
         assert_eq!(flags(&d, "p2"), (false, true), "the episode brought back stays back");
     }
+
+    // ---- hiding one video ----
+
+    #[test]
+    fn hiding_a_video_alone_on_its_card_hides_the_series_it_grows_into() {
+        let d = db();
+        add(&d, row("p1", "The Blackwood Tapes Pt 1"));
+        add(&d, row("other", "Cooking With Gas"));
+
+        assert_eq!(d.hide_video("p1").unwrap(), vec!["p1"]);
+        assert_eq!(flags(&d, "p1"), (true, true), "the show, not an episode");
+        assert_eq!(flags(&d, "other"), (false, false));
+
+        // Part 2, weeks later.
+        add(&d, row("p2", "The Blackwood Tapes Pt 2"));
+        assert_eq!(d.hide_series_arrivals().unwrap(), vec!["p2"]);
+        assert_eq!(flags(&d, "p2"), (true, true), "and so the part after it follows");
+    }
+
+    #[test]
+    fn hiding_a_video_alone_takes_an_upcoming_part_with_it() {
+        let d = db();
+        add(&d, row("p1", "The Blackwood Tapes Pt 1"));
+        // Never on screen, so p1 is alone on its card; but it is the next part.
+        add(&d, NewVideo { status: VideoStatus::Upcoming, ..row("p2", "The Blackwood Tapes Pt 2") });
+
+        assert_eq!(sorted(d.hide_video("p1").unwrap()), vec!["p1", "p2"]);
+        assert_eq!(flags(&d, "p2"), (true, true));
+    }
+
+    #[test]
+    fn hiding_one_part_of_a_series_hides_only_that_part() {
+        let d = db();
+        tapes(&d);
+
+        assert_eq!(d.hide_video("p2").unwrap(), vec!["p2"]);
+        assert_eq!(flags(&d, "p2"), (true, false), "an episode, not the show");
+        assert_eq!(flags(&d, "p1"), (false, false));
+
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        assert!(d.hide_series_arrivals().unwrap().is_empty());
+        assert_eq!(flags(&d, "p3"), (false, false));
+    }
+
+    #[test]
+    fn hiding_a_hidden_video_again_changes_nothing() {
+        let d = db();
+        tapes(&d);
+        d.hide_video("p2").unwrap();
+        assert!(d.hide_video("p2").unwrap().is_empty());
+        add(&d, row("solo", "A Quiet Walk"));
+        d.hide_video("solo").unwrap();
+        assert!(d.hide_video("solo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn hiding_an_unknown_video_changes_nothing() {
+        let d = db();
+        tapes(&d);
+        assert!(d.hide_video("no such video").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unhiding_a_video_alone_lifts_the_series_it_hid() {
+        let d = db();
+        add(&d, row("p1", "The Blackwood Tapes Pt 1"));
+        add(&d, NewVideo { status: VideoStatus::Upcoming, ..row("p2", "The Blackwood Tapes Pt 2") });
+        d.hide_video("p1").unwrap();
+
+        assert_eq!(sorted(d.unhide_video("p1").unwrap()), vec!["p1", "p2"]);
+        assert_eq!(flags(&d, "p1"), (false, false));
+        assert_eq!(flags(&d, "p2"), (false, false), "the part it took with it comes back too");
+
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        assert!(d.hide_series_arrivals().unwrap().is_empty(), "a new part is just a new part");
+    }
+
+    #[test]
+    fn unhiding_one_part_of_a_hidden_series_keeps_the_series_hidden() {
+        let d = db();
+        tapes(&d);
+        d.set_series_hidden("p1", true).unwrap();
+
+        assert_eq!(d.unhide_video("p2").unwrap(), vec!["p2"]);
+        assert_eq!(flags(&d, "p2"), (false, true), "the episode brought back, the mark kept");
+        assert_eq!(flags(&d, "p1"), (true, true));
+    }
+
+    #[test]
+    fn unhiding_a_video_alone_that_hid_no_series_only_unhides_it() {
+        let d = db();
+        add(&d, row("solo", "A Quiet Walk"));
+        d.set_hidden("solo", true).unwrap();
+        assert_eq!(d.unhide_video("solo").unwrap(), vec!["solo"]);
+        assert_eq!(flags(&d, "solo"), (false, false));
+        assert_eq!(stamps(&d, "solo").1, None, "no series decision was made about it");
+    }
+
+    // ---- the v16 upgrade: hides made before the rule ----
+
+    /// Runs the v16 step over `d`, as an upgrade from v15 would.
+    fn upgrade(d: &Db) {
+        let conn = d.conn.lock().unwrap();
+        conn.pragma_update(None, "user_version", 15).unwrap();
+        migrate(&conn).unwrap();
+    }
+
+    fn seen(d: &Db, id: &str, at: i64) {
+        sql(d, &format!("UPDATE videos SET first_seen_at={at} WHERE id='{id}'"));
+    }
+
+    /// Hidden by hand at `at`, before the rule: `hidden` alone, no mark.
+    fn hid(d: &Db, id: &str, at: i64) {
+        sql(d, &format!("UPDATE videos SET hidden=1, hidden_changed_at={at} WHERE id='{id}'"));
+    }
+
+    #[test]
+    fn the_upgrade_marks_a_video_hidden_alone_and_hides_the_parts_that_came_after() {
+        let d = db();
+        tapes(&d);
+        add(&d, row("p3", "The Blackwood Tapes Pt 3"));
+        add(&d, row("solo", "A Quiet Walk"));
+        seen(&d, "p1", 50);
+        hid(&d, "p1", 100);
+        seen(&d, "p2", 200);
+        seen(&d, "p3", 300);
+        seen(&d, "other", 10);
+        seen(&d, "solo", 10);
+        hid(&d, "solo", 20);
+
+        upgrade(&d);
+        for id in ["p1", "p2", "p3"] {
+            assert_eq!(flags(&d, id), (true, true), "{id}");
+        }
+        assert_eq!(flags(&d, "solo"), (true, true), "still alone: it catches what comes");
+        assert_eq!(flags(&d, "other"), (false, false));
+        assert!(stamps(&d, "p1").1.is_some(), "a decision like any other: it syncs");
+    }
+
+    #[test]
+    fn the_upgrade_leaves_a_hide_made_beside_a_part_already_there() {
+        let d = db();
+        tapes(&d);
+        seen(&d, "p1", 50);
+        seen(&d, "p2", 60);
+        hid(&d, "p1", 100);
+
+        upgrade(&d);
+        assert_eq!(flags(&d, "p1"), (true, false), "an episode, as it was");
+        assert_eq!(flags(&d, "p2"), (false, false));
+    }
+
+    #[test]
+    fn the_upgrade_leaves_a_series_hidden_part_by_part() {
+        let d = db();
+        tapes(&d);
+        seen(&d, "p1", 50);
+        seen(&d, "p2", 60);
+        hid(&d, "p1", 100);
+        hid(&d, "p2", 110);
+
+        upgrade(&d);
+        assert_eq!(flags(&d, "p1"), (true, false));
+        assert_eq!(flags(&d, "p2"), (true, false));
+    }
+
+    #[test]
+    fn the_upgrade_leaves_a_series_with_a_later_part_brought_back_by_hand() {
+        let d = db();
+        tapes(&d);
+        seen(&d, "p1", 50);
+        hid(&d, "p1", 100);
+        seen(&d, "p2", 200);
+        // Hidden, then brought back: someone wanted this part.
+        sql(&d, "UPDATE videos SET hidden=0, hidden_changed_at=250 WHERE id='p2'");
+
+        upgrade(&d);
+        assert_eq!(flags(&d, "p1"), (true, false));
+        assert_eq!(flags(&d, "p2"), (false, false));
+    }
+
+    #[test]
+    fn the_upgrade_leaves_a_video_decided_about_as_a_series() {
+        let d = db();
+        add(&d, row("solo", "A Quiet Walk"));
+        hid(&d, "solo", 100);
+        sql(&d, "UPDATE videos SET series_hidden_changed_at=90 WHERE id='solo'");
+
+        upgrade(&d);
+        assert_eq!(flags(&d, "solo"), (true, false));
+    }
+
+    #[test]
+    fn the_upgrade_spares_a_later_part_added_by_hand() {
+        let d = db();
+        add(&d, row("p1", "The Blackwood Tapes Pt 1"));
+        add(&d, NewVideo { added_manually: true, ..row("p2", "The Blackwood Tapes Pt 2") });
+        seen(&d, "p1", 50);
+        hid(&d, "p1", 100);
+        seen(&d, "p2", 200);
+
+        upgrade(&d);
+        assert_eq!(flags(&d, "p1"), (true, true));
+        assert_eq!(flags(&d, "p2"), (false, false), "pasting it in was asking to see it");
+    }
+
+    #[test]
+    fn the_upgrade_runs_once() {
+        let d = db();
+        add(&d, row("solo", "A Quiet Walk"));
+        hid(&d, "solo", 100);
+        let conn = d.conn.lock().unwrap();
+        migrate(&conn).unwrap();
+        drop(conn);
+        assert_eq!(flags(&d, "solo"), (true, false), "already at v16: nothing to upgrade");
+    }
 }
 
 #[cfg(test)]
@@ -7319,7 +7680,7 @@ mod series_auto_download_tests {
         let version: i64 = d.conn.lock().unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
         assert_eq!(since(&d, "a"), None);
         assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
     }
@@ -7423,10 +7784,13 @@ mod sync_tests {
     #[test]
     fn upgrading_adds_series_hidden_unset_and_unstamped() {
         let conn = v9();
+        // A part hidden beside another already there: an episode. (Hidden alone
+        // on its card, the v16 step would take it for its series.)
         conn.execute_batch(
             "INSERT INTO channels (id,title,url,subscribed,added_at) VALUES ('UC1','One','u',1,7);
              INSERT INTO videos (id,channel_id,title,status,first_seen_at,hidden)
-               VALUES ('a','UC1','t','ready',1,1);",
+               VALUES ('a','UC1','The Blackwood Tapes Pt 1','ready',1,1),
+                      ('b','UC1','The Blackwood Tapes Pt 2','ready',1,0);",
         ).unwrap();
         let d = Db::init(conn).unwrap();
         assert_eq!(series_stamp(&d, "a"), (false, None), "a hidden video is not a hidden series");

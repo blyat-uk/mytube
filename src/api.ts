@@ -37,8 +37,13 @@ export const api = {
   previewTakeoutCsv: (path: string) => invoke<TakeoutRow[]>("preview_takeout_csv", { path }),
   importTakeoutCsv: (path: string, channelIds: string[]) =>
     invoke<ImportResult>("import_takeout_csv", { path, channelIds }),
+  /** Hides one video, or brings it back. A video alone on its card hides the
+   *  series it grows into, so a part that joins it later is hidden on arrival,
+   *  and bringing it back lifts that again. Resolves with the ids of every
+   *  video it changed, which can include ones not on screen, such as a coming
+   *  premiere. */
   setVideoHidden: (videoId: string, hidden: boolean) =>
-    invoke<void>("set_video_hidden", { videoId, hidden }),
+    invoke<string[]>("set_video_hidden", { videoId, hidden }),
   /** Hides a series as a whole, named by the part leading its card, and marks
    *  every part so one that joins the series later is hidden on arrival.
    *  Un-hiding clears both. Resolves with the ids of every part it changed,
@@ -93,7 +98,9 @@ export const api = {
    *  stored overrides are left alone. */
   enqueueDownloads: (videoIds: string[], quality?: Quality | null) =>
     invoke<number>("enqueue_downloads", { videoIds, quality: quality ?? null }),
-  /** Which series each download belongs to, for its link on the Downloads tab. */
+  /** Which series each video belongs to -- the card Find siblings would open,
+   *  ready parts only -- for a download's link on the Downloads tab, and for
+   *  the question a hide asks. A video alone on its card is left out. */
   downloadSeries: (videoIds: string[]) => invoke<DownloadSeries[]>("download_series", { videoIds }),
   /** Everything one video offers, and what the Settings default would pick
    *  from it. Runs yt-dlp, so it takes a few seconds. */

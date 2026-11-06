@@ -378,14 +378,34 @@ pub async fn import_takeout_csv(
     Ok(result)
 }
 
-/// Hides a video so polling never surfaces it again.
+/// Hides a video so polling never surfaces it again, or brings it back, and
+/// returns the ids of every video whose flags changed.
+///
+/// A video alone on its card hides the series it grows into (see
+/// `Db::hide_video`), and that sweeps at once, as Hide series does: a part on
+/// another card whose own card holds this video would otherwise stay on screen
+/// until the next poll.
 #[tauri::command]
 pub async fn set_video_hidden(
     video_id: String,
     hidden: bool,
     state: State<'_, Arc<AppState>>,
-) -> R<()> {
-    db_blocking(&state, move |db| db.set_hidden(&video_id, hidden)).await
+) -> R<Vec<String>> {
+    db_blocking(&state, move |db| {
+        if !hidden {
+            return db.unhide_video(&video_id);
+        }
+        let mut changed = db.hide_video(&video_id)?;
+        if db.get_video(&video_id)?.is_some_and(|v| v.series_hidden) {
+            match db.hide_series_arrivals() {
+                Ok(more) => changed.extend(more),
+                // The hide itself is in; the next poll's sweep takes the rest.
+                Err(err) => eprintln!("mytube: sweeping after a hide failed: {err}"),
+            }
+        }
+        Ok(changed)
+    })
+    .await
 }
 
 /// Hides (or brings back) the series a card leads, as a whole: every part on
