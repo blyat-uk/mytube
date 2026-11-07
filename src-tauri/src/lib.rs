@@ -61,6 +61,10 @@ pub fn run() {
             std::thread::spawn(move || {
                 std::fs::create_dir_all(download_dir).ok();
             });
+            // What a crash or a forced quit left in the private temp
+            // directories of earlier runs' yt-dlp (`proc::Scratch`). A thread
+            // of its own: nothing waits on it.
+            std::thread::spawn(proc::sweep_stale_scratch);
 
             // The tray first: `window::track` asks whether one exists before it
             // turns a close into a hide. Only logged on failure — an app with

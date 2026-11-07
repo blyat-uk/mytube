@@ -12,11 +12,23 @@
 //! itself and then runs the real yt-dlp as a *child* -- so killing the process
 //! we spawned can leave the one doing the work running, on every OS. Unix puts
 //! the tree in a process group of its own; Windows puts it in a Job Object.
+//!
+//! Every tree also gets a private temporary directory ([`Scratch`]): `TMPDIR`,
+//! `TMP` and `TEMP` all name it, so whatever the tree unpacks or copies lands
+//! where MyTube can find it, and it is deleted on a thread of its own once
+//! the tree is gone -- the cancel returns at once, and the clearing up follows
+//! behind. The bootloader deletes its `_MEI…` unpack folder itself after a
+//! normal exit, but never after the SIGKILL a cancel or a timeout sends (and
+//! the same goes for yt-dlp's copy of a browser's cookie database): in the
+//! system temp directory those piled up, 301 of them and 21 GB on one Mac.
 
 use std::ffi::OsStr;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -44,6 +56,142 @@ pub fn std_command(program: impl AsRef<OsStr>) -> std::process::Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+/// Where every tree's private temporary directory lives:
+/// `<system temp>/mytube/<pid>/<n>`. Per process, so that
+/// [`sweep_stale_scratch`] can tell a crashed run's leftovers from those of a
+/// MyTube still running -- the CLI, a test run, a second build.
+fn scratch_root() -> PathBuf {
+    std::env::temp_dir().join("mytube")
+}
+
+/// A removal that fails is tried again this often...
+const SCRATCH_RETRY: Duration = Duration::from_millis(250);
+/// ...this many times (30 s). Unix needs one try: SIGKILL has stopped
+/// everything, and an unlink does not care who holds a file open. On Windows a
+/// killed process's handles outlive `TerminateJobObject` for a moment, and a
+/// file still open cannot be deleted.
+const SCRATCH_TRIES: u32 = 120;
+
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One tree's private temporary directory. It is owned by the tree's shared
+/// state, so it is dropped -- and deleted -- only once the [`TreeChild`] *and*
+/// every [`KillTree`] handed out (a download's cancel handle) are gone, by
+/// which time nothing in the tree is running: an unreaped tree is killed when
+/// its `TreeChild` drops.
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    /// `None` if the directory cannot be made; the tree then gets the system
+    /// temp directory, as it always did, rather than not running at all.
+    fn create() -> Option<Scratch> {
+        let n = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = scratch_root().join(std::process::id().to_string()).join(n.to_string());
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => Some(Scratch { path }),
+            Err(e) => {
+                eprintln!("[mytube] no private temp directory at {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Points every variable a tool might read at the directory: `TMPDIR`
+    /// (PyInstaller's unix bootloader, Python's `tempfile`), `TMP` (Windows'
+    /// `GetTempPath`, which the Windows bootloader uses) and `TEMP`.
+    fn apply(&self, cmd: &mut Command) {
+        for var in ["TMPDIR", "TMP", "TEMP"] {
+            cmd.env(var, &self.path);
+        }
+    }
+}
+
+impl Drop for Scratch {
+    /// Deletes the directory on a thread of its own: a drop can happen on a
+    /// runtime worker, and on Windows a removal may have to wait for a killed
+    /// process to let go of its files.
+    fn drop(&mut self) {
+        let path = std::mem::take(&mut self.path);
+        let here = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mytube-scratch".into())
+            .spawn(move || remove_patiently(&here));
+        if spawned.is_err() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn remove_patiently(path: &Path) {
+    for attempt in 1..=SCRATCH_TRIES {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) if attempt == SCRATCH_TRIES => {
+                // Left for the next start's sweep.
+                eprintln!("[mytube] could not remove {}: {e}", path.display());
+            }
+            Err(_) => std::thread::sleep(SCRATCH_RETRY),
+        }
+    }
+}
+
+/// Deletes the private temp directories of MyTube processes that are no
+/// longer running: what a crash, a forced quit or a removal that kept failing
+/// left behind. Never a live process's -- the CLI, a test run or a second
+/// build may be using its own. Blocking; the app calls it on a thread at
+/// startup.
+pub fn sweep_stale_scratch() {
+    sweep_scratch_in(&scratch_root());
+}
+
+fn sweep_scratch_in(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let me = std::process::id();
+    for e in rd.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid != me && !process_alive(pid) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Whether a process with this id exists. A pid the kernel has since handed
+/// to some other program answers yes, which only keeps a directory until a
+/// later start.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    if pid <= 0 {
+        return false;
+    }
+    // Signal 0 is no signal at all: it only asks whether the process exists.
+    // EPERM means it does, as somebody else's.
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    exists || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // No such process -- unless it is one we may not open, which runs.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok == 0 || code == STILL_ACTIVE as u32
+    }
 }
 
 /// The stop button for one spawned process tree. Cheap to clone and safe to
@@ -113,6 +261,9 @@ impl KillTree {
 struct Tree {
     pgid: i32,
     reaped: std::sync::atomic::AtomicBool,
+    /// Dropped with the last handle to the tree, which deletes it.
+    #[allow(dead_code, reason = "held only to be dropped with the tree")]
+    scratch: Option<Scratch>,
 }
 
 #[cfg(unix)]
@@ -131,6 +282,10 @@ impl Tree {
 #[cfg(windows)]
 struct Tree {
     job: windows_sys::Win32::Foundation::HANDLE,
+    /// Dropped after `Drop::drop` has closed the job (so after the kill it
+    /// implies), which deletes it.
+    #[allow(dead_code, reason = "held only to be dropped with the tree")]
+    scratch: Option<Scratch>,
 }
 
 // A Job Object handle is a kernel handle, usable from any thread; the raw
@@ -169,7 +324,7 @@ impl Tree {
                 CloseHandle(job);
                 return Err(err);
             }
-            Ok(Tree { job })
+            Ok(Tree { job, scratch: None })
         }
     }
 
@@ -234,6 +389,12 @@ impl TreeChild {
         self.tree.clone()
     }
 
+    /// The tree's private temp directory, if it got one.
+    #[cfg(test)]
+    pub fn scratch(&self) -> Option<&Path> {
+        self.tree.inner.scratch.as_ref().map(|s| s.path.as_path())
+    }
+
     /// Waits for the leader and reaps it. From then on the tree is no longer
     /// killed on drop, and on unix no clone of the handle signals it either.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -270,8 +431,16 @@ impl Drop for TreeChild {
 /// and closing it would take `STARTUPINFOEX` plumbing std does not expose.
 ///
 /// `kill_on_drop` is set as well, as the backstop for the leader.
+///
+/// The tree runs with a private temp directory ([`Scratch`]), deleted once
+/// the tree and every handle to it are gone.
 pub fn spawn_tree(cmd: &mut Command) -> io::Result<TreeChild> {
     cmd.kill_on_drop(true);
+    // A spawn that fails drops it again, which deletes it.
+    let scratch = Scratch::create();
+    if let Some(s) = &scratch {
+        s.apply(cmd);
+    }
 
     #[cfg(unix)]
     {
@@ -281,7 +450,7 @@ pub fn spawn_tree(cmd: &mut Command) -> io::Result<TreeChild> {
         // been reaped, which cannot happen before we have waited for it.
         let pgid = child.id().map(|p| p as i32).unwrap_or(0);
         let tree = KillTree {
-            inner: Arc::new(Tree { pgid, reaped: Default::default() }),
+            inner: Arc::new(Tree { pgid, reaped: Default::default(), scratch }),
         };
         Ok(TreeChild { child, tree, reaped: false })
     }
@@ -290,7 +459,8 @@ pub fn spawn_tree(cmd: &mut Command) -> io::Result<TreeChild> {
     {
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
-        let tree = Tree::new()?;
+        let mut tree = Tree::new()?;
+        tree.scratch = scratch;
         let mut child = cmd.spawn()?;
         // `raw_handle` is `None` only once the child has been waited for.
         if let Some(handle) = child.raw_handle() {
@@ -449,6 +619,97 @@ mod tests {
         let gone = wait_until(false, &secs).await;
         let _ = std::process::Command::new("pkill").arg("-f").arg(&secs).status();
         assert!(gone, "a grandchild outlived the timeout");
+    }
+
+    /// The removal runs on a thread of its own, so it is waited for.
+    async fn removed(p: &Path) -> bool {
+        for _ in 0..200 {
+            if std::fs::symlink_metadata(p).is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_tree_gets_a_private_temp_dir_that_goes_once_it_has_exited() {
+        let mut cmd = command("sh");
+        cmd.arg("-c").arg(r#"printf '%s\n%s\n%s\n' "$TMPDIR" "$TMP" "$TEMP"; echo x > "$TMPDIR/left-behind""#);
+        let out = output(&mut cmd).await.expect("sh is available");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines.iter().all(|l| *l == lines[0]), "every temp variable names one dir: {lines:?}");
+        let dir = PathBuf::from(lines[0]);
+        assert!(dir.starts_with(scratch_root().join(std::process::id().to_string())), "{dir:?}");
+        assert!(removed(&dir).await, "{dir:?} outlived its tree, with what it left in it");
+    }
+
+    #[tokio::test]
+    async fn a_killed_tree_leaves_nothing_in_its_temp_dir() {
+        // What PyInstaller's onefile bootloader does: unpack into
+        // `$TMPDIR/_MEI…`, run the real program, and delete the folder only on
+        // a normal exit -- which a cancel's SIGKILL never allows. 301 of them,
+        // 21 GB, had piled up on one Mac before this.
+        let secs = secs(309);
+        let mut cmd = command("sh");
+        cmd.arg("-c").arg(format!(
+            r#"mkdir "$TMPDIR/_MEIfake" && echo lib > "$TMPDIR/_MEIfake/Python" && sleep {secs}"#
+        ));
+        let mut tc = spawn_tree(&mut cmd).expect("sh is available");
+        let dir = tc.scratch().expect("a private temp dir").to_path_buf();
+        let lib = dir.join("_MEIfake").join("Python");
+        for _ in 0..200 {
+            if lib.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(lib.exists(), "the tree should have unpacked first");
+
+        tc.tree().kill();
+        let _ = tc.wait().await;
+        drop(tc);
+        let gone = removed(&dir).await;
+        let _ = std::process::Command::new("pkill").arg("-f").arg(&secs).status();
+        assert!(gone, "{dir:?} outlived the killed tree");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_handle_keeps_the_dir_until_it_too_is_dropped() {
+        // `queue::Job` holds a clone to cancel with; the dir must not go while
+        // anything could still be running in it.
+        let mut tc = spawn_tree(&mut command("true")).expect("true is available");
+        let handle = tc.tree();
+        let dir = tc.scratch().unwrap().to_path_buf();
+        let _ = tc.wait().await;
+        drop(tc);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(dir.is_dir(), "a handle to the tree is still out");
+        drop(handle);
+        assert!(removed(&dir).await);
+    }
+
+    #[test]
+    fn the_sweep_removes_dead_processes_dirs_and_keeps_live_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A pid that was ours a moment ago and is now dead.
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let dead = c.id();
+        c.wait().unwrap();
+        let me = std::process::id();
+        let parent = std::os::unix::process::parent_id();
+        for pid in [dead, me, parent] {
+            std::fs::create_dir_all(root.join(pid.to_string()).join("0").join("_MEIx")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("not-a-pid")).unwrap();
+        sweep_scratch_in(root);
+        assert!(!root.join(dead.to_string()).exists(), "a dead process's leftovers go");
+        assert!(root.join(me.to_string()).exists(), "never our own");
+        assert!(root.join(parent.to_string()).exists(), "never a live process's");
+        assert!(root.join("not-a-pid").exists(), "nothing that is not ours");
     }
 }
 
