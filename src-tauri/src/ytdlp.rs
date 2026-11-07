@@ -279,6 +279,26 @@ pub fn is_subtitle_failure(stderr: &str) -> bool {
     stderr.contains("Unable to download video subtitles")
 }
 
+/// Whether a failed download failed because the part file it went on with
+/// cannot be resumed: YouTube answers its `Range: bytes=<size of the part>-`
+/// with `416 Requested range not satisfiable`. `queue::run_one` then deletes
+/// the part files and runs the download again from the start.
+///
+/// Seen 2026-11-07 (yt-dlp 2026.10.26, 5AbzLO9n83o, format 721): a part file
+/// left on 26 Oct had grown to 603,621,808 bytes, and by the retry YouTube was
+/// serving that format as a 540,009,596-byte stream -- re-encoded, and smaller
+/// than what was already on disk. yt-dlp's own answer to a 416 is to ask again
+/// with no range at all and start over if the sizes differ, but googlevideo
+/// refused that request with a 416 too, so the run failed with `ERROR: unable
+/// to download video data: HTTP Error 416: Requested range not satisfiable`
+/// -- and since a failed download keeps its part files, so did every Retry.
+///
+/// Only an `ERROR` line counts: a 416 yt-dlp retried its way past is not what
+/// ended the run.
+pub fn is_unresumable(stderr: &str) -> bool {
+    stderr.lines().any(|l| l.starts_with("ERROR:") && l.contains("HTTP Error 416"))
+}
+
 /// Runs phase 1 and returns the resolved metadata plus intended path.
 ///
 /// Whether a listing error is YouTube refusing a channel whose account it has
@@ -1097,6 +1117,28 @@ mod tests {
              Requests"));
         assert!(!is_subtitle_failure("ERROR: [youtube] xyz: Video unavailable"));
         assert!(!is_subtitle_failure(""));
+    }
+
+    #[test]
+    fn a_part_file_that_cannot_be_resumed_is_recognised_and_nothing_else_is() {
+        // The whole of what yt-dlp 2026.10.26 printed for 5AbzLO9n83o, whose
+        // 603,621,808-byte part file outgrew the 540,009,596-byte stream it
+        // was resuming (the traceback is `-v`'s; a plain run prints the line).
+        assert!(is_unresumable(
+            "ERROR: unable to download video data: HTTP Error 416: Requested range not \
+             satisfiable\n\
+             Traceback (most recent call last):\n  \
+             File \"yt_dlp/downloader/http.py\", line 119, in establish_connection\n\
+             yt_dlp.networking.exceptions.HTTPError: HTTP Error 416: Requested range not \
+             satisfiable\n"));
+        assert!(!is_unresumable(
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden"));
+        assert!(!is_unresumable("ERROR: [youtube] xyz: Video unavailable"));
+        assert!(!is_unresumable(
+            "WARNING: [youtube] HTTP Error 416: Requested range not satisfiable. Retrying\n\
+             ERROR: unable to download video data: HTTP Error 403: Forbidden"),
+            "a 416 yt-dlp got past is not what failed the run");
+        assert!(!is_unresumable(""));
     }
 
     #[test]

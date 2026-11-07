@@ -441,8 +441,8 @@ impl Drop for Seat {
 /// (`.ytdl`), ffmpeg's merge target (`.temp.mkv`), and the thumbnail and
 /// subtitle tracks (`.en.srt`) fetched for embedding, and the chapter list
 /// written for ffmpeg to embed (`.meta` -- FFmpegMetadataPP's
-/// `replace_extension(filename, 'meta')`). Format ids are matched as digits,
-/// which is what YouTube uses.
+/// `replace_extension(filename, 'meta')`). Format ids are matched by
+/// YouTube's shape (`is_format_id`).
 fn is_leftover(out_path: &Path, name: &str) -> bool {
     if out_path.file_name().and_then(|n| n.to_str()) == Some(name) {
         return true;
@@ -466,12 +466,26 @@ fn after_stem<'a>(out_path: &Path, name: &'a str) -> Option<&'a str> {
     name.strip_prefix(stem)?.strip_prefix('.')
 }
 
-/// `f137.mp4`, `f251.webm` -- one of the streams yt-dlp downloads to merge.
+/// `f137.mp4`, `f251.webm`, `f140-drc.m4a` -- one of the streams yt-dlp
+/// downloads to merge.
 fn is_format_stream(rest: &str) -> bool {
     let Some((id, ext)) = rest.strip_prefix('f').and_then(|t| t.split_once('.')) else {
         return false;
     };
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) && !ext.is_empty()
+    is_format_id(id) && !ext.is_empty()
+}
+
+/// A YouTube format id: the itag, then any of the suffixes yt-dlp gives the
+/// variants of one (`join_nonempty` in its YouTube extractor, 2026.10.26):
+/// `-drc` for dynamic range compression, `-sr` for an AI-upscaled stream, and
+/// `-<protocol>` (`137-https`, `251-dash`) or `-dashy` when two formats share
+/// an itag. A custom download names them exactly -- `721+140-drc` -- so they
+/// are as real a stream as a bare itag. Never a dot: yt-dlp puts the
+/// extension after it.
+fn is_format_id(id: &str) -> bool {
+    let mut parts = id.split('-');
+    parts.next().is_some_and(|itag| !itag.is_empty() && itag.chars().all(|c| c.is_ascii_digit()))
+        && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// The formats a subtitle track can arrive in. `--sub-format srt/best` asks
@@ -503,6 +517,38 @@ fn is_subtitle_track(rest: &str) -> bool {
 fn is_subtitle_leftover(out_path: &Path, name: &str) -> bool {
     after_stem(out_path, name)
         .is_some_and(|rest| is_subtitle_track(rest.strip_suffix(".part").unwrap_or(rest)))
+}
+
+/// A file of `out_path`'s that yt-dlp is still writing and would resume -- a
+/// stream's `.part`, a DASH fragment's `.part-FragN`, their `.ytdl` resume
+/// state -- and nothing it has finished: what goes before a download whose
+/// part file could not be resumed starts over (`run_one`). A finished stream
+/// stays, since yt-dlp uses it as it is and never asks YouTube for it again.
+///
+/// What is being written has to be one of this download's own shapes, the
+/// container itself (a single format's `<stem>.mkv.part`), a stream or a
+/// subtitle track, which is stricter than `is_leftover`'s bare `.part`: a
+/// `Part 1.5` downloading in the same folder begins with `Part 1`'s stem and a
+/// dot, and its part files are another job's, mid-write.
+fn is_partial(out_path: &Path, name: &str) -> bool {
+    let Some(written) = after_stem(out_path, name).and_then(unfinished) else {
+        return false;
+    };
+    out_path.extension().and_then(|e| e.to_str()) == Some(written)
+        || is_format_stream(written)
+        || is_subtitle_track(written)
+}
+
+/// `rest` without the suffix that says yt-dlp is still writing it, if it has
+/// one: `f137.mp4.part`, `f137.mp4.part-Frag9` and `f137.mp4.ytdl` all give
+/// `f137.mp4`. yt-dlp names a fragment `<part file>-Frag<N>`
+/// (`FragmentFD`'s `'%s-Frag%d' % (tmpfilename, frag_index)`).
+fn unfinished(rest: &str) -> Option<&str> {
+    if let Some(written) = rest.strip_suffix(".part").or_else(|| rest.strip_suffix(".ytdl")) {
+        return Some(written);
+    }
+    let (written, n) = rest.rsplit_once(".part-Frag")?;
+    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then_some(written)
 }
 
 /// Deletes everything in `out_path`'s directory that `wanted` says a download
@@ -567,6 +613,13 @@ async fn sweep_leftovers(out_paths: Vec<PathBuf>) {
 async fn sweep_subtitles(out_paths: Vec<PathBuf>) {
     let _ = tokio::task::spawn_blocking(move || sweep_blocking(&out_paths, is_subtitle_leftover))
         .await;
+}
+
+/// `sweep_blocking` of the part files alone, awaited from a blocking thread,
+/// before a download whose part file could not be resumed starts over: left
+/// in place, yt-dlp would only try to resume it again.
+async fn sweep_partials(out_paths: Vec<PathBuf>) {
+    let _ = tokio::task::spawn_blocking(move || sweep_blocking(&out_paths, is_partial)).await;
 }
 
 /// Runs blocking filesystem work off the runtime's workers; see
@@ -1141,24 +1194,43 @@ async fn run_one(
         blocking(move || std::fs::create_dir_all(parent)).await??;
     }
 
+    // Two failures are worked around rather than reported, each at most once
+    // and in whichever order they come, so a download runs at most three
+    // times. A cancel in the meantime is caught by `Job::started` refusing the
+    // next yt-dlp, which `run_ytdlp` then kills.
+    let mut quality = quality;
+    let mut started_over = false;
     let mut ran =
         run_ytdlp(app, &inv.runner, &quality, video_id, &out_path, &print_file, cancel).await?;
-
-    // Subtitles are a preference and never a reason to fail a download, but
-    // yt-dlp fetches them before the video and one track it cannot fetch fails
-    // the whole run: `_write_subtitles` raises unless `--ignore-errors`. Seen
-    // 2026-10-12 (yt-dlp 2026.10.10): `ERROR: Unable to download video
-    // subtitles for 'de-DE': HTTP Error 429: Too Many Requests`. So the
-    // download runs once more without them, and that run's outcome is final.
-    // The tracks that did arrive go first: no run will embed them now. A
-    // cancel in the meantime is caught by `Job::started` refusing the second
-    // yt-dlp, which `run_ytdlp` then kills.
-    if retry_without_subtitles(&quality, cancel.is_cancelled(), ran.status.success(), &ran.stderr) {
-        let why = ran.stderr.lines().find(|l| ytdlp::is_subtitle_failure(l)).unwrap_or_default();
-        eprintln!("[mytube] {video_id}: {why}; downloading again without subtitles");
-        sweep_subtitles(out_paths.clone()).await;
-        let plain = Quality { subtitles: false, ..quality.clone() };
-        ran = run_ytdlp(app, &inv.runner, &plain, video_id, &out_path, &print_file, cancel).await?;
+    loop {
+        let (cancelled, success) = (cancel.is_cancelled(), ran.status.success());
+        // Subtitles are a preference and never a reason to fail a download,
+        // but yt-dlp fetches them before the video and one track it cannot
+        // fetch fails the whole run: `_write_subtitles` raises unless
+        // `--ignore-errors`. Seen 2026-10-12 (yt-dlp 2026.10.10): `ERROR:
+        // Unable to download video subtitles for 'de-DE': HTTP Error 429: Too
+        // Many Requests`. So the download runs again without them. The tracks
+        // that did arrive go first: no run will embed them now.
+        if retry_without_subtitles(&quality, cancelled, success, &ran.stderr) {
+            let why = ran.stderr.lines().find(|l| ytdlp::is_subtitle_failure(l)).unwrap_or_default();
+            eprintln!("[mytube] {video_id}: {why}; downloading again without subtitles");
+            sweep_subtitles(out_paths.clone()).await;
+            quality = Quality { subtitles: false, ..quality };
+        // A failed download keeps its part files so a Retry resumes them, but
+        // one that cannot be resumed -- YouTube re-encoded the stream smaller
+        // than what is already on disk (`ytdlp::is_unresumable`) -- would fail
+        // every Retry the same way for good. So it goes, with the rest of what
+        // was being written, and the download starts over from the beginning.
+        } else if start_over(started_over, cancelled, success, &ran.stderr) {
+            let why = ran.stderr.lines().find(|l| ytdlp::is_unresumable(l)).unwrap_or_default();
+            eprintln!("[mytube] {video_id}: {why}; deleting the part files and starting over");
+            sweep_partials(out_paths.clone()).await;
+            started_over = true;
+        } else {
+            break;
+        }
+        ran = run_ytdlp(app, &inv.runner, &quality, video_id, &out_path, &print_file, cancel)
+            .await?;
     }
     let Ran { status, stderr: stderr_text, tree } = ran;
 
@@ -1234,6 +1306,15 @@ async fn run_one(
 /// is never a third.
 fn retry_without_subtitles(q: &Quality, cancelled: bool, success: bool, stderr: &str) -> bool {
     !cancelled && !success && quality::embeds_subtitles(q) && ytdlp::is_subtitle_failure(stderr)
+}
+
+/// Whether a run of yt-dlp that has just ended is to have its part files
+/// deleted and be run again from the start: it failed because one of them
+/// could not be resumed (`ytdlp::is_unresumable`), not because it was
+/// cancelled, and the download has not started over already -- the run from
+/// scratch had nothing to resume, so a 416 of its own is final.
+fn start_over(started_over: bool, cancelled: bool, success: bool, stderr: &str) -> bool {
+    !started_over && !cancelled && !success && ytdlp::is_unresumable(stderr)
 }
 
 /// What one run of yt-dlp came to.
@@ -1392,6 +1473,8 @@ mod tests {
             "Some Video [2026-01-02].mkv",                 // the merged file itself
             "Some Video [2026-01-02].mkv.part",            // single-format, in progress
             "Some Video [2026-01-02].f137.mp4",            // a finished stream
+            "Some Video [2026-01-02].f140-drc.m4a",        // one whose id has a suffix
+            "Some Video [2026-01-02].f137-sr.mp4",
             "Some Video [2026-01-02].f251.webm.part",      // a stream in progress
             "Some Video [2026-01-02].f251.webm.ytdl",      // its resume state
             "Some Video [2026-01-02].f137.mp4.part-Frag9", // one DASH fragment
@@ -1436,6 +1519,7 @@ mod tests {
         for name in [
             "Part 1.5.mkv",
             "Part 1.5.f137.mp4",
+            "Part 1.5.f140-drc.m4a",
             "Part 2.mkv",
             "Part 1 (2).mkv",
             "Part 1.mkv.jpg.mkv",
@@ -1517,6 +1601,136 @@ mod tests {
         let audio = Quality { subtitles: true, mode: "audio".into(), audio_format: "mp3".into(),
                               ..Quality::default() };
         assert!(!retry_without_subtitles(&audio, false, false, SUBTITLE_429));
+    }
+
+    #[test]
+    fn before_starting_over_only_what_is_still_being_written_is_cleared() {
+        let out = Path::new("/d/Name.mkv");
+        for name in [
+            "Name.f721.mp4.part",        // the stream that would not resume
+            "Name.f140-drc.m4a.part",    // one whose id has a suffix
+            "Name.mkv.part",             // a single format, in progress
+            "Name.f137.mp4.part-Frag9",  // one DASH fragment
+            "Name.f137.mp4.ytdl",        // and the state it resumes them from
+            "Name.en.srt.part",          // a subtitle track in progress
+        ] {
+            assert!(is_partial(out, name), "{name} should go");
+        }
+        for name in [
+            "Name.mkv",                  // a whole video is nothing to resume
+            "Name.f721.mp4",             // a finished stream is used as it is
+            "Name.f140-drc.m4a",
+            "Name.temp.mkv",
+            "Name.jpg",
+            "Name.meta",
+            "Name.en.srt",
+            "Name.f137.mp4.part-Frag",   // no fragment number
+            "Name.webm.part",            // not this download's container
+            "Other.f721.mp4.part",
+        ] {
+            assert!(!is_partial(out, name), "{name} must stay");
+        }
+    }
+
+    #[test]
+    fn starting_over_never_touches_a_video_whose_name_extends_this_one() {
+        // `Part 1.5` downloading beside `Part 1` is another job's, mid-write.
+        let out = Path::new("/d/Part 1.mkv");
+        for name in [
+            "Part 1.5.mkv.part",
+            "Part 1.5.f137.mp4.part",
+            "Part 1.5.f140-drc.m4a.part",
+            "Part 1.5.f137.mp4.part-Frag3",
+            "Part 1.5.f137.mp4.ytdl",
+            "Part 1.5.en.srt.part",
+        ] {
+            assert!(!is_partial(out, name), "{name} must survive");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_restart_sweep_clears_the_part_files_and_keeps_what_is_finished() {
+        let dir = std::env::temp_dir().join(format!("mytube-restart-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("V.mkv");
+        for n in ["V.f721.mp4.part", "V.f140-drc.m4a", "V.jpg", "V.5.f137.mp4.part",
+                  "W.f721.mp4.part"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        sweep_partials(vec![out.clone()]).await;
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["V.5.f137.mp4.part", "V.f140-drc.m4a", "V.jpg", "W.f721.mp4.part"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const RANGE_416: &str =
+        "ERROR: unable to download video data: HTTP Error 416: Requested range not satisfiable\n";
+
+    #[test]
+    fn a_part_file_that_will_not_resume_is_deleted_and_the_download_starts_over() {
+        assert!(start_over(false, false, false, RANGE_416));
+
+        assert!(!start_over(false, true, false, RANGE_416),
+                "a cancelled run is the cancel's, not a failure to work around");
+        assert!(!start_over(false, false, true, RANGE_416),
+                "a run that succeeded has nothing to do again");
+        assert!(!start_over(false, false, false,
+                            "ERROR: unable to download video data: HTTP Error 403: Forbidden\n"),
+                "any other failure is the download's own, and keeps its part files");
+    }
+
+    /// The 416 `start_over` is for, against YouTube with the real yt-dlp and the
+    /// download's real argv: a part file bigger than the stream it would
+    /// resume, as a re-encode leaves one, fails the run; once `sweep_partials`
+    /// has cleared it, the same run succeeds.
+    ///
+    ///     cargo test --manifest-path src-tauri/Cargo.toml unresumable_part_file_for_real -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires network, yt-dlp, ffmpeg and deno"]
+    async fn an_unresumable_part_file_for_real() {
+        async fn run(r: &ytdlp::Runner, q: &Quality, out: &Path, print: &Path) -> (bool, String) {
+            let o = tokio::process::Command::new(&r.program)
+                .args(ytdlp::download_args(r, q, "jNQXAC9IVRw", out, print))
+                .output()
+                .await
+                .expect("yt-dlp runs");
+            (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
+        }
+        let settings = crate::config::load().unwrap_or_default();
+        let tools = crate::tools::Tools::new(crate::tools::bin_dir(), reqwest::Client::new());
+        let inv = tools.ytdlp(&settings).await.expect("a yt-dlp");
+        let dir = std::env::temp_dir().join(format!("mytube-real-416-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, print) = (dir.join("V.mkv"), dir.join("V.path"));
+        // Format 160 of this video is 190 KiB, so 10 MB of it is past the end.
+        let part = dir.join("V.f160.mp4.part");
+        std::fs::File::create(&part).unwrap().set_len(10_000_000).unwrap();
+        let q = Quality { format: "160+140".into(), ..Quality::default() };
+
+        let (ok, stderr) = run(&inv.runner, &q, &out, &print).await;
+        println!("first run: {}", stderr.lines().find(|l| l.starts_with("ERROR")).unwrap_or(""));
+        assert!(start_over(false, false, ok, &stderr), "expected a 416:\n{stderr}");
+
+        sweep_partials(vec![out.clone()]).await;
+        assert!(!part.exists(), "the part file that would not resume is gone");
+        let (ok, stderr) = run(&inv.runner, &q, &out, &print).await;
+        assert!(ok, "the run from scratch failed:\n{stderr}");
+        assert!(out.exists(), "and it landed the video");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_starts_over_once() {
+        // The run from scratch had no part file to resume; a 416 of its own is
+        // final, never a loop.
+        assert!(!start_over(true, false, false, RANGE_416));
     }
 
     #[test]
