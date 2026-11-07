@@ -3,9 +3,12 @@
 //!
 //! - `sources.rs`: which build to fetch for this OS/arch, and how to read the
 //!   publishers' checksum files and redirects (with what was observed live).
-//! - `locate.rs`: the resolution order -- override, managed, system -- and
+//! - `locate.rs`: the resolution order -- override, system, managed -- and
 //!   each tool's `--version`.
 //! - `install.rs`: stream, hash, verify, extract, rename into place.
+//!
+//! A tool already on the system is used as it is; MyTube downloads its own
+//! only when there is none it can use, and updates only that copy.
 //!
 //! Resolution is cached: every download and every probe asks for yt-dlp, and a
 //! PyInstaller `--version` costs a second or more, so the tools are looked up
@@ -346,17 +349,20 @@ impl Tools {
         self.ensure_locked(s).await;
     }
 
-    /// Whether `kind` needs a first install. yt-dlp does whenever there is
-    /// no managed copy -- a system one only tides things over until the
-    /// managed, kept-current one lands. ffmpeg and deno only when nothing at
-    /// all resolved. An override is never second-guessed.
+    /// Whether `kind` needs installing: nothing usable resolved at all, or
+    /// the managed copy that did is an older release's layout (the Mac's
+    /// single-file yt-dlp, `sources::MAC_YTDLP_DIR`). A system copy is used
+    /// as it is and never second-guessed, and neither is an override.
     async fn needs_install(&self, kind: ToolKind, s: &Settings) -> bool {
         if !override_of(s, kind).trim().is_empty() {
             return false;
         }
-        match kind {
-            ToolKind::Ytdlp => locate::managed(kind, &self.bin, self.target).is_none(),
-            _ => matches!(self.resolved(s).await[idx(kind)], Resolution::Missing),
+        match &self.resolved(s).await[idx(kind)] {
+            Resolution::Missing => true,
+            Resolution::Found(f) => {
+                f.source == ToolSource::Managed && !locate::current(kind, &self.bin, self.target)
+            }
+            Resolution::BadOverride(_) => false,
         }
     }
 
@@ -364,12 +370,19 @@ impl Tools {
         for kind in ToolKind::ALL {
             if self.needs_install(kind, s).await {
                 let _ = self.install(kind, s, ToolState::Installing, None, None).await;
-            } else if kind != ToolKind::Ytdlp {
-                // Resolved some other way since (a system package, an
-                // override): an old download failure no longer applies.
-                // yt-dlp's error can be an update's, which only a successful
-                // check clears.
+                continue;
+            }
+            let source = self.resolved(s).await[idx(kind)].found().map(|f| f.source);
+            // Resolved some other way since (a system package, an override):
+            // an old download failure no longer applies. A managed yt-dlp's
+            // error can be an update's, which only a successful check clears.
+            if !(kind == ToolKind::Ytdlp && source == Some(ToolSource::Managed)) {
                 self.set_error(kind, None).await;
+            }
+            // A system copy has taken over, so what an older release
+            // installed (the Mac's single-file yt-dlp) will never run again.
+            if source == Some(ToolSource::System) {
+                install::remove_obsolete(&self.bin, &self.target.obsolete(kind));
             }
         }
         self.emit_status(s).await;
@@ -413,11 +426,18 @@ impl Tools {
 
     /// Checks the chosen channel's latest yt-dlp and installs it if it is not
     /// the one we have. `force` skips the 24 h gate and the auto-update
-    /// setting (the "Check for updates" button). Only ever the managed copy.
-    /// `patience` is how long a staged download may wait for the lease.
+    /// setting (the "Check for updates" button). Only ever the managed copy,
+    /// and only while it is the one in use: a system yt-dlp is its
+    /// installer's to update, and a managed copy left unused beside one is
+    /// not worth 40 MB a day. `patience` is how long a staged download may
+    /// wait for the lease.
     async fn update_ytdlp(&self, s: &Settings, force: bool, patience: Duration) -> Outcome {
         const K: ToolKind = ToolKind::Ytdlp;
-        if !s.ytdlp_path.trim().is_empty() || locate::managed(K, &self.bin, self.target).is_none() {
+        if !s.ytdlp_path.trim().is_empty() {
+            return Outcome::Skipped;
+        }
+        let in_use = self.resolved(s).await[idx(K)].found().is_some_and(|f| f.source == ToolSource::Managed);
+        if !in_use {
             return Outcome::Skipped;
         }
         let channel = channel_of(s);
@@ -504,23 +524,32 @@ impl Tools {
         let plan = self.plan(kind, s, tag).await?;
         let progress = |p: ToolProgress| self.emit_progress(p);
         let staged = install::stage(&self.http, &self.bin, &plan, &progress).await?;
-        let placed = if let Some(patience) = guarded {
+        if let Some(patience) = guarded {
             // The swap itself: only while no yt-dlp is running.
             let Some(guard) = self.write_lease_within(patience).await else {
                 staged.discard();
                 return Ok(Outcome::Busy);
             };
             let placed = staged.place(&self.bin);
+            // Still under the write lease: no invocation may start from the
+            // old resolution, whose path the old layout's removal is about
+            // to take away.
+            self.retire_old_layout(kind).await;
             drop(guard);
-            placed?
+            placed?;
         } else {
-            staged.place(&self.bin)?
+            staged.place(&self.bin)?;
+            self.retire_old_layout(kind).await;
+        }
+        // Run the new copy once, now. It proves the program starts, and on
+        // macOS it pays the one-time signature check of the onedir yt-dlp's
+        // ~100 libraries (~13 s, `sources::MAC_YTDLP_DIR`) here, in the
+        // background, instead of in the next download.
+        let ran = match locate::managed(kind, &self.bin, self.target) {
+            Some(p) => locate::version_of(kind, &p).await,
+            None => None,
         };
-        self.invalidate().await;
-        let version = match plan.version {
-            Some(v) => Some(v),
-            None => locate::version_of(kind, &placed[0]).await,
-        };
+        let version = plan.version.or(ran);
         let mut st = self.state.lock().await;
         let t = now();
         let r = st.manifest.entry(kind);
@@ -532,6 +561,13 @@ impl Tools {
         }
         st.manifest.save(&self.bin).context("writing tools.json")?;
         Ok(Outcome::Done)
+    }
+
+    /// After a placement: forget the cached resolution, and delete what an
+    /// older release installed for `kind` in place of what was just placed.
+    async fn retire_old_layout(&self, kind: ToolKind) {
+        self.invalidate().await;
+        install::remove_obsolete(&self.bin, &self.target.obsolete(kind));
     }
 
     /// The write lease, tried now and then every `swap_retry` until
@@ -586,7 +622,14 @@ impl Tools {
                             url: sources::release_asset_url(h, repo, &tag, "SHA2-256SUMS"),
                             name: a.ytdlp.to_string(),
                         },
-                        unpack: Unpack::Bare { dest: t.exe("yt-dlp") },
+                        unpack: if t.os == "macos" {
+                            Unpack::ZipDir {
+                                dest: sources::MAC_YTDLP_DIR.to_string(),
+                                main: sources::MAC_YTDLP_EXE.to_string(),
+                            }
+                        } else {
+                            Unpack::Bare { dest: t.exe("yt-dlp") }
+                        },
                     }],
                     version: Some(tag),
                 }
@@ -861,11 +904,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn offline_with_no_managed_copy_falls_back_to_the_system_ytdlp() {
+        async fn a_system_ytdlp_is_used_and_ours_is_never_downloaded_or_updated() {
             let tmp = tempfile::tempdir().unwrap();
             let bin = tmp.path().join("bin");
             let sys = tmp.path().join("sys");
             fake::all(&sys, "2026.08.19");
+            // Offline: any attempt to fetch would land a 404 in the status.
             let tools = tools_at(&bin, &offline().await, Search::only(vec![sys.clone()]));
             let s = Settings::default();
             tools.ensure_all(&s).await;
@@ -875,10 +919,33 @@ mod tests {
             assert_eq!(inv.runner.ffmpeg_location.as_deref(), Some(sys.as_path()));
             assert_eq!(inv.runner.deno, Some(sys.join("deno")));
             assert_eq!(inv.runner.cookies, Cookies::Browser("firefox".into()));
+            drop(inv);
             let st = &tools.status(&s).await[0];
-            assert_eq!(st.source, ToolSource::System);
-            // The failed managed download still shows, so Retry is offered.
-            assert_eq!(st.state, ToolState::Error);
+            assert_eq!((st.source, st.state, st.error.as_deref()), (ToolSource::System, ToolState::Ready, None));
+            assert_eq!(st.last_check, None, "no update check is shown for a copy MyTube does not update");
+
+            // Neither the daily check nor the button touches the network for it.
+            tools.maybe_update(&s).await;
+            let statuses = tools.update_now(&s).await.unwrap();
+            assert!(statuses.iter().all(|t| t.error.is_none()), "{statuses:?}");
+            assert!(!bin.join("yt-dlp").exists());
+        }
+
+        #[tokio::test]
+        async fn a_system_ytdlp_too_old_to_drive_is_passed_over_for_ours() {
+            let routes = Routes::default();
+            let base = start(routes.clone()).await;
+            publish_all(&routes);
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("bin");
+            let sys = tmp.path().join("sys");
+            fake::all(&sys, "2024.04.09");
+            let tools = tools_at(&bin, &base, Search::only(vec![sys.clone()]));
+            let s = Settings::default();
+            tools.ensure_all(&s).await;
+            let st = tools.status(&s).await;
+            assert_eq!(st.iter().map(|t| t.source).collect::<Vec<_>>(), vec![ToolSource::Managed, ToolSource::System, ToolSource::System]);
+            assert_eq!(tools.invocation(&s, Cookies::None).await.unwrap().runner.program, bin.join("yt-dlp"));
         }
 
         #[tokio::test]
@@ -1033,7 +1100,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_system_ffmpeg_and_deno_are_not_downloaded_but_ytdlp_is() {
+        async fn nothing_already_on_the_system_is_downloaded() {
             let routes = Routes::default();
             let base = start(routes.clone()).await;
             publish_all(&routes);
@@ -1045,8 +1112,115 @@ mod tests {
             let s = Settings::default();
             tools.ensure_all(&s).await;
             let st = tools.status(&s).await;
-            assert_eq!(st.iter().map(|t| t.source).collect::<Vec<_>>(), vec![ToolSource::Managed, ToolSource::System, ToolSource::System]);
-            assert!(!bin.join("ffmpeg").exists() && !bin.join("deno").exists());
+            assert_eq!(st.iter().map(|t| t.source).collect::<Vec<_>>(), vec![ToolSource::System; 3]);
+            assert!(!bin.join("yt-dlp").exists() && !bin.join("ffmpeg").exists() && !bin.join("deno").exists());
+        }
+
+        fn mac() -> Target {
+            Target { os: "macos", arch: "aarch64" }
+        }
+
+        fn tools_on(target: Target, bin: &Path, base: &str, search: Search) -> Tools {
+            let hosts = Hosts { github: base.into(), martin_riedl: base.into() };
+            Tools::with_parts(bin.to_path_buf(), client(), target, hosts, search)
+        }
+
+        /// A system ffmpeg and deno, so a Mac test downloads yt-dlp alone.
+        fn system_ffmpeg_and_deno(dir: &Path) {
+            fake::tool(dir, "ffmpeg", "ffmpeg version 9.0.2 Copyright");
+            fake::tool(dir, "ffprobe", "ffprobe version 9.0.2 Copyright");
+            fake::tool(dir, "deno", "deno 2.9.7 (stable, release, aarch64-apple-darwin)");
+        }
+
+        /// `yt-dlp_macos.zip` as yt-dlp publishes it: the program beside
+        /// `_internal/`. The program counts its runs in `runs`.
+        fn onedir_zip(tag: &str, runs: &Path, extra: &str) -> Vec<u8> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let o = zip::write::SimpleFileOptions::default();
+                w.add_directory("_internal/", o.unix_permissions(0o755)).unwrap();
+                w.start_file(format!("_internal/{extra}"), o.unix_permissions(0o755)).unwrap();
+                w.write_all(b"lib").unwrap();
+                w.start_file("yt-dlp_macos", o.unix_permissions(0o755)).unwrap();
+                w.write_all(&script(&format!("echo run >> '{}'\necho {tag}", runs.display()))).unwrap();
+                w.finish().unwrap();
+            }
+            buf.into_inner()
+        }
+
+        fn publish_onedir(routes: &Routes, tag: &str, zip: &[u8]) {
+            let repo = "yt-dlp/yt-dlp-nightly-builds";
+            routes.set(&format!("/{repo}/releases/latest"), Reply::Redirect(format!("/{repo}/releases/tag/{tag}")));
+            routes.set(&format!("/{repo}/releases/tag/{tag}"), Reply::Body(b"<html>release</html>".to_vec()));
+            routes.set(
+                &format!("/{repo}/releases/download/{tag}/SHA2-256SUMS"),
+                Reply::Body(format!("{}  yt-dlp_macos\n{}  yt-dlp_macos.zip\n", sha256_hex(b"onefile"), sha256_hex(zip)).into_bytes()),
+            );
+            routes.set(&format!("/{repo}/releases/download/{tag}/yt-dlp_macos.zip"), Reply::Body(zip.to_vec()));
+        }
+
+        fn runs(p: &Path) -> usize {
+            std::fs::read_to_string(p).map(|s| s.lines().count()).unwrap_or(0)
+        }
+
+        #[tokio::test]
+        async fn the_mac_gets_the_onedir_build_in_place_of_the_single_file() {
+            let routes = Routes::default();
+            let base = start(routes.clone()).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (bin, sys, ran) = (tmp.path().join("bin"), tmp.path().join("sys"), tmp.path().join("runs"));
+            system_ffmpeg_and_deno(&sys);
+            publish_onedir(&routes, "2026.11.05.000000", &onedir_zip("2026.11.05.000000", &ran, "old.so"));
+            // What 6.1.0 left: the single-file build, which still works.
+            let legacy = fake::tool(&bin, "yt-dlp", "2026.11.04.232659");
+            let tools = tools_on(mac(), &bin, &base, Search::only(vec![sys]));
+            let s = Settings::default();
+            assert_eq!(tools.invocation(&s, Cookies::None).await.unwrap().runner.program, legacy, "it serves until replaced");
+
+            tools.ensure_all(&s).await;
+            let exe = bin.join("yt-dlp_macos").join("yt-dlp_macos");
+            assert!(!legacy.exists(), "the single file is gone once the folder is in place");
+            assert!(bin.join("yt-dlp_macos").join("_internal").join("old.so").is_file());
+            assert_eq!(tools.invocation(&s, Cookies::None).await.unwrap().runner.program, exe);
+            let st = &tools.status(&s).await[0];
+            assert_eq!((st.source, st.state, st.version.as_deref()), (ToolSource::Managed, ToolState::Ready, Some("2026.11.05.000000")));
+
+            // An update swaps the whole folder, and runs the new build once
+            // straight away -- macOS checks a fresh build's libraries on its
+            // first run, which must not be the next download's.
+            {
+                let mut st = tools.state.lock().await;
+                st.manifest.entry(ToolKind::Ytdlp).last_check = Some(now() - 2 * UPDATE_EVERY_SECS);
+                st.manifest.save(&bin).unwrap();
+            }
+            publish_onedir(&routes, "2026.11.06.000000", &onedir_zip("2026.11.06.000000", &ran, "new.so"));
+            let before = runs(&ran);
+            tools.maybe_update(&s).await;
+            assert!(runs(&ran) > before, "the new build was run once after the swap");
+            let internal: Vec<_> = std::fs::read_dir(bin.join("yt-dlp_macos").join("_internal"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(internal, vec!["new.so"]);
+            assert!(!bin.join("yt-dlp_macos.old").exists());
+            assert_eq!(tools.status(&s).await[0].version.as_deref(), Some("2026.11.06.000000"));
+        }
+
+        #[tokio::test]
+        async fn a_system_ytdlp_takes_over_and_the_macs_old_single_file_goes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (bin, sys) = (tmp.path().join("bin"), tmp.path().join("sys"));
+            system_ffmpeg_and_deno(&sys);
+            fake::tool(&sys, "yt-dlp", "2026.10.26");
+            let legacy = fake::tool(&bin, "yt-dlp", "2026.11.04.232659");
+            let tools = tools_on(mac(), &bin, &offline().await, Search::only(vec![sys.clone()]));
+            let s = Settings::default();
+            tools.ensure_all(&s).await;
+            assert!(!legacy.exists(), "nothing will run it again");
+            let st = &tools.status(&s).await[0];
+            assert_eq!((st.source, st.state, st.error.as_deref()), (ToolSource::System, ToolState::Ready, None));
+            assert!(!bin.join("yt-dlp_macos").exists(), "and nothing was downloaded in its place");
         }
 
         #[tokio::test]

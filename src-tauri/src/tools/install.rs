@@ -1,6 +1,7 @@
 //! Getting a verified tool into `bin/`: download into `bin/.staging/`, hash
 //! while streaming, compare against the publisher's SHA-256, extract only the
-//! executables we run, and only then move them into place.
+//! executables we run (or, for the Mac's yt-dlp, the one folder it runs from),
+//! and only then move them into place.
 //!
 //! The invariant every step keeps: **nothing reaches its final name in `bin/`
 //! until it has been verified, and the final step is a rename.** A download
@@ -55,6 +56,12 @@ pub enum Unpack {
     Bare { dest: String },
     Zip { take: Vec<(String, String)> },
     TarXz { take: Vec<(String, String)> },
+    /// Every member of the zip, into the folder `dest` of `bin/` -- the Mac's
+    /// yt-dlp, a program plus the `_internal/` it loads (see
+    /// `sources::MAC_YTDLP_DIR`). `main` is the file inside that is run: it
+    /// must be there, and is made executable. A member whose path would leave
+    /// the folder, or a symbolic link, fails the whole install.
+    ZipDir { dest: String, main: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +80,8 @@ pub struct Plan {
     pub fetches: Vec<Fetch>,
 }
 
-/// Verified executables waiting in `.staging/`, and where each goes.
+/// Verified executables (or one folder, [`Unpack::ZipDir`]) waiting in
+/// `.staging/`, and where each goes.
 #[derive(Debug)]
 pub struct Staged {
     files: Vec<(PathBuf, String)>,
@@ -92,6 +100,7 @@ impl Staged {
     ///   and if *that* fails the old one is renamed straight back. `.old` is
     ///   deleted only after success, best effort: a running exe cannot be
     ///   deleted, and `sweep` gets it at the next start.
+    /// - a folder, on any OS: see [`place_dir`].
     ///
     /// On failure the files not yet placed are removed from `.staging/`.
     pub fn place(self, bin: &Path) -> Result<Vec<PathBuf>> {
@@ -104,9 +113,14 @@ impl Staged {
         let mut placed = Vec::new();
         for (i, (from, dest)) in self.files.iter().enumerate() {
             let to = bin.join(dest);
-            if let Err(e) = place_one(bin, from, dest, &to, rename) {
+            let result = if from.is_dir() {
+                place_dir(bin, from, dest, &to, rename)
+            } else {
+                place_one(bin, from, dest, &to, rename)
+            };
+            if let Err(e) = result {
                 for (p, _) in &self.files[i..] {
-                    let _ = std::fs::remove_file(p);
+                    remove_path(p);
                 }
                 return Err(e);
             }
@@ -117,7 +131,53 @@ impl Staged {
 
     pub fn discard(self) {
         for (p, _) in &self.files {
+            remove_path(p);
+        }
+    }
+}
+
+/// Deletes `p`, a file or a whole folder, best effort.
+fn remove_path(p: &Path) {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        Ok(_) => {
             let _ = std::fs::remove_file(p);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Puts a staged folder at `to`. No OS renames a folder over a non-empty one,
+/// so the old folder goes aside to `<dest>.old` first, the new one takes its
+/// name, and if *that* fails the old one is renamed straight back -- a failed
+/// update leaves the tool exactly as it was. The instant between the two
+/// renames is the only one in which `to` is missing, and an update makes this
+/// swap holding the write lease, so no yt-dlp starts in it. `.old` is deleted
+/// after, and by [`sweep`] if that fails.
+fn place_dir(bin: &Path, from: &Path, dest: &str, to: &Path, rename: &dyn Fn(&Path, &Path) -> io::Result<()>) -> Result<()> {
+    if std::fs::symlink_metadata(to).is_err() {
+        return rename(from, to).with_context(|| format!("installing {dest}"));
+    }
+    let old = free_old_name(bin, dest);
+    rename(to, &old).with_context(|| format!("moving the old {dest} aside"))?;
+    if let Err(e) = rename(from, to) {
+        let _ = rename(&old, to);
+        return Err(e).with_context(|| format!("installing {dest}"));
+    }
+    remove_path(&old);
+    Ok(())
+}
+
+/// Deletes what an older MyTube installed and this one no longer runs
+/// (`Target::obsolete`), best effort -- on Windows a running exe cannot go,
+/// and it is tried again after the next install.
+pub fn remove_obsolete(bin: &Path, names: &[String]) {
+    for name in names {
+        let p = bin.join(name);
+        if std::fs::symlink_metadata(&p).is_ok() {
+            remove_path(&p);
         }
     }
 }
@@ -144,12 +204,16 @@ fn place_one(bin: &Path, from: &Path, dest: &str, to: &Path, rename: &dyn Fn(&Pa
     Ok(())
 }
 
-/// `<dest>.old`, or `<dest>.<n>.old` when an earlier `.old` is still held
-/// open by a process that has not exited (Windows).
-#[cfg(windows)]
+/// `<dest>.old`, or `<dest>.<n>.old` when an earlier `.old` cannot be
+/// deleted -- a file still held open by a process that has not exited
+/// (Windows).
 fn free_old_name(bin: &Path, dest: &str) -> PathBuf {
     let first = bin.join(format!("{dest}.old"));
-    if !first.exists() || std::fs::remove_file(&first).is_ok() {
+    if std::fs::symlink_metadata(&first).is_err() {
+        return first;
+    }
+    remove_path(&first);
+    if std::fs::symlink_metadata(&first).is_err() {
         return first;
     }
     let stamp = chrono::Utc::now().timestamp_millis();
@@ -157,14 +221,14 @@ fn free_old_name(bin: &Path, dest: &str) -> PathBuf {
 }
 
 /// Deletes what an interrupted install or a replaced binary left behind:
-/// the whole `.staging/` and every `*.old`. Best effort -- a still-running old
-/// exe on Windows stays until the next start.
+/// the whole `.staging/` and every `*.old`, file or folder. Best effort -- a
+/// still-running old exe on Windows stays until the next start.
 pub fn sweep(bin: &Path) {
     let _ = std::fs::remove_dir_all(bin.join(STAGING));
     if let Ok(rd) = std::fs::read_dir(bin) {
         for e in rd.flatten() {
             if e.file_name().to_string_lossy().ends_with(".old") {
-                let _ = std::fs::remove_file(e.path());
+                remove_path(&e.path());
             }
         }
     }
@@ -389,14 +453,87 @@ async fn unpack(
             }
             wanted.into_iter().map(|(_, dest, to)| (to, dest)).collect()
         }
+        Unpack::ZipDir { dest, main } => {
+            progress(ToolProgress { tool: kind, phase: ToolPhase::Extract, received: 0, total: None });
+            let to = staging.join(format!("{dest}.new"));
+            let (part, root, main) = (part.to_path_buf(), to.clone(), main.clone());
+            let extracted = tokio::task::spawn_blocking(move || extract_zip_tree(&part, &root, &main))
+                .await
+                .map_err(|e| anyhow!("extraction task failed: {e}"))
+                .and_then(|r| r);
+            if let Err(e) = extracted {
+                remove_path(&to);
+                return Err(e);
+            }
+            // The folder, not just its program, is what gets placed: the
+            // program loads everything beside it.
+            return Ok(vec![(to, dest.clone())]);
+        }
     };
     if let Err(e) = out.iter().try_for_each(|(p, _)| make_executable(p)) {
         for (p, _) in &out {
-            let _ = std::fs::remove_file(p);
+            remove_path(p);
         }
         return Err(e);
     }
     Ok(out)
+}
+
+/// Unpacks every member of a zip under `root`, keeping each file's unix mode,
+/// and makes `main` (relative to `root`) executable.
+///
+/// Nothing may land outside `root`: a member with an absolute path or one that
+/// climbs out with `..` (`enclosed_name` is `None` for both) fails the whole
+/// unpack, and so does a symbolic link, which could point a later member's
+/// write anywhere. The real archive holds neither; refusing one costs an
+/// install, while the copy already in `bin/` stays where it is.
+fn extract_zip_tree(archive: &Path, root: &Path, main: &str) -> Result<()> {
+    remove_path(root);
+    std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    let file = std::fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(io::BufReader::new(file)).context("reading the zip")?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        let rel = entry
+            .enclosed_name()
+            .ok_or_else(|| anyhow!("the archive holds a path outside its folder: {name}"))?;
+        let out = root.join(&rel);
+        if entry.is_symlink() {
+            bail!("the archive holds a symbolic link, which MyTube does not unpack: {name}");
+        }
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut f = std::fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
+        io::copy(&mut entry, &mut f).with_context(|| format!("extracting {name}"))?;
+        f.sync_all()?;
+        set_mode(&out, entry.unix_mode())?;
+    }
+    let exe = root.join(main);
+    if !exe.is_file() {
+        bail!("the archive has no {main}");
+    }
+    make_executable(&exe)
+}
+
+/// A member's permission bits as the archive recorded them (the type bits
+/// dropped). A member with none keeps what `File::create` gave it.
+#[cfg(unix)]
+fn set_mode(p: &Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = mode else { return Ok(()) };
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & 0o777))
+        .with_context(|| format!("setting the mode of {}", p.display()))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: Option<u32>) -> Result<()> {
+    Ok(())
 }
 
 fn base_name(path: &str) -> &str {
@@ -826,11 +963,14 @@ mod tests {
         std::fs::write(bin.join(STAGING).join("yt-dlp-0-yt-dlp_linux.part"), b"half").unwrap();
         std::fs::write(bin.join("yt-dlp.old"), b"previous").unwrap();
         std::fs::write(bin.join("deno.1789931890.old"), b"previous").unwrap();
+        std::fs::create_dir_all(bin.join("yt-dlp_macos.old").join("_internal")).unwrap();
+        std::fs::write(bin.join("yt-dlp_macos.old").join("_internal").join("lib.so"), b"previous").unwrap();
         std::fs::write(bin.join("yt-dlp"), b"current").unwrap();
         sweep(bin);
         assert!(!bin.join(STAGING).exists());
         assert!(!bin.join("yt-dlp.old").exists());
         assert!(!bin.join("deno.1789931890.old").exists());
+        assert!(!bin.join("yt-dlp_macos.old").exists(), "a folder set aside by a swap goes too");
         assert_eq!(std::fs::read(bin.join("yt-dlp")).unwrap(), b"current");
     }
 
@@ -976,6 +1116,200 @@ mod tests {
         assert!(!fresh.path().join("ffmpeg").exists());
         assert!(!fresh.path().join("ffprobe").exists());
         assert!(staging_is_empty(fresh.path()));
+    }
+
+    /// A zip shaped like `yt-dlp_macos.zip`: files with their unix modes, and
+    /// explicit directory entries, no top-level folder.
+    fn zip_tree(dirs: &[&str], files: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for d in dirs {
+                w.add_directory(*d, opts.unix_permissions(0o755)).unwrap();
+            }
+            for (name, data, mode) in files {
+                w.start_file(*name, opts.unix_permissions(*mode)).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn onedir_plan(base: &str) -> Plan {
+        Plan {
+            kind: ToolKind::Ytdlp,
+            version: Some("2026.11.04.232659".into()),
+            fetches: vec![Fetch {
+                url: format!("{base}/dl/yt-dlp_macos.zip"),
+                checksum: Checksum::InList { url: format!("{base}/SUMS"), name: "yt-dlp_macos.zip".into() },
+                unpack: Unpack::ZipDir { dest: "yt-dlp_macos".into(), main: "yt-dlp_macos".into() },
+            }],
+        }
+    }
+
+    fn serve_onedir(routes: &Routes, zip: &[u8]) {
+        routes.set("/SUMS", Reply::Body(format!("{}  yt-dlp_macos.zip\n", sha256_hex(zip)).into_bytes()));
+        routes.set("/dl/yt-dlp_macos.zip", Reply::Body(zip.to_vec()));
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != STAGING)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_whole_zip_unpacks_into_its_folder_with_its_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let routes = Routes::default();
+        let base = start(routes.clone()).await;
+        let zip = zip_tree(
+            &["_internal/", "_internal/certifi/"],
+            &[
+                ("_internal/certifi/cacert.pem", b"PEM", 0o644),
+                ("_internal/libssl.3.dylib", b"DYLIB", 0o755),
+                // Stored without an executable bit: the runnable file is made
+                // executable whatever the archive says.
+                ("yt-dlp_macos", b"#!/bin/sh\necho 2026.11.04.232659\n", 0o644),
+            ],
+        );
+        serve_onedir(&routes, &zip);
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path();
+
+        let placed = install(&client(), bin, &onedir_plan(&base)).await.unwrap();
+        let dir = bin.join("yt-dlp_macos");
+        assert_eq!(placed, vec![dir.clone()]);
+        assert_eq!(names_in(bin), vec!["yt-dlp_macos"]);
+        assert_eq!(names_in(&dir), vec!["_internal", "yt-dlp_macos"]);
+        assert_eq!(std::fs::read(dir.join("_internal/certifi/cacert.pem")).unwrap(), b"PEM");
+        let mode = |p: &str| std::fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("yt-dlp_macos"), 0o755);
+        assert_eq!(mode("_internal/libssl.3.dylib"), 0o755);
+        assert_eq!(mode("_internal/certifi/cacert.pem"), 0o644);
+        assert!(staging_is_empty(bin));
+    }
+
+    #[tokio::test]
+    async fn an_update_replaces_the_whole_folder_and_leaves_no_old_one() {
+        let routes = Routes::default();
+        let base = start(routes.clone()).await;
+        let zip = zip_tree(&["_internal/"], &[("_internal/new.so", b"NEW", 0o755), ("yt-dlp_macos", b"new", 0o755)]);
+        serve_onedir(&routes, &zip);
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path();
+        let dir = bin.join("yt-dlp_macos");
+        std::fs::create_dir_all(dir.join("_internal")).unwrap();
+        std::fs::write(dir.join("_internal/stale.so"), b"OLD").unwrap();
+        std::fs::write(dir.join("yt-dlp_macos"), b"old").unwrap();
+
+        install(&client(), bin, &onedir_plan(&base)).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("yt-dlp_macos")).unwrap(), b"new");
+        assert_eq!(names_in(&dir.join("_internal")), vec!["new.so"], "nothing of the old build survives");
+        assert_eq!(names_in(bin), vec!["yt-dlp_macos"], "no .old left beside it");
+        assert!(staging_is_empty(bin));
+    }
+
+    /// The rename that puts the new folder in place fails after the old one
+    /// was moved aside: the old one must come straight back, whole.
+    #[test]
+    fn a_failed_folder_swap_puts_the_old_folder_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path();
+        let new = bin.join(STAGING).join("yt-dlp_macos.new");
+        std::fs::create_dir_all(new.join("_internal")).unwrap();
+        std::fs::write(new.join("yt-dlp_macos"), b"new").unwrap();
+        let dir = bin.join("yt-dlp_macos");
+        std::fs::create_dir_all(dir.join("_internal")).unwrap();
+        std::fs::write(dir.join("_internal/lib.so"), b"OLD").unwrap();
+        std::fs::write(dir.join("yt-dlp_macos"), b"old").unwrap();
+        let staged = Staged { files: vec![(new.clone(), "yt-dlp_macos".into())] };
+
+        let err = staged
+            .place_with(bin, &|from, to| {
+                if from == new.as_path() {
+                    Err(io::Error::other("simulated: the final rename failed"))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("simulated"), "{err:#}");
+        assert_eq!(std::fs::read(dir.join("yt-dlp_macos")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("_internal/lib.so")).unwrap(), b"OLD");
+        assert_eq!(names_in(bin), vec!["yt-dlp_macos"], "no .old left beside it");
+        assert!(staging_is_empty(bin), "the unplaced folder is not left in staging");
+    }
+
+    #[tokio::test]
+    async fn a_zip_that_would_write_outside_its_folder_installs_nothing() {
+        let routes = Routes::default();
+        let base = start(routes.clone()).await;
+        let zip = zip_tree(&[], &[("yt-dlp_macos", b"x", 0o755), ("../escaped", b"evil", 0o644)]);
+        serve_onedir(&routes, &zip);
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let err = install(&client(), &bin, &onedir_plan(&base)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("../escaped"), "{err:#}");
+        assert!(!tmp.path().join("escaped").exists() && !bin.join(STAGING).join("escaped").exists());
+        assert!(!bin.join("yt-dlp_macos").exists());
+        assert!(staging_is_empty(&bin));
+    }
+
+    /// No links: none are in the real archive, and one could point a later
+    /// member's write anywhere. Refusing costs an update, never the copy
+    /// already installed.
+    #[tokio::test]
+    async fn a_zip_holding_a_symbolic_link_installs_nothing() {
+        let routes = Routes::default();
+        let base = start(routes.clone()).await;
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("yt-dlp_macos", opts.unix_permissions(0o755)).unwrap();
+            w.write_all(b"x").unwrap();
+            w.add_symlink("_internal", "/etc", opts).unwrap();
+            w.finish().unwrap();
+        }
+        let zip = buf.into_inner();
+        serve_onedir(&routes, &zip);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = install(&client(), tmp.path(), &onedir_plan(&base)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("link"), "{err:#}");
+        assert!(!tmp.path().join("yt-dlp_macos").exists());
+        assert!(staging_is_empty(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn a_zip_without_its_runnable_file_installs_nothing() {
+        let routes = Routes::default();
+        let base = start(routes.clone()).await;
+        let zip = zip_tree(&["_internal/"], &[("_internal/lib.so", b"x", 0o755)]);
+        serve_onedir(&routes, &zip);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = install(&client(), tmp.path(), &onedir_plan(&base)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("the archive has no yt-dlp_macos"), "{err:#}");
+        assert!(!tmp.path().join("yt-dlp_macos").exists());
+        assert!(staging_is_empty(tmp.path()));
+    }
+
+    #[test]
+    fn obsolete_files_are_removed_and_anything_else_is_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path();
+        std::fs::write(bin.join("yt-dlp"), b"the old single file").unwrap();
+        std::fs::write(bin.join("deno"), b"deno").unwrap();
+        remove_obsolete(bin, &["yt-dlp".to_string(), "never-there".to_string()]);
+        assert_eq!(names_in(bin), vec!["deno"]);
     }
 
     #[test]

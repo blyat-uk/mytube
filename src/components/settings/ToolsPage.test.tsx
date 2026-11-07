@@ -150,23 +150,54 @@ describe("Tools page", () => {
     expect(await screen.findByText("yt-dlp updated to 2026.09.20.")).toBeDefined();
   });
 
-  /** A system yt-dlp is replaced by a managed install, which the shell already
+  /** A missing yt-dlp is installed by the check, which the shell already
    *  toasts as "yt-dlp is ready." — saying "updated to" as well is one event
    *  told twice. */
   it("says nothing of its own when the check installs a managed yt-dlp", async () => {
-    backend.tools = [
-      tool({ kind: "ytdlp", source: "system", version: "2025.01.01", path: "/usr/bin/yt-dlp" }),
-      TOOLS_OK[1],
-      TOOLS_OK[2],
-    ];
+    backend.tools = [tool({ kind: "ytdlp", source: "missing" }), TOOLS_OK[1], TOOLS_OK[2]];
     await renderCards();
-    await screen.findByText("2025.01.01");
+    expect(card("yt-dlp").classList.contains("is-missing")).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
     await waitFor(() => expect(api.toolsUpdateNow).toHaveBeenCalledTimes(1));
     // The card taking the answer is the sign the call has fully settled.
     expect(await screen.findByText("Managed by MyTube")).toBeDefined();
     expect(screen.queryByText(/yt-dlp updated to/)).toBeNull();
     expect(screen.queryByText("yt-dlp is up to date.")).toBeNull();
+  });
+
+  /** A yt-dlp already on the system is used as it is and never updated by
+   *  MyTube, so the button would do nothing; the block says why instead. */
+  it("leaves a system yt-dlp's updates to whatever installed it", async () => {
+    backend.tools = [
+      tool({ kind: "ytdlp", source: "system", version: "2026.10.26", path: "/opt/homebrew/bin/yt-dlp" }),
+      TOOLS_OK[1],
+      TOOLS_OK[2],
+    ];
+    await renderCards();
+    const block = screen.getByRole("heading", { level: 3, name: "yt-dlp updates" }).closest(".st-block")!;
+    expect(block.querySelector(".st-tl-external")?.textContent).toMatch(
+      /using the yt-dlp already installed on this computer and leaves updating it to whatever installed it.*apply only if MyTube downloads its own/,
+    );
+    expect(screen.queryByRole("button", { name: "Check for updates" })).toBeNull();
+    // The choices stay: they are what a copy of MyTube's own would follow.
+    expect(screen.getByRole("radiogroup", { name: "yt-dlp channel" })).toBeDefined();
+  });
+
+  it("leaves a yt-dlp named in settings.json to the person who named it", async () => {
+    backend.tools = [
+      tool({ kind: "ytdlp", source: "override", version: "2026.10.26", path: "/opt/yt/yt-dlp" }),
+      TOOLS_OK[1],
+      TOOLS_OK[2],
+    ];
+    await renderCards();
+    expect(page().querySelector(".st-tl-external")?.textContent).toMatch(/named in settings\.json and leaves updating it to you/);
+    expect(screen.queryByRole("button", { name: "Check for updates" })).toBeNull();
+  });
+
+  it("has no such note while yt-dlp is MyTube's own", async () => {
+    await renderCards();
+    expect(page().querySelector(".st-tl-external")).toBeNull();
+    expect(screen.getByRole("button", { name: "Check for updates" })).toBeDefined();
   });
 
   it("says when yt-dlp was last checked, beside the button", async () => {

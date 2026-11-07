@@ -1,6 +1,6 @@
-//! Finding a tool: a settings.json override, MyTube's managed copy, or one
-//! already on the system -- in the order each tool wants them -- and asking it
-//! its version.
+//! Finding a tool: a settings.json override, one already on the system, or
+//! MyTube's managed copy -- in that order, for all three -- and asking it its
+//! version.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,8 +12,10 @@ use super::sources::{self, Target};
 
 /// A PyInstaller onefile build unpacks itself before it can print anything,
 /// and on Windows the first run of a fresh exe also waits on Defender, so
-/// this is generous. It only bounds a hung binary; a working one answers in
-/// well under a second after the first run.
+/// this is generous. It only bounds a hung binary. A working one answers in
+/// well under a second after the first run -- except a onefile build on
+/// macOS, which takes ~10 s on every run (`sources::MAC_YTDLP_DIR`), and the
+/// Mac's onedir build on its first run (~13 s).
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where "the system" looks: `PATH`, then the directories a GUI launch
@@ -123,15 +125,22 @@ pub fn program_name(kind: ToolKind) -> &'static str {
     }
 }
 
-/// The managed copy of `kind` in `bin`, if every file of it is there (ffmpeg
-/// without its ffprobe is not an install: yt-dlp needs both).
+/// The managed copy of `kind` in `bin`: this release's layout if every file
+/// of it is there (ffmpeg without its ffprobe is not an install: yt-dlp needs
+/// both), else what an older release installed (`Target::obsolete`, the Mac's
+/// single-file yt-dlp), which still runs and keeps downloads going until
+/// `ensure_all` has replaced it -- see [`current`].
 pub fn managed(kind: ToolKind, bin: &Path, t: Target) -> Option<PathBuf> {
-    let files = t.files(kind);
-    if files.iter().all(|f| bin.join(f).is_file()) {
-        Some(bin.join(&files[0]))
-    } else {
-        None
+    if current(kind, bin, t) {
+        return Some(bin.join(&t.files(kind)[0]));
     }
+    t.obsolete(kind).into_iter().map(|f| bin.join(f)).find(|p| p.is_file())
+}
+
+/// Whether the managed copy of `kind` is in this release's layout. `false`
+/// with [`managed`] still `Some` is the old layout, due a reinstall.
+pub fn current(kind: ToolKind, bin: &Path, t: Target) -> bool {
+    t.files(kind).iter().all(|f| bin.join(f).is_file())
 }
 
 /// Runs `cmd` to the end within `limit`, killing it if it overruns.
@@ -194,12 +203,19 @@ pub async fn version_of(kind: ToolKind, path: &Path) -> Option<String> {
     sources::parse_version(kind, &String::from_utf8_lossy(&out.stdout))
 }
 
-/// Resolution order, per the spec:
+/// Resolution order, the same for all three:
 ///
 /// - override non-empty -> that path, or an error naming the key;
-/// - yt-dlp: managed -> system (the managed copy is the one kept current);
-/// - ffmpeg, deno: system -> managed (a distro ffmpeg is as good as ours and
-///   costs no download). A system deno older than 2.3.0 counts as absent.
+/// - system -> managed. One already installed is used as it is and costs no
+///   download; MyTube fetches its own only when there is none. For yt-dlp
+///   that means keeping the system copy current is its installer's job
+///   (Homebrew, pip, a package manager), never MyTube's: until 6.1.0 the
+///   managed copy came first because it is the one MyTube can update.
+/// - A system copy counts only if it is usable: a deno older than 2.3.0 is
+///   absent, and so is a yt-dlp that will not answer `--version` (a shim
+///   whose interpreter is gone) or predates `--js-runtimes`
+///   ([`sources::YTDLP_MIN`]), which every run passes. The next one along the
+///   path is tried, then the managed copy.
 pub async fn resolve(
     kind: ToolKind,
     override_path: &str,
@@ -234,7 +250,12 @@ pub async fn resolve(
                 continue;
             }
             let version = version_of(kind, &p).await;
-            if kind == ToolKind::Deno && !version.as_deref().is_some_and(sources::deno_new_enough) {
+            let usable = match kind {
+                ToolKind::Deno => version.as_deref().is_some_and(sources::deno_new_enough),
+                ToolKind::Ytdlp => version.as_deref().is_some_and(sources::ytdlp_new_enough),
+                ToolKind::Ffmpeg => true,
+            };
+            if !usable {
                 continue;
             }
             return Some(Found { path: p, source: ToolSource::System, version });
@@ -242,15 +263,9 @@ pub async fn resolve(
         None
     };
 
-    let found = match kind {
-        ToolKind::Ytdlp => match managed_found().await {
-            Some(f) => Some(f),
-            None => system_found().await,
-        },
-        ToolKind::Ffmpeg | ToolKind::Deno => match system_found().await {
-            Some(f) => Some(f),
-            None => managed_found().await,
-        },
+    let found = match system_found().await {
+        Some(f) => Some(f),
+        None => managed_found().await,
     };
     found.map(Resolution::Found).unwrap_or(Resolution::Missing)
 }
@@ -288,27 +303,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ytdlp_prefers_override_then_managed_then_system() {
+    async fn ytdlp_prefers_override_then_system_then_managed() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         let sys = tmp.path().join("sys");
         let own = tmp.path().join("own");
-        fake::tool(&sys, "yt-dlp", "2020.01.01");
         let search = Search::only(vec![sys.clone()]);
-
-        let r = resolve(ToolKind::Ytdlp, "", &bin, host(), &search).await;
-        let f = r.found().unwrap();
-        assert_eq!((f.source, f.path.clone(), f.version.as_deref()), (ToolSource::System, sys.join("yt-dlp"), Some("2020.01.01")));
 
         fake::tool(&bin, "yt-dlp", "2026.09.16.232951");
         let r = resolve(ToolKind::Ytdlp, "", &bin, host(), &search).await;
         let f = r.found().unwrap();
         assert_eq!((f.source, f.version.as_deref()), (ToolSource::Managed, Some("2026.09.16.232951")));
 
+        // One already on the system wins over ours, even an older one.
+        fake::tool(&sys, "yt-dlp", "2026.01.02");
+        let r = resolve(ToolKind::Ytdlp, "", &bin, host(), &search).await;
+        let f = r.found().unwrap();
+        assert_eq!((f.source, f.path.clone(), f.version.as_deref()), (ToolSource::System, sys.join("yt-dlp"), Some("2026.01.02")));
+
         let mine = fake::tool(&own, "my-ytdlp", "1999.1.1");
         let r = resolve(ToolKind::Ytdlp, mine.to_str().unwrap(), &bin, host(), &search).await;
         let f = r.found().unwrap();
         assert_eq!((f.source, f.path.clone()), (ToolSource::Override, mine));
+    }
+
+    #[tokio::test]
+    async fn a_system_ytdlp_that_is_too_old_or_will_not_run_counts_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let (old, broken, good) = (tmp.path().join("old"), tmp.path().join("broken"), tmp.path().join("good"));
+        // Older than `--js-runtimes`, which every MyTube run passes.
+        fake::tool(&old, "yt-dlp", "2024.04.09");
+        // A shim whose interpreter is gone: there, but nothing answers.
+        let b = fake::tool(&broken, "yt-dlp", "x");
+        std::fs::write(&b, "#!/bin/sh\nexit 127\n").unwrap();
+
+        let search = Search::only(vec![old.clone(), broken.clone()]);
+        assert_eq!(resolve(ToolKind::Ytdlp, "", &bin, host(), &search).await, Resolution::Missing);
+
+        // A good one further along the path is still found past both.
+        fake::tool(&good, "yt-dlp", "2025.11.12");
+        let search = Search::only(vec![old.clone(), broken.clone(), good.clone()]);
+        let r = resolve(ToolKind::Ytdlp, "", &bin, host(), &search).await;
+        assert_eq!(r.found().unwrap().path, good.join("yt-dlp"));
+
+        // With none usable, the managed one is the answer.
+        fake::tool(&bin, "yt-dlp", "2026.09.16.232951");
+        let search = Search::only(vec![old, broken]);
+        let r = resolve(ToolKind::Ytdlp, "", &bin, host(), &search).await;
+        assert_eq!(r.found().unwrap().source, ToolSource::Managed);
+    }
+
+    #[tokio::test]
+    async fn the_macs_old_single_file_ytdlp_serves_until_its_folder_replaces_it() {
+        let mac = Target { os: "macos", arch: "aarch64" };
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let none = Search::only(vec![]);
+        assert_eq!(managed(ToolKind::Ytdlp, &bin, mac), None);
+
+        let legacy = fake::tool(&bin, "yt-dlp", "2026.11.04.232659");
+        assert_eq!(managed(ToolKind::Ytdlp, &bin, mac), Some(legacy.clone()));
+        assert!(!current(ToolKind::Ytdlp, &bin, mac), "the single file is not this release's layout");
+        let r = resolve(ToolKind::Ytdlp, "", &bin, mac, &none).await;
+        assert_eq!((r.found().unwrap().source, r.found().unwrap().path.clone()), (ToolSource::Managed, legacy));
+
+        let folder = fake::tool(&bin.join("yt-dlp_macos"), "yt-dlp_macos", "2026.11.05");
+        assert_eq!(managed(ToolKind::Ytdlp, &bin, mac), Some(folder.clone()));
+        assert!(current(ToolKind::Ytdlp, &bin, mac));
+        // Elsewhere the single file *is* the layout.
+        assert!(current(ToolKind::Ytdlp, &bin, host()));
     }
 
     #[tokio::test]

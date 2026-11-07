@@ -90,6 +90,9 @@ export default function ToolsPage() {
   const anyBusy = tools?.some((t) => toolInFlight(t.state)) ?? false;
   const ytdlp = tools?.find((t) => t.kind === "ytdlp");
   const updating = pending.has(UPDATE);
+  // A yt-dlp MyTube did not install is used as it is and never updated by
+  // it, so "Check for updates" would do nothing there.
+  const external = ytdlp?.source === "system" || ytdlp?.source === "override";
 
   const updateNow = (announce: boolean) => run(UPDATE, async () => {
     const before = ytdlp?.version ?? null;
@@ -156,11 +159,18 @@ export default function ToolsPage() {
       <Block
         title="yt-dlp updates"
         className="st-tl-updates"
-        aside={<>
+        aside={external ? null : <>
           {ytdlp?.lastCheck ? <span>Last checked {formatRelative(ytdlp.lastCheck)}</span> : null}
           {checkButton}
         </>}
       >
+        {external && (
+          <p className="st-tl-external">
+            {ytdlp?.source === "system"
+              ? "MyTube is using the yt-dlp already installed on this computer and leaves updating it to whatever installed it (a package manager, Homebrew, pip). These settings apply only if MyTube downloads its own, which it does when no usable yt-dlp is installed."
+              : "MyTube is using the yt-dlp named in settings.json and leaves updating it to you. These settings apply only to a copy MyTube downloads itself."}
+          </p>
+        )}
         <OptRow
           title="Channel"
           hint="YouTube breaks things often, and the fixes reach nightly first."

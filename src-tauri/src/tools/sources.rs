@@ -14,7 +14,10 @@
 //! - Release assets answer `302` to `release-assets.githubusercontent.com`,
 //!   then `200`. Sizes: yt-dlp_linux 40 MB, yt-dlp_macos 37 MB, yt-dlp.exe
 //!   18 MB; deno zips ~40 MB; ffmpeg-master-latest-linux64-gpl.tar.xz 153 MB,
-//!   -win64-gpl.zip 196 MB.
+//!   -win64-gpl.zip 196 MB. Seen 2026-11-07 (nightly 2026.11.04.232659):
+//!   `yt-dlp_macos.zip` 54 MB, listed in the same `SHA2-256SUMS` (it
+//!   verified), 162 entries with no top-level folder: the executable
+//!   `yt-dlp_macos` and `_internal/` (28 directories, 133 files, no symlinks).
 //! - yt-dlp's `SHA2-256SUMS` (both channels): one `<64 lowercase hex>  <name>`
 //!   per line, two spaces, LF, covering `yt-dlp`, `yt-dlp.exe`,
 //!   `yt-dlp_linux`, `yt-dlp_linux_aarch64`, `yt-dlp_macos`, the musllinux,
@@ -67,15 +70,47 @@ impl Target {
         }
     }
 
-    /// The executables a managed install of `kind` puts in `bin/`.
+    /// The executables a managed install of `kind` puts in `bin/`, relative
+    /// to it; the first is the one that is run.
     pub fn files(&self, kind: ToolKind) -> Vec<String> {
         match kind {
+            ToolKind::Ytdlp if self.os == "macos" => vec![format!("{MAC_YTDLP_DIR}/{MAC_YTDLP_EXE}")],
             ToolKind::Ytdlp => vec![self.exe("yt-dlp")],
             ToolKind::Ffmpeg => vec![self.exe("ffmpeg"), self.exe("ffprobe")],
             ToolKind::Deno => vec![self.exe("deno")],
         }
     }
+
+    /// What an older MyTube installed for `kind` in `bin/` that this one no
+    /// longer does: the Mac's single-file yt-dlp, before [`MAC_YTDLP_DIR`].
+    /// It still runs, so it is used until its replacement is in place, and
+    /// deleted then (or once a system copy has taken over).
+    pub fn obsolete(&self, kind: ToolKind) -> Vec<String> {
+        match kind {
+            ToolKind::Ytdlp if self.os == "macos" => vec!["yt-dlp".to_string()],
+            _ => Vec::new(),
+        }
+    }
 }
+
+/// The Mac's managed yt-dlp is the "onedir" build, `yt-dlp_macos.zip`,
+/// unpacked whole into this folder of `bin/`: the executable [`MAC_YTDLP_EXE`]
+/// beside `_internal/`, which holds its Python and ~100 libraries.
+///
+/// Not the single-file `yt-dlp_macos`, a PyInstaller "onefile" build that
+/// unpacks those libraries into a fresh `$TMPDIR/_MEI…` folder on every run.
+/// macOS validates the code signature of every library the first time it is
+/// loaded from a new file (`dlopen` -> dyld `registerSignature` -> `fcntl`, 93%
+/// of a `sample` of the stalled process), and a fresh folder is new files
+/// every time: measured 2026-11-07 on macOS 27.0 (Apple Silicon), nightly
+/// 2026.11.04.232659, 10.2-10.9 s for a bare `--version` on every run, about
+/// 0.85 s of it CPU. A download runs yt-dlp twice (probe, then download), so
+/// each sat at 0% for ~20 s. The onedir build pays that check once, on its
+/// first run from where it was unpacked (12.95 s), then 0.23 s; a real probe
+/// went from 12.5 s to 2.7 s. Whether the check survives a reboot was not
+/// tested.
+pub const MAC_YTDLP_DIR: &str = "yt-dlp_macos";
+pub const MAC_YTDLP_EXE: &str = "yt-dlp_macos";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfmpegSource {
@@ -95,8 +130,9 @@ pub struct Assets {
     pub ffmpeg: FfmpegSource,
 }
 
-/// The managed builds for `t`, or an error naming it. `yt-dlp_macos` is a
-/// universal binary, so both Mac arches share it.
+/// The managed builds for `t`, or an error naming it. `yt-dlp_macos.zip` is
+/// universal (x86_64 and arm64), so both Mac arches share it; see
+/// [`MAC_YTDLP_DIR`] for why it is the zip and not the single file.
 pub fn assets(t: Target) -> Result<Assets> {
     let a = match (t.os, t.arch) {
         ("linux", "x86_64") => Assets {
@@ -110,12 +146,12 @@ pub fn assets(t: Target) -> Result<Assets> {
             ffmpeg: FfmpegSource::Builds { asset: "ffmpeg-master-latest-linuxarm64-gpl.tar.xz" },
         },
         ("macos", "aarch64") => Assets {
-            ytdlp: "yt-dlp_macos",
+            ytdlp: "yt-dlp_macos.zip",
             deno_triple: "aarch64-apple-darwin",
             ffmpeg: FfmpegSource::MartinRiedl { arch: "arm64" },
         },
         ("macos", "x86_64") => Assets {
-            ytdlp: "yt-dlp_macos",
+            ytdlp: "yt-dlp_macos.zip",
             deno_triple: "x86_64-apple-darwin",
             ffmpeg: FfmpegSource::MartinRiedl { arch: "amd64" },
         },
@@ -232,6 +268,17 @@ pub fn semver_triple(v: &str) -> Option<(u32, u32, u32)> {
 
 pub fn deno_new_enough(version: &str) -> bool {
     semver_triple(version).is_some_and(|v| v >= DENO_MIN)
+}
+
+/// The oldest yt-dlp MyTube can drive: every run passes `--js-runtimes`,
+/// which first appears in 2025.11.12's `options.py` (absent at 2025.10.22,
+/// checked against the tags on GitHub 2026-11-07), and an older one refuses
+/// the whole command line. A system yt-dlp older than this counts as absent.
+pub const YTDLP_MIN: (u32, u32, u32) = (2025, 11, 12);
+
+/// `2026.11.04.232659` reads as `(2026, 11, 4)` through [`semver_triple`].
+pub fn ytdlp_new_enough(version: &str) -> bool {
+    semver_triple(version).is_some_and(|v| v >= YTDLP_MIN)
 }
 
 /// Whether yt-dlp's verbose header says deno is an available JS runtime:
@@ -365,7 +412,7 @@ ff43689725104fe47ac67a2b0c0babb5375ed7e39d4fe17363a7b206cd6aa8b7  ffmpeg-master-
         assert_eq!(
             t("macos", "aarch64"),
             Assets {
-                ytdlp: "yt-dlp_macos",
+                ytdlp: "yt-dlp_macos.zip",
                 deno_triple: "aarch64-apple-darwin",
                 ffmpeg: FfmpegSource::MartinRiedl { arch: "arm64" },
             }
@@ -373,7 +420,7 @@ ff43689725104fe47ac67a2b0c0babb5375ed7e39d4fe17363a7b206cd6aa8b7  ffmpeg-master-
         assert_eq!(
             t("macos", "x86_64"),
             Assets {
-                ytdlp: "yt-dlp_macos",
+                ytdlp: "yt-dlp_macos.zip",
                 deno_triple: "x86_64-apple-darwin",
                 ffmpeg: FfmpegSource::MartinRiedl { arch: "amd64" },
             }
@@ -411,6 +458,32 @@ ff43689725104fe47ac67a2b0c0babb5375ed7e39d4fe17363a7b206cd6aa8b7  ffmpeg-master-
         assert_eq!(mac.files(ToolKind::Ffmpeg), vec!["ffmpeg", "ffprobe"]);
         assert_eq!(win.files(ToolKind::Ytdlp), vec!["yt-dlp.exe"]);
         assert_eq!(mac.files(ToolKind::Deno), vec!["deno"]);
+    }
+
+    #[test]
+    fn the_mac_ytdlp_is_a_folder_and_the_single_file_it_replaced_is_obsolete() {
+        let mac = Target { os: "macos", arch: "aarch64" };
+        let linux = Target { os: "linux", arch: "x86_64" };
+        assert_eq!(mac.files(ToolKind::Ytdlp), vec!["yt-dlp_macos/yt-dlp_macos"]);
+        assert_eq!(mac.obsolete(ToolKind::Ytdlp), vec!["yt-dlp"]);
+        assert_eq!(linux.files(ToolKind::Ytdlp), vec!["yt-dlp"]);
+        for kind in ToolKind::ALL {
+            assert!(linux.obsolete(kind).is_empty(), "{kind:?}");
+            assert!(Target { os: "windows", arch: "x86_64" }.obsolete(kind).is_empty(), "{kind:?}");
+        }
+        assert!(mac.obsolete(ToolKind::Ffmpeg).is_empty() && mac.obsolete(ToolKind::Deno).is_empty());
+    }
+
+    #[test]
+    fn a_ytdlp_without_js_runtimes_is_not_new_enough() {
+        // 2025.11.12 is the first release whose options.py has `--js-runtimes`
+        // (absent at 2025.10.22), which every MyTube run passes.
+        assert!(ytdlp_new_enough("2025.11.12"));
+        assert!(ytdlp_new_enough("2026.11.04.232659"));
+        assert!(ytdlp_new_enough("2026.01.02"));
+        assert!(!ytdlp_new_enough("2025.10.22"));
+        assert!(!ytdlp_new_enough("2024.04.09"));
+        assert!(!ytdlp_new_enough("garbage"));
     }
 
     #[test]

@@ -5310,6 +5310,14 @@ label.st-row-title { cursor: pointer; }
    narrow for both beside the title, they drop under it rather than squeeze. */
 .st-tl-updates .st-block-head { flex-wrap: wrap; }
 
+/* A yt-dlp MyTube did not install: why there is no "Check for updates". */
+.st-tl-external {
+  margin: 0 0 12px;
+  font-size: 1.25rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
 .st-tl-foot {
   display: flex;
   align-items: center;
