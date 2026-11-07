@@ -72,12 +72,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      # The Windows image checks out with autocrlf=true, which would rewrite the
-      # RSS fixtures `include_str!` embeds byte for byte.
-      - name: Keep line endings as committed
-        if: matrix.os_name == 'windows'
-        run: git config --global core.autocrlf false
-
+      # LF on Windows too, which the fixtures `include_str!` embeds byte for
+      # byte need: .gitattributes sees to it.
       - uses: actions/checkout@v7
 
       # Tauri's Debian prerequisites, minus libayatana-appindicator3-dev: the
@@ -91,16 +87,7 @@ jobs:
             libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev librsvg2-dev patchelf
 
-      - uses: oven-sh/setup-bun@v2
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Install frontend dependencies
-        run: bun install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - name: Frontend tests
         run: bun run test
@@ -174,15 +161,18 @@ jobs:
             container: ubuntu:22.04
             os_name: linux
             bundles: deb,rpm,appimage
+            smoke: bash .github/scripts/smoke-linux.sh
           - runner: windows-latest
             os_name: windows
             bundles: nsis
+            smoke: pwsh -NoProfile -NonInteractive -File .github/scripts/smoke-windows.ps1
           - runner: macos-latest      # Apple Silicon
             os_name: macos
             bundles: app,dmg
+            smoke: bash .github/scripts/smoke-macos.sh
     runs-on: ${{ matrix.runner }}
     # Bash everywhere a step names no shell. Inside the Linux container the
-    # default is `sh` -- dash, which has no `[[` -- and the smoke tests use it.
+    # default is `sh` -- dash, which has no `[[` -- and the steps below use it.
     defaults:
       run:
         shell: bash
@@ -199,12 +189,6 @@ jobs:
       # bundler sets it for linuxdeploy too; this covers anything it spawns.
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
-      # Same reason as in the test job: the RSS fixtures are embedded byte for
-      # byte.
-      - name: Keep line endings as committed
-        if: matrix.os_name == 'windows'
-        run: git config --global core.autocrlf false
-
       # Runs as root in the bare ubuntu:22.04 container, which has no sudo and
       # almost nothing else, so it comes before checkout: without git >= 2.18
       # on PATH, actions/checkout falls back to a REST download with no .git.
@@ -229,152 +213,24 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # The workspace is owned by the runner's user, not the container's root,
-      # and git refuses to read a repository owned by someone else. checkout
-      # only trusts it for its own commands.
-      - name: Trust the workspace (Linux container)
-        if: matrix.os_name == 'linux'
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - uses: oven-sh/setup-bun@v2
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      # Also trusts the workspace, which the Linux container needs.
+      - uses: ./.github/actions/setup
         with:
-          workspaces: src-tauri
-          key: release
-
-      - name: Install frontend dependencies
-        run: bun install --frozen-lockfile
+          cache-key: release
 
       # beforeBuildCommand runs `bun run build` (tsc + vite) first.
       - name: Build
         timeout-minutes: 60
         run: bun run tauri build --ci --bundles ${{ matrix.bundles }}
 
-      # ---------------------------------------------------------------- Linux
-
-      - name: Smoke test — version (Linux)
-        if: matrix.os_name == 'linux'
-        timeout-minutes: 5
-        run: |
-          out=$(src-tauri/target/release/mytube --version)
-          echo "$out"
-          [[ "$out" == "mytube $VERSION" ]] || { echo "::error::expected 'mytube $VERSION', got '$out'"; exit 1; }
-
-      - name: Smoke test — self-test (Linux)
-        if: matrix.os_name == 'linux'
-        timeout-minutes: 20
-        run: |
-          dir="$RUNNER_TEMP/tools"
-          code=0
-          src-tauri/target/release/mytube --self-test "$dir" || code=$?
-          echo "--- $dir/self-test.txt"
-          cat "$dir/self-test.txt" || echo "::error::self-test.txt was not written"
-          exit $code
-
-      - name: Smoke test — AppImage starts
-        if: matrix.os_name == 'linux'
-        timeout-minutes: 5
-        run: |
-          appimage=$(ls src-tauri/target/release/bundle/appimage/mytube_"$VERSION"_*.AppImage)
-          chmod +x "$appimage"
-          "$appimage" --appimage-extract-and-run --version
-
-      - name: Smoke test — .deb installs and runs
-        if: matrix.os_name == 'linux'
-        timeout-minutes: 10
-        run: |
-          deb=$(ls src-tauri/target/release/bundle/deb/mytube_"$VERSION"_*.deb)
-          # Root in the container already, and no sudo there to call.
-          DEBIAN_FRONTEND=noninteractive apt-get install -y "./$deb"
-          out=$(/usr/bin/mytube --version)
-          echo "$out"
-          [[ "$out" == "mytube $VERSION" ]] || { echo "::error::expected 'mytube $VERSION', got '$out'"; exit 1; }
-
-      # -------------------------------------------------------------- Windows
-      # The release exe is a GUI-subsystem program: PowerShell's `&` would not
-      # wait for it, and it has no console of its own. Start-Process -Wait gives
-      # the exit code, a redirect gives it a stdout handle (cli.rs attaches to a
-      # console only when it has none), and self-test.txt is the record anyway.
-
-      - name: Smoke test — version (Windows)
-        if: matrix.os_name == 'windows'
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $exe = Resolve-Path 'src-tauri\target\release\mytube.exe'
-          $out = Join-Path $env:RUNNER_TEMP 'version.txt'
-          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
-          # Get-Content -Raw returns $null for an empty file, and $null.Trim()
-          # throws something unreadable; the string cast keeps it a string.
-          $line = "$(Get-Content $out -Raw)".Trim()
-          Write-Output $line
-          if ($p.ExitCode -ne 0) { throw "mytube --version exited with $($p.ExitCode)" }
-          if (-not $line) { throw "mytube --version printed nothing" }
-          if ($line -ne "mytube $env:VERSION") { throw "expected 'mytube $env:VERSION', got '$line'" }
-
-      - name: Smoke test — self-test (Windows)
-        if: matrix.os_name == 'windows'
-        timeout-minutes: 20
-        shell: pwsh
-        run: |
-          $exe = Resolve-Path 'src-tauri\target\release\mytube.exe'
-          $dir = Join-Path $env:RUNNER_TEMP 'tools'
-          $out = Join-Path $env:RUNNER_TEMP 'self-test-stdout.txt'
-          # Start-Process joins ArgumentList with spaces and quotes nothing.
-          $p = Start-Process -FilePath $exe -ArgumentList '--self-test', "`"$dir`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
-          $report = Join-Path $dir 'self-test.txt'
-          Write-Output "--- $report"
-          if (Test-Path $report) { Get-Content $report } else { Write-Output "::error::self-test.txt was not written"; Get-Content $out -ErrorAction SilentlyContinue }
-          if ($p.ExitCode -ne 0) { throw "mytube --self-test exited with $($p.ExitCode)" }
-
-      - name: Smoke test — installer (Windows)
-        if: matrix.os_name == 'windows'
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          $setup = Get-ChildItem "src-tauri\target\release\bundle\nsis\mytube_$($env:VERSION)_*-setup.exe" | Select-Object -First 1
-          if (-not $setup) { throw "no NSIS installer for $env:VERSION" }
-          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
-          # installMode currentUser: Tauri's NSIS template installs to $LOCALAPPDATA\<productName>.
-          $exe = Join-Path $env:LOCALAPPDATA 'mytube\mytube.exe'
-          if (-not (Test-Path $exe)) { throw "installer did not install $exe" }
-          $out = Join-Path $env:RUNNER_TEMP 'installed-version.txt'
-          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
-          $line = "$(Get-Content $out -Raw)".Trim()
-          Write-Output $line
-          if ($p.ExitCode -ne 0) { throw "installed mytube --version exited with $($p.ExitCode)" }
-          if (-not $line) { throw "installed mytube --version printed nothing" }
-          if ($line -ne "mytube $env:VERSION") { throw "installed: expected 'mytube $env:VERSION', got '$line'" }
-
-      # ---------------------------------------------------------------- macOS
-      # Everything runs from inside the .app: that binary, not target/release's,
-      # is what a user gets.
-
-      - name: Smoke test — the .app (macOS)
-        if: matrix.os_name == 'macos'
-        timeout-minutes: 5
-        run: |
-          app=src-tauri/target/release/bundle/macos/mytube.app
-          codesign --verify --deep --strict --verbose=2 "$app"
-          out=$("$app/Contents/MacOS/mytube" --version)
-          echo "$out"
-          [[ "$out" == "mytube $VERSION" ]] || { echo "::error::expected 'mytube $VERSION', got '$out'"; exit 1; }
-          hdiutil verify src-tauri/target/release/bundle/dmg/mytube_"$VERSION"_*.dmg
-
-      - name: Smoke test — self-test (macOS)
-        if: matrix.os_name == 'macos'
-        timeout-minutes: 20
-        run: |
-          dir="$RUNNER_TEMP/tools"
-          code=0
-          src-tauri/target/release/bundle/macos/mytube.app/Contents/MacOS/mytube --self-test "$dir" || code=$?
-          echo "--- $dir/self-test.txt"
-          cat "$dir/self-test.txt" || echo "::error::self-test.txt was not written"
-          exit $code
+      # One script per OS (.github/scripts/smoke-*), because the three share
+      # no check and not even a shell: as steps they would each show as
+      # skipped on the other two legs. Each check is a log group, and a failure
+      # an annotation naming it. The longest check is the self-test's three
+      # tool downloads.
+      - name: Smoke test
+        timeout-minutes: 30
+        run: ${{ matrix.smoke }}
 
       # ------------------------------------------------------------ artifacts
 

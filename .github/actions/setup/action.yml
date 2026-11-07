@@ -1,0 +1,40 @@
+name: Set up bun and Rust
+description: >-
+  What release.yml's test and build jobs both do after checkout: bun, a stable
+  Rust with its build cache, and the frontend's dependencies. One copy, so the
+  two jobs cannot drift apart. The OS packages stay in the jobs, because the
+  build installs them in a container before checkout and the tests on the
+  runner after it.
+
+inputs:
+  cache-key:
+    description: >-
+      Added to the Rust cache's key. The build passes `release`, so its
+      release-profile target directory is cached apart from the tests' debug one.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Needed only in the build's Linux container, where the workspace belongs
+    # to the runner's user rather than the container's root and git refuses to
+    # read a repository owned by someone else (checkout trusts it for its own
+    # commands only). Harmless everywhere else, so it runs everywhere rather
+    # than showing as a skipped step on four of the six jobs.
+    - name: Trust the workspace
+      shell: bash
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - uses: oven-sh/setup-bun@v2
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: src-tauri
+        key: ${{ inputs.cache-key }}
+
+    - name: Install frontend dependencies
+      shell: bash
+      run: bun install --frozen-lockfile

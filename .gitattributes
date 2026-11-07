@@ -1,0 +1,7 @@
+# LF in every checkout, on every OS. The Rust tests embed fixtures byte for
+# byte (`include_str!` of tests/fixtures/*.xml and *.json), and Git for Windows
+# defaults to core.autocrlf=true, which would hand them CRLF: the feed and
+# listing parsers' tests then fail on Windows only. This replaces the
+# `git config core.autocrlf false` the release workflow ran before checkout,
+# and covers a Windows clone as well. Binary files are detected and left alone.
+* text=auto eol=lf
