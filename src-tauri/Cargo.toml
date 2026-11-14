@@ -1,6 +1,6 @@
 [package]
 name = "mytube"
-version = "6.2.1"
+version = "6.3.0"
 description = "A desktop YouTube subscription feed and downloader"
 authors = ["blyat-uk"]
 license = "MIT"
