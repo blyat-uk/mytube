@@ -151,7 +151,7 @@ pub async fn subscription_stats(state: State<'_, Arc<AppState>>) -> R<Vec<Channe
     db_blocking(&state, |db| db.subscription_stats()).await
 }
 
-/// The stats above the Subscriptions grid (Settings -> Appearance -> Show
+/// The stats above the Subscriptions grid (Settings -> Interface -> Show
 /// stats) for the channel pick and the search box. The clock is read here, not
 /// in `Db`, so the database layer stays testable at any moment.
 #[tauri::command]

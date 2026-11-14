@@ -1,13 +1,14 @@
 import type { ComponentType } from "react";
 import {
-  IconSectionAbout, IconSectionAppearance, IconSectionBackup, IconSectionDownloads,
-  IconSectionNewVideos, IconSectionPlayer, IconSectionSignIn, IconSectionSync, IconSectionTools,
+  IconSectionAbout, IconSectionBackup, IconSectionDownloads,
+  IconSectionInterface, IconSectionNewVideos, IconSectionPlayer, IconSectionSignIn, IconSectionSync,
+  IconSectionTools,
 } from "../Icons";
 import type { RailLine, SectionId, SettingsCtx } from "./context";
 import AboutPage, { summary as aboutSummary } from "./AboutPage";
-import AppearancePage, { summary as appearanceSummary } from "./AppearancePage";
 import BackupPage, { summary as backupSummary } from "./BackupPage";
 import DownloadsPage, { summary as downloadsSummary } from "./DownloadsPage";
+import InterfacePage, { summary as interfaceSummary } from "./InterfacePage";
 import NewVideosPage, { summary as newVideosSummary } from "./NewVideosPage";
 import PlayerPage, { summary as playerSummary } from "./PlayerPage";
 import SignInPage, { summary as signInSummary } from "./SignInPage";
@@ -35,7 +36,7 @@ export const SECTIONS: Section[] = [
   { id: "new-videos", label: "New videos", tier: "Your library", Icon: IconSectionNewVideos, Page: NewVideosPage, summary: newVideosSummary },
   { id: "sync", label: "Sync", tier: "Across computers", Icon: IconSectionSync, Page: SyncPage, summary: syncSummary },
   { id: "backup", label: "Backup & transfer", tier: "Across computers", Icon: IconSectionBackup, Page: BackupPage, summary: backupSummary },
-  { id: "appearance", label: "Appearance", tier: "Under the hood", Icon: IconSectionAppearance, Page: AppearancePage, summary: appearanceSummary },
+  { id: "interface", label: "Interface", tier: "Under the hood", Icon: IconSectionInterface, Page: InterfacePage, summary: interfaceSummary },
   { id: "tools", label: "Tools", tier: "Under the hood", Icon: IconSectionTools, Page: ToolsPage, summary: toolsSummary },
   { id: "about", label: "About", tier: "Under the hood", Icon: IconSectionAbout, Page: AboutPage, summary: aboutSummary },
 ];

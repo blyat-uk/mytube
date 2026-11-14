@@ -136,7 +136,7 @@ export interface StatsFilter {
 }
 
 /** The Subscriptions feed's stats, drawn as the waveform above the grid
- *  (Settings → Appearance → Show stats). Over `status = 'ready'` rows only. */
+ *  (Settings → Interface → Show stats). Over `status = 'ready'` rows only. */
 export interface FeedStats {
   /** Every video counted: toWatch + watched + hidden. */
   videos: number;
@@ -317,7 +317,7 @@ export interface DownloadSeries {
   fresh: number;
 }
 
-/** Settings → Appearance → Parts panel. Rust repairs anything else to `"visible"`. */
+/** Settings → Interface → Parts panel. Rust repairs anything else to `"visible"`. */
 export type PartsPanel = "visible" | "hidden";
 
 export interface Settings {
@@ -347,18 +347,23 @@ export interface Settings {
   /** Ask GitHub once a day whether a newer MyTube release exists. Off means no
    *  request at all. */
   check_app_updates: boolean;
-  /** Text size in percent, 80–200 in steps of 10 (Settings → Appearance), set
+  /** Text size in percent, 80–200 in steps of 10 (Settings → Interface), set
    *  as `--text-scale`: text only, never icons, thumbnails or spacing. It
    *  makes up for this machine's screen, which is why it is in this block. */
   text_scale: number;
   /** The stats above the Subscriptions feed and inside a series (Settings →
-   *  Appearance). Off unless switched on; machine-local like `text_scale`. */
+   *  Interface). Off unless switched on; machine-local like `text_scale`. */
   show_stats: boolean;
-  /** Settings → Appearance → Parts panel: whether a series card's part count
+  /** Settings → Interface → Parts panel: whether a series card's part count
    *  sits over its thumbnail until pointed at (`"visible"`), or stays out of
    *  the way until pointed at (`"hidden"`). Machine-local like `show_stats`;
    *  read through `format::partsPanelOf`, since an older backend sends none. */
   parts_panel: PartsPanel;
+  /** Settings → Interface → Delete the file when marked watched: marking a
+   *  downloaded video watched deletes its file without asking. Off by default;
+   *  machine-local like `show_stats`. Read `=== true`, since an older backend
+   *  sends no key. */
+  delete_when_watched: boolean;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;

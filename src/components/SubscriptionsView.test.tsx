@@ -153,7 +153,7 @@ function renderView(over: ViewProps = {}) {
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
         channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
         pickableChannels={NO_CHANNELS} onSeeChannel={onSeeChannel} showStats={false}
-        partsPanel="visible"
+        partsPanel="visible" deleteWhenWatched={false}
         {...props}
       />
     </ToastProvider>
@@ -611,6 +611,52 @@ describe("marking a downloaded video as watched", () => {
 
     await waitFor(() => expect(setWatched).toHaveBeenCalledWith("vid1", false));
     expect(screen.queryByText("Delete the downloaded file?")).toBeNull();
+  });
+
+  describe("with Delete the file when marked watched on", () => {
+    it("deletes the file without asking, once the mark has landed", async () => {
+      renderView({ deleteWhenWatched: true });
+      fireEvent.click(within(await openMenu(), "Mark as watched"));
+
+      await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
+      expect(setWatched).toHaveBeenCalledWith("vid1", true);
+      expect(setWatched.mock.invocationCallOrder[0])
+        .toBeLessThan(deleteDownload.mock.invocationCallOrder[0]);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      // Nothing asked, so something has to say it happened.
+      expect(await screen.findByText("Deleted the file for “Some video”.")).toBeTruthy();
+      await waitFor(() =>
+        expect(document.querySelector(".card")?.className).not.toContain("is-downloaded"),
+      );
+    });
+
+    it("keeps the file when the mark fails", async () => {
+      setWatched.mockImplementationOnce(() => Promise.reject("database is locked"));
+      renderView({ deleteWhenWatched: true });
+      fireEvent.click(within(await openMenu(), "Mark as watched"));
+
+      expect(await screen.findByText("database is locked")).toBeTruthy();
+      expect(deleteDownload).not.toHaveBeenCalled();
+      expect(document.querySelector(".card")?.className).toContain("is-downloaded");
+    });
+
+    it("deletes nothing when un-watching", async () => {
+      videos = [video({ watched: true })];
+      renderView({ deleteWhenWatched: true });
+      fireEvent.click(within(await openMenu(), "Mark as unwatched"));
+
+      await waitFor(() => expect(setWatched).toHaveBeenCalledWith("vid1", false));
+      expect(deleteDownload).not.toHaveBeenCalled();
+    });
+
+    it("still asks before the menu's Delete downloaded file", async () => {
+      videos = [video({ watched: true })];
+      renderView({ deleteWhenWatched: true });
+      fireEvent.click(within(await openMenu(), "Delete downloaded file"));
+
+      expect(await screen.findByText("Delete the downloaded file?")).toBeTruthy();
+      expect(deleteDownload).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -1808,7 +1854,7 @@ describe("keeping your place in the feed", () => {
 /* ---------------- the stats over the grid ---------------- */
 
 /**
- * Settings → Appearance → Show stats: the feed's waveform over the grid, an
+ * Settings → Interface → Show stats: the feed's waveform over the grid, an
  * open series' bands over its parts. Off, nothing is asked and nothing is
  * drawn; on, the feed's stats follow the pick, the search and every reload,
  * and a change made from a card asks again a beat later.

@@ -92,12 +92,15 @@ function Shell() {
   // seen at once. Another filter over groups, gone with the other two.
   const [autoDownloading, setAutoDownloading] = useState(false);
   const [cardSize, setCardSize] = useState(CARD_DEFAULT);
-  // Settings → Appearance → Show stats. Read with the rest at startup, then
+  // Settings → Interface → Show stats. Read with the rest at startup, then
   // followed through every save Settings lands -- never by reading the file
   // again on each visit to the tab.
   const [showStats, setShowStats] = useState(false);
-  // Settings → Appearance → Parts panel, read and followed the same way.
+  // Settings → Interface → Parts panel, read and followed the same way.
   const [partsPanel, setPartsPanel] = useState<PartsPanel>("visible");
+  // Settings → Interface → Delete the file when marked watched, the same way
+  // again: both tabs that can mark a video watched act on it.
+  const [deleteWhenWatched, setDeleteWhenWatched] = useState(false);
   const [sort, setSort] = useState<SortOrder>("newest");
   // The video whose series the grid is pinned to, or null for the normal feed.
   const [siblingOf, setSiblingOf] = useState<Video | null>(null);
@@ -408,6 +411,7 @@ function Shell() {
         // `=== true`: a backend older than the switch sends no key at all.
         setShowStats(s.show_stats === true);
         setPartsPanel(partsPanelOf(s));
+        setDeleteWhenWatched(s.delete_when_watched === true);
         const v = s.view;
         const restored = normalizePick({ ids: v.channel_ids, except: v.channels_except === true });
         setChannelPick(restored);
@@ -464,6 +468,7 @@ function Shell() {
   const onSettingsSaved = useCallback((s: Settings) => {
     setShowStats(s.show_stats === true);
     setPartsPanel(partsPanelOf(s));
+    setDeleteWhenWatched(s.delete_when_watched === true);
   }, []);
 
   // The feed's scroll container, handed to SubscriptionsView so leaving a series
@@ -584,6 +589,7 @@ function Shell() {
             onSeeChannel={seeChannel}
             showStats={showStats}
             partsPanel={partsPanel}
+            deleteWhenWatched={deleteWhenWatched}
           />
         )}
         {tab === "downloads" && (
@@ -593,6 +599,7 @@ function Shell() {
             scrollRef={contentRef}
             search={downloadSearch}
             onOpenSeries={openFromDownloads}
+            deleteWhenWatched={deleteWhenWatched}
           />
         )}
         {tab === "settings" && <SettingsView onSaved={onSettingsSaved} />}

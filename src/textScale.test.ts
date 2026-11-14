@@ -90,7 +90,7 @@ describe("bootTextScale", () => {
     await vi.waitFor(() => expect(scale()).toBe("1.2"));
   });
 
-  it("leaves alone a size picked on the Appearance page before a late read lands", async () => {
+  it("leaves alone a size picked on the Interface page before a late read lands", async () => {
     vi.useFakeTimers();
     let answer: (s: { text_scale: number }) => void = () => {};
     const done = bootTextScale(() => new Promise((r) => { answer = r; }));

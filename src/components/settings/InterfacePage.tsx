@@ -1,17 +1,19 @@
 import { useEffect, useId, useRef, type CSSProperties, type KeyboardEvent } from "react";
-import { IconSectionAppearance } from "../Icons";
+import { IconSectionInterface } from "../Icons";
 import { TEXT_SCALE, applyTextScale, normalizeTextScale } from "../../textScale";
 import { partsPanelOf } from "../../format";
 import type { PartsPanel } from "../../types";
 import { useSettingsCtx, type RailLine, type SettingsCtx } from "./context";
 import { Block, Cap, OptRow, Segmented, SettingsPage, Switch, type SegOption } from "./parts";
 
-/** "Text size 125%", then "· stats on" and "· panel hidden" while they are --
- *  only what is off its default, so the line stays short. */
+/** "Text size 125%", then "· stats on", "· panel hidden" and "· deletes when
+ *  watched" while they are -- only what is off its default, so the line stays
+ *  short. */
 export function summary({ settings: s }: SettingsCtx): RailLine {
   const parts = [`Text size ${normalizeTextScale(s.text_scale)}%`];
   if (s.show_stats) parts.push("stats on");
   if (partsPanelOf(s) === "hidden") parts.push("panel hidden");
+  if (s.delete_when_watched === true) parts.push("deletes when watched");
   return { text: parts.join(" · ") };
 }
 
@@ -111,11 +113,12 @@ function ScaleSlider({ value, labelledBy, describedBy, onInput, onRelease }: {
  * the pointer.
  *
  * Then whether the feed shows its stats, and whether a series card's parts
- * panel covers its picture until pointed at or the other way round: picks,
- * saved at once, which the shell hears through the doc's `onSaved` -- this
- * view is gone by the time Subscriptions is back on screen.
+ * panel covers its picture until pointed at or the other way round, and
+ * whether marking a downloaded video watched deletes its file without asking:
+ * picks, saved at once, which the shell hears through the doc's `onSaved` --
+ * this view is gone by the time Subscriptions is back on screen.
  */
-export default function AppearancePage() {
+export default function InterfacePage() {
   const { settings: s, set, save, flush } = useSettingsCtx();
   const capId = useId();
   const hintId = useId();
@@ -136,9 +139,9 @@ export default function AppearancePage() {
 
   return (
     <SettingsPage
-      icon={<IconSectionAppearance />}
-      title="Appearance"
-      intro="How MyTube looks on this screen. These settings stay on this computer: an export carries none of them."
+      icon={<IconSectionInterface />}
+      title="Interface"
+      intro="How MyTube looks and behaves."
     >
       <Block>
         <Cap id={capId}>Text size</Cap>
@@ -196,6 +199,16 @@ export default function AppearancePage() {
             onChange={(v) => save("parts_panel", v)}
           />
         </OptRow>
+      </Block>
+
+      <Block>
+        <Switch
+          label="Delete the file when marked watched"
+          hint="Marking a downloaded video as watched removes its file at once, without asking. The video stays in your feed."
+          // `=== true`: a backend older than the switch sends no key at all.
+          checked={s.delete_when_watched === true}
+          onChange={(on) => save("delete_when_watched", on)}
+        />
       </Block>
     </SettingsPage>
   );

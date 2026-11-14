@@ -168,11 +168,14 @@ interface Props {
   /** Narrows the feed to one channel, with the search cleared and any open
    *  series left. */
   onSeeChannel: (channelId: string) => void;
-  /** Settings → Appearance → Show stats: the waveform over the feed, the
+  /** Settings → Interface → Show stats: the waveform over the feed, the
    *  bands over an open series. Off, the view is exactly what it was without. */
   showStats: boolean;
-  /** Settings → Appearance → Parts panel, for the series cards in the grid. */
+  /** Settings → Interface → Parts panel, for the series cards in the grid. */
   partsPanel: PartsPanel;
+  /** Settings → Interface → Delete the file when marked watched: watching a
+   *  downloaded video deletes its file instead of asking about it. */
+  deleteWhenWatched: boolean;
 }
 
 export default function SubscriptionsView(p: Props) {
@@ -191,7 +194,7 @@ export default function SubscriptionsView(p: Props) {
 
   const {
     channelIds, channelsExcept, search, hideWatched, downloadedOnly, showHidden, sort, reloadToken,
-    siblingOf, onSeriesTally, scrollRef, minLength,
+    siblingOf, onSeriesTally, scrollRef, minLength, deleteWhenWatched,
   } = p;
   // A series view is a flat list of parts on purpose, so grouping stands down
   // while one is open rather than collapsing the very series being shown.
@@ -451,15 +454,19 @@ export default function SubscriptionsView(p: Props) {
     }
   }, [patch, progress, run]);
 
-  /** Mirrors what the backend writes when it clears a download. */
-  const deleteFile = useCallback((video: Video) => {
-    void run(video.id, () => api.deleteDownload(video.id), {
+  /** Mirrors what the backend writes when it clears a download. `announce`
+   *  is for a delete nobody was asked about, which has to say it happened. */
+  const deleteFile = useCallback((video: Video, announce = false) => {
+    void run(video.id, async () => {
+      await api.deleteDownload(video.id);
+      if (announce) toast.success(`Deleted the file for “${video.title}”.`);
+    }, {
       optimistic: () => {
         patch(video.id, NO_FILE);
         return () => patch(video.id, fileOf(video));
       },
     });
-  }, [patch, run]);
+  }, [patch, run, toast]);
 
   /**
    * Removes a video from view without waiting for a refetch, taking its card
@@ -528,11 +535,14 @@ export default function SubscriptionsView(p: Props) {
       // except in a series, which shows every part whatever the filters say.
       if (next && hideWatched && !siblingOf) drop(video.id);
       // Watching something is usually the end of its life on disk — but that is
-      // the user's call, and it is a separate step from marking it watched.
+      // the user's call, and it is a separate step from marking it watched:
+      // asked here, or answered once for good in Settings. Either way only
+      // after the mark has landed, so a mark that fails never costs the file.
       // The dialog gets the video as it now is: its copy reads `watched`, and
       // the argument is the row from before the click.
       if (next && hasDownloadedFile(video)) {
-        setConfirm({ kind: "file", video: { ...video, ...watched } });
+        if (deleteWhenWatched) deleteFile(video, true);
+        else setConfirm({ kind: "file", video: { ...video, ...watched } });
       }
     }, {
       optimistic: () => {
@@ -540,7 +550,7 @@ export default function SubscriptionsView(p: Props) {
         return () => patch(video.id, { watched: video.watched, watched_at: video.watched_at });
       },
     });
-  }, [patch, drop, hideWatched, siblingOf, run, bump]);
+  }, [patch, drop, hideWatched, siblingOf, run, bump, deleteWhenWatched, deleteFile]);
 
   const unhideVideo = useCallback((video: Video) => {
     void run(video.id, async () => {

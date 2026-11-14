@@ -57,9 +57,13 @@ interface Props {
   search: string;
   /** Opens the series a download belongs to on Subscriptions, led by it. */
   onOpenSeries: (video: Video, stem: string | null) => void;
+  /** Settings → Interface → Delete the file when marked watched. */
+  deleteWhenWatched: boolean;
 }
 
-export default function DownloadsView({ reloadToken, cardSize, scrollRef, search, onOpenSeries }: Props) {
+export default function DownloadsView({
+  reloadToken, cardSize, scrollRef, search, onOpenSeries, deleteWhenWatched,
+}: Props) {
   const toast = useToast();
   const [items, setItems] = useState<Video[]>([]);
   // Each active row reads its own entry, so a tick renders one row, not the tab.
@@ -251,15 +255,19 @@ export default function DownloadsView({ reloadToken, cardSize, scrollRef, search
     await api.deleteDownload(v.id);
     toast.success(`Deleted the file for “${v.title}”.`);
   }, { optimistic: () => takeOff(v) });
-  /** The Subscriptions menu's rule: watching a video asks about its file, and
-   *  un-watching one asks nothing. Its own key, so it never locks the row's
-   *  other buttons, but two toggles cannot be out at once and land out of order. */
+  /** The Subscriptions menu's rule: watching a video asks about its file, or
+   *  deletes it unasked when Settings says to, and un-watching one does
+   *  neither. Its own key, so it never locks the row's other buttons, but two
+   *  toggles cannot be out at once and land out of order. */
   const toggleWatched = (v: Video) => {
     const next = !v.watched;
     const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
     return run(`watched:${v.id}`, async () => {
       await api.setWatched(v.id, next);
-      if (next && hasDownloadedFile(v)) setConfirmFile({ ...v, ...watched });
+      if (next && hasDownloadedFile(v)) {
+        if (deleteWhenWatched) void remove({ ...v, ...watched });
+        else setConfirmFile({ ...v, ...watched });
+      }
     }, {
       optimistic: () => {
         put(v.id, watched);

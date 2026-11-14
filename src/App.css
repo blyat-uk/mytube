@@ -41,7 +41,7 @@
   --resume-text: #ecd6a6;
   --resume-text-dim: #bba77c;
 
-  /* The stats (Settings > Appearance > Show stats) draw a video's state the way
+  /* The stats (Settings > Interface > Show stats) draw a video's state the way
      YouTube draws the bar under a thumbnail: red watched, green on disk, a
      quiet grey for what is left, and hatching for what you hid. */
   --stat-watched: var(--brand);
@@ -74,7 +74,7 @@
     "Noto Sans", "Liberation Sans", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
-  /* Settings > Appearance's text size, set on <html> by the page: 1 is 100%. */
+  /* Settings > Interface's text size, set on <html> by the page: 1 is 100%. */
   --text-scale: 1;
 
   color-scheme: dark;
@@ -1444,7 +1444,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
    pointer leaves the thumbnail. Keyboard focus never hides it: it is the count.
    .card-thumb's overflow clips it on the way out, and the global reduced-motion
    block below already cuts the transition to nothing. That is Settings ->
-   Appearance -> Parts panel: Visible, the default. */
+   Interface -> Parts panel: Visible, the default. */
 .video-grid:not(.is-parts-panel-hidden) .series-card .card-thumb:hover .series-count:not(:hover) {
   transform: translateX(101%);
 }
@@ -5352,7 +5352,7 @@ label.st-row-title { cursor: pointer; }
   .st-tl-bar.is-indeterminate .st-tl-fill { animation: none; }
 }
 
-/* --- Appearance --------------------------------------------------------------- */
+/* --- Interface ---------------------------------------------------------------- */
 
 /* Text in rem like the rest, so this page's own words follow its slider; the
    button's box and the slider stay px. The slider itself is New videos' drawn

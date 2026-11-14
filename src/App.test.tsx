@@ -42,6 +42,8 @@ const appVersionInfo = vi.fn<() => Promise<VersionInfo>>(() => Promise.resolve(V
 const syncNudge = vi.fn<() => Promise<void>>(() => Promise.resolve());
 const feedStats = vi.fn<(f: StatsFilter) => Promise<FeedStats>>(() => Promise.resolve(STATS));
 const downloadSeries = vi.fn<(ids: string[]) => Promise<DownloadSeries[]>>(() => Promise.resolve([]));
+const setWatched = vi.fn<(id: string, watched: boolean) => Promise<void>>(() => Promise.resolve());
+const deleteDownload = vi.fn<(id: string) => Promise<void>>(() => Promise.resolve());
 // Kept, as the backend keeps it: a second visit to Settings reads back what
 // the first one saved.
 const saveSettings = vi.fn((s: Settings) => {
@@ -74,6 +76,8 @@ vi.mock("./api", () => {
       subscriptionStats: () => Promise.resolve([]),
       feedStats: (f: StatsFilter) => feedStats(f),
       downloadSeries: (ids: string[]) => downloadSeries(ids),
+      setWatched: (id: string, watched: boolean) => setWatched(id, watched),
+      deleteDownload: (id: string) => deleteDownload(id),
       saveSettings: (s: Settings) => saveSettings(s),
       syncStatus: unanswered,
       detectBrowsers: unanswered,
@@ -112,6 +116,7 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
     window_maximized: false,
     cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
     check_app_updates: true, text_scale: 100, show_stats: false, parts_panel: "visible",
+    delete_when_watched: false,
     ytdlp_path: "", ffmpeg_path: "", deno_path: "",
     quality: { ...DEFAULT_QUALITY },
     view: defaultView(view),
@@ -1015,11 +1020,11 @@ describe("cloud sync", () => {
  * through the saves Settings reports, never through a fresh read.
  */
 describe("the feed's stats", () => {
-  /** Settings, opened at Appearance, and its Show stats switch. */
+  /** Settings, opened at Interface, and its Show stats switch. */
   async function statsSwitch() {
     fireEvent.click(button("Settings"));
     const rail = await screen.findByRole("navigation", { name: "Settings sections" });
-    fireEvent.click(within(rail).getByRole("button", { name: "Appearance" }));
+    fireEvent.click(within(rail).getByRole("button", { name: "Interface" }));
     return await screen.findByRole("switch", { name: "Show stats" }) as HTMLInputElement;
   }
 
@@ -1100,7 +1105,7 @@ describe("the series cards' parts panel", () => {
 
     fireEvent.click(button("Settings"));
     const rail = await screen.findByRole("navigation", { name: "Settings sections" });
-    fireEvent.click(within(rail).getByRole("button", { name: "Appearance" }));
+    fireEvent.click(within(rail).getByRole("button", { name: "Interface" }));
     const panel = await screen.findByRole("radiogroup", { name: "Parts panel" });
     fireEvent.click(within(panel).getByRole("radio", { name: "Hidden" }));
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
@@ -1109,5 +1114,70 @@ describe("the series cards' parts panel", () => {
     fireEvent.click(button("Subscriptions"));
     await screen.findByRole("article");
     expect(grid().classList.contains("is-parts-panel-hidden")).toBe(true);
+  });
+});
+
+/**
+ * Settings → Interface → Delete the file when marked watched reaches both tabs
+ * that can mark a video watched, the way Show stats reaches the feed: read once
+ * at launch, then followed through the saves Settings reports.
+ */
+describe("deleting a file when it is marked watched", () => {
+  const downloaded = (): Video => ({ ...feedVideo(), download_state: "done", file_path: "/videos/some.mkv" });
+  /** The card's Mark as watched, found but not pressed: pressing it is left to
+   *  the test, so the press and the wait after it share one tick and the mark's
+   *  answer lands inside that wait rather than between the two. */
+  const markWatchedItem = async () => {
+    fireEvent.contextMenu(await screen.findByRole("article"));
+    return within(screen.getByRole("menu")).getAllByRole("menuitem")
+      .find((n) => n.textContent === "Mark as watched")!;
+  };
+  /** Lets the mark's own call finish, which clears its pending key. */
+  const settle = () => act(async () => {});
+
+  it("asks first by default", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([downloaded()]));
+    render(<App />);
+    fireEvent.click(await markWatchedItem());
+
+    expect(await screen.findByRole("dialog", { name: "Delete the downloaded file?" })).toBeTruthy();
+    expect(deleteDownload).not.toHaveBeenCalled();
+    await settle();
+  });
+
+  it("deletes without asking from launch when the setting says so, on either tab", async () => {
+    settings = { ...settingsWith(), delete_when_watched: true };
+    listVideos.mockImplementation(() => Promise.resolve([downloaded()]));
+    render(<App />);
+    fireEvent.click(await markWatchedItem());
+
+    await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    deleteDownload.mockClear();
+    fireEvent.click(button("Downloads"));
+    fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+    await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await settle();
+  });
+
+  it("follows the switch from Settings back to the feed, without a restart", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([downloaded()]));
+    render(<App />);
+    await screen.findByRole("article");
+
+    fireEvent.click(button("Settings"));
+    const rail = await screen.findByRole("navigation", { name: "Settings sections" });
+    fireEvent.click(within(rail).getByRole("button", { name: "Interface" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Delete the file when marked watched" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings.mock.calls[0][0]).toMatchObject({ delete_when_watched: true });
+
+    fireEvent.click(button("Subscriptions"));
+    fireEvent.click(await markWatchedItem());
+    await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await settle();
   });
 });

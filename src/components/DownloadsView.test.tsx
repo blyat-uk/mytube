@@ -70,13 +70,13 @@ afterEach(cleanup);
 /** Stands in for the shell's `.content`, the area a popped-out thumbnail must stay inside. */
 let scrollArea: HTMLElement;
 
-function renderView(cardSize = 260, search = "", onOpenSeries = vi.fn()) {
+function renderView(cardSize = 260, search = "", onOpenSeries = vi.fn(), deleteWhenWatched = false) {
   scrollArea = document.createElement("main");
   const tree = (q: string) => (
     <ToastProvider>
       <DownloadsView
         reloadToken={0} cardSize={cardSize} scrollRef={{ current: scrollArea }}
-        search={q} onOpenSeries={onOpenSeries}
+        search={q} onOpenSeries={onOpenSeries} deleteWhenWatched={deleteWhenWatched}
       />
     </ToastProvider>
   );
@@ -236,6 +236,47 @@ describe("Downloads row actions", () => {
     expect(await screen.findByText("database is locked")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Mark as watched" })).toBeTruthy();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  describe("with Delete the file when marked watched on", () => {
+    const withSwitchOn = () => renderView(260, "", vi.fn(), true);
+
+    it("deletes the file without asking, once the mark has landed", async () => {
+      videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+      withSwitchOn();
+
+      fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+
+      await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("a"));
+      expect(setWatched).toHaveBeenCalledWith("a", true);
+      expect(setWatched.mock.invocationCallOrder[0])
+        .toBeLessThan(deleteDownload.mock.invocationCallOrder[0]);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(await screen.findByText("Deleted the file for “Finished”.")).toBeTruthy();
+      await waitFor(() => expect(screen.queryByText("Finished")).toBeNull());
+    });
+
+    it("keeps the file when the mark fails", async () => {
+      setWatched.mockImplementation(() => Promise.reject("database is locked"));
+      videos = [video({ id: "a", title: "Finished", download_state: "done" })];
+      withSwitchOn();
+
+      fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+
+      expect(await screen.findByText("database is locked")).toBeTruthy();
+      expect(deleteDownload).not.toHaveBeenCalled();
+      expect(screen.getByText("Finished")).toBeTruthy();
+    });
+
+    it("deletes nothing when un-watching", async () => {
+      videos = [video({ id: "a", title: "Seen", download_state: "done", watched: true, watched_at: 5 })];
+      withSwitchOn();
+
+      fireEvent.click(await screen.findByRole("button", { name: "Mark as unwatched" }));
+
+      await waitFor(() => expect(setWatched).toHaveBeenCalledWith("a", false));
+      expect(deleteDownload).not.toHaveBeenCalled();
+    });
   });
 });
 

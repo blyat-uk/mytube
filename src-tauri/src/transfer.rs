@@ -1162,6 +1162,7 @@ mod tests {
         s.text_scale = 150;
         s.show_stats = true;
         s.parts_panel = "hidden".into();
+        s.delete_when_watched = true;
         s.view.search = "should not travel".into();
 
         let zipped = tmp.path().join("a.zip");
@@ -1185,7 +1186,7 @@ mod tests {
         let raw = serde_json::to_string(&m.settings).unwrap();
         for absent in [
             "window_width", "window_height", "window_x", "window_y", "view", "text_scale", "show_stats",
-            "parts_panel",
+            "parts_panel", "delete_when_watched",
         ] {
             assert!(!raw.contains(absent), "{absent} travelled in the settings block");
         }
@@ -1252,6 +1253,7 @@ mod tests {
         assert_eq!(after.text_scale, 100, "the archive's text size was adopted");
         assert!(!after.show_stats, "the archive's stats switch was adopted");
         assert_eq!(after.parts_panel, "visible", "the archive's parts panel was adopted");
+        assert!(!after.delete_when_watched, "the archive's delete-when-watched switch was adopted");
         assert_eq!(after.view.search, "", "the archive's feed filters were adopted");
     }
 

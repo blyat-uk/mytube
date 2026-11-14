@@ -25,7 +25,7 @@ describe("the rail", () => {
     const names = within(nav).getAllByRole("button").map((b) => b.getAttribute("aria-label"));
     expect(names).toEqual([
       "Downloads", "YouTube sign-in", "Player", "New videos", "Sync", "Backup & transfer",
-      "Appearance", "Tools", "About",
+      "Interface", "Tools", "About",
     ]);
     expect(nav.textContent).toMatch(/Essentials.*Your library.*Across computers.*Under the hood/);
   });

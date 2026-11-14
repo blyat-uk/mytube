@@ -6,7 +6,7 @@ import type {
 } from "../../types";
 
 export type SectionId =
-  | "downloads" | "signin" | "player" | "new-videos" | "sync" | "backup" | "appearance" | "tools"
+  | "downloads" | "signin" | "player" | "new-videos" | "sync" | "backup" | "interface" | "tools"
   | "about";
 
 /**

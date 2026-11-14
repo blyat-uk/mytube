@@ -1,5 +1,5 @@
 /*
- * Settings → Appearance's text size. A percentage of the stylesheet's own
+ * Settings → Interface's text size. A percentage of the stylesheet's own
  * sizes, handed to CSS as the unitless `--text-scale` on the root element:
  * App.css sets `html { font-size: calc(10px * var(--text-scale, 1)) }` and
  * sizes every piece of text in rem, so this one property moves all the text
@@ -43,7 +43,7 @@ export const BOOT_WAIT_MS = 1000;
  * renders: if the backend is wedged, App.tsx's own settings read (which the
  * shell already waits on) decides what the window shows, not a promise in here.
  * A read that lands after the wait still applies, unless something -- the
- * Appearance page's slider -- has set a size since: that one is newer.
+ * Interface page's slider -- has set a size since: that one is newer.
  */
 export function bootTextScale(
   read: () => Promise<{ text_scale: number }>,

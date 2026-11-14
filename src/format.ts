@@ -313,7 +313,7 @@ export function cardZoom(px: number): number {
   return (clampCardSize(px) - CARD_MIN) / (CARD_MAX - CARD_MIN);
 }
 
-/** Settings → Appearance → Parts panel, read off whatever the backend sent:
+/** Settings → Interface → Parts panel, read off whatever the backend sent:
  *  anything but `"hidden"` -- a backend older than the setting sends no key at
  *  all -- is the default, the panel on show. */
 export function partsPanelOf(s: { parts_panel?: unknown }): PartsPanel {

@@ -447,7 +447,7 @@ pub struct Settings {
     pub sync_server: String,
     #[serde(default = "d_card_size")]
     pub card_size: u32,
-    /// Settings -> Appearance's text size, in percent, 80 to 200 in steps of
+    /// Settings -> Interface's text size, in percent, 80 to 200 in steps of
     /// 10. The frontend turns it into `--text-scale`, which scales text only:
     /// icons, thumbnails and spacing stay as they are. Machine-local, like the
     /// window geometry: it makes up for one screen's size and distance, so a
@@ -455,14 +455,14 @@ pub struct Settings {
     /// `adopt_portable` leaves it be.
     #[serde(default = "d_text_scale")]
     pub text_scale: u32,
-    /// Settings -> Appearance's Show stats: the waveform above the
+    /// Settings -> Interface's Show stats: the waveform above the
     /// Subscriptions grid and the bands above a series. Off by default.
     /// Machine-local like `text_scale`: whether there is room for it is this
     /// screen's question, so a named field that never rides `extra` into an
     /// export, and `adopt_portable` leaves it be.
     #[serde(default)]
     pub show_stats: bool,
-    /// Settings -> Appearance's Parts panel: `visible` (the default) lays a
+    /// Settings -> Interface's Parts panel: `visible` (the default) lays a
     /// series card's part count over its thumbnail and slides it away while the
     /// pointer is on the picture; `hidden` is the reverse, the picture whole
     /// until pointed at. Anything else is repaired to `visible` on load.
@@ -471,6 +471,16 @@ pub struct Settings {
     /// leaves it be.
     #[serde(default = "d_parts_panel")]
     pub parts_panel: String,
+    /// Settings -> Interface's Delete the file when marked watched: marking a
+    /// downloaded video watched deletes its file at once instead of asking.
+    /// Off by default, since it removes files without a word. Only the click
+    /// does it -- the frontend reads this; a watched mark arriving by sync or
+    /// import deletes nothing. Machine-local like its neighbours on that page:
+    /// a backup restored onto another computer must not start deleting files
+    /// there unasked, so a named field that never rides `extra` into an export,
+    /// and `adopt_portable` leaves it be.
+    #[serde(default)]
+    pub delete_when_watched: bool,
     #[serde(default = "d_window_width")]
     pub window_width: u32,
     #[serde(default = "d_window_height")]
@@ -557,7 +567,8 @@ impl Settings {
     }
 
     /// Takes the portable half of `incoming`, keeping this machine's window
-    /// geometry, text size, stats switch, parts panel and feed filters. The mirror of
+    /// geometry, text size, stats switch, parts panel, delete-when-watched
+    /// switch and feed filters. The mirror of
     /// `keep_view_of`.
     ///
     /// The split is between settings that describe *the library* — where
@@ -1304,7 +1315,31 @@ mod tests {
     }
 
     #[test]
-    fn appearance_picks_saved_from_the_settings_page_are_what_gets_written() {
+    fn delete_when_watched_defaults_off_and_round_trips_as_a_named_key() {
+        assert!(!Settings::default().delete_when_watched);
+        let s = Settings::from_json_str(r#"{"delete_when_watched":true}"#).unwrap();
+        assert!(s.delete_when_watched);
+        assert!(s.extra.is_empty(), "{:?}", s.extra);
+        let written = s.to_json_string().unwrap();
+        assert!(written.contains(r#""delete_when_watched": true"#), "{written}");
+        assert!(Settings::from_json_str(&written).unwrap().delete_when_watched);
+    }
+
+    #[test]
+    fn adopt_portable_leaves_delete_when_watched_alone() {
+        let mut local = Settings::default();
+        let mut incoming = an_incoming_file();
+        incoming.delete_when_watched = true;
+        local.adopt_portable_with(&incoming, |_| true);
+        assert!(!local.delete_when_watched, "another machine started this one deleting files");
+        local.delete_when_watched = true;
+        incoming.delete_when_watched = false;
+        local.adopt_portable_with(&incoming, |_| true);
+        assert!(local.delete_when_watched, "another machine switched this one's deleting off");
+    }
+
+    #[test]
+    fn interface_picks_saved_from_the_settings_page_are_what_gets_written() {
         // `save_settings` defers to the file for the blocks the page holds a
         // stale copy of; these picks are the page's own, so they must not be.
         let disk = Settings::default();

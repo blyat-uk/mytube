@@ -23,7 +23,7 @@ interface Props {
   hasMore: boolean;
   cardSize: number;
   onCardSize: (px: number) => void;
-  /** Settings → Appearance → Parts panel. A class on the grid, all CSS, so no
+  /** Settings → Interface → Parts panel. A class on the grid, all CSS, so no
    *  series card re-renders when it changes. Visible unless given. */
   partsPanel?: PartsPanel;
   onLoadMore: () => void;

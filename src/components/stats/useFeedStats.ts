@@ -8,7 +8,7 @@ import type { FeedStats } from "../../types";
 export const BUMP_DELAY = 600;
 
 export interface FeedStatsOptions {
-  /** Settings → Appearance → Show stats. Off asks for nothing and holds
+  /** Settings → Interface → Show stats. Off asks for nothing and holds
    *  nothing: the stats are null. */
   enabled: boolean;
   /**

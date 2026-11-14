@@ -29,6 +29,7 @@ export const SETTINGS: Settings = {
   window_maximized: false,
   cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
   check_app_updates: true, text_scale: 100, show_stats: false, parts_panel: "visible",
+  delete_when_watched: false,
   ytdlp_path: "", ffmpeg_path: "", deno_path: "",
   quality: { ...DEFAULT_QUALITY },
   view: {
