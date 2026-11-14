@@ -472,6 +472,12 @@ describe("searching downloads", () => {
     videos = [video({ id: "a", title: "Episode 4" })];
     const view = renderView();
     await screen.findByText("Episode 4");
+    // Let the series lookup answer first. On a slow runner (the v6.3.0 Windows
+    // job) the wait above can settle before React runs the effect that asks;
+    // the search's re-render then starts it, and its answer landed after the
+    // test, outside act. Reproduced every time by making each zero-delay timer
+    // already due by the next loop turn; across the suite only this test broke.
+    await waitFor(() => expect(downloadSeries).toHaveBeenCalled());
     view.search("zzz");
     expect(screen.getByText("No download matches “zzz”")).toBeDefined();
   });
