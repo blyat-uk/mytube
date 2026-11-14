@@ -1,14 +1,24 @@
 import { useEffect, useId, useRef, type CSSProperties, type KeyboardEvent } from "react";
 import { IconSectionAppearance } from "../Icons";
 import { TEXT_SCALE, applyTextScale, normalizeTextScale } from "../../textScale";
+import { partsPanelOf } from "../../format";
+import type { PartsPanel } from "../../types";
 import { useSettingsCtx, type RailLine, type SettingsCtx } from "./context";
-import { Block, Cap, SettingsPage, Switch } from "./parts";
+import { Block, Cap, OptRow, Segmented, SettingsPage, Switch, type SegOption } from "./parts";
 
-/** "Text size 125%", and "· stats on" while they are. */
+/** "Text size 125%", then "· stats on" and "· panel hidden" while they are --
+ *  only what is off its default, so the line stays short. */
 export function summary({ settings: s }: SettingsCtx): RailLine {
-  const size = `Text size ${normalizeTextScale(s.text_scale)}%`;
-  return { text: s.show_stats ? `${size} · stats on` : size };
+  const parts = [`Text size ${normalizeTextScale(s.text_scale)}%`];
+  if (s.show_stats) parts.push("stats on");
+  if (partsPanelOf(s) === "hidden") parts.push("panel hidden");
+  return { text: parts.join(" · ") };
 }
+
+const PANEL_OPTIONS: SegOption<PartsPanel>[] = [
+  { value: "visible", label: "Visible" },
+  { value: "hidden", label: "Hidden" },
+];
 
 /**
  * What a key does to the size, or null for a key it ignores. Handled here
@@ -100,14 +110,16 @@ function ScaleSlider({ value, labelledBy, describedBy, onInput, onRelease }: {
  * itself, so text growing around it can push it down but never sideways under
  * the pointer.
  *
- * Then whether the feed shows its stats: a pick, saved at once, which the
- * shell hears through the doc's `onSaved` -- this view is gone by the time
- * Subscriptions is back on screen.
+ * Then whether the feed shows its stats, and whether a series card's parts
+ * panel covers its picture until pointed at or the other way round: picks,
+ * saved at once, which the shell hears through the doc's `onSaved` -- this
+ * view is gone by the time Subscriptions is back on screen.
  */
 export default function AppearancePage() {
   const { settings: s, set, save, flush } = useSettingsCtx();
   const capId = useId();
   const hintId = useId();
+  const panelHintId = useId();
   const value = normalizeTextScale(s.text_scale);
 
   // Held, not saved, until the gesture ends: settings.json is written once per
@@ -126,7 +138,7 @@ export default function AppearancePage() {
     <SettingsPage
       icon={<IconSectionAppearance />}
       title="Appearance"
-      intro="How MyTube looks on this screen. Both settings stay on this computer: an export carries neither."
+      intro="How MyTube looks on this screen. These settings stay on this computer: an export carries none of them."
     >
       <Block>
         <Cap id={capId}>Text size</Cap>
@@ -168,6 +180,22 @@ export default function AppearancePage() {
           checked={s.show_stats === true}
           onChange={(on) => save("show_stats", on)}
         />
+      </Block>
+
+      <Block>
+        <OptRow
+          title="Parts panel"
+          hint="The part count over a series card's picture. Visible: it slides away while you point at the picture. Hidden: the picture shows whole, and the count slides in while you point at it."
+          hintId={panelHintId}
+        >
+          <Segmented
+            label="Parts panel"
+            describedBy={panelHintId}
+            options={PANEL_OPTIONS}
+            value={partsPanelOf(s)}
+            onChange={(v) => save("parts_panel", v)}
+          />
+        </OptRow>
       </Block>
     </SettingsPage>
   );

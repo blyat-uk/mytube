@@ -111,7 +111,7 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
     window_width: 1280, window_height: 840, window_x: null, window_y: null,
     window_maximized: false,
     cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
-    check_app_updates: true, text_scale: 100, show_stats: false,
+    check_app_updates: true, text_scale: 100, show_stats: false, parts_panel: "visible",
     ytdlp_path: "", ffmpeg_path: "", deno_path: "",
     quality: { ...DEFAULT_QUALITY },
     view: defaultView(view),
@@ -1067,5 +1067,47 @@ describe("the feed's stats", () => {
     await pause(50);
     expect(screen.queryByTestId("waveform")).toBeNull();
     expect(feedStats).toHaveBeenCalledTimes(asked);
+  });
+});
+
+/**
+ * Parts panel is picked in Settings like Show stats, and reaches the feed the
+ * same way: read once at launch, then followed through the saves Settings
+ * reports. All of it is one class on the grid; the CSS does the rest.
+ */
+describe("the series cards' parts panel", () => {
+  const grid = () => document.querySelector(".video-grid")!;
+
+  it("is on show from launch by default", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    await screen.findByRole("article");
+    expect(grid().classList.contains("is-parts-panel-hidden")).toBe(false);
+  });
+
+  it("is hidden from launch when the setting says so", async () => {
+    settings = { ...settingsWith(), parts_panel: "hidden" };
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    await screen.findByRole("article");
+    expect(grid().classList.contains("is-parts-panel-hidden")).toBe(true);
+  });
+
+  it("follows the pick from Settings back to the feed, without a restart", async () => {
+    listVideos.mockImplementation(() => Promise.resolve([feedVideo()]));
+    render(<App />);
+    await screen.findByRole("article");
+
+    fireEvent.click(button("Settings"));
+    const rail = await screen.findByRole("navigation", { name: "Settings sections" });
+    fireEvent.click(within(rail).getByRole("button", { name: "Appearance" }));
+    const panel = await screen.findByRole("radiogroup", { name: "Parts panel" });
+    fireEvent.click(within(panel).getByRole("radio", { name: "Hidden" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings.mock.calls[0][0]).toMatchObject({ parts_panel: "hidden" });
+
+    fireEvent.click(button("Subscriptions"));
+    await screen.findByRole("article");
+    expect(grid().classList.contains("is-parts-panel-hidden")).toBe(true);
   });
 });

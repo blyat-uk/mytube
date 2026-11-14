@@ -1,4 +1,4 @@
-import type { Video } from "./types";
+import type { PartsPanel, Video } from "./types";
 
 export function formatDuration(secs: number | null): string {
   if (!secs || secs <= 0) return "";
@@ -311,6 +311,13 @@ export function clampCardSize(px: number): number {
  *  series panel) needs this number, not `--card-w`. */
 export function cardZoom(px: number): number {
   return (clampCardSize(px) - CARD_MIN) / (CARD_MAX - CARD_MIN);
+}
+
+/** Settings → Appearance → Parts panel, read off whatever the backend sent:
+ *  anything but `"hidden"` -- a backend older than the setting sends no key at
+ *  all -- is the default, the panel on show. */
+export function partsPanelOf(s: { parts_panel?: unknown }): PartsPanel {
+  return s.parts_panel === "hidden" ? "hidden" : "visible";
 }
 
 /** `deltaY` follows wheel convention: negative scrolls up, which zooms in. */

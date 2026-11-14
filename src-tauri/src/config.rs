@@ -65,6 +65,9 @@ fn d_window_height() -> u32 {
 fn d_text_scale() -> u32 {
     100
 }
+fn d_parts_panel() -> String {
+    "visible".into()
+}
 fn d_sort() -> SortOrder {
     SortOrder::Newest
 }
@@ -459,6 +462,15 @@ pub struct Settings {
     /// export, and `adopt_portable` leaves it be.
     #[serde(default)]
     pub show_stats: bool,
+    /// Settings -> Appearance's Parts panel: `visible` (the default) lays a
+    /// series card's part count over its thumbnail and slides it away while the
+    /// pointer is on the picture; `hidden` is the reverse, the picture whole
+    /// until pointed at. Anything else is repaired to `visible` on load.
+    /// Machine-local like `show_stats`, its neighbour on that page: a named
+    /// field that never rides `extra` into an export, and `adopt_portable`
+    /// leaves it be.
+    #[serde(default = "d_parts_panel")]
+    pub parts_panel: String,
     #[serde(default = "d_window_width")]
     pub window_width: u32,
     #[serde(default = "d_window_height")]
@@ -511,6 +523,9 @@ impl Settings {
         if v.ytdlp_channel != "stable" {
             v.ytdlp_channel = "nightly".into();
         }
+        if v.parts_panel != "hidden" {
+            v.parts_panel = "visible".into();
+        }
         v.view.sanitize();
         v.quality.sanitize();
         Ok(v)
@@ -542,7 +557,7 @@ impl Settings {
     }
 
     /// Takes the portable half of `incoming`, keeping this machine's window
-    /// geometry, text size, stats switch and feed filters. The mirror of
+    /// geometry, text size, stats switch, parts panel and feed filters. The mirror of
     /// `keep_view_of`.
     ///
     /// The split is between settings that describe *the library* — where
@@ -1258,14 +1273,47 @@ mod tests {
     }
 
     #[test]
-    fn a_stats_switch_saved_from_the_settings_page_is_what_gets_written() {
+    fn parts_panel_defaults_visible_and_repairs_anything_else() {
+        assert_eq!(Settings::default().parts_panel, "visible");
+        let s = Settings::from_json_str(r#"{"parts_panel":"hidden"}"#).unwrap();
+        assert_eq!(s.parts_panel, "hidden");
+        // Named, not `extra`: `extra` is what an export carries off the machine.
+        assert!(s.extra.is_empty(), "{:?}", s.extra);
+        let written = s.to_json_string().unwrap();
+        assert!(written.contains(r#""parts_panel": "hidden""#), "{written}");
+        assert_eq!(Settings::from_json_str(&written).unwrap().parts_panel, "hidden");
+        // A hand edit the page could not show lands on the default.
+        for junk in [r#""Hidden""#, r#""off""#, r#""""#] {
+            let s = Settings::from_json_str(&format!(r#"{{"parts_panel":{junk}}}"#)).unwrap();
+            assert_eq!(s.parts_panel, "visible", "{junk}");
+        }
+    }
+
+    #[test]
+    fn adopt_portable_leaves_the_parts_panel_alone() {
+        let mut local = Settings::from_json_str(r#"{"parts_panel":"hidden"}"#).unwrap();
+        let mut incoming = an_incoming_file();
+        incoming.parts_panel = "visible".into();
+        local.adopt_portable_with(&incoming, |_| true);
+        assert_eq!(local.parts_panel, "hidden", "another machine brought this one's panel back");
+
+        let mut local = Settings::default();
+        incoming.parts_panel = "hidden".into();
+        local.adopt_portable_with(&incoming, |_| true);
+        assert_eq!(local.parts_panel, "visible", "another machine hid this one's panel");
+    }
+
+    #[test]
+    fn appearance_picks_saved_from_the_settings_page_are_what_gets_written() {
         // `save_settings` defers to the file for the blocks the page holds a
-        // stale copy of; the switch is the page's own, so it must not be one.
+        // stale copy of; these picks are the page's own, so they must not be.
         let disk = Settings::default();
-        let mut sent = Settings::from_json_str(r#"{"show_stats":true}"#).unwrap();
+        let mut sent =
+            Settings::from_json_str(r#"{"show_stats":true,"parts_panel":"hidden"}"#).unwrap();
         sent.keep_view_of(&disk);
         sent.keep_machine_overrides_of(&disk);
         assert!(sent.show_stats);
+        assert_eq!(sent.parts_panel, "hidden");
     }
 
     #[test]

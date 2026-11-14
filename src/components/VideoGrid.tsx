@@ -4,7 +4,7 @@ import SeriesCard from "./SeriesCard";
 import { cardZoom, nextCardSize, type CardAction } from "../format";
 import type { Marking } from "../marking";
 import type { ProgressStore } from "../progress";
-import type { Video, VideoGroup } from "../types";
+import type { PartsPanel, Video, VideoGroup } from "../types";
 
 interface Props {
   /** One entry per card. Ungrouped views wrap each video in a group of one, so
@@ -23,6 +23,9 @@ interface Props {
   hasMore: boolean;
   cardSize: number;
   onCardSize: (px: number) => void;
+  /** Settings → Appearance → Parts panel. A class on the grid, all CSS, so no
+   *  series card re-renders when it changes. Visible unless given. */
+  partsPanel?: PartsPanel;
   onLoadMore: () => void;
   onAction: (action: CardAction, video: Video) => void;
   onContextMenu: (video: Video, x: number, y: number) => void;
@@ -41,7 +44,7 @@ const NEAR_VIEWPORT = 400;
 
 export default function VideoGrid({
   groups, progress, pending, slow, refreshing = false, loading, hasMore, cardSize, onCardSize,
-  onLoadMore, onAction, onContextMenu, onOpenSeries, marking, empty,
+  partsPanel = "visible", onLoadMore, onAction, onContextMenu, onOpenSeries, marking, empty,
 }: Props) {
   const sentinel = useRef<HTMLDivElement | null>(null);
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -181,7 +184,10 @@ export default function VideoGrid({
     <>
       <div
         ref={gridRef}
-        className={`video-grid${refreshing ? " is-refreshing" : ""}`}
+        className={
+          `video-grid${refreshing ? " is-refreshing" : ""}` +
+          (partsPanel === "hidden" ? " is-parts-panel-hidden" : "")
+        }
         style={{
           ["--card-w" as string]: `${cardSize}px`,
           ["--card-zoom" as string]: String(cardZoom(cardSize)),

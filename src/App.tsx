@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CARD_DEFAULT, clampCardSize } from "./format";
+import { CARD_DEFAULT, clampCardSize, partsPanelOf } from "./format";
 import { EVERY_CHANNEL, normalizeIds, pruneIds, type ChannelPick } from "./channelPick";
 import {
   DEFAULT_STARRED, normalizeStarred, normalizeViewFilters, normalizeViews,
@@ -17,8 +17,8 @@ import {
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
 import type {
-  Channel, QuickFilter, SavedView, Settings, SortOrder, ToolKind, ToolState, ToolStatus, Video,
-  ViewState,
+  Channel, PartsPanel, QuickFilter, SavedView, Settings, SortOrder, ToolKind, ToolState, ToolStatus,
+  Video, ViewState,
 } from "./types";
 import "./App.css";
 
@@ -96,6 +96,8 @@ function Shell() {
   // followed through every save Settings lands -- never by reading the file
   // again on each visit to the tab.
   const [showStats, setShowStats] = useState(false);
+  // Settings → Appearance → Parts panel, read and followed the same way.
+  const [partsPanel, setPartsPanel] = useState<PartsPanel>("visible");
   const [sort, setSort] = useState<SortOrder>("newest");
   // The video whose series the grid is pinned to, or null for the normal feed.
   const [siblingOf, setSiblingOf] = useState<Video | null>(null);
@@ -405,6 +407,7 @@ function Shell() {
         setCardSize(clampCardSize(s.card_size ?? CARD_DEFAULT));
         // `=== true`: a backend older than the switch sends no key at all.
         setShowStats(s.show_stats === true);
+        setPartsPanel(partsPanelOf(s));
         const v = s.view;
         const restored = normalizePick({ ids: v.channel_ids, except: v.channels_except === true });
         setChannelPick(restored);
@@ -455,9 +458,13 @@ function Shell() {
   }, []);
 
   // Settings is unmounted whenever another tab is up, so what it saved is
-  // handed over as it lands; the feed shows or drops its stats the moment the
-  // tab is back. Stable, so the doc's verbs keep their identity.
-  const onSettingsSaved = useCallback((s: Settings) => setShowStats(s.show_stats === true), []);
+  // handed over as it lands; the feed shows or drops its stats, and its series
+  // cards wear their parts panel, the moment the tab is back. Stable, so the
+  // doc's verbs keep their identity.
+  const onSettingsSaved = useCallback((s: Settings) => {
+    setShowStats(s.show_stats === true);
+    setPartsPanel(partsPanelOf(s));
+  }, []);
 
   // The feed's scroll container, handed to SubscriptionsView so leaving a series
   // -- or riding out a poll's refetch -- can put the grid back where it was.
@@ -576,6 +583,7 @@ function Shell() {
             pickableChannels={pickableChannels}
             onSeeChannel={seeChannel}
             showStats={showStats}
+            partsPanel={partsPanel}
           />
         )}
         {tab === "downloads" && (

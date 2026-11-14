@@ -1443,8 +1443,18 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
    pointer over where it stood is over the picture, so it stays gone until the
    pointer leaves the thumbnail. Keyboard focus never hides it: it is the count.
    .card-thumb's overflow clips it on the way out, and the global reduced-motion
-   block below already cuts the transition to nothing. */
-.series-card .card-thumb:hover .series-count:not(:hover) { transform: translateX(101%); }
+   block below already cuts the transition to nothing. That is Settings ->
+   Appearance -> Parts panel: Visible, the default. */
+.video-grid:not(.is-parts-panel-hidden) .series-card .card-thumb:hover .series-count:not(:hover) {
+  transform: translateX(101%);
+}
+/* Parts panel: Hidden is the reverse. The panel waits outside the right edge,
+   the picture whole, and pointing anywhere on the thumbnail slides it in to be
+   read -- the panel included, so it stays while you read it. Keyboard focus on
+   the card brings it in too: it is the count, and the hover never comes. */
+.video-grid.is-parts-panel-hidden .series-count { transform: translateX(101%); }
+.video-grid.is-parts-panel-hidden .card-thumb:hover .series-count,
+.video-grid.is-parts-panel-hidden .series-card:focus-visible .series-count { transform: none; }
 /* Everything in the panel scales with the grid zoom, like the hover buttons.
    The text also follows the text size: every term of each clamp is scaled by
    it (the bounds as rem), so the two settings multiply rather than fight. */

@@ -168,6 +168,7 @@ describe("cardAction", () => {
 
 import {
   cardZoom, clampCardSize, nextCardSize, insertToken, popoutPlacement, TEMPLATE_PRESETS, TOKEN_CHIPS,
+  partsPanelOf,
 } from "./format";
 
 describe("hasDownloadedFile", () => {
@@ -306,5 +307,17 @@ describe("the channel panel's helpers", () => {
     expect(h).toBeGreaterThanOrEqual(0);
     expect(h).toBeLessThan(360);
     expect(nameHue("Arashi Recap")).not.toBe(h);
+  });
+});
+
+describe("partsPanelOf", () => {
+  it("is hidden only when the settings say so", () => {
+    expect(partsPanelOf({ parts_panel: "hidden" })).toBe("hidden");
+    expect(partsPanelOf({ parts_panel: "visible" })).toBe("visible");
+  });
+  it("shows the panel for a backend older than the setting, or anything it cannot read", () => {
+    expect(partsPanelOf({})).toBe("visible");
+    expect(partsPanelOf({ parts_panel: "Hidden" })).toBe("visible");
+    expect(partsPanelOf({ parts_panel: true })).toBe("visible");
   });
 });

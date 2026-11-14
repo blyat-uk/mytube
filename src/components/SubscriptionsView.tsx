@@ -15,7 +15,7 @@ import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction } from "../
 import { useSiblingMarking } from "../marking";
 import { usePending } from "../pending";
 import { createProgressStore } from "../progress";
-import type { DownloadSeries, SortOrder, Video, VideoGroup } from "../types";
+import type { DownloadSeries, PartsPanel, SortOrder, Video, VideoGroup } from "../types";
 
 const PAGE = 100;
 /** Enough for every part of any series, for the parts a hide asks about. */
@@ -171,6 +171,8 @@ interface Props {
   /** Settings → Appearance → Show stats: the waveform over the feed, the
    *  bands over an open series. Off, the view is exactly what it was without. */
   showStats: boolean;
+  /** Settings → Appearance → Parts panel, for the series cards in the grid. */
+  partsPanel: PartsPanel;
 }
 
 export default function SubscriptionsView(p: Props) {
@@ -1085,6 +1087,7 @@ export default function SubscriptionsView(p: Props) {
       hasMore={hasMore}
       cardSize={p.cardSize}
       onCardSize={p.onCardSize}
+      partsPanel={p.partsPanel}
       onLoadMore={() => fetchPage(offset.current)}
       onAction={onAction}
       onContextMenu={onContextMenu}

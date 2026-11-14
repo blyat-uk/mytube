@@ -198,6 +198,56 @@ describe("Appearance · show stats", () => {
   });
 });
 
+describe("Appearance · parts panel", () => {
+  const group = () => screen.getByRole("radiogroup", { name: "Parts panel" });
+  const option = (name: "Visible" | "Hidden") =>
+    within(group()).getByRole("radio", { name }) as HTMLInputElement;
+
+  it("is Visible by default, and says what each pick does", async () => {
+    await renderSettings("appearance");
+    expect(option("Visible").checked).toBe(true);
+    expect(option("Hidden").checked).toBe(false);
+    const hint = group().getAttribute("aria-describedby");
+    expect(document.getElementById(hint!)!.textContent).toMatch(
+      /Visible: it slides away.*Hidden: the picture shows whole/,
+    );
+  });
+
+  it("shows a stored Hidden", async () => {
+    backend.settings = { ...SETTINGS, parts_panel: "hidden" };
+    await renderSettings("appearance");
+    expect(option("Hidden").checked).toBe(true);
+  });
+
+  it("reads a settings file from before the setting as Visible", async () => {
+    const { parts_panel: _, ...older } = SETTINGS;
+    backend.settings = older as typeof SETTINGS;
+    await renderSettings("appearance");
+    expect(option("Visible").checked).toBe(true);
+  });
+
+  it("saves at once when picked, and again when picked back", async () => {
+    await renderSettings("appearance");
+    fireEvent.click(option("Hidden"));
+    expect((await saved(1)).parts_panel).toBe("hidden");
+    expect(option("Hidden").checked).toBe(true);
+    // The rest of the file rides along untouched.
+    expect(lastSaved().show_stats).toBe(SETTINGS.show_stats);
+    expect(lastSaved().text_scale).toBe(SETTINGS.text_scale);
+
+    fireEvent.click(option("Visible"));
+    expect((await saved(2)).parts_panel).toBe("visible");
+    expect(option("Visible").checked).toBe(true);
+  });
+
+  it("says so in the rail while it is hidden", async () => {
+    await renderSettings("appearance");
+    fireEvent.click(option("Hidden"));
+    expect(lineOf("Appearance")).toBe("Text size 100% · panel hidden");
+    await saved();
+  });
+});
+
 describe("Appearance · keys", () => {
   it("steps by 10, pages by 50, and jumps to either end", () => {
     expect(scaleAfterKey(100, "ArrowRight")).toBe(110);
@@ -227,6 +277,13 @@ describe("Appearance · rail", () => {
   it("adds the stats while they are on", () => {
     const on = { settings: { ...SETTINGS, text_scale: 120, show_stats: true } } as SettingsCtx;
     expect(summary(on)).toEqual({ text: "Text size 120% · stats on" });
+  });
+
+  it("adds a hidden parts panel, after the stats", () => {
+    const hidden = { ...SETTINGS, parts_panel: "hidden" as const };
+    expect(summary({ settings: hidden } as SettingsCtx)).toEqual({ text: "Text size 100% · panel hidden" });
+    expect(summary({ settings: { ...hidden, show_stats: true } } as SettingsCtx))
+      .toEqual({ text: "Text size 100% · stats on · panel hidden" });
   });
 
   it("reads the stored size in the rail", async () => {

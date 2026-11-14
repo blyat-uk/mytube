@@ -317,6 +317,9 @@ export interface DownloadSeries {
   fresh: number;
 }
 
+/** Settings → Appearance → Parts panel. Rust repairs anything else to `"visible"`. */
+export type PartsPanel = "visible" | "hidden";
+
 export interface Settings {
   download_dir: string; filename_template: string; player_command: string;
   max_concurrent_downloads: number; poll_interval_minutes: number;
@@ -351,6 +354,11 @@ export interface Settings {
   /** The stats above the Subscriptions feed and inside a series (Settings →
    *  Appearance). Off unless switched on; machine-local like `text_scale`. */
   show_stats: boolean;
+  /** Settings → Appearance → Parts panel: whether a series card's part count
+   *  sits over its thumbnail until pointed at (`"visible"`), or stays out of
+   *  the way until pointed at (`"hidden"`). Machine-local like `show_stats`;
+   *  read through `format::partsPanelOf`, since an older backend sends none. */
+  parts_panel: PartsPanel;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;

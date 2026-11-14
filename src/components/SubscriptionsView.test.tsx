@@ -153,6 +153,7 @@ function renderView(over: ViewProps = {}) {
         cardSize={260} onCardSize={vi.fn()} reloadToken={0}
         channelCount={1} onAdd={vi.fn()} scrollRef={scrollRef}
         pickableChannels={NO_CHANNELS} onSeeChannel={onSeeChannel} showStats={false}
+        partsPanel="visible"
         {...props}
       />
     </ToastProvider>
