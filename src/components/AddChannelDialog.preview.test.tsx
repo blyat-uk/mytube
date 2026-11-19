@@ -31,6 +31,7 @@ vi.mock("../api", () => ({
     probeFormats: (id: string) => probeFormats(id),
     getSettings: () => Promise.resolve({ quality: DEFAULT_QUALITY } as Settings),
     subscriptionStats: () => Promise.resolve([]),
+    listRecommendations: () => Promise.resolve([]),
     previewTakeoutCsv: () => Promise.resolve([]),
   },
   errText: (e: unknown) => String(e),
@@ -99,6 +100,7 @@ async function renderDialog(channels: Channel[] = [FOLLOWED]) {
         <AddChannelDialog
           open onClose={onClose} channels={channels} onChanged={onChanged}
           subsFolded onSubsFolded={onSubsFolded}
+          recsFolded onRecsFolded={() => {}} recsSort="videos" onRecsSort={() => {}}
         />
       </ToastProvider>,
     );

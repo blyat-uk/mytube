@@ -6,6 +6,7 @@ import type {
   ImportResult, TakeoutRow, ArchiveSummary, ImportMode, ImportReport, TransferEstimate,
   PlayerOption, BrowserScan, CookiesFileInfo, ToolStatus, Quality, VideoFormats, VersionInfo,
   SyncStatus, ChannelStats, AddPreview, PlaylistEntry, AddPlaylistResult, FeedStats, StatsFilter,
+  Recommendation,
 } from "./types";
 
 export const api = {
@@ -34,6 +35,11 @@ export const api = {
   addPlaylist: (entries: PlaylistEntry[]) =>
     invoke<AddPlaylistResult>("add_playlist", { entries }),
   removeChannel: (channelId: string) => invoke<void>("remove_channel", { channelId }),
+  /** The Add dialog's suggested channels, as the background check left them. */
+  listRecommendations: () => invoke<Recommendation[]>("list_recommendations"),
+  /** "Never suggest this channel again." */
+  dismissRecommendation: (channelId: string) =>
+    invoke<void>("dismiss_recommendation", { channelId }),
   previewTakeoutCsv: (path: string) => invoke<TakeoutRow[]>("preview_takeout_csv", { path }),
   importTakeoutCsv: (path: string, channelIds: string[]) =>
     invoke<ImportResult>("import_takeout_csv", { path, channelIds }),

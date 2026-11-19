@@ -74,6 +74,7 @@ vi.mock("./api", () => {
       appVersionInfo: () => appVersionInfo(),
       syncNudge: () => syncNudge(),
       subscriptionStats: () => Promise.resolve([]),
+      listRecommendations: () => Promise.resolve([]),
       feedStats: (f: StatsFilter) => feedStats(f),
       downloadSeries: (ids: string[]) => downloadSeries(ids),
       setWatched: (id: string, watched: boolean) => setWatched(id, watched),
@@ -101,7 +102,8 @@ function defaultView(over: Partial<ViewState> = {}): ViewState {
   return {
     channel_ids: [], search: "", hide_watched: false, downloaded_only: false,
     show_hidden: false, grouped: false, in_progress: false,
-    auto_downloading: false, sort: "newest", subs_folded: false, starred_filters: ALL_STARRED,
+    auto_downloading: false, sort: "newest", subs_folded: false, recs_folded: false,
+    recs_sort: "videos", starred_filters: ALL_STARRED,
     min_length: 0, min_parts: 0, channels_except: false, saved_views: [],
     ...over,
   };
@@ -447,6 +449,26 @@ describe("the Add dialog's folded list", () => {
     fireEvent.click(button("Subscriptions 0"));
     await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
     expect(saveViewState).toHaveBeenCalledWith(defaultView({ subs_folded: true }));
+  });
+});
+
+/** The Recommendations below it fold and sort, remembered the same way. */
+describe("the Add dialog's recommendations", () => {
+  it("opens folded and in the order it was left", async () => {
+    settings = settingsWith({ recs_folded: true, recs_sort: "popular" });
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await act(async () => { fireEvent.click(button("Add")); });
+    expect(button("Recommendations 0").getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("writes the order into the saved view", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await act(async () => { fireEvent.click(button("Add")); });
+    fireEvent.click(button("Most popular"));
+    await waitFor(() => expect(saveViewState).toHaveBeenCalledTimes(1));
+    expect(saveViewState).toHaveBeenCalledWith(defaultView({ recs_sort: "popular" }));
   });
 });
 

@@ -40,6 +40,7 @@ vi.mock("../api", () => ({
     autoDownloadBacklogCount: (id: string, w: boolean, h: boolean) =>
       autoDownloadBacklogCount(id, w, h),
     subscriptionStats: () => subscriptionStats(),
+    listRecommendations: () => Promise.resolve([]),
   },
   errText: (e: unknown) => String(e),
   fileSrc: (path: string) => `asset://localhost${path}`,
@@ -88,6 +89,10 @@ async function renderDialog(channels: Channel[] = CHANNELS, { folded = false } =
           onChanged={onChanged}
           subsFolded={folded}
           onSubsFolded={onSubsFolded}
+          recsFolded
+          onRecsFolded={() => {}}
+          recsSort="videos"
+          onRecsSort={() => {}}
         />
       </ToastProvider>,
     );
@@ -252,6 +257,7 @@ describe("folding the list", () => {
             open onClose={vi.fn()} channels={CHANNELS} onChanged={vi.fn()}
             subsFolded={folded}
             onSubsFolded={(f) => { remembered(f); setFolded(f); }}
+            recsFolded onRecsFolded={vi.fn()} recsSort="videos" onRecsSort={vi.fn()}
           />
         </ToastProvider>
       );

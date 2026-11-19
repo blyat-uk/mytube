@@ -109,6 +109,31 @@ export interface TakeoutRow {
 /** One subscribed channel's share of the library (`subscription_stats`).
  *  Counts are over its ready rows only. A channel with none still has a row,
  *  of zeros. */
+/** One of a suggested channel's latest uploads. camelCase, like every dialog
+ *  payload. */
+export interface RecUpload {
+  id: string;
+  title: string;
+  publishedAt: number | null;
+  thumbPath: string | null;
+}
+
+/** A channel the Add dialog's Recommendations suggest. `popularity` is how
+ *  many followed channels point at it; `videoCount` its total uploads. */
+export interface Recommendation {
+  id: string;
+  title: string;
+  handle: string | null;
+  thumbPath: string | null;
+  subscribers: number | null;
+  videoCount: number | null;
+  popularity: number;
+  uploads: RecUpload[];
+}
+
+/** The Recommendations' order: total uploads, or followed channels pointing at it. */
+export type RecSort = "videos" | "popular";
+
 export interface ChannelStats {
   channelId: string;
   videos: number;
@@ -290,6 +315,9 @@ export interface ViewState {
   /** The Add dialog's subscription list, folded away. Not a filter: it rides
    *  in this block because it is remembered the same way, per machine. */
   subs_folded: boolean;
+  /** The Add dialog's Recommendations: folded away, and their order. */
+  recs_folded: boolean;
+  recs_sort: RecSort;
   /** The filters starred into the top bar, in `QUICK_ORDER`. The rest live in
    *  the All filters sidebar alone. Per machine, like the rest of the block. */
   starred_filters: QuickFilter[];

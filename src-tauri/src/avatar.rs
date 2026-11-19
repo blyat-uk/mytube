@@ -91,7 +91,7 @@ async fn refresh(db: &Db, http: &reqwest::Client, channel_id: &str, url: &str, p
 
 /// The picture's bytes. Anything but an image is refused, so an error page
 /// served with a 200 never lands on disk wearing a `.jpg`.
-async fn download(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+pub(crate) async fn download(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     let resp = http.get(url).send().await?;
     if !resp.status().is_success() {
         bail!("HTTP {}", resp.status());
@@ -119,7 +119,7 @@ async fn download(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
 /// The temporary name is unique per write, because two listings of one
 /// channel can land at once -- a new subscription's backfill beside the poll
 /// that follows it.
-fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);

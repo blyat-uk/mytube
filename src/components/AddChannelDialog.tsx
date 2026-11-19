@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import TakeoutDialog from "./TakeoutDialog";
 import CustomDownloadDialog, { type Batch } from "./CustomDownloadDialog";
 import SubscriptionList from "./add/SubscriptionList";
+import RecommendationList from "./add/RecommendationList";
 import {
   ChannelAnswer, PlaylistCard, PreviewSkeleton, VideoCard, type Acting,
 } from "./add/LinkPreview";
@@ -13,7 +14,7 @@ import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { usePending } from "../pending";
 import type {
-  AddKind, AddPreview, Channel, ChannelStats, PlaylistPreview, TakeoutRow, Video,
+  AddKind, AddPreview, Channel, ChannelStats, PlaylistPreview, RecSort, TakeoutRow, Video,
 } from "../types";
 
 interface Props {
@@ -26,6 +27,12 @@ interface Props {
    *  remembers it with the rest of the view. */
   subsFolded: boolean;
   onSubsFolded: (folded: boolean) => void;
+  /** The Recommendations below it: folded away, and their order. The shell
+   *  owns and remembers both, like `subsFolded`. */
+  recsFolded: boolean;
+  onRecsFolded: (folded: boolean) => void;
+  recsSort: RecSort;
+  onRecsSort: (sort: RecSort) => void;
 }
 
 /**
@@ -61,6 +68,7 @@ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 export default function AddChannelDialog({
   open: isOpen, onClose, channels, onChanged, subsFolded, onSubsFolded,
+  recsFolded, onRecsFolded, recsSort, onRecsSort,
 }: Props) {
   const toast = useToast();
   const [input, setInput] = useState("");
@@ -487,6 +495,17 @@ export default function AddChannelDialog({
           reveal={reveal}
           importing={importing}
           onImportCsv={() => void pickCsv()}
+          onChanged={changed}
+        />
+
+        <div className="add-divider is-between" />
+
+        <RecommendationList
+          folded={recsFolded}
+          onFold={onRecsFolded}
+          sort={recsSort}
+          onSort={onRecsSort}
+          refreshKey={channels}
           onChanged={changed}
         />
       </div>

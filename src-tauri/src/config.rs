@@ -256,6 +256,13 @@ pub struct ViewState {
     /// list shown) for a first run and for a view saved before the key.
     #[serde(default)]
     pub subs_folded: bool,
+    /// The Add dialog's Recommendations, folded away; the same reasoning as
+    /// `subs_folded`, and shown for a first run.
+    #[serde(default)]
+    pub recs_folded: bool,
+    /// How the Recommendations are ordered.
+    #[serde(default)]
+    pub recs_sort: RecSort,
     /// The filters starred into the top bar; every other one lives in the All
     /// filters sidebar alone. Ids from `QUICK_FILTERS`, kept in that order by
     /// `sanitize` so the same stars always serialise the same way. An empty
@@ -294,6 +301,8 @@ impl Default for ViewState {
             auto_downloading: false,
             sort: SortOrder::Newest,
             subs_folded: false,
+            recs_folded: false,
+            recs_sort: RecSort::Videos,
             starred_filters: d_starred_filters(),
             min_length: 0,
             min_parts: 0,
@@ -389,6 +398,18 @@ fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D:
         Some(OneOrMany::One(id)) => vec![id],
         Some(OneOrMany::Many(ids)) => ids,
     })
+}
+
+/// The Add dialog's Recommendations order: the channel's total uploads
+/// (default), or how many followed channels point at it. An unknown value
+/// reads as the default rather than costing the whole view (`lenient_view`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecSort {
+    Popular,
+    #[default]
+    #[serde(other)]
+    Videos,
 }
 
 fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ViewState, D::Error> {
@@ -816,6 +837,8 @@ mod tests {
             auto_downloading: true,
             sort: SortOrder::Length,
             subs_folded: true,
+            recs_folded: true,
+            recs_sort: RecSort::Popular,
             starred_filters: vec!["downloaded_only".into(), "channel_ids".into()],
             min_length: 18000,
             min_parts: 5,
@@ -994,6 +1017,23 @@ mod tests {
         let ungrouped =
             Settings::from_json_str(r#"{"view":{"subs_folded":true,"grouped":false}}"#).unwrap();
         assert!(ungrouped.view.subs_folded);
+    }
+
+    #[test]
+    fn recommendations_start_open_by_most_videos_and_remember_both() {
+        let old = Settings::from_json_str(r#"{"view":{"hide_watched":true}}"#).unwrap();
+        assert!(!old.view.recs_folded);
+        assert_eq!(old.view.recs_sort, RecSort::Videos);
+        let set = Settings::from_json_str(
+            r#"{"view":{"recs_folded":true,"recs_sort":"popular"}}"#).unwrap();
+        assert!(set.view.recs_folded);
+        assert_eq!(set.view.recs_sort, RecSort::Popular);
+        let odd = Settings::from_json_str(
+            r#"{"view":{"hide_watched":true,"recs_sort":"bogus"}}"#).unwrap();
+        assert_eq!(odd.view.recs_sort, RecSort::Videos);
+        assert!(odd.view.hide_watched, "an unknown sort must not cost the rest of the view");
+        let back = serde_json::to_value(&set.view).unwrap();
+        assert_eq!(back["recs_sort"], "popular");
     }
 
     #[test]

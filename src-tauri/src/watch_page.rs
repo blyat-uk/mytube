@@ -70,7 +70,7 @@ pub struct WatchPage {
 /// player response's `"videoDetails":{"videoId":…}`, and which comes first is
 /// not something to rely on. A stream deserializer reads exactly one value and
 /// stops, so the megabyte of page after it is never looked at.
-fn object_at(html: &str, key: &str, starts: &str) -> Option<Value> {
+pub(crate) fn object_at(html: &str, key: &str, starts: &str) -> Option<Value> {
     let at = html.find(&format!("{key}{starts}"))? + key.len();
     let value = serde_json::Deserializer::from_str(&html[at..])
         .into_iter::<Value>()

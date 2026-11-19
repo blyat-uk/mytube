@@ -87,8 +87,13 @@ pub fn outcome(video_id: &str, fetched: Fetched) -> Outcome {
 
 /// One GET of a watch page, with the consent cookie `watch_page::fetch` sends.
 pub async fn fetch_page(http: &reqwest::Client, video_id: &str) -> Fetched {
+    fetch(http, &ytdlp::watch_url(video_id)).await
+}
+
+/// One GET of any YouTube page, as [`fetch_page`] sends it.
+pub async fn fetch(http: &reqwest::Client, url: &str) -> Fetched {
     let sent = http
-        .get(ytdlp::watch_url(video_id))
+        .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .header(reqwest::header::COOKIE, watch_page::CONSENT_COOKIE)
         .send()
@@ -129,22 +134,30 @@ impl Pace {
     /// one throttle.
     pub fn note(&mut self, outcome: &Outcome) {
         match outcome {
-            Outcome::Throttled => self.slow_down(),
-            Outcome::Unreadable => {
-                self.misses += 1;
-                if self.misses >= UNREADABLE_RUN {
-                    self.misses = 0;
-                    self.slow_down();
-                }
-            }
-            Outcome::Store(_) | Outcome::Gone => {
-                self.misses = 0;
-                self.interval = (self.interval / 2).max(BASE);
-            }
+            Outcome::Throttled => self.throttled(),
+            Outcome::Unreadable => self.unreadable(),
+            Outcome::Store(_) | Outcome::Gone => self.answered(),
         }
     }
 
-    fn slow_down(&mut self) {
+    /// A request YouTube answered: halves the wait, to [`BASE`].
+    pub fn answered(&mut self) {
+        self.misses = 0;
+        self.interval = (self.interval / 2).max(BASE);
+    }
+
+    /// A page without what it should hold; [`UNREADABLE_RUN`] in a row are one
+    /// throttle.
+    pub fn unreadable(&mut self) {
+        self.misses += 1;
+        if self.misses >= UNREADABLE_RUN {
+            self.misses = 0;
+            self.throttled();
+        }
+    }
+
+    /// A refusal: doubles the wait, to [`CAP`].
+    pub fn throttled(&mut self) {
         self.interval = (self.interval * 2).min(CAP);
     }
 }

@@ -17,8 +17,8 @@ import {
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
 import type {
-  Channel, PartsPanel, QuickFilter, SavedView, Settings, SortOrder, ToolKind, ToolState, ToolStatus,
-  Video, ViewState,
+  Channel, PartsPanel, QuickFilter, RecSort, SavedView, Settings, SortOrder, ToolKind, ToolState,
+  ToolStatus, Video, ViewState,
 } from "./types";
 import "./App.css";
 
@@ -40,13 +40,15 @@ function buildViewState(v: {
   channelPick: ChannelPick; search: string; hideWatched: boolean;
   downloadedOnly: boolean; showHidden: boolean; grouped: boolean;
   inProgress: boolean; autoDownloading: boolean; sort: SortOrder; subsFolded: boolean;
+  recsFolded: boolean; recsSort: RecSort;
   starred: QuickFilter[]; minLength: number; minParts: number; savedViews: SavedView[];
 }): ViewState {
   return {
     channel_ids: v.channelPick.ids, search: v.search,
     hide_watched: v.hideWatched, downloaded_only: v.downloadedOnly, show_hidden: v.showHidden,
     grouped: v.grouped, in_progress: v.inProgress, auto_downloading: v.autoDownloading,
-    sort: v.sort, subs_folded: v.subsFolded, starred_filters: v.starred,
+    sort: v.sort, subs_folded: v.subsFolded, recs_folded: v.recsFolded, recs_sort: v.recsSort,
+    starred_filters: v.starred,
     min_length: v.minLength, min_parts: v.minParts, channels_except: v.channelPick.except,
     saved_views: v.savedViews,
   };
@@ -118,6 +120,8 @@ function Shell() {
   // The Add dialog's subscription list, folded away. Not a filter, but
   // remembered with them: it is how this machine's user left the dialog.
   const [subsFolded, setSubsFolded] = useState(false);
+  const [recsFolded, setRecsFolded] = useState(false);
+  const [recsSort, setRecsSort] = useState<RecSort>("videos");
   // The filters starred into the top bar; the rest live in the All filters
   // sidebar alone. Always held in `QUICK_ORDER`, like the channel pick is held
   // sorted, so the same stars are the same JSON to the view writer.
@@ -432,6 +436,10 @@ function Shell() {
         // `=== true`: a view saved by an older build has no key at all.
         const folded = v.subs_folded === true;
         setSubsFolded(folded);
+        const recsFold = v.recs_folded === true;
+        setRecsFolded(recsFold);
+        const recsOrder: RecSort = v.recs_sort === "popular" ? "popular" : "videos";
+        setRecsSort(recsOrder);
         // A view with no stars at all (saved before they existed) reads as the
         // default set, which the backend fills in the same way.
         const stars = normalizeStarred(v.starred_filters);
@@ -442,6 +450,7 @@ function Shell() {
           channelPick: restored, search: v.search, hideWatched: v.hide_watched,
           downloadedOnly: v.downloaded_only, showHidden: v.show_hidden, grouped: v.grouped,
           inProgress: v.in_progress, autoDownloading: autoDl, sort: v.sort, subsFolded: folded,
+          recsFolded: recsFold, recsSort: recsOrder,
           starred: stars, minLength: lengths.min_length, minParts: lengths.min_parts,
           savedViews: views,
         }));
@@ -455,7 +464,7 @@ function Shell() {
         // never actually managed to read.
         persistedView.current = JSON.stringify(buildViewState({
           channelPick, search, hideWatched, downloadedOnly, showHidden, grouped, inProgress,
-          autoDownloading, sort, subsFolded, starred, minLength, minParts, savedViews,
+          autoDownloading, sort, subsFolded, recsFolded, recsSort, starred, minLength, minParts, savedViews,
         }));
       })
       .finally(() => setHydrated(true));
@@ -494,7 +503,7 @@ function Shell() {
     if (!hydrated) return;
     const view = buildViewState({
       channelPick, search, hideWatched, downloadedOnly, showHidden, grouped, inProgress,
-      autoDownloading, sort, subsFolded, starred, minLength, minParts, savedViews,
+      autoDownloading, sort, subsFolded, recsFolded, recsSort, starred, minLength, minParts, savedViews,
     });
     const serialised = JSON.stringify(view);
     if (serialised === persistedView.current) return;
@@ -505,7 +514,8 @@ function Shell() {
     }, 400);
     return () => window.clearTimeout(t);
   }, [hydrated, channelPick, search, hideWatched, downloadedOnly, showHidden, grouped, inProgress,
-      autoDownloading, sort, subsFolded, starred, minLength, minParts, savedViews]);
+      autoDownloading, sort, subsFolded, recsFolded, recsSort, starred, minLength, minParts,
+      savedViews]);
 
   // SubscriptionsView and TopNav both seed themselves from props at mount, so
   // rendering before the saved view lands would spend a query on the
@@ -612,6 +622,10 @@ function Shell() {
         onChanged={onAddChanged}
         subsFolded={subsFolded}
         onSubsFolded={setSubsFolded}
+        recsFolded={recsFolded}
+        onRecsFolded={setRecsFolded}
+        recsSort={recsSort}
+        onRecsSort={setRecsSort}
       />
     </div>
   );

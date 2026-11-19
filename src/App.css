@@ -3455,6 +3455,120 @@ label.field-label { display: block; }
 .auto-dl-count.is-error { color: #ffb9ba; }
 .auto-dl-buttons { display: flex; flex: none; gap: 6px; }
 
+/* --- recommendations ---
+   A second folding section under Subscriptions, built on the same classes
+   (`add-subs`, `add-fold`, `add-subs-body`). Open together, the two share the
+   dialog's height; a folded one gives its share back. */
+
+.add-divider.is-between { margin: 12px -20px 10px; }
+.add-subs.is-folded { flex: none; }
+/* Under an open Subscriptions list the suggestions keep a share of their own
+   -- shrinking in proportion, a hundred channels squeezed them to their
+   header -- and the list takes what is left. With the list folded they take
+   it all. */
+.add-recs:not(.is-folded) { flex: 0 0 auto; max-height: 45vh; }
+.add-subs.is-folded ~ .add-recs:not(.is-folded) { flex: 1 1 auto; max-height: none; }
+
+.rec-sort {
+  display: inline-flex;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.rec-sort-btn {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 1.25rem;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.rec-sort-btn + .rec-sort-btn { border-left: 1px solid var(--line); }
+.rec-sort-btn:hover:not(.is-on) { background: var(--surface-2); color: var(--text); }
+.rec-sort-btn.is-on { background: var(--accent-soft); color: var(--add-accent-text); }
+
+.rec-list { gap: 0; }
+.rec { flex: none; padding: 10px 8px 12px; border-radius: 10px; }
+.rec + .rec { border-top: 1px solid var(--line-soft); }
+.rec-head { display: flex; align-items: center; gap: 11px; }
+.rec .add-pic { width: 36px; height: 36px; font-size: 14px; }
+.rec-who { flex: 1 1 auto; min-width: 0; }
+.rec-name {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rec-sub { margin: 2px 0 0; color: var(--muted); font-size: 1.2rem; }
+.rec-handle {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--add-accent-text);
+  cursor: pointer;
+}
+.rec-handle:hover { text-decoration: underline; }
+.rec-subscribe { flex: none; }
+.rec-dismiss { width: 30px; height: 30px; color: var(--faint); }
+.rec-dismiss:hover:not(:disabled) { color: var(--text); }
+.rec-dismiss .icon { width: 14px; height: 14px; }
+
+/* The last four uploads, under the name: what the decision is made from. */
+.rec-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 9px 0 0 47px;
+}
+.rec-up {
+  appearance: none;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.rec-up-img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--card);
+  transition: box-shadow 120ms ease;
+}
+.rec-up:hover .rec-up-img,
+.rec-up:focus-visible .rec-up-img { box-shadow: 0 0 0 2px var(--add-accent-line); }
+.rec-up-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 1.15rem;
+  line-height: 1.3;
+}
+.rec-up-age { color: var(--faint); font-size: 1.1rem; }
+
+/* Narrow: two thumbnails a row, starting under the picture. */
+@container add-dialog (max-width: 42rem) {
+  .rec-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-left: 0; }
+}
+
 /* --- toasts -------------------------------------------------------------- */
 
 .toast-stack {

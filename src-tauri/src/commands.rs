@@ -268,6 +268,25 @@ pub async fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>)
     .await
 }
 
+/// The Add dialog's Recommendations, as `recs` last left them.
+#[tauri::command]
+pub async fn list_recommendations(state: State<'_, Arc<AppState>>)
+    -> R<Vec<crate::models::Recommendation>> {
+    db_blocking(&state, |db| db.list_recommendations()).await
+}
+
+/// "Never suggest this channel again". Its pictures go with it.
+#[tauri::command]
+pub async fn dismiss_recommendation(channel_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
+    db_blocking(&state, move |db| {
+        for file in db.dismiss_recommendation(&channel_id)? {
+            let _ = std::fs::remove_file(file);
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Parses the CSV without importing anything, so the UI can offer a checklist.
 #[tauri::command]
 pub async fn preview_takeout_csv(

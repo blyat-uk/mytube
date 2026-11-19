@@ -15,6 +15,7 @@ pub mod player;
 pub mod poll;
 pub mod proc;
 pub mod quality;
+pub mod recs;
 pub mod queue;
 pub mod resolve;
 pub mod rss;
@@ -157,6 +158,10 @@ pub fn run() {
             // time on a clock of its own -- see `descriptions` for the pace.
             tauri::async_runtime::spawn(descriptions::run(state.clone()));
 
+            // Recommendations: one watch page per new subscription video, one
+            // check per candidate channel, on the same pace -- see `recs`.
+            tauri::async_runtime::spawn(recs::run(state.clone()));
+
             tauri::async_runtime::spawn(async move {
                 // Replaces absent and approximate-bucket dates with real ones.
                 let fixed = poll::repair_dates(&state).await;
@@ -193,6 +198,8 @@ pub fn run() {
             commands::preview_add,
             commands::add_playlist,
             commands::remove_channel,
+            commands::list_recommendations,
+            commands::dismiss_recommendation,
             commands::import_takeout_csv,
             commands::preview_takeout_csv,
             commands::set_video_hidden,

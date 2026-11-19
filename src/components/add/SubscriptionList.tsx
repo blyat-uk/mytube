@@ -1,6 +1,7 @@
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import ChannelPanel from "./ChannelPanel";
 import ChannelPicture from "./ChannelPicture";
+import { useFold } from "./useFold";
 import type { Backlog } from "./AutoDownloadPrompt";
 import {
   IconAutoDownload, IconCaret, IconDownload, IconImportCsv, IconMember, IconSearch,
@@ -25,8 +26,6 @@ interface Props {
   onChanged: () => void;
 }
 
-/** `--fold-time`: how long the list takes to fold. */
-const FOLD_TIME = 260;
 /** How long a row's panel takes to open or close, plus a frame or two. */
 const PANEL_TIME = 300;
 
@@ -87,34 +86,7 @@ export default function SubscriptionList({
 
   useEffect(() => () => window.clearTimeout(scrollTimer.current), []);
 
-  // The fold slides between two measured heights: what the list stood at when
-  // it was folded (read as the button is pressed, before the class changes),
-  // and what it settles at once it is out (read after, with the dialog's own
-  // limit already applied). Folded, CSS holds it at 0; the animation only
-  // carries it between the two, so nothing is left behind on the element.
-  const body = useRef<HTMLDivElement | null>(null);
-  const foldFrom = useRef<number | null>(null);
-  const firstFold = useRef(true);
-  useLayoutEffect(() => {
-    const el = body.current;
-    const measured = foldFrom.current;
-    foldFrom.current = null;
-    if (firstFold.current) { firstFold.current = false; return; }
-    // Unfolded from elsewhere ("Show in list") starts from nothing.
-    const from = measured ?? (folded ? null : 0);
-    if (!el || from === null || typeof el.animate !== "function") return;
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
-    const to = el.offsetHeight;
-    if (from === to) return;
-    el.animate([{ height: `${from}px` }, { height: `${to}px` }], {
-      duration: FOLD_TIME, easing: "cubic-bezier(0.2, 0.7, 0.2, 1)",
-    });
-  }, [folded]);
-
-  function toggleFold() {
-    foldFrom.current = body.current?.offsetHeight ?? null;
-    onFold(!folded);
-  }
+  const { body, toggle: toggleFold } = useFold(folded, onFold);
 
   /** Once the panel has opened (and the list unfolded), scroll the whole row
    *  into view: a row near the bottom would otherwise open out of sight. */

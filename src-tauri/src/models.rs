@@ -778,3 +778,28 @@ pub struct SyncPeer {
     pub last_write_at: Option<i64>,
 }
 
+
+/// One of a suggested channel's latest uploads, as the Add dialog shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecUpload {
+    pub id: String,
+    pub title: String,
+    pub published_at: Option<i64>,
+    pub thumb_path: Option<String>,
+}
+
+/// A channel suggested in the Add dialog's Recommendations. `popularity` is
+/// how many followed channels point at it; `video_count` its total uploads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Recommendation {
+    pub id: String,
+    pub title: String,
+    pub handle: Option<String>,
+    pub thumb_path: Option<String>,
+    pub subscribers: Option<i64>,
+    pub video_count: Option<i64>,
+    pub popularity: i64,
+    pub uploads: Vec<RecUpload>,
+}
