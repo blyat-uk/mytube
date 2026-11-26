@@ -119,7 +119,7 @@ pub fn handle_of(input: &str) -> Option<String> {
 /// `%E3%81%82` → `あ`. A malformed escape is kept as it is and bytes that do
 /// not form UTF-8 are replaced, so this never fails: it only has to make a
 /// copied URL comparable with the handle as YouTube reports it.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let hex = |b: u8| (b as char).to_digit(16);
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

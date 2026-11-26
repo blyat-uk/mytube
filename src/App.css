@@ -3514,6 +3514,12 @@ label.field-label { display: block; }
   font: inherit;
   color: var(--add-accent-text);
   cursor: pointer;
+  /* A long handle is cut short rather than run under the Subscribe button. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: top;
 }
 .rec-handle:hover { text-decoration: underline; }
 .rec-subscribe { flex: none; }

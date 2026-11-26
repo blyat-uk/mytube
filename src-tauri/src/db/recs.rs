@@ -278,7 +278,10 @@ impl Db {
                   ORDER BY r.video_count DESC NULLS LAST, r.title, r.id",
                 qualified()))?;
             let rows = st.query_map([], |r| Ok(Recommendation {
-                id: r.get(0)?, title: r.get(1)?, handle: r.get(2)?, thumb_path: r.get(3)?,
+                id: r.get(0)?, title: r.get(1)?,
+                // Rows checked before the handle was decoded at the source.
+                handle: r.get::<_, Option<String>>(2)?.map(|h| crate::resolve::percent_decode(&h)),
+                thumb_path: r.get(3)?,
                 subscribers: r.get(4)?, video_count: r.get(5)?, popularity: r.get(6)?,
                 uploads: Vec::new(),
             }))?;

@@ -128,7 +128,8 @@ pub fn parse_channel_page(html: &str) -> Option<ChannelFacts> {
         handle: text("vanityChannelUrl")
             .and_then(|u| u.rsplit('/').next())
             .filter(|h| h.starts_with('@'))
-            .map(str::to_string),
+            // A non-Latin handle is percent-encoded in the URL (`@%E0%B8%9E…`).
+            .map(crate::resolve::percent_decode),
         avatar_url: meta.pointer("/avatar/thumbnails/0/url").and_then(Value::as_str).map(str::to_string),
         subscribers: count_of("subscriber"),
         video_count: count_of("video"),
@@ -448,6 +449,14 @@ mod tests {
         assert_eq!(f.subscribers, Some(7910));
         assert_eq!(f.video_count, Some(11));
         assert!(f.avatar_url.unwrap().starts_with("https://yt3."));
+    }
+
+    #[test]
+    fn channel_page_handle_is_decoded() {
+        let page = r#"<script>var ytInitialData = {"metadata":{"channelMetadataRenderer":{
+            "title":"Thai","externalId":"UCfdAUuUI_gNd8BQmsJOyVdg",
+            "vanityChannelUrl":"http://www.youtube.com/@%E0%B8%9E%E0%B8%B9%E0%B9%88Novel"}}};</script>"#;
+        assert_eq!(parse_channel_page(page).unwrap().handle.as_deref(), Some("@พู่Novel"));
     }
 
     #[test]
