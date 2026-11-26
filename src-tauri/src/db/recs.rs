@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::Db;
 use crate::models::{RecUpload, Recommendation};
-use crate::recs::{ChannelFacts, Leads};
+use crate::recs::ChannelFacts;
 
 pub(super) const SCHEMA_V17: &str = "
 CREATE TABLE IF NOT EXISTS rec_scans (
@@ -47,17 +47,18 @@ CREATE TABLE IF NOT EXISTS rec_uploads (
 );
 ";
 
+/// v18: up next's sightings dropped. `rec_links.kind` stays (part of the key),
+/// only ever 'collab' from here on.
+pub(super) const SCHEMA_V18: &str = "
+DELETE FROM rec_links WHERE kind <> 'collab';
+DROP INDEX IF EXISTS rec_links_seen;
+";
+
 const DAY: i64 = 86_400;
 
 /// How far back a video's upload may lie behind its first sighting and still
 /// count as new: keeps a fresh subscription's backfill out of the scan.
 const NEW_WITHIN: i64 = 7 * DAY;
-
-/// How long an "up next" sighting counts. A collab is kept for good.
-const NEXT_KEPT: i64 = 90 * DAY;
-
-/// How many followed channels must have shown a channel in their sidebars.
-const NEXT_SOURCES: i64 = 3;
 
 /// Re-check intervals: an active channel's strip goes stale in a day; a
 /// dormant one is asked again in a month, in case it woke up.
@@ -69,19 +70,16 @@ const RECHECK_INACTIVE: i64 = 30 * DAY;
 /// stays listed meanwhile, and the rest of the queue goes ahead of it.
 const RETRY: i64 = DAY;
 
-/// The channels that could be suggested, with how many followed channels point
-/// at each: one collab credit, or "up next" beside videos of [`NEXT_SOURCES`]
-/// followed channels -- never one you follow, once removed, or dismissed.
-fn qualified() -> String {
-    format!(
-        "SELECT l.channel_id AS id, COUNT(DISTINCT l.source_channel_id) AS popularity
-           FROM rec_links l
-          WHERE NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = l.channel_id AND c.subscribed = 1)
-            AND NOT EXISTS (SELECT 1 FROM tombstones t WHERE t.kind = 'channel' AND t.id = l.channel_id)
-            AND NOT EXISTS (SELECT 1 FROM rec_channels r WHERE r.id = l.channel_id AND r.dismissed = 1)
-          GROUP BY l.channel_id
-         HAVING MAX(l.kind = 'collab') = 1
-             OR COUNT(DISTINCT CASE WHEN l.kind = 'next' THEN l.source_channel_id END) >= {NEXT_SOURCES}")
+/// The channels that could be suggested -- one collab credit is enough -- with
+/// how many followed channels credited each; never one you follow, once
+/// removed, or dismissed.
+fn qualified() -> &'static str {
+    "SELECT l.channel_id AS id, COUNT(DISTINCT l.source_channel_id) AS popularity
+       FROM rec_links l
+      WHERE NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = l.channel_id AND c.subscribed = 1)
+        AND NOT EXISTS (SELECT 1 FROM tombstones t WHERE t.kind = 'channel' AND t.id = l.channel_id)
+        AND NOT EXISTS (SELECT 1 FROM rec_channels r WHERE r.id = l.channel_id AND r.dismissed = 1)
+      GROUP BY l.channel_id"
 }
 
 /// Drops `id`'s strip, and its picture unless the channel has a row of its own
@@ -123,38 +121,34 @@ impl Db {
             [NEW_WITHIN, now], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
-    /// Marks `video` scanned and keeps what its page pointed at (`None`: the
-    /// page could not be read, which is not asked again). Channels you follow
-    /// are not kept: they could never be suggested.
-    pub fn record_rec_scan(&self, video: &str, source: &str, leads: Option<&Leads>, now: i64)
+    /// Marks `video` scanned and keeps the channels credited on it (`None`:
+    /// the page could not be read, which is not asked again). Channels you
+    /// follow are not kept: they could never be suggested.
+    pub fn record_rec_scan(&self, video: &str, source: &str, collabs: Option<&[String]>, now: i64)
         -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute("INSERT OR REPLACE INTO rec_scans (video_id, scanned_at) VALUES (?1, ?2)",
                    params![video, now])?;
-        if let Some(leads) = leads {
+        if let Some(collabs) = collabs {
             let mut st = tx.prepare_cached(
                 "INSERT OR IGNORE INTO rec_links (channel_id, video_id, kind, source_channel_id, seen_at)
-                 SELECT ?1, ?2, ?3, ?4, ?5
+                 SELECT ?1, ?2, 'collab', ?3, ?4
                   WHERE NOT EXISTS (SELECT 1 FROM channels WHERE id = ?1 AND subscribed = 1)")?;
-            for (kind, ids) in [("collab", &leads.collab), ("next", &leads.next)] {
-                for id in ids {
-                    st.execute(params![id, video, kind, source, now])?;
-                }
+            for id in collabs {
+                st.execute(params![id, video, source, now])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Forgets "up next" sightings older than [`NEXT_KEPT`], then every strip
-    /// that is no longer shown and every candidate that no longer qualifies
-    /// (a dismissal is kept: it is the user's). Returns the files to delete.
-    pub fn prune_recs(&self, now: i64) -> Result<Vec<String>> {
+    /// Forgets every strip that is no longer shown and every candidate that
+    /// no longer qualifies (a dismissal is kept: it is the user's). Returns
+    /// the files to delete.
+    pub fn prune_recs(&self) -> Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM rec_links WHERE kind = 'next' AND seen_at < ?1",
-                   [now - NEXT_KEPT])?;
         let q = qualified();
         let stale: Vec<(String, bool)> = {
             let mut st = tx.prepare(&format!(
@@ -343,12 +337,8 @@ mod tests {
         }).unwrap();
     }
 
-    fn collab(ids: &[&str]) -> Leads {
-        Leads { collab: ids.iter().map(|s| s.to_string()).collect(), next: vec![] }
-    }
-
-    fn next(ids: &[&str]) -> Leads {
-        Leads { collab: vec![], next: ids.iter().map(|s| s.to_string()).collect() }
+    fn collab(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
     }
 
     fn facts(id: &str, videos: i64) -> ChannelFacts {
@@ -390,6 +380,25 @@ mod tests {
         assert_eq!(d.next_rec_scan(now()).unwrap(), None, "the library before the upgrade is not scanned");
         video(&d, "new", "UCa", now());
         assert_eq!(d.next_rec_scan(now()).unwrap(), Some(("new".into(), "UCa".into())));
+    }
+
+    #[test]
+    fn v18_forgets_up_next_sightings() {
+        let d = Db::open_in_memory().unwrap();
+        let t = now();
+        for (v, src) in [("v1", "UCa"), ("v2", "UCb"), ("v3", "UCc")] {
+            follow(&d, src);
+            d.conn.lock().unwrap().execute(
+                "INSERT INTO rec_links (channel_id, video_id, kind, source_channel_id, seen_at)
+                 VALUES ('UCnews', ?1, 'next', ?2, ?3)", params![v, src, t]).unwrap();
+        }
+        d.record_rec_scan("v4", "UCa", Some(&collab(&["UCcollab"])), t).unwrap();
+        alive(&d, "UCnews", 5, t);
+        alive(&d, "UCcollab", 5, t);
+        let conn = d.conn.into_inner().unwrap();
+        conn.execute_batch("PRAGMA user_version = 17;").unwrap();
+        let d = Db::init(conn).unwrap();
+        assert_eq!(listed(&d), vec!["UCcollab"], "a sidebar beside three channels is no longer a lead");
     }
 
     #[test]
@@ -458,20 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn next_needs_three_source_channels() {
-        let d = Db::open_in_memory().unwrap();
-        let t = now();
-        for (v, src) in [("v1", "UCa"), ("v2", "UCa"), ("v3", "UCb")] {
-            follow(&d, src);
-            d.record_rec_scan(v, src, Some(&next(&["UCx"])), t).unwrap();
-        }
-        assert_eq!(d.next_rec_check(t).unwrap(), None, "two channels, however many videos");
-        follow(&d, "UCc");
-        d.record_rec_scan("v4", "UCc", Some(&next(&["UCx"])), t).unwrap();
-        assert_eq!(d.next_rec_check(t).unwrap().as_deref(), Some("UCx"));
-    }
-
-    #[test]
     fn followed_removed_and_dismissed_never_listed() {
         let d = Db::open_in_memory().unwrap();
         follow(&d, "UCa");
@@ -520,22 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn old_next_links_pruned() {
-        let d = Db::open_in_memory().unwrap();
-        let t = now();
-        for (v, src) in [("v1", "UCa"), ("v2", "UCb"), ("v3", "UCc")] {
-            follow(&d, src);
-            d.record_rec_scan(v, src, Some(&next(&["UCx"])), t).unwrap();
-        }
-        d.record_rec_scan("v4", "UCa", Some(&collab(&["UCy"])), t).unwrap();
-        alive(&d, "UCx", 5, t);
-        alive(&d, "UCy", 5, t);
-        assert_eq!(sorted(listed(&d)), vec!["UCx", "UCy"]);
-        d.prune_recs(t + 91 * DAY).unwrap();
-        assert_eq!(listed(&d), vec!["UCy"], "a collab is kept; the sidebar is only recent");
-    }
-
-    #[test]
     fn popularity_counts_distinct_sources() {
         let d = Db::open_in_memory().unwrap();
         let t = now();
@@ -543,7 +522,6 @@ mod tests {
             follow(&d, src);
             d.record_rec_scan(v, src, Some(&collab(&["UCx"])), t).unwrap();
         }
-        d.record_rec_scan("v4", "UCb", Some(&next(&["UCx"])), t).unwrap();
         alive(&d, "UCx", 40, t);
         let r = &d.list_recommendations().unwrap()[0];
         assert_eq!(r.popularity, 2);
@@ -601,7 +579,7 @@ mod tests {
         d.set_rec_avatar("UCx", "/thumbs/channels/UCx.jpg").unwrap();
         follow(&d, "UCx");
         assert!(listed(&d).is_empty());
-        assert_eq!(d.prune_recs(t).unwrap(), vec!["/thumbs/recs/UCx-v.jpg"],
+        assert_eq!(d.prune_recs().unwrap(), vec!["/thumbs/recs/UCx-v.jpg"],
             "the picture is the subscription's now");
     }
 }

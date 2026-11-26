@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -285,6 +285,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 17 {
         conn.execute_batch(recs::SCHEMA_V17)?;
         conn.execute("INSERT OR IGNORE INTO rec_scans (video_id, scanned_at) SELECT id, 0 FROM videos", [])?;
+    }
+
+    // v18: "up next" is no longer a source of suggestions (`recs::parse_collabs`
+    // says why): its sightings go, and the index only their pruning read.
+    if version < 18 {
+        conn.execute_batch(recs::SCHEMA_V18)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -7690,7 +7696,7 @@ mod series_auto_download_tests {
         let version: i64 = d.conn.lock().unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(SCHEMA_VERSION, 18);
         assert_eq!(since(&d, "a"), None);
         assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
     }

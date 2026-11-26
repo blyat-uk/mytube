@@ -13,15 +13,6 @@ use crate::models::{Feed, RecUpload};
 use crate::poll::AppState;
 use crate::{avatar, config, watch_page};
 
-/// The channels one watch page points at, the uploader left out.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Leads {
-    /// Credited on the video itself: the Collaborators dialog.
-    pub collab: Vec<String>,
-    /// In the "up next" sidebar.
-    pub next: Vec<String>,
-}
-
 /// What a channel's `/videos` page says about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelFacts {
@@ -74,24 +65,28 @@ fn channel_ids(v: &Value, except: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The channels a watch page points at. `None` when the page carries no
-/// `ytInitialData` at all -- a bot check, a consent wall -- which is not the
-/// same as a page that points nowhere.
+/// The channels credited on a watch page's video, the uploader left out.
+/// `None` when the page carries no `ytInitialData` at all -- a bot check, a
+/// consent wall -- which is not the same as a page that credits no one.
 ///
 /// A collab's owner block holds the Collaborators dialog, a `browseId` per
 /// credited channel (verified on `bZitriM8N28`, 2026-11-19: five); a plain
-/// video's holds only the uploader's. The sidebar is signed out, so what it
-/// suggests is the topic's, never the user's.
-pub fn parse_leads(html: &str, uploader: &str) -> Option<Leads> {
+/// video's holds only the uploader's.
+///
+/// The "up next" sidebar is deliberately not read. Signed out, about half of
+/// it is whatever is popular where the request comes from, not the topic's
+/// (2026-11-21, a manhwa-recap library seen from Thailand: Thai TV news,
+/// finance talk, GTA let's-plays beside every video). That filler recurs
+/// beside more followed channels than the related channels do -- TOP NEWS
+/// LIVE beside 31 of them -- so no "seen beside N channels" rule can tell the
+/// two apart; ~100 suggestions it let through were all dismissed by hand.
+pub fn parse_collabs(html: &str, uploader: &str) -> Option<Vec<String>> {
     let data = initial_data(html)?;
-    let mut leads = Leads::default();
+    let mut collabs = Vec::new();
     if let Some(owner) = find(&data, "videoOwnerRenderer") {
-        channel_ids(owner, uploader, &mut leads.collab);
+        channel_ids(owner, uploader, &mut collabs);
     }
-    if let Some(sidebar) = find(&data, "secondaryResults") {
-        channel_ids(sidebar, uploader, &mut leads.next);
-    }
-    Some(leads)
+    Some(collabs)
 }
 
 /// Every `content` text under `v`.
@@ -158,14 +153,14 @@ pub fn parse_count(text: &str) -> Option<i64> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Answer { Answered, Unreadable, Throttled }
 
-/// What a scan learned: `Some(leads)` to record (`Some(None)`: the video is
+/// What a scan learned: `Some(collabs)` to record (`Some(None)`: the video is
 /// scanned with nothing found), `None` to ask again later. A page without
 /// `ytInitialData` -- usually a bot check -- is scanned with nothing rather
 /// than retried: the pace slows instead, as in [`crate::descriptions`].
-pub fn scanned(fetched: &Fetched, uploader: &str) -> (Option<Option<Leads>>, Answer) {
+pub fn scanned(fetched: &Fetched, uploader: &str) -> (Option<Option<Vec<String>>>, Answer) {
     match fetched {
-        Fetched::Page(html) => match parse_leads(html, uploader) {
-            Some(leads) => (Some(Some(leads)), Answer::Answered),
+        Fetched::Page(html) => match parse_collabs(html, uploader) {
+            Some(collabs) => (Some(Some(collabs)), Answer::Answered),
             None => (Some(None), Answer::Unreadable),
         },
         Fetched::Status(404 | 410) => (Some(None), Answer::Answered),
@@ -312,11 +307,11 @@ pub async fn run(state: Arc<AppState>) {
 async fn scan(state: &AppState, video: &str, channel: &str, now: i64) -> Answer {
     let fetched = descriptions::fetch_page(&state.http, video).await;
     let (record, answer) = scanned(&fetched, channel);
-    if let Some(leads) = record {
+    if let Some(collabs) = record {
         let (db, video, channel) = (state.db.clone(), video.to_string(), channel.to_string());
         let pruned = tokio::task::spawn_blocking(move || {
-            db.record_rec_scan(&video, &channel, leads.as_ref(), now)?;
-            db.prune_recs(now)
+            db.record_rec_scan(&video, &channel, collabs.as_deref(), now)?;
+            db.prune_recs()
         }).await;
         match pruned {
             Ok(Ok(files)) => delete(files).await,
@@ -422,8 +417,9 @@ mod tests {
     #[test]
     fn collab_page_lists_its_collaborators() {
         // bZitriM8N28, uploaded by AnimeCapped Manga with four others.
-        let leads = parse_leads(COLLAB, "UC5qhtUpMhpBacu9sm3V2fag").unwrap();
-        assert_eq!(sorted(leads.collab), vec![
+        // Only these four: the sidebar's channels are not collaborators.
+        let collabs = parse_collabs(COLLAB, "UC5qhtUpMhpBacu9sm3V2fag").unwrap();
+        assert_eq!(sorted(collabs), vec![
             "UC0-KdRW0iLL5igOsyGZd8kg", // Ever AU Manhwa
             "UCHxxNV44sQhvuXjkj2cpIBA", // Ackerman Manhwa
             "UCLZl9M3zsIYCWx3M0FU1eGg", // Evergarden Manhwa
@@ -432,24 +428,15 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_channels_are_leads() {
-        let leads = parse_leads(COLLAB, "UC5qhtUpMhpBacu9sm3V2fag").unwrap();
-        assert_eq!(sorted(leads.next), vec!["UC6x41swVZP3rEmy-ODxLMFA", "UCtBu8Wb2BUoduUXJS9Uss7Q"],
-            "the uploader's own videos in the sidebar are not a lead");
-    }
-
-    #[test]
     fn plain_video_has_no_collab() {
-        // dQw4w9WgXcQ: one owner, whose id is the uploader's.
-        let leads = parse_leads(PLAIN, "UCuAXFkgsw1L7xaCfnd5JJOw").unwrap();
-        assert!(leads.collab.is_empty());
-        assert_eq!(leads.next.len(), 7);
-        assert!(!leads.next.contains(&"UCuAXFkgsw1L7xaCfnd5JJOw".to_string()));
+        // dQw4w9WgXcQ: one owner, whose id is the uploader's; seven channels
+        // in its sidebar, none of them a lead.
+        assert_eq!(parse_collabs(PLAIN, "UCuAXFkgsw1L7xaCfnd5JJOw"), Some(vec![]));
     }
 
     #[test]
     fn page_without_initial_data_is_none() {
-        assert_eq!(parse_leads("<html>Our systems have detected unusual traffic</html>", "UCx"), None);
+        assert_eq!(parse_collabs("<html>Our systems have detected unusual traffic</html>", "UCx"), None);
     }
 
     #[test]
@@ -520,9 +507,9 @@ mod tests {
     #[test]
     fn scan_outcomes() {
         let page = Fetched::Page(COLLAB.into());
-        let (leads, answer) = scanned(&page, "UC5qhtUpMhpBacu9sm3V2fag");
+        let (collabs, answer) = scanned(&page, "UC5qhtUpMhpBacu9sm3V2fag");
         assert_eq!(answer, Answer::Answered);
-        assert_eq!(leads.unwrap().unwrap().collab.len(), 4);
+        assert_eq!(collabs.unwrap().unwrap().len(), 4);
 
         let bot = Fetched::Page("<html>unusual traffic</html>".into());
         assert_eq!(scanned(&bot, "UCx"), (Some(None), Answer::Unreadable),
@@ -573,9 +560,11 @@ mod tests {
         let http = reqwest::Client::new();
         let now = chrono::Utc::now().timestamp();
         let page = descriptions::fetch_page(&http, "bZitriM8N28").await;
-        let (leads, answer) = scanned(&page, "UC5qhtUpMhpBacu9sm3V2fag");
+        let (collabs, answer) = scanned(&page, "UC5qhtUpMhpBacu9sm3V2fag");
         assert_eq!(answer, Answer::Answered);
-        assert_eq!(leads.unwrap().unwrap().collab.len(), 4);
+        // Four when the fixture was saved; three on 2026-11-21 (Evergarden
+        // Manhwa's credit gone). Credits change, so: some, from this page.
+        assert!(!collabs.unwrap().unwrap().is_empty());
 
         for (id, alive) in [("UC4QcdYGH6IKUlNUhn8lzzWQ", false), ("UCfdAUuUI_gNd8BQmsJOyVdg", true)] {
             let page = descriptions::fetch(&http, &channel_page_url(id)).await;

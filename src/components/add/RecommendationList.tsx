@@ -33,9 +33,8 @@ function channelUrl(r: Recommendation): string {
 }
 
 /**
- * The Add dialog's Recommendations: channels found on new subscription videos
- * -- credited on a collab, or beside them in "up next" -- that `recs` checked
- * and found alive. Each shows its last four uploads, which are what the
+ * The Add dialog's Recommendations: channels credited on a collab with new
+ * subscription videos, that `recs` checked and found alive. Each shows its last four uploads, which are what the
  * decision is made from. Subscribe goes the Add box's own way; × is for good.
  */
 export default function RecommendationList({ folded, onFold, sort, onSort, refreshKey, onChanged }: Props) {
