@@ -94,6 +94,10 @@ html, body, #root {
   height: 100%;
   margin: 0;
 }
+/* The page itself never scrolls (body is overflow: hidden), but macOS still
+   rubber-bands it: a scroll that ran off the end of a box with nowhere else to
+   go -- a dialog's list -- dragged the whole window, dialog and all, about. */
+html, body { overscroll-behavior: none; }
 
 body {
   background: var(--bg);
@@ -2603,8 +2607,15 @@ label.field-label { display: block; }
   place-items: start center;
   padding: 8vh 20px 20px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   animation: fadein 140ms ease;
 }
+/* While a dialog is open the feed behind it holds still. overscroll-behavior
+   alone cannot promise that: a backdrop with nothing to scroll is skipped, and
+   WebKit (macOS, Linux) hands the wheel on to the box the dialog is rendered
+   inside -- `.content`, for every dialog a view opens -- not the one it is
+   painted over. The gutter stays, so the cards behind do not reflow. */
+.app:has(.modal-backdrop) .content { overflow: hidden; scrollbar-gutter: stable; }
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
 
 .modal {
@@ -2668,6 +2679,7 @@ label.field-label { display: block; }
   flex-direction: column;
   max-height: calc(100vh - 8vh - 20px);
   overflow-y: auto;
+  overscroll-behavior: contain;
   container: add-dialog / inline-size;
 }
 .add-close .icon { width: 16px; height: 16px; }
