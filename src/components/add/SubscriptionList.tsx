@@ -175,12 +175,14 @@ export default function SubscriptionList({
     void run(`open:${c.id}`, () => api.openExternal(c.url));
   }
 
-  /** Removal deletes every video the channel has, so it must not run twice --
-   *  the confirm stays pressed and disabled until the answer is in. */
-  function removeChannel(c: Channel) {
+  /** Removal deletes the channel's videos, so it must not run twice -- the
+   *  confirm stays pressed and disabled until the answer is in. */
+  function removeChannel(c: Channel, deleteDownloads: boolean) {
     void run(`remove:${c.id}`, async () => {
-      await api.removeChannel(c.id);
-      toast.success(`Removed ${c.title} and its videos.`);
+      const kept = await api.removeChannel(c.id, deleteDownloads);
+      toast.success(kept > 0
+        ? `Removed ${c.title}. Your ${kept} downloaded ${kept === 1 ? "video stays" : "videos stay"} in your library.`
+        : `Removed ${c.title} and its videos.`);
       setConfirmRemove(null);
       setOpenId((id) => (id === c.id ? null : id));
       onChanged();
@@ -292,7 +294,7 @@ export default function SubscriptionList({
                           onAutoConfirm={(backlog) => setAutoDownload(c, true, backlog)}
                           onAutoCancel={() => setAutoPrompt(null)}
                           onAskRemove={() => { setAutoPrompt(null); setConfirmRemove(c.id); }}
-                          onRemove={() => removeChannel(c)}
+                          onRemove={(deleteDownloads) => removeChannel(c, deleteDownloads)}
                           onKeep={() => setConfirmRemove(null)}
                         />
                       )}

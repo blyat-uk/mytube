@@ -257,15 +257,52 @@ pub async fn add_channel(
         .ok_or_else(|| "Channel disappeared after being added".to_string())
 }
 
+/// Ends a subscription. What it downloaded stays, playable, under the channel
+/// -- now an uploader -- and only the rest goes (`Db::unsubscribe`); with
+/// `delete_downloads` everything goes, the files too. Returns how many videos
+/// stayed.
 #[tauri::command]
-pub async fn remove_channel(channel_id: String, state: State<'_, Arc<AppState>>) -> R<()> {
-    db_blocking(&state, move |db| {
-        db.remove_channel(&channel_id)?;
-        // After the row, so a removal that fails keeps its picture.
-        crate::avatar::forget(&channel_id);
-        Ok(())
+pub async fn remove_channel(
+    channel_id: String,
+    delete_downloads: bool,
+    state: State<'_, Arc<AppState>>,
+) -> R<usize> {
+    // Downloads under way stop first, either way: one finishing after its row
+    // went would land on disk with nothing in the library pointing at it.
+    let id = channel_id.clone();
+    let under_way = db_blocking(&state, move |db| db.downloads_under_way(&id)).await?;
+    for video_id in under_way {
+        state.queue.cancel(&video_id).await.map_err(e)?;
+    }
+    let (kept, paths) = db_blocking(&state, move |db| {
+        let (kept, paths) = if delete_downloads {
+            (0, db.remove_channel(&channel_id)?)
+        } else {
+            db.unsubscribe(&channel_id)?
+        };
+        // After the row, so a removal that fails keeps its picture; and only
+        // with the row, since a channel that kept videos still shows it.
+        if kept == 0 {
+            crate::avatar::forget(&channel_id);
+        }
+        Ok((kept, paths))
     })
-    .await
+    .await?;
+    // Unwaited, as `delete_download`'s unlink is: a spun-down disk takes
+    // seconds, and the rows are already gone.
+    tauri::async_runtime::spawn_blocking(move || paths.iter().for_each(|p| unlink(p)));
+    Ok(kept)
+}
+
+/// Deletes a file the library has let go of. Already gone is the outcome
+/// wanted, not a failure worth a line.
+fn unlink(path: &str) {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("mytube: could not delete {path}: {err}")
+        }
+        _ => {}
+    }
 }
 
 /// The Add dialog's Recommendations, as `recs` last left them.
@@ -774,6 +811,10 @@ pub async fn open_in_player(video_id: String, state: State<'_, Arc<AppState>>) -
 /// it. A failure there is only logged; the row is already `none` either way,
 /// the same outcome the old unlink-then-clear order reached when the unlink
 /// failed.
+///
+/// A polled video of a channel you no longer follow had only its file to
+/// stay for, so the row goes with it (`Db::drop_if_unfollowed`) and the shell
+/// refetches.
 #[tauri::command]
 pub async fn delete_download(
     video_id: String,
@@ -781,25 +822,20 @@ pub async fn delete_download(
     app: AppHandle,
 ) -> R<()> {
     let id = video_id.clone();
-    let path = db_blocking(&state, move |db| {
+    let (path, dropped) = db_blocking(&state, move |db| {
         let v = db
             .get_video(&id)?
             .ok_or_else(|| anyhow::anyhow!("Unknown video"))?;
         db.clear_file_path(&id)?;
-        Ok(v.file_path)
+        Ok((v.file_path, db.drop_if_unfollowed(&id)?))
     })
     .await?;
     crate::queue::emit_state(&app, &video_id, DownloadState::None, None, None);
+    if dropped {
+        let _ = app.emit(crate::removed::CLEARED_EVENT, ());
+    }
     if let Some(p) = path {
-        tauri::async_runtime::spawn_blocking(move || {
-            // Already gone is the outcome wanted, not a failure worth a line.
-            match std::fs::remove_file(&p) {
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                    eprintln!("mytube: could not delete {p}: {err}")
-                }
-                _ => {}
-            }
-        });
+        tauri::async_runtime::spawn_blocking(move || unlink(&p));
     }
     Ok(())
 }

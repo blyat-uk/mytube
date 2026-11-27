@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -298,6 +298,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     // exported -- each machine keeps its own once-a-day clock.
     if version < 19 && !column_exists(conn, "channels", "removed_checked_at")? {
         conn.execute("ALTER TABLE channels ADD COLUMN removed_checked_at INTEGER", [])?;
+    }
+
+    // v20: a subscription can now end with its row kept -- the channel
+    // becomes an uploader holding only its downloads (`Db::unsubscribe`) --
+    // and that removal has to travel as a deleted row's does.
+    if version < 20 {
+        conn.execute_batch(UNSUBSCRIBE_TRIGGER)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -548,6 +555,23 @@ BEGIN
   ON CONFLICT (kind, id) DO UPDATE
      SET removed_at = MAX(tombstones.removed_at, excluded.removed_at)
    WHERE tombstones.removed_at < OLD.first_seen_at;
+END;
+";
+
+/// v20: an unsubscribe tombstones the channel exactly as `sync_channel_removed`
+/// does a deleted row, so other machines drop the subscription either way. Not
+/// when the same write moved the stamp: that is `Db::apply_sync` carrying a
+/// removal that already has its tombstone.
+const UNSUBSCRIBE_TRIGGER: &str = "
+CREATE TRIGGER IF NOT EXISTS sync_channel_unsubscribed AFTER UPDATE OF subscribed ON channels
+WHEN OLD.subscribed <> 0 AND NEW.subscribed = 0
+ AND NEW.subscribed_changed_at IS OLD.subscribed_changed_at
+BEGIN
+  INSERT INTO tombstones (kind, id, removed_at)
+  VALUES ('channel', OLD.id, CAST(strftime('%s','now') AS INTEGER))
+  ON CONFLICT (kind, id) DO UPDATE
+     SET removed_at = MAX(tombstones.removed_at, excluded.removed_at)
+   WHERE tombstones.removed_at < COALESCE(OLD.subscribed_changed_at, 0);
 END;
 ";
 
@@ -1084,6 +1108,27 @@ const PRUNE_ORPHAN_CHANNEL: &str = "DELETE FROM channels
      WHERE id=?1 AND subscribed=0
        AND NOT EXISTS (SELECT 1 FROM videos WHERE channel_id=?1)";
 
+/// The rows a removed subscription does not keep: everything but a download,
+/// done or on its way. Deleting one of those would leave its file on disk
+/// with nothing in the library pointing at it.
+const UNKEPT: &str = "download_state IN ('none','failed')";
+
+/// Deletes a removed subscription's videos but the ones `UNKEPT` spares, and
+/// the channel too once none is left; returns how many stayed. Shared by
+/// `Db::unsubscribe` and a sync apply carrying a removal, so the two can never
+/// disagree about what stays. Unsubscribing a channel that kept some is the
+/// caller's: the two date it differently.
+fn drop_unkept(conn: &Connection, channel_id: &str) -> Result<usize> {
+    conn.execute(&format!("DELETE FROM videos WHERE channel_id=?1 AND {UNKEPT}"),
+                 params![channel_id])?;
+    let kept: usize = conn.query_row("SELECT COUNT(*) FROM videos WHERE channel_id=?1",
+                                     params![channel_id], |r| r.get(0))?;
+    if kept == 0 {
+        conn.execute("DELETE FROM channels WHERE id=?1", params![channel_id])?;
+    }
+    Ok(kept)
+}
+
 const SET_PUBLISHED_IF_MISSING: &str = "UPDATE videos SET published_at=?2,
             sort_at = CASE WHEN added_manually=1 THEN sort_at
                            ELSE COALESCE(sort_at, ?2) END
@@ -1307,10 +1352,77 @@ impl Db {
         Ok(self.list_channels()?.into_iter().find(|c| c.id == id))
     }
 
-    pub fn remove_channel(&self, id: &str) -> Result<()> {
+    /// Removes a subscription and every video it brought, downloaded or not,
+    /// by the cascade. Returns the downloaded files and the thumbnails those
+    /// rows named, for the caller to unlink: `db.rs` never touches the disk.
+    pub fn remove_channel(&self, id: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let paths = {
+            let mut st = tx.prepare(
+                "SELECT file_path FROM videos
+                  WHERE channel_id=?1 AND download_state='done' AND file_path IS NOT NULL
+                 UNION ALL
+                 SELECT thumb_path FROM videos WHERE channel_id=?1 AND thumb_path IS NOT NULL")?;
+            let rows = st.query_map(params![id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        tx.execute("DELETE FROM channels WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(paths)
+    }
+
+    /// Ends a subscription but keeps what it downloaded: those rows stay,
+    /// playable, under the channel -- now an uploader like any other -- and
+    /// every other row goes, manual ones too. A channel left with nothing goes
+    /// as `remove_channel` takes it. Either way the removal is tombstoned
+    /// (`sync_channel_removed`, `UNSUBSCRIBE_TRIGGER`), so it travels.
+    /// Returns how many videos stayed and the thumbnails of those that went.
+    pub fn unsubscribe(&self, id: &str) -> Result<(usize, Vec<String>)> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let thumbs = {
+            let mut st = tx.prepare(&format!(
+                "SELECT thumb_path FROM videos
+                  WHERE channel_id=?1 AND {UNKEPT} AND thumb_path IS NOT NULL"))?;
+            let rows = st.query_map(params![id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        let kept = drop_unkept(&tx, id)?;
+        if kept > 0 {
+            // Machine-local, and no use to an uploader nothing polls: a later
+            // subscribe starts with it off, as any subscription does.
+            tx.execute("UPDATE channels SET subscribed=0, auto_download_since=NULL WHERE id=?1",
+                       params![id])?;
+        }
+        tx.commit()?;
+        Ok((kept, thumbs))
+    }
+
+    /// The channel's downloads queued or running, which a removal stops first.
+    pub fn downloads_under_way(&self, channel_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM channels WHERE id=?1", params![id])?;
-        Ok(())
+        let mut st = conn.prepare(
+            "SELECT id FROM videos
+              WHERE channel_id=?1 AND download_state IN ('queued','downloading')")?;
+        let rows = st.query_map(params![channel_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A polled video of a channel you no longer follow stayed only for its
+    /// file (`unsubscribe`). Its download deleted, it goes too, and the
+    /// channel with its last video. A manual one stays, as on any uploader.
+    /// Returns whether the row went.
+    pub fn drop_if_unfollowed(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let channel: Option<String> = conn.query_row(&format!(
+            "DELETE FROM videos
+              WHERE id=?1 AND added_manually=0 AND {UNKEPT}
+                AND channel_id IN (SELECT id FROM channels WHERE subscribed=0)
+             RETURNING channel_id"), params![id], |r| r.get(0)).optional()?;
+        let Some(channel) = channel else { return Ok(false) };
+        conn.execute(PRUNE_ORPHAN_CHANNEL, params![channel])?;
+        Ok(true)
     }
 
     /// Records whether you have joined this channel's membership, which is what
@@ -6500,6 +6612,13 @@ INSERT INTO channels (id, title, handle, url, subscribed, subscribed_changed_at,
                       member, member_changed_at, added_at)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
+/// A removal arriving for a channel that keeps this machine's downloads
+/// (`drop_unkept`): dated by the removal, as everything an apply writes is.
+/// `auto_download_since` goes as `Db::unsubscribe` clears it.
+const UNSUBSCRIBE_SYNC_CHANNEL: &str = "
+UPDATE channels SET subscribed = 0, subscribed_changed_at = ?2, auto_download_since = NULL
+ WHERE id = ?1";
+
 const SET_SYNC_CHANNEL: &str = "
 UPDATE channels SET subscribed = ?2, subscribed_changed_at = ?3,
                     member = ?4, member_changed_at = ?5
@@ -6676,7 +6795,13 @@ impl Db {
                     Some(l) => snapshot::merge_channel(&[l, incoming]),
                     None => incoming.clone(),
                 };
-                if removed_subscription(&joined, &channel_tombstones) {
+                // Step 3's too: a local subscription the tombstone covers, even
+                // when the remover's copy arrived, unsubscribed -- applied here
+                // as a plain change, it would keep every video.
+                if removed_subscription(&joined, &channel_tombstones)
+                    || (!joined.subscribed
+                        && local.as_ref().is_some_and(|l| removed_subscription(l, &channel_tombstones)))
+                {
                     continue;
                 }
                 match local {
@@ -6704,8 +6829,10 @@ impl Db {
             }
         }
 
-        // 3. Local subscriptions a tombstone covers go, and the cascade takes
-        //    their uploads -- manual ones too, exactly as a local removal would.
+        // 3. Local subscriptions a tombstone covers go, and their uploads --
+        //    manual ones too -- exactly as a local removal would, by the same
+        //    `drop_unkept`: what this machine downloaded stays, under the
+        //    channel, unsubscribed as of the removal.
         let doomed: Vec<(String, i64)> = {
             let mut st = tx.prepare(
                 "SELECT c.id, t.removed_at FROM channels c
@@ -6717,7 +6844,11 @@ impl Db {
         };
         for (id, removed_at) in &doomed {
             tx.execute(TOMBSTONE_MANUAL_UPLOADS, params![id, removed_at])?;
-            writes += tx.execute("DELETE FROM channels WHERE id=?1", params![id])?;
+            if drop_unkept(&tx, id)? > 0 {
+                tx.execute(UNSUBSCRIBE_SYNC_CHANNEL, params![id, removed_at])?;
+                tx.execute(RESTAMP_SYNC_CHANNEL, params![id, removed_at, None::<i64>])?;
+            }
+            writes += 1;
         }
 
         // 4. Videos.
@@ -6765,6 +6896,12 @@ impl Db {
                 {
                     continue;
                 }
+                // A polled video comes with its subscription. One whose channel
+                // is not followed here stayed on the sender only for its file
+                // (`Db::unsubscribe`), which this machine does not have.
+                if !incoming.added_manually && subscribed_here != Some(true) {
+                    continue;
+                }
                 if covered(video_tombstones.get(&incoming.id).copied(), Some(incoming.added_at)) {
                     continue;
                 }
@@ -6783,13 +6920,15 @@ impl Db {
         }
 
         // 5. Local manual videos a tombstone covers go, measured against the
-        //    `first_seen_at` step 4 may just have moved on; then any uploader
-        //    left with nothing, by the same rule a local delete prunes by.
+        //    `first_seen_at` step 4 may just have moved on -- but for one this
+        //    machine downloaded, whose file would be left behind; then any
+        //    uploader left with nothing, by the same rule a local delete
+        //    prunes by.
         let condemned: Vec<(String, String)> = {
-            let mut st = tx.prepare(
+            let mut st = tx.prepare(&format!(
                 "SELECT v.id, v.channel_id FROM videos v
                    JOIN tombstones t ON t.kind = 'video' AND t.id = v.id
-                  WHERE v.added_manually <> 0 AND v.first_seen_at <= t.removed_at")?;
+                  WHERE v.added_manually <> 0 AND v.first_seen_at <= t.removed_at AND v.{UNKEPT}"))?;
             let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -7826,7 +7965,7 @@ mod series_auto_download_tests {
         let version: i64 = d.conn.lock().unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 19);
+        assert_eq!(SCHEMA_VERSION, 20);
         assert_eq!(since(&d, "a"), None);
         assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
     }
@@ -8128,6 +8267,85 @@ mod sync_tests {
         assert!(stamped_now(&at, tombstone(&d, "channel", "UC1")));
         assert!(stamped_now(&at, tombstone(&d, "video", "m")), "the cascade counts as a delete");
         assert_eq!(tombstone(&d, "video", "p"), None, "a polled video is the poll's to bring back");
+    }
+
+    #[test]
+    fn unsubscribing_keeps_the_downloads_and_tombstones_the_subscription() {
+        let d = one_video("p");
+        for id in ["done", "queued", "failed"] {
+            d.insert_video_if_new(&polled(id, "UC1")).unwrap();
+        }
+        d.insert_video_if_new(&manual("m", "UC1")).unwrap();
+        d.set_download_state("done", DownloadState::Done, Some("/v/done.mkv"), None).unwrap();
+        d.set_download_state("queued", DownloadState::Queued, None, None).unwrap();
+        d.set_download_state("failed", DownloadState::Failed, None, Some("boom")).unwrap();
+        d.set_channel_auto_download("UC1", true).unwrap();
+        sql(&d, "UPDATE videos SET thumb_path='/t/' || id");
+
+        let ((kept, mut thumbs), at) = around(|| d.unsubscribe("UC1").unwrap());
+        // A download on its way stays too: the command cancels those first,
+        // and one that slipped in after is safer kept than orphaned.
+        assert_eq!(kept, 2);
+        thumbs.sort();
+        assert_eq!(thumbs, ["/t/failed", "/t/m", "/t/p"]);
+        for (id, here) in [("done", true), ("queued", true), ("failed", false), ("m", false), ("p", false)] {
+            assert_eq!(d.get_video(id).unwrap().is_some(), here, "{id}");
+        }
+        let c = d.get_channel("UC1").unwrap().unwrap();
+        assert!(!c.subscribed && !c.auto_download);
+        assert!(stamped_now(&at, channel_stamps(&d, "UC1")[0]));
+        assert!(stamped_now(&at, tombstone(&d, "channel", "UC1")), "it travels like a deleted row");
+        assert!(stamped_now(&at, tombstone(&d, "video", "m")));
+        assert!(d.list_subscribed_channels().unwrap().is_empty(), "nothing polls it");
+    }
+
+    #[test]
+    fn unsubscribing_with_nothing_downloaded_removes_the_channel() {
+        let d = one_video("p");
+        let ((kept, _), at) = around(|| d.unsubscribe("UC1").unwrap());
+        assert_eq!(kept, 0);
+        assert!(d.get_channel("UC1").unwrap().is_none());
+        assert!(stamped_now(&at, tombstone(&d, "channel", "UC1")));
+    }
+
+    #[test]
+    fn removing_a_channel_hands_back_its_files_and_thumbnails() {
+        let d = one_video("p");
+        d.insert_video_if_new(&polled("done", "UC1")).unwrap();
+        d.set_download_state("done", DownloadState::Done, Some("/v/done.mkv"), None).unwrap();
+        sql(&d, "UPDATE videos SET thumb_path='/t/' || id");
+        let mut paths = d.remove_channel("UC1").unwrap();
+        paths.sort();
+        assert_eq!(paths, ["/t/done", "/t/p", "/v/done.mkv"]);
+        assert!(d.get_video("done").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_deleted_download_of_an_unfollowed_channel_takes_its_row() {
+        let d = one_video("p");
+        d.insert_video_if_new(&manual("m", "UC1")).unwrap();
+        for id in ["p", "m"] {
+            d.set_download_state(id, DownloadState::Done, Some("/v/x.mkv"), None).unwrap();
+        }
+        assert!(!d.drop_if_unfollowed("p").unwrap(), "still downloaded");
+        d.clear_file_path("p").unwrap();
+        d.upsert_channel(&chan("UC1")).unwrap();
+        assert!(!d.drop_if_unfollowed("p").unwrap(), "a subscription's video is the poll's");
+
+        d.set_download_state("p", DownloadState::Done, Some("/v/x.mkv"), None).unwrap();
+        assert_eq!(d.unsubscribe("UC1").unwrap().0, 2);
+        d.clear_file_path("p").unwrap();
+        assert!(d.drop_if_unfollowed("p").unwrap());
+        assert!(d.get_video("p").unwrap().is_none());
+        d.clear_file_path("m").unwrap();
+        assert!(!d.drop_if_unfollowed("m").unwrap(), "a manual video stays, as on any uploader");
+        assert!(d.get_channel("UC1").unwrap().is_some());
+
+        d.set_download_state("m", DownloadState::Done, Some("/v/x.mkv"), None).unwrap();
+        sql(&d, "UPDATE videos SET added_manually=0");
+        d.clear_file_path("m").unwrap();
+        assert!(d.drop_if_unfollowed("m").unwrap());
+        assert!(d.get_channel("UC1").unwrap().is_none(), "the channel goes with its last video");
     }
 
     #[test]
@@ -8451,6 +8669,62 @@ mod sync_tests {
         assert!(a.get_channel("UC1").unwrap().unwrap().subscribed);
         assert_eq!(channel_stamps(&a, "UC1")[0], Some(400));
         assert_eq!(tombstone(&a, "channel", "UC1"), Some(300), "kept, and no longer covering it");
+        assert!(!sync(&a, &b).changed);
+    }
+
+    #[test]
+    fn an_unsubscribe_travels_and_each_machine_keeps_its_own_downloads() {
+        let (a, b) = (library(), library());
+        a.set_download_state("a", DownloadState::Done, Some("/a.mkv"), None).unwrap();
+        // Watched, so A's snapshot carries its unsubscribed copy of UC1 too.
+        a.set_watched("a", true).unwrap();
+        b.set_download_state("b", DownloadState::Done, Some("/b.mkv"), None).unwrap();
+        b.insert_video_if_new(&manual("m", "UC1")).unwrap();
+        b.set_download_state("m", DownloadState::Done, Some("/m.mkv"), None).unwrap();
+        pin(&b, "videos", "m", "first_seen_at=100");
+        a.unsubscribe("UC1").unwrap();
+        sql(&a, "UPDATE tombstones SET removed_at=300; UPDATE channels SET subscribed_changed_at=300");
+
+        assert!(sync(&a, &b).changed);
+        let c = b.get_channel("UC1").unwrap().unwrap();
+        assert!(!c.subscribed);
+        assert_eq!(channel_stamps(&b, "UC1")[0], Some(300), "the remover's time, not this clock's");
+        for (id, here) in [("a", false), ("b", true), ("c", false), ("m", true)] {
+            assert_eq!(b.get_video(id).unwrap().is_some(), here, "{id} on B");
+        }
+        assert!(!sync(&a, &b).changed, "a second apply writes nothing");
+
+        // And back: A keeps its download and takes none of B's.
+        sync(&b, &a);
+        for (id, here) in [("a", true), ("b", false), ("m", false)] {
+            assert_eq!(a.get_video(id).unwrap().is_some(), here, "{id} on A");
+        }
+    }
+
+    #[test]
+    fn a_kept_video_never_reaches_a_machine_that_did_not_keep_it() {
+        let (a, b) = (library(), library());
+        a.set_download_state("a", DownloadState::Done, Some("/a.mkv"), None).unwrap();
+        a.set_watched("a", true).unwrap();
+        a.unsubscribe("UC1").unwrap();
+        sync(&a, &b);
+        assert!(b.get_channel("UC1").unwrap().is_none(), "B downloaded nothing, so nothing stays");
+        assert!(b.get_video("a").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_manual_delete_elsewhere_spares_a_downloaded_copy() {
+        let (a, b) = (library(), library());
+        a.upsert_channel(&adhoc("UC2")).unwrap();
+        a.insert_video_if_new(&manual("m", "UC2")).unwrap();
+        pin(&a, "videos", "m", "first_seen_at=120");
+        sync(&a, &b);
+        b.set_download_state("m", DownloadState::Done, Some("/m.mkv"), None).unwrap();
+
+        a.delete_video("m").unwrap();
+        a.prune_orphan_channel("UC2").unwrap();
+        sync(&a, &b);
+        assert!(b.get_video("m").unwrap().is_some(), "its file would be left with no row");
         assert!(!sync(&a, &b).changed);
     }
 

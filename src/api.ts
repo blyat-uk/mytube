@@ -34,7 +34,11 @@ export const api = {
    *  already in the library are left alone, Shorts refused. */
   addPlaylist: (entries: PlaylistEntry[]) =>
     invoke<AddPlaylistResult>("add_playlist", { entries }),
-  removeChannel: (channelId: string) => invoke<void>("remove_channel", { channelId }),
+  /** Ends a subscription. Its downloaded videos stay, under a channel nothing
+   *  polls any more, unless `deleteDownloads` takes them and their files too.
+   *  Resolves to how many videos stayed. */
+  removeChannel: (channelId: string, deleteDownloads: boolean) =>
+    invoke<number>("remove_channel", { channelId, deleteDownloads }),
   /** The Add dialog's suggested channels, as the background check left them. */
   listRecommendations: () => invoke<Recommendation[]>("list_recommendations"),
   /** "Never suggest this channel again." */

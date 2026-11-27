@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import AutoDownloadPrompt, { type Backlog } from "./AutoDownloadPrompt";
 import {
   IconAutoDownload, IconBusy, IconDelete, IconExternal, IconLastChecked, IconLatestUpload,
@@ -26,7 +26,8 @@ interface Props {
   onAutoConfirm: (backlog: Backlog | null) => void;
   onAutoCancel: () => void;
   onAskRemove: () => void;
-  onRemove: () => void;
+  /** `deleteDownloads`: the files go too, not only the rest of its videos. */
+  onRemove: (deleteDownloads: boolean) => void;
   onKeep: () => void;
 }
 
@@ -70,29 +71,7 @@ export default function ChannelPanel(p: Props) {
       )}
 
       {p.confirming ? (
-        <div className="add-ch-confirm" role="group" aria-label={`Remove ${c.title}?`}>
-          <p className="add-ch-confirm-text">
-            {s.videos > 0
-              ? <>Remove <b>{c.title}</b> and delete its {s.videos} video{s.videos === 1 ? "" : "s"}?</>
-              : <>Remove <b>{c.title}</b>?</>}
-          </p>
-          <div className="add-ch-confirm-buttons">
-            <PanelButton
-              glyph={<IconDelete />}
-              label="Remove"
-              tone="btn-danger"
-              {...p.busy.remove}
-              onClick={p.onRemove}
-            />
-            <PanelButton
-              label="Keep"
-              tone="btn-quiet"
-              // Too late to keep it once the removal is out.
-              busy={p.busy.remove.busy}
-              onClick={p.onKeep}
-            />
-          </div>
-        </div>
+        <RemoveConfirm channel={c} stats={s} busy={p.busy.remove} onRemove={p.onRemove} onKeep={p.onKeep} />
       ) : (
         <div className="add-ch-actions">
           <PanelButton glyph={<IconExternal />} label="Open on YouTube" {...p.busy.open} onClick={p.onOpen} />
@@ -141,6 +120,63 @@ export default function ChannelPanel(p: Props) {
       {p.prompting && (
         <AutoDownloadPrompt channel={c} onConfirm={p.onAutoConfirm} onCancel={p.onAutoCancel} />
       )}
+    </div>
+  );
+}
+
+/**
+ * "Remove?" in the actions' place. What it downloaded stays unless the box
+ * says otherwise, which is offered only when there is something on disk to
+ * delete. Mounted per asking, so the box starts unticked every time.
+ */
+function RemoveConfirm({ channel: c, stats: s, busy, onRemove, onKeep }: {
+  channel: Channel;
+  stats: ChannelStats;
+  busy: Busy;
+  onRemove: (deleteDownloads: boolean) => void;
+  onKeep: () => void;
+}) {
+  const [deleteDownloads, setDeleteDownloads] = useState(false);
+  const kept = deleteDownloads ? 0 : s.downloaded;
+  const doomed = s.videos - kept;
+  const videos = (n: number) => `${n} video${n === 1 ? "" : "s"}`;
+  return (
+    <div className="add-ch-confirm" role="group" aria-label={`Remove ${c.title}?`}>
+      <div className="add-ch-confirm-body">
+        <p className="add-ch-confirm-text">
+          {doomed > 0
+            ? <>Remove <b>{c.title}</b> and delete {kept > 0 ? "the other" : "its"} {videos(doomed)}?</>
+            : <>Remove <b>{c.title}</b>?</>}
+          {kept > 0 && <> Your {kept} downloaded {kept === 1 ? "video stays" : "videos stay"} in your library.</>}
+        </p>
+        {s.downloaded > 0 && (
+          <label className="add-ch-confirm-opt">
+            <input
+              type="checkbox"
+              checked={deleteDownloads}
+              disabled={busy.busy}
+              onChange={(e) => setDeleteDownloads(e.currentTarget.checked)}
+            />
+            Also delete the {s.downloaded === 1 ? "downloaded video" : `${s.downloaded} downloaded videos`} from disk
+          </label>
+        )}
+      </div>
+      <div className="add-ch-confirm-buttons">
+        <PanelButton
+          glyph={<IconDelete />}
+          label="Remove"
+          tone="btn-danger"
+          {...busy}
+          onClick={() => onRemove(deleteDownloads)}
+        />
+        <PanelButton
+          label="Keep"
+          tone="btn-quiet"
+          // Too late to keep it once the removal is out.
+          busy={busy.busy}
+          onClick={onKeep}
+        />
+      </div>
     </div>
   );
 }

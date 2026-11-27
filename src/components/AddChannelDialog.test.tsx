@@ -12,7 +12,8 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}
 const setChannelMember =
   vi.fn<(id: string, member: boolean) => Promise<number>>(() => Promise.resolve(0));
 const openExternal = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
-const removeChannel = vi.fn<(id: string) => Promise<void>>(() => Promise.resolve());
+const removeChannel =
+  vi.fn<(id: string, deleteDownloads: boolean) => Promise<number>>(() => Promise.resolve(0));
 type Backlog = { includeWatched: boolean; includeHidden: boolean };
 const setChannelAutoDownload =
   vi.fn<(id: string, enabled: boolean, backlog: Backlog | null) => Promise<number>>(
@@ -28,7 +29,7 @@ vi.mock("../api", () => ({
     previewAdd: () => Promise.resolve({ kind: "channel", subscribedId: null }),
     addChannel: () => Promise.resolve({}),
     addVideo: () => Promise.resolve({}),
-    removeChannel: (id: string) => removeChannel(id),
+    removeChannel: (id: string, deleteDownloads: boolean) => removeChannel(id, deleteDownloads),
     previewTakeoutCsv: () => Promise.resolve([
       { channelId: "UCaaaaaaaaaaaaaaaaaaaaaa", title: "Alpha", alreadySubscribed: false },
     ]),
@@ -117,7 +118,7 @@ function openRow(title: string) {
 beforeEach(() => {
   setChannelMember.mockReset().mockResolvedValue(0);
   openExternal.mockReset().mockResolvedValue(undefined);
-  removeChannel.mockReset().mockResolvedValue(undefined);
+  removeChannel.mockReset().mockResolvedValue(0);
   setChannelAutoDownload.mockReset().mockResolvedValue(0);
   autoDownloadBacklogCount.mockReset().mockResolvedValue(0);
   subscriptionStats.mockReset().mockResolvedValue([]);
@@ -392,14 +393,65 @@ describe("a channel's actions", () => {
     expect(within(panel("Daily Comics")).queryByRole("button", { name: "Open on YouTube" })).toBeNull();
 
     fireEvent.click(within(ask).getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC2"));
+    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC2", false));
     expect(await screen.findByText("Removed Daily Comics and its videos.")).toBeTruthy();
     expect(onChanged).toHaveBeenCalled();
   });
 
+  it("offers no box to tick when nothing is downloaded", async () => {
+    subscriptionStats.mockResolvedValue([stats("UC2", { videos: 207 })]);
+    await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
+    const ask = within(panel("Daily Comics")).getByRole("group", { name: "Remove Daily Comics?" });
+    expect(within(ask).queryByRole("checkbox")).toBeNull();
+  });
+
+  it("keeps what is downloaded unless the box says otherwise", async () => {
+    subscriptionStats.mockResolvedValue([stats("UC2", { videos: 207, downloaded: 3 })]);
+    removeChannel.mockResolvedValue(3);
+    await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
+    const ask = within(panel("Daily Comics")).getByRole("group", { name: "Remove Daily Comics?" });
+    const box = within(ask).getByRole("checkbox", {
+      name: "Also delete the 3 downloaded videos from disk",
+    }) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    expect(ask.textContent).toContain(
+      "Remove Daily Comics and delete the other 204 videos? Your 3 downloaded videos stay in your library.");
+
+    fireEvent.click(within(ask).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC2", false));
+    expect(await screen.findByText(
+      "Removed Daily Comics. Your 3 downloaded videos stay in your library.")).toBeTruthy();
+  });
+
+  it("deletes the downloads too once the box is ticked, and asks afresh each time", async () => {
+    subscriptionStats.mockResolvedValue([stats("UC2", { videos: 1, downloaded: 1 })]);
+    await renderDialog();
+    openRow("Daily Comics");
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
+    let ask = within(panel("Daily Comics")).getByRole("group", { name: "Remove Daily Comics?" });
+    expect(ask.textContent).toContain("Remove Daily Comics? Your 1 downloaded video stays in your library.");
+    fireEvent.click(within(ask).getByRole("checkbox", { name: "Also delete the downloaded video from disk" }));
+    expect(ask.textContent).toContain("Remove Daily Comics and delete its 1 video?");
+
+    // Backing out and asking again starts unticked.
+    fireEvent.click(within(ask).getByRole("button", { name: "Keep" }));
+    fireEvent.click(inPanel("Daily Comics", "Remove"));
+    ask = within(panel("Daily Comics")).getByRole("group", { name: "Remove Daily Comics?" });
+    const box = within(ask).getByRole("checkbox") as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+    fireEvent.click(within(ask).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC2", true));
+    expect(await screen.findByText("Removed Daily Comics and its videos.")).toBeTruthy();
+  });
+
   it("removes once, however often the confirmation is pressed", async () => {
     let finish = () => {};
-    removeChannel.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
+    removeChannel.mockImplementation(() => new Promise<number>((res) => { finish = () => res(0); }));
     await renderDialog();
     openRow("Daily Comics");
     fireEvent.click(inPanel("Daily Comics", "Remove"));
@@ -462,7 +514,7 @@ describe("a terminated channel", () => {
     expect(removeChannel).not.toHaveBeenCalled();
     fireEvent.click(within(screen.getByRole("group", { name: "Remove Free manhwa?" }))
       .getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC3"));
+    await waitFor(() => expect(removeChannel).toHaveBeenCalledWith("UC3", false));
   });
 
   it("leaves a live channel's row alone", async () => {

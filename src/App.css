@@ -3313,14 +3313,21 @@ label.field-label { display: block; }
 /* The question takes the actions' place at the actions' height, so the
    panel does not jump when it is asked. */
 .add-ch-confirm { gap: 6px 12px; animation: add-swap-in 160ms var(--fold-ease); }
+.add-ch-confirm-body { display: grid; flex: 1 1 22rem; gap: 8px; min-width: 0; }
 .add-ch-confirm-text {
-  flex: 1 1 22rem;
-  min-width: 0;
   margin: 0;
   color: var(--add-danger-text);
   font-size: 1.3rem;
 }
 .add-ch-confirm-text b { font-weight: 600; }
+.add-ch-confirm-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  font-size: 1.25rem;
+  cursor: pointer;
+}
 .add-ch-confirm-buttons { display: flex; gap: 6px; margin-left: auto; }
 
 @container add-panel (max-width: 54rem) {
