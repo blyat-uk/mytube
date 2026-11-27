@@ -392,6 +392,11 @@ export interface Settings {
    *  machine-local like `show_stats`. Read `=== true`, since an older backend
    *  sends no key. */
   delete_when_watched: boolean;
+  /** Settings → New videos → Auto-clear: once a day per channel, the videos
+   *  YouTube no longer has are deleted unless downloaded. On by default;
+   *  machine-local.
+   *  Read `!== false`, since an older backend sends no key. */
+  auto_clear_removed: boolean;
   /** Hand-edit-only overrides. No control writes them; they ride through every
    *  save untouched because `commit()` always spreads the whole object. */
   ytdlp_path: string; ffmpeg_path: string; deno_path: string;

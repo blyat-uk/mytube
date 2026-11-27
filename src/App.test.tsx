@@ -118,7 +118,7 @@ function settingsWith(view: Partial<ViewState> = {}): Settings {
     window_maximized: false,
     cookies_browser: "auto", cookies_file: "", ytdlp_channel: "nightly", ytdlp_auto_update: true,
     check_app_updates: true, text_scale: 100, show_stats: false, parts_panel: "visible",
-    delete_when_watched: false,
+    delete_when_watched: false, auto_clear_removed: true,
     ytdlp_path: "", ffmpeg_path: "", deno_path: "",
     quality: { ...DEFAULT_QUALITY },
     view: defaultView(view),
@@ -986,6 +986,22 @@ describe("cloud sync", () => {
     const lists = listChannels.mock.calls.length;
 
     act(() => listeners.get("sync://finished")!({ payload: null }));
+
+    await waitFor(() => expect(listVideos.mock.calls.length).toBeGreaterThan(feeds));
+    expect(listChannels.mock.calls.length).toBeGreaterThan(lists);
+    expect(screen.queryByText(/new video/)).toBeNull();
+  });
+
+  it("refetches the channels and the feed when Auto-clear deletes videos, and toasts nothing", async () => {
+    render(<App />);
+    await screen.findByLabelText("Search videos");
+    await waitFor(() => expect(listeners.has("library://cleared")).toBe(true));
+    await waitFor(() => expect(listVideos).toHaveBeenCalled());
+    await pause(50);
+    const feeds = listVideos.mock.calls.length;
+    const lists = listChannels.mock.calls.length;
+
+    act(() => listeners.get("library://cleared")!({ payload: null }));
 
     await waitFor(() => expect(listVideos.mock.calls.length).toBeGreaterThan(feeds));
     expect(listChannels.mock.calls.length).toBeGreaterThan(lists);

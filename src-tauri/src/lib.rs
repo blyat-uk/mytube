@@ -16,6 +16,7 @@ pub mod poll;
 pub mod proc;
 pub mod quality;
 pub mod recs;
+pub mod removed;
 pub mod queue;
 pub mod resolve;
 pub mod rss;
@@ -161,6 +162,10 @@ pub fn run() {
             // Recommendations: one watch page per new subscription video, one
             // check per candidate channel, on the same pace -- see `recs`.
             tauri::async_runtime::spawn(recs::run(state.clone()));
+
+            // Auto-clear: each subscription's whole uploads playlist, once a
+            // day, at random times -- see `removed`.
+            tauri::async_runtime::spawn(removed::run(state.clone(), app.handle().clone()));
 
             tauri::async_runtime::spawn(async move {
                 // Replaces absent and approximate-bucket dates with real ones.

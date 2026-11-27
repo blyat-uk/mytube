@@ -210,6 +210,17 @@ describe("New videos · check at startup", () => {
   });
 });
 
+describe("New videos · auto-clear", () => {
+  it("is on by default and saves the switch at once", async () => {
+    await renderPage();
+    const sw = screen.getByRole("switch", { name: "Auto-clear videos deleted from YouTube" }) as HTMLInputElement;
+    expect(sw.checked).toBe(true);
+    fireEvent.click(sw);
+    expect(sw.checked).toBe(false);
+    expect((await saved()).auto_clear_removed).toBe(false);
+  });
+});
+
 describe("New videos · how far back", () => {
   it("steps one video at a time, saving each press", async () => {
     await renderPage();

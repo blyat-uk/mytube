@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id, published_at
 "#;
 
 /// Current schema version. Bump and add a step below when the schema changes.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -291,6 +291,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     // says why): its sightings go, and the index only their pruning read.
     if version < 18 {
         conn.execute_batch(recs::SCHEMA_V18)?;
+    }
+
+    // v19: when Auto-clear last read the channel's whole uploads playlist
+    // (`removed::run`). Machine-local: no trigger, no stamp, never synced or
+    // exported -- each machine keeps its own once-a-day clock.
+    if version < 19 && !column_exists(conn, "channels", "removed_checked_at")? {
+        conn.execute("ALTER TABLE channels ADD COLUMN removed_checked_at INTEGER", [])?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1060,6 +1067,11 @@ const UPDATE_META: &str = "UPDATE videos SET
        view_count=COALESCE(?3, view_count),
        status=?4
      WHERE id=?1";
+
+/// A row Auto-clear may delete once YouTube stops listing it. A downloaded
+/// video stays: its file is now the only copy.
+const CLEARABLE: &str = "(status='ready' AND download_state IN ('none','failed')
+                          AND added_manually=0)";
 
 const SET_PUBLISHED: &str = "UPDATE videos SET published_at=?2,
             sort_at = CASE WHEN added_manually=1 THEN sort_at ELSE ?2 END
@@ -2932,6 +2944,62 @@ impl Db {
         Ok(())
     }
 
+    /// The subscription whose videos Auto-clear should check next: the one
+    /// checked longest ago, if that was before `before`, never-checked ones
+    /// first in no particular order. A terminated account is never polled and
+    /// is left alone here too. Returns its id and whether you are a member.
+    pub fn channel_due_for_removal_check(&self, before: i64) -> Result<Option<(String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT id, member FROM channels
+              WHERE subscribed=1 AND terminated_at IS NULL
+                AND COALESCE(removed_checked_at, 0) < ?1
+              ORDER BY COALESCE(removed_checked_at, 0), random() LIMIT 1",
+            params![before], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+    }
+
+    pub fn set_removal_checked(&self, channel_id: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE channels SET removed_checked_at=?2 WHERE id=?1",
+                     params![channel_id, at])?;
+        Ok(())
+    }
+
+    /// Every video of a channel, each with whether Auto-clear may delete it:
+    /// ready, neither downloaded nor on its way, and not added by hand -- an
+    /// unlisted video you pasted in is in no listing, and is still there.
+    pub fn removal_rows(&self, channel_id: &str) -> Result<Vec<(String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(&format!(
+            "SELECT id, {CLEARABLE} FROM videos WHERE channel_id=?1"))?;
+        let rows = st.query_map([channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Deletes rows YouTube no longer has -- skipping any a download reached
+    /// after it was picked -- and returns how many went, with their
+    /// thumbnails for the caller to delete.
+    pub fn delete_removed(&self, ids: &[String]) -> Result<(usize, Vec<String>)> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut gone = 0;
+        let mut thumbs = Vec::new();
+        {
+            let mut pick = tx.prepare(&format!(
+                "SELECT thumb_path FROM videos WHERE id=?1 AND {CLEARABLE}"))?;
+            let mut delete = tx.prepare("DELETE FROM videos WHERE id=?1")?;
+            for id in ids {
+                let Some(thumb) = pick.query_row([id], |r| r.get::<_, Option<String>>(0))
+                    .optional()? else { continue };
+                delete.execute([id])?;
+                gone += 1;
+                thumbs.extend(thumb);
+            }
+        }
+        tx.commit()?;
+        Ok((gone, thumbs))
+    }
+
     /// Drops an unsubscribed channel once it has no videos left, so ad-hoc
     /// uploaders do not accumulate as empty rows.
     pub fn prune_orphan_channel(&self, channel_id: &str) -> Result<()> {
@@ -3218,6 +3286,68 @@ mod tests {
                    sort_at: published, feed_rank: 0, added_manually: false,
                    duration_secs: Some(600), view_count: Some(1),
                    status: VideoStatus::Ready }
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn removal_rows_mark_what_auto_clear_may_delete() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.upsert_channel(&chan("UC2", "Two")).unwrap();
+        d.insert_videos_if_new(&[
+            vid("plain", "UC1", Some(1)), vid("done", "UC1", Some(2)),
+            vid("failed", "UC1", Some(3)), vid("queued", "UC1", Some(4)),
+            NewVideo { added_manually: true, ..vid("pasted", "UC1", Some(5)) },
+            NewVideo { status: VideoStatus::Upcoming, ..vid("soon", "UC1", Some(6)) },
+            vid("other", "UC2", Some(7)),
+        ]).unwrap();
+        d.set_download_state("done", DownloadState::Done, Some("/x.mkv"), None).unwrap();
+        d.set_download_state("failed", DownloadState::Failed, None, Some("boom")).unwrap();
+        d.set_download_state("queued", DownloadState::Queued, None, None).unwrap();
+
+        let mut rows = d.removal_rows("UC1").unwrap();
+        rows.sort();
+        assert_eq!(rows, vec![
+            ("done".to_string(), false), ("failed".to_string(), true),
+            ("pasted".to_string(), false), ("plain".to_string(), true),
+            ("queued".to_string(), false), ("soon".to_string(), false),
+        ]);
+    }
+
+    #[test]
+    fn the_channel_checked_longest_ago_is_due_once_a_day() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.upsert_channel(&chan("UC2", "Two")).unwrap();
+        d.upsert_channel(&Channel { subscribed: false, ..chan("UC3", "Uploader") }).unwrap();
+        let now = 10 * 86_400;
+        d.set_removal_checked("UC1", now - 3_600).unwrap();
+        // Never checked comes first; an uploader you do not follow never does.
+        assert_eq!(d.channel_due_for_removal_check(now - 86_400).unwrap(),
+                   Some(("UC2".to_string(), false)));
+        d.set_removal_checked("UC2", now).unwrap();
+        // UC1 was checked an hour ago: nothing is due until a day has passed.
+        assert_eq!(d.channel_due_for_removal_check(now - 86_400).unwrap(), None);
+        assert_eq!(d.channel_due_for_removal_check(now + 86_400 - 3_599).unwrap(),
+                   Some(("UC1".to_string(), false)));
+    }
+
+    #[test]
+    fn delete_removed_spares_a_row_a_download_reached_since() {
+        let d = db();
+        d.upsert_channel(&chan("UC1", "One")).unwrap();
+        d.insert_videos_if_new(&[vid("a", "UC1", Some(1)), vid("b", "UC1", Some(2))]).unwrap();
+        d.set_thumb_path("a", "/thumbs/a.jpg").unwrap();
+        d.set_download_state("b", DownloadState::Queued, None, None).unwrap();
+
+        let (gone, thumbs) = d.delete_removed(&ids(&["a", "b", "never"])).unwrap();
+        assert_eq!(gone, 1);
+        assert_eq!(thumbs, ids(&["/thumbs/a.jpg"]));
+        assert!(d.get_video("a").unwrap().is_none());
+        assert!(d.get_video("b").unwrap().is_some());
     }
 
     #[test]
@@ -7696,7 +7826,7 @@ mod series_auto_download_tests {
         let version: i64 = d.conn.lock().unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 18);
+        assert_eq!(SCHEMA_VERSION, 19);
         assert_eq!(since(&d, "a"), None);
         assert!(d.mark_series_auto_download_arrivals().unwrap().is_empty());
     }

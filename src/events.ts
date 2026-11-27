@@ -115,3 +115,11 @@ export function useSyncStatus(handler?: (status: SyncStatus) => void) {
 export function useSyncFinished(handler?: () => void) {
   useTauriEvent<null>("sync://finished", () => handler?.());
 }
+
+/**
+ * Auto-clear deleted videos YouTube no longer has. Its own event for the same
+ * reason as `sync://finished`: nothing here is new to you.
+ */
+export function useLibraryCleared(handler?: () => void) {
+  useTauriEvent<null>("library://cleared", () => handler?.());
+}

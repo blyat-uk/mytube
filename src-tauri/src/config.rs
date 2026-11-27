@@ -502,6 +502,13 @@ pub struct Settings {
     /// and `adopt_portable` leaves it be.
     #[serde(default)]
     pub delete_when_watched: bool,
+    /// Settings -> New videos' Auto-clear: once a day per channel, the videos
+    /// YouTube no longer has are deleted unless downloaded (see `removed`). On
+    /// by default: a deleted or private video can never be downloaded, so its
+    /// row is only clutter. Machine-local, since every machine runs its own
+    /// checks; `adopt_portable` leaves it be.
+    #[serde(default = "d_true")]
+    pub auto_clear_removed: bool,
     #[serde(default = "d_window_width")]
     pub window_width: u32,
     #[serde(default = "d_window_height")]
@@ -1389,6 +1396,12 @@ mod tests {
         sent.keep_machine_overrides_of(&disk);
         assert!(sent.show_stats);
         assert_eq!(sent.parts_panel, "hidden");
+    }
+
+    #[test]
+    fn auto_clear_defaults_on() {
+        assert!(Settings::default().auto_clear_removed);
+        assert!(!Settings::from_json_str(r#"{"auto_clear_removed":false}"#).unwrap().auto_clear_removed);
     }
 
     #[test]

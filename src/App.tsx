@@ -12,7 +12,8 @@ import AddChannelDialog from "./components/AddChannelDialog";
 import { ToastProvider, useToast } from "./components/Toast";
 import { api, errText } from "./api";
 import {
-  useAppUpdate, useOpenAbout, usePollEvents, useSyncFinished, useToolsStatus, useTransferFinished,
+  useAppUpdate, useLibraryCleared, useOpenAbout, usePollEvents, useSyncFinished, useToolsStatus,
+  useTransferFinished,
 } from "./events";
 import { toolsReadyMessage } from "./components/settings/tools";
 import { useAppVersion } from "./appVersion";
@@ -228,6 +229,13 @@ function Shell() {
   // reason as an import, and likewise never `poll://finished` -- a synced
   // video is one you already know about, so it earns no toast and no badge.
   useSyncFinished(() => {
+    void loadChannels();
+    reload();
+  });
+
+  // Auto-clear deleted videos YouTube no longer has: the counts and the feed
+  // both shrink.
+  useLibraryCleared(() => {
     void loadChannels();
     reload();
   });

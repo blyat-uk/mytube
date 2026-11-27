@@ -346,6 +346,11 @@ pub async fn probe(inv: &Invocation, q: &Quality, url: &str, download_dir: &str,
 /// every poll, and on macOS a Chromium-family browser asks for Keychain access
 /// each time it does.
 pub fn flat_playlist_args(r: &Runner, channel_id: &str, limit: u32) -> Vec<String> {
+    listing_args(r, &channel_videos_url(channel_id), Some(limit))
+}
+
+/// [`flat_playlist_args`] for any listing URL, as deep as `limit` or all of it.
+fn listing_args(r: &Runner, url: &str, limit: Option<u32>) -> Vec<String> {
     let mut a = runtime_args(r);
     a.extend([
         s("--flat-playlist"),
@@ -355,12 +360,23 @@ pub fn flat_playlist_args(r: &Runner, channel_id: &str, limit: u32) -> Vec<Strin
         // Day-granular is plenty for ordering; RSS later supplies exact times
         // for the recent window.
         s("--extractor-args"), s("youtubetab:approximate_date"),
-        s("--playlist-end"), limit.to_string(),
-        s("--no-warnings"),
-        s("--color"), s("no_color"),
-        channel_videos_url(channel_id),
     ]);
+    if let Some(limit) = limit {
+        a.extend([s("--playlist-end"), limit.to_string()]);
+    }
+    a.extend([s("--no-warnings"), s("--color"), s("no_color"), url.to_string()]);
     a
+}
+
+/// A channel's uploads playlist: every public upload, past livestreams
+/// included, where the Videos tab leaves livestreams out -- and paged 100 at a
+/// time rather than 30, so the cheapest way to read a whole channel. Verified
+/// 2026-11-27: Lofi Girl's newest 20 uploads held 2 past streams, its Videos
+/// tab's none; a 438-video channel listed the same 438 both ways, in 3.9s
+/// against 5.7s. Members-only videos may not be in it; see `removed::check`.
+pub fn uploads_url(channel_id: &str) -> String {
+    format!("https://www.youtube.com/playlist?list=UU{}",
+            channel_id.strip_prefix("UC").unwrap_or(channel_id))
 }
 
 pub fn parse_progress_line(line: &str) -> Option<(f64, String, String)> {
@@ -507,17 +523,24 @@ async fn run_with_timeout(
 /// updater from swapping yt-dlp out from under it.
 pub async fn flat_playlist(inv: &Invocation, channel_id: &str, limit: u32)
     -> Result<Listing> {
-    let r = &inv.runner;
-    let out = run_with_timeout(&r.program, flat_playlist_args(r, channel_id, limit),
-                               LISTING_TIMEOUT)
-        .await?;
+    read_listing(inv, flat_playlist_args(&inv.runner, channel_id, limit), channel_id).await
+}
+
+/// Every entry `url` lists, however many: Auto-clear's once-a-day read of a
+/// whole channel. Same terms as [`flat_playlist`], cookies included (none).
+pub async fn full_listing(inv: &Invocation, url: &str) -> Result<Listing> {
+    read_listing(inv, listing_args(&inv.runner, url, None), url).await
+}
+
+async fn read_listing(inv: &Invocation, args: Vec<String>, what: &str) -> Result<Listing> {
+    let out = run_with_timeout(&inv.runner.program, args, LISTING_TIMEOUT).await?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!("yt-dlp listing failed for {channel_id}: {}",
+        return Err(anyhow!("yt-dlp listing failed for {what}: {}",
                            err.lines().last().unwrap_or("unknown error")));
     }
     parse_listing(&String::from_utf8_lossy(&out.stdout))
-        .map_err(|e| anyhow!("yt-dlp listing failed for {channel_id}: {e}"))
+        .map_err(|e| anyhow!("yt-dlp listing failed for {what}: {e}"))
 }
 
 // ------------------------------------------------------------- formats
@@ -1338,6 +1361,18 @@ mod tests {
             assert_eq!(a.contains(&"--no-windows-filenames".to_string()), !cfg!(windows),
                        "{a:?}");
         }
+    }
+
+    #[test]
+    fn a_full_listing_reads_the_uploads_playlist_to_the_end() {
+        assert_eq!(uploads_url("UChVeoHrxBtYDHmqpJI7sE_A"),
+                   "https://www.youtube.com/playlist?list=UUhVeoHrxBtYDHmqpJI7sE_A");
+        let a = listing_args(&bare(), &uploads_url("UC1"), None);
+        assert!(!a.contains(&"--playlist-end".to_string()), "{a:?}");
+        assert_eq!(a.last().map(String::as_str), Some("https://www.youtube.com/playlist?list=UU1"));
+        let a = flat_playlist_args(&bare(), "UC1", 30);
+        assert_eq!(value_of(&a, "--playlist-end").as_deref(), Some("30"));
+        assert_eq!(a.last().map(String::as_str), Some("https://www.youtube.com/channel/UC1/videos"));
     }
 
     #[test]

@@ -331,6 +331,15 @@ export default function NewVideosPage() {
             onChange={(on) => save("poll_on_startup", on)}
           />
         </div>
+
+        <div className="st-nv-startup">
+          <Switch
+            label="Auto-clear videos deleted from YouTube"
+            hint="Once a day, each channel's videos are checked; deleted or private ones can never be downloaded, so they leave your library. Downloaded videos stay."
+            checked={s.auto_clear_removed !== false}
+            onChange={(on) => save("auto_clear_removed", on)}
+          />
+        </div>
       </Block>
 
       <Block>
