@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "mytube"
-version = "6.4.1"
+version = "6.4.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
