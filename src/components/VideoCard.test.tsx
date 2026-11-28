@@ -136,3 +136,120 @@ describe("VideoCard downloaded state", () => {
     expect(container.querySelector(".card")?.className).not.toContain("is-downloaded");
   });
 });
+
+describe("VideoCard hover bar", () => {
+  const DONE = { download_state: "done" as DownloadState, file_path: "/v.mkv" };
+  const tileNames = () =>
+    Array.from(document.querySelectorAll(".card-tile")).map((t) => t.getAttribute("aria-label"));
+
+  it("holds four tiles in slots that never move: action, watched, YouTube, remove", () => {
+    renderCard(DONE);
+    expect(tileNames()).toEqual(["Play", "Mark as watched", "Open on YouTube", "Delete downloaded file"]);
+    cleanup();
+    renderCard();
+    expect(tileNames()).toEqual(["Download", "Mark as watched", "Open on YouTube", "Hide from feed"]);
+  });
+
+  it("routes each tile through onAction without also firing the card", () => {
+    const { onAction } = renderCard(DONE);
+    fireEvent.click(screen.getByRole("button", { name: "Mark as watched" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete downloaded file" }));
+    expect(onAction.mock.calls.map((c) => c[0])).toEqual(["watched", "delete-file"]);
+  });
+
+  it("marks only the permanent tile as dangerous, and the main one as main", () => {
+    renderCard(DONE);
+    expect(screen.getByRole("button", { name: "Delete downloaded file" }).className).toContain("is-danger");
+    expect(screen.getByRole("button", { name: "Play" }).className).toContain("is-main");
+    cleanup();
+    renderCard();
+    expect(screen.getByRole("button", { name: "Hide from feed" }).className).not.toContain("is-danger");
+  });
+
+  // Cancel sits in the main slot but must never be the bright, easy tile.
+  it("never makes Cancel the main tile", () => {
+    renderCard({ download_state: "queued" });
+    expect(screen.getByRole("button", { name: "Cancel download" }).className).not.toContain("is-main");
+  });
+
+  it("holds the main and remove tiles for a call in flight, but not watched or YouTube", () => {
+    render(<VideoCard video={video(DONE)} pending onAction={vi.fn()} onContextMenu={vi.fn()} />);
+    const disabled = (name: string) =>
+      screen.getByRole<HTMLButtonElement>("button", { name }).disabled;
+    expect(disabled("Play")).toBe(true);
+    expect(disabled("Delete downloaded file")).toBe(true);
+    expect(disabled("Mark as watched")).toBe(false);
+    expect(disabled("Open on YouTube")).toBe(false);
+  });
+
+  it("shows the progress ring as progress, leaving Cancel to the tile", () => {
+    renderCard({ download_state: "downloading" });
+    expect(screen.getByRole("progressbar", { name: "Download progress" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /Cancel download/ })).toHaveLength(1);
+  });
+});
+
+describe("VideoCard asking about its file", () => {
+  const DONE = { download_state: "done" as DownloadState, file_path: "/v.mkv" };
+  function renderAsking(asking: "file" | "watched", over: Partial<Video> = {}) {
+    const onAction = vi.fn();
+    const onAnswer = vi.fn();
+    render(
+      <VideoCard
+        video={video({ ...DONE, ...over })}
+        asking={asking}
+        onAnswer={onAnswer}
+        onAction={onAction}
+        onContextMenu={vi.fn()}
+      />,
+    );
+    return { onAction, onAnswer };
+  }
+
+  it("asks on the card, naming the video, with Keep holding the focus", () => {
+    renderAsking("watched", { watched: true });
+    const asked = screen.getByRole("group", { name: "Delete the downloaded file?" });
+    expect(asked.textContent).toContain("Delete the file? Marked watched.");
+    expect(asked.textContent).toContain("Some video");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Keep" }));
+  });
+
+  it("answers Keep and Delete file, never running the card's own action", () => {
+    const { onAction, onAnswer } = renderAsking("file");
+    fireEvent.click(screen.getByRole("group", { name: "Delete the downloaded file?" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete file" }));
+    expect(onAnswer.mock.calls.map((c) => c[1])).toEqual([false, true]);
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("says when the video has not been watched", () => {
+    renderAsking("file");
+    expect(screen.getByRole("group").textContent).toContain("Delete the file? Not watched yet.");
+  });
+
+  it("goes as Keep when the pointer leaves", () => {
+    const { onAnswer } = renderAsking("file");
+    fireEvent.mouseLeave(screen.getByRole("article"));
+    expect(onAnswer).toHaveBeenCalledWith(expect.anything(), false);
+  });
+
+  it("goes as Keep when nobody answers, unless the pointer comes to it", () => {
+    vi.useFakeTimers();
+    try {
+      const { onAnswer } = renderAsking("file");
+      act(() => { vi.advanceTimersByTime(5999); });
+      expect(onAnswer).not.toHaveBeenCalled();
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(onAnswer).toHaveBeenCalledWith(expect.anything(), false);
+
+      cleanup();
+      const held = renderAsking("file");
+      fireEvent.mouseEnter(screen.getByRole("article"));
+      act(() => { vi.advanceTimersByTime(60_000); });
+      expect(held.onAnswer).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

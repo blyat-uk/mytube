@@ -516,7 +516,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 .icon-btn.is-danger { color: #ffc9ca; border-color: rgba(255, 90, 95, 0.4); background: var(--danger-soft); }
 .icon-btn.is-danger:hover:not(:disabled) { background: rgba(255, 90, 95, 0.24); border-color: var(--danger); }
 .icon-btn.is-spinning > span[aria-hidden],
-.card-btn.is-spinning > .card-glyph {
+.card-tile.is-spinning .card-glyph {
   display: inline-block;
   animation: spin 900ms linear infinite;
 }
@@ -1337,6 +1337,8 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 .card.is-watched { opacity: 0.55; }
 .card.is-watched:hover { opacity: 0.85; }
+/* A card asking about its file is read in full, watched or not. */
+.card.is-watched.is-asking { opacity: 1; }
 .card[data-state="failed"] { border-color: rgba(255, 90, 95, 0.35); }
 
 /* Marking siblings by hand: ctrl+click picks cards out, and dragging one onto
@@ -1631,33 +1633,19 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   color: #0d2a12;
 }
 .pill-auto .icon { width: 1.2em; height: 1.2em; }
+/* A download in progress: the ring, or the Queued badge, over a darkened
+   picture. They are status, so they show without a hover. Every action lives
+   in the bar (`.card-bar`), and nothing else ever darkens the thumbnail. */
 .card-overlay {
   position: absolute;
   z-index: 2;
   inset: 0;
   display: grid;
   place-items: center;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.58));
-  opacity: 0;
-  transition: opacity 140ms ease;
+  background: rgba(0, 0, 0, 0.5);
 }
-.card:hover .card-overlay,
-.card:focus-within .card-overlay,
-.card-overlay.is-busy { opacity: 1; }
-.card-overlay.is-busy { background: rgba(0, 0, 0, 0.5); }
 
-.card-actions {
-  display: flex;
-  align-items: center;
-  gap: calc(var(--act) * 0.2);
-  transform: translateY(4px);
-  transition: transform 140ms ease;
-}
-.card:hover .card-actions,
-.card:focus-within .card-actions { transform: translateY(0); }
-
-/* One size for both buttons; the hierarchy is weight, not scale. The primary
-   action is a solid disc, the link to YouTube a quiet translucent one. */
+/* The ring is a round button of its own; `.is-ring` below sizes it. */
 .card-btn {
   position: relative;
   appearance: none;
@@ -1682,20 +1670,14 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
   border-color: rgba(255, 255, 255, 0.45);
 }
 .card-btn:focus-visible { border-radius: 50%; outline-offset: 3px; }
-.card-btn.is-primary {
-  background: rgba(255, 255, 255, 0.94);
-  border-color: transparent;
-  color: #101010;
-}
-.card-btn.is-primary:hover { background: #fff; }
 /* A call is out for this card. The buttons are disabled for exactly as long,
    and the spinner only appears once it is slow (`usePending`), so a quick
    answer shows nothing at all -- no grey flash, no hover to take back. */
 .card-glyph { display: grid; place-items: center; }
 .card-btn:disabled,
+.card-tile:disabled,
 .queued-badge:disabled { cursor: progress; }
 .card-btn:disabled:hover { transform: none; }
-.card-btn.is-primary:disabled:hover { background: rgba(255, 255, 255, 0.94); }
 .card.is-pending { cursor: progress; }
 
 /* The grid on screen while its replacement is fetched: a sibling mark or unlink
@@ -1853,6 +1835,193 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--muted); }
 }
 .dot { color: var(--faint); }
 .card-speed { color: var(--accent); font-variant-numeric: tabular-nums; }
+
+/* --- the hover bar -------------------------------------------------------
+
+   Four tiles over a video card's whole body, edge to edge (`cardTiles`): the
+   card's own action, watched, YouTube, and the way out of the feed. Title and
+   meta give way to it -- at the moment you act you need neither -- and the
+   body keeps its height, so nothing in the grid moves. Picked from mockups:
+   the bar waits 150ms of rest before it comes (a pointer sweeping across the
+   grid would otherwise blink every title it passes), leaves at once and
+   faster than it came, and everything moves upward -- the text lifts away, the
+   tiles rise in left to right, 40ms apart, the main action first. Keyboard
+   focus shows it without the wait. All CSS: a hover renders nothing. */
+.video-card {
+  --bar-wait: 150ms;
+  --bar-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --bar-in: cubic-bezier(0.2, 0.9, 0.25, 1);
+  --bar-out: cubic-bezier(0.4, 0, 1, 1);
+  /* Follows the zoom, as the round buttons did: legible on a 160px card, not
+     swollen on a 640px one. */
+  --tile-icon: clamp(20px, calc(var(--card-w, 260px) * 0.1), 30px);
+}
+.video-card:has(:focus-visible) { --bar-wait: 0ms; }
+.video-card .card-body { position: relative; overflow: hidden; }
+
+/* Leaving the card, the text comes back just after the bar starts to go. */
+.video-card :is(.card-title, .card-meta) {
+  transition: opacity 170ms ease 60ms, transform 240ms var(--bar-ease) 60ms;
+}
+.video-card:is(:hover, .is-slow, .is-asking, :has(:focus-visible)) :is(.card-title, .card-meta) {
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: opacity 120ms var(--bar-out) var(--bar-wait),
+              transform 170ms var(--bar-out) var(--bar-wait);
+}
+
+.card-bar {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  pointer-events: none;
+}
+/* A slow call keeps the bar up, so its spinner is on screen without a hover. */
+.video-card:is(:hover, .is-slow, :has(:focus-visible)) .card-bar { pointer-events: auto; }
+
+.card-tile {
+  --i: 0;
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  padding: 0;
+  font: inherit;
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  border: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(16px) scale(0.92);
+  transition: flex-grow 220ms var(--bar-ease), background 150ms ease, color 150ms ease,
+              opacity 110ms var(--bar-out), transform 140ms var(--bar-out);
+}
+.card-tile:first-child { border-left: 0; }
+.card-tile:nth-child(2) { --i: 1; }
+.card-tile:nth-child(3) { --i: 2; }
+.card-tile:nth-child(4) { --i: 3; }
+.video-card:is(:hover, .is-slow, :has(:focus-visible)) .card-tile {
+  opacity: 1;
+  transform: none;
+  transition: flex-grow 220ms var(--bar-ease), background 150ms ease, color 150ms ease,
+              opacity 170ms ease-out calc(var(--bar-wait) + var(--i) * 40ms),
+              transform 300ms var(--bar-in) calc(var(--bar-wait) + var(--i) * 40ms);
+}
+
+/* The tile under the pointer grows, the rest give way, and it says what it
+   does: the icon lifts and its word rises in under it. It grows around the
+   pointer, so it never slides out from under it. The word sits under the icon
+   rather than beside it because height is what every zoom has: beside it,
+   "YouTube" did not fit on the smallest card. */
+.card-tile:is(:hover, :focus-visible) { flex-grow: 1.9; background: rgba(255, 255, 255, 0.11); }
+.card-tile .icon { width: var(--tile-icon); height: var(--tile-icon); }
+.card-tile .card-glyph { transition: transform 220ms var(--bar-ease); }
+.card-tile:is(:hover, :focus-visible) .card-glyph {
+  transform: translateY(calc(var(--tile-icon) * -0.36)) scale(0.9);
+}
+.card-tile-word {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% + var(--tile-icon) * 0.28);
+  text-align: center;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(7px);
+  transition: opacity 150ms ease 55ms, transform 220ms var(--bar-ease);
+}
+.card-tile:is(:hover, :focus-visible) .card-tile-word { opacity: 1; transform: none; }
+.card-tile:focus-visible { outline-offset: -3px; }
+
+/* The main action is the one bright tile -- white, as the round button was.
+   Cancel never is: it sits in the same slot, but must not be the easy one. */
+.card-tile.is-main { background: rgba(255, 255, 255, 0.94); color: #101010; border-left: 0; }
+.card-tile.is-main:is(:hover, :focus-visible) { background: #fff; }
+.card-tile.is-danger:is(:hover, :focus-visible) { background: var(--danger-soft); color: var(--danger); }
+.card-tile.is-on { color: var(--ok); }
+/* On a downloaded card the tiles sit on its green face, and Play is the green. */
+.card.is-downloaded .card-tile {
+  background: rgba(0, 0, 0, 0.16);
+  border-left-color: rgba(198, 219, 200, 0.14);
+  color: #e3efe4;
+}
+.card.is-downloaded .card-tile:is(:hover, :focus-visible) { background: rgba(0, 0, 0, 0.38); }
+.card.is-downloaded .card-tile.is-main { background: var(--ok); color: #0d2a12; }
+.card.is-downloaded .card-tile.is-main:is(:hover, :focus-visible) { background: #72e17d; }
+.card.is-downloaded .card-tile.is-danger:is(:hover, :focus-visible) {
+  background: rgba(255, 90, 95, 0.2);
+  color: #ff6b70;
+}
+.card.is-downloaded .card-tile.is-on { color: var(--ok); }
+
+/* Whether to delete the file, asked on the card instead of in a dialog: the
+   question and the video it is about (the bar has covered its title), then
+   Keep or Delete file, filling what is left. */
+.card-ask {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  cursor: default;
+  animation: card-ask-in 160ms var(--bar-in);
+}
+@keyframes card-ask-in { from { opacity: 0; transform: translateY(6px); } }
+.card.is-downloaded .card-ask { background: var(--ok-face); }
+.card-ask-q,
+.card-ask-title {
+  padding: 0 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-ask-q { padding-top: 7px; font-size: 1.25rem; font-weight: 600; }
+.card-ask-note { font-weight: 400; color: var(--muted); }
+.card.is-downloaded .card-ask-note { color: var(--ok-text-dim); }
+.card-ask-title { padding-bottom: 6px; font-size: 1.15rem; color: var(--muted); }
+.card.is-downloaded .card-ask-title { color: var(--ok-text-dim); }
+.card-ask-row { flex: 1; display: flex; min-height: 0; }
+.card-ask-row button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  font: inherit;
+  font-size: 1.3rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.card-ask-row button:focus-visible { outline-offset: -3px; }
+.card-ask-keep { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+.card-ask-keep:hover { background: rgba(255, 255, 255, 0.13); }
+.card.is-downloaded .card-ask-keep { background: rgba(0, 0, 0, 0.2); color: #e3efe4; }
+.card.is-downloaded .card-ask-keep:hover { background: rgba(0, 0, 0, 0.38); }
+.card-ask-delete { background: var(--danger); color: #fff; }
+.card-ask-delete:hover { background: #ff7377; }
+.card-ask-delete:disabled { cursor: progress; opacity: 0.7; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* Nothing travels: the swap is a cross-fade, the word simply appears, and
+     the tile under the pointer is wider at once. */
+  .video-card :is(.card-title, .card-meta, .card-tile, .card-glyph, .card-tile-word),
+  .video-card:is(:hover, .is-slow, .is-asking, :has(:focus-visible)) :is(.card-title, .card-meta, .card-tile),
+  .video-card .card-tile:is(:hover, :focus-visible) :is(.card-glyph, .card-tile-word) {
+    transform: none;
+  }
+  .video-card .card-tile { transition: background 150ms ease, color 150ms ease, opacity 110ms ease; }
+  .video-card:is(:hover, .is-slow, :has(:focus-visible)) .card-tile {
+    transition: background 150ms ease, color 150ms ease, opacity 170ms ease var(--bar-wait);
+  }
+  .card-ask { animation: none; }
+}
 
 /* --- feed stats: the waveform ------------------------------------------- */
 
@@ -3741,7 +3910,9 @@ label.field-label { display: block; }
   to   { opacity: 1; transform: scale(1); }
 }
 .context-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
   padding: 8px 10px;
   border: 0;
@@ -3757,6 +3928,11 @@ label.field-label { display: block; }
 .context-item:disabled { color: var(--faint); cursor: default; }
 .context-item.is-danger { color: var(--danger); }
 .context-item.is-danger:hover { background: var(--danger-soft); }
+/* The glyph the card's tiles and the Downloads rows use for the same thing. */
+.context-icon { display: grid; place-items: center; flex: none; color: var(--muted); }
+.context-icon .icon { width: 16px; height: 16px; }
+.context-item.is-danger .context-icon { color: var(--danger); }
+.context-sep { height: 1px; margin: 5px 4px; background: var(--line); }
 
 /* Hidden videos, visible only via "Show hidden". */
 .card.is-hidden-video { opacity: 0.4; }

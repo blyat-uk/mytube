@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
-import VideoCard from "./VideoCard";
+import VideoCard, { type CardAsk } from "./VideoCard";
 import SeriesCard from "./SeriesCard";
-import { cardZoom, nextCardSize, type CardAction } from "../format";
+import { cardZoom, nextCardSize, type TileAction } from "../format";
 import type { Marking } from "../marking";
 import type { ProgressStore } from "../progress";
 import type { PartsPanel, Video, VideoGroup } from "../types";
@@ -27,8 +27,11 @@ interface Props {
    *  series card re-renders when it changes. Visible unless given. */
   partsPanel?: PartsPanel;
   onLoadMore: () => void;
-  onAction: (action: CardAction, video: Video) => void;
+  onAction: (action: TileAction, video: Video) => void;
   onContextMenu: (video: Video, x: number, y: number) => void;
+  /** The one card asking whether to delete its file, and how it is answered. */
+  ask?: { id: string; kind: CardAsk } | null;
+  onAnswer?: (video: Video, deleteFile: boolean) => void;
   /** Opens a series, anchored on its leader and named by its shared stem. */
   onOpenSeries: (leader: Video, stem: string | null) => void;
   /** Selecting and dragging cards to mark them siblings by hand. Optional: a
@@ -44,7 +47,8 @@ const NEAR_VIEWPORT = 400;
 
 export default function VideoGrid({
   groups, progress, pending, slow, refreshing = false, loading, hasMore, cardSize, onCardSize,
-  partsPanel = "visible", onLoadMore, onAction, onContextMenu, onOpenSeries, marking, empty,
+  partsPanel = "visible", onLoadMore, onAction, onContextMenu, ask, onAnswer, onOpenSeries, marking,
+  empty,
 }: Props) {
   const sentinel = useRef<HTMLDivElement | null>(null);
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -216,6 +220,8 @@ export default function VideoGrid({
               onAction={onAction}
               onContextMenu={onCtx}
               mark={marking?.forGroup(g)}
+              asking={ask?.id === g.videos[0].id ? ask.kind : undefined}
+              onAnswer={onAnswer}
             />
           ),
         )}

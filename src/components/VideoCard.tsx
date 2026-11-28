@@ -1,14 +1,23 @@
-import { memo, useMemo, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { thumbSrc } from "../api";
 import {
-  cardAction, cardActionLabel, formatDate, formatDuration, formatRelative,
-  hasDownloadedFile,
+  cardAction, cardTiles, formatDate, formatDuration, formatRelative, hasDownloadedFile,
 } from "../format";
-import type { CardAction } from "../format";
-import { IconBusy, IconCancel, IconDownload, IconExternal, IconPlay, IconRetry } from "./Icons";
+import type { Tile, TileAction } from "../format";
+import {
+  IconBusy, IconCancel, IconDelete, IconDownload, IconExternal, IconHidden, IconPlay, IconRetry,
+  IconShow, IconWatched,
+} from "./Icons";
 import type { CardMark } from "../marking";
 import { useProgress, type ProgressStore } from "../progress";
 import type { Video } from "../types";
+
+/**
+ * Why a card is asking, in place of a dialog, whether to delete its file: the
+ * trash tile or the menu's Delete downloaded file ("file"), or a downloaded
+ * video just marked watched ("watched").
+ */
+export type CardAsk = "file" | "watched";
 
 interface Props {
   video: Video;
@@ -19,33 +28,52 @@ interface Props {
    *  on the card does nothing, so a second press cannot land on whatever the
    *  first is about to turn the card into. */
   pending?: boolean;
-  /** The call has been out long enough to notice, so the primary button spins. */
+  /** The call has been out long enough to notice, so the primary tile spins. */
   slow?: boolean;
-  onAction: (action: CardAction, video: Video) => void;
+  onAction: (action: TileAction, video: Video) => void;
   onContextMenu: (video: Video, e: React.MouseEvent) => void;
   /** Selection and drag, when the view offers sibling marking. */
   mark?: CardMark;
+  /** Set on the one card asking about its file; every other card gets nothing,
+   *  so the memo holds for the rest of the grid. */
+  asking?: CardAsk;
+  /** The answer: `true` deletes the file. */
+  onAnswer?: (video: Video, deleteFile: boolean) => void;
 }
 
 const RING_R = 26;
 const RING_C = 2 * Math.PI * RING_R;
 
-const ACTION_ICON: Record<CardAction, ReactNode> = {
-  download: <IconDownload />,
-  play: <IconPlay />,
-  cancel: <IconCancel />,
-  retry: <IconRetry />,
-  open: <IconExternal />,
-};
+/** A question nobody is looking at goes as Keep: never the file. The pointer
+ *  on the card holds it open for as long as it stays. */
+const ASK_UNATTENDED_MS = 6000;
+
+function tileIcon(tile: Tile, video: Video): ReactNode {
+  switch (tile.action) {
+    case "download": return <IconDownload />;
+    case "play": return <IconPlay />;
+    case "cancel": return <IconCancel />;
+    case "retry": return <IconRetry />;
+    case "open": return <IconExternal />;
+    case "watched": return <IconWatched done={video.watched} />;
+    case "delete-file":
+    case "delete": return <IconDelete />;
+    case "hide": return <IconHidden />;
+    case "unhide": return <IconShow />;
+  }
+}
 
 /**
  * Memoised, and every prop is built to hold its identity -- the view replaces
  * only the video object that changed, its handlers are stable, `mark` is cached
  * per card, progress is read from a store by id -- so a change to one card, or
  * a progress tick, renders that card and leaves the rest of the grid alone.
+ * Hovering renders nothing at all: the bar is always in the DOM, and showing it
+ * is CSS.
  */
 export default memo(function VideoCard({
-  video, progress: store, pending = false, slow = false, onAction, onContextMenu, mark,
+  video, progress: store, pending = false, slow = false, onAction, onContextMenu, mark, asking,
+  onAnswer,
 }: Props) {
   const progress = useProgress(store, video.id);
   // Prefer the locally cached thumbnail, fall back to the remote URL, then to a
@@ -61,11 +89,26 @@ export default memo(function VideoCard({
   const src = sources[srcIndex];
 
   const action = cardAction(video);
+  const tiles = cardTiles(video);
   const state = video.download_state;
   const busy = state === "downloading" || state === "queued";
   const downloaded = hasDownloadedFile(video);
   const duration = formatDuration(video.duration_secs);
   const percent = state === "downloading" ? Math.max(0, Math.min(100, progress?.percent ?? 0)) : 0;
+
+  const card = useRef<HTMLElement | null>(null);
+  const keep = useRef<HTMLButtonElement | null>(null);
+  const unattended = useRef(0);
+  useEffect(() => {
+    if (!asking || !onAnswer) return;
+    // Keep has the focus, so Enter and Escape both answer the safe way.
+    keep.current?.focus({ preventScroll: true });
+    // Asked from under the pointer (the trash tile), it waits for the pointer
+    // to leave; asked from the menu, the pointer may never come, so a clock.
+    if (card.current?.matches(":hover")) return;
+    unattended.current = window.setTimeout(() => onAnswer(video, false), ASK_UNATTENDED_MS);
+    return () => window.clearTimeout(unattended.current);
+  }, [asking, onAnswer, video]);
 
   const run = () => onAction(action, video);
   /**
@@ -73,22 +116,21 @@ export default memo(function VideoCard({
    * up. The second click of a double-click is dropped as well: the action flips
    * with the state -- Download is Cancel once the row is queued -- so a
    * double-click read as two clicks downloads and then cancels, however fast
-   * the first call answers.
+   * the first call answers. `held`: the button waits out a call in flight.
    */
-  const press = (fn: () => void) => (e: React.MouseEvent) => {
+  const press = (fn: () => void, held = true) => (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (e.detail > 1 || pending) return;
+    if (e.detail > 1 || (held && pending)) return;
     fn();
   };
-  /** The spinner once the call is slow enough to notice, the glyph otherwise.
-   *  The span is what `.is-spinning` turns. */
-  const glyph = (icon: ReactNode) => (
-    <span className="card-glyph" aria-hidden="true">{slow ? <IconBusy /> : icon}</span>
-  );
+  /** Which tiles a call in flight holds: the ones on the card's own key
+   *  (`frontend.md`). Watched and YouTube have keys of their own. */
+  const heldBy = (a: TileAction) => a !== "watched" && a !== "open";
 
   return (
     <article
-      className={`card${video.watched ? " is-watched" : ""}${busy ? " is-busy" : ""}${downloaded ? " is-downloaded" : ""}${video.hidden ? " is-hidden-video" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}${pending ? " is-pending" : ""}`}
+      ref={card}
+      className={`card video-card${video.watched ? " is-watched" : ""}${busy ? " is-busy" : ""}${downloaded ? " is-downloaded" : ""}${video.hidden ? " is-hidden-video" : ""}${mark?.selected ? " is-selected" : ""}${mark?.dropTarget ? " is-drop-target" : ""}${pending ? " is-pending" : ""}${slow ? " is-slow" : ""}${asking ? " is-asking" : ""}`}
       // A ctrl+click is a selection, not a download, so marking gets first
       // refusal on the click and the primary action only runs if it declines.
       onClick={(e) => {
@@ -97,6 +139,8 @@ export default memo(function VideoCard({
         run();
       }}
       onContextMenu={(e) => onContextMenu(video, e)}
+      onMouseEnter={asking ? () => window.clearTimeout(unattended.current) : undefined}
+      onMouseLeave={asking && onAnswer ? () => onAnswer(video, false) : undefined}
       {...mark?.drag}
       aria-busy={pending || undefined}
       data-state={state}
@@ -133,21 +177,26 @@ export default memo(function VideoCard({
 
         {duration && <span className="pill pill-duration">{duration}</span>}
 
-        {/* The scrim is a plain layer: clicks that miss a button fall through to
-            the card, which runs the same primary action. A slow call keeps it
-            up, so the spinner is on screen without a hover. */}
-        <div className={`card-overlay${busy || slow ? " is-busy" : ""}`}>
-          <div className="card-actions">
+        {/* Only a download in progress darkens the picture: the ring and the
+            Queued badge are status, and must show without a hover. Every
+            action lives in the bar below. Clicks that miss the ring fall
+            through to the card, which cancels just the same. */}
+        {busy && (
+          <div className="card-overlay">
             {state === "downloading" ? (
-              <button
-                type="button"
-                // No spinner: a cancel takes the ring off the card at once
-                // (the view marks the row `none` before the call goes out).
+              // Not a button of its own any more: the bar's Cancel is that, and
+              // a click here falls through to the card, which cancels too. Its
+              // hover X still says so. No spinner: a cancel takes the ring off
+              // the card at once (the view marks the row `none` before the call
+              // goes out).
+              <div
                 className="card-btn is-ring"
+                role="progressbar"
+                aria-label="Download progress"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(percent)}
                 title={`Cancel — ${video.title}`}
-                disabled={pending}
-                aria-busy={pending || undefined}
-                onClick={press(run)}
               >
                 <svg className="ring" viewBox="0 0 64 64" aria-hidden="true">
                   <circle className="ring-track" cx="32" cy="32" r={RING_R} />
@@ -160,11 +209,10 @@ export default memo(function VideoCard({
                     strokeDashoffset={RING_C * (1 - percent / 100)}
                   />
                 </svg>
-                <span className="ring-pct">{Math.round(percent)}%</span>
+                <span className="ring-pct" aria-hidden="true">{Math.round(percent)}%</span>
                 <span className="ring-hover" aria-hidden="true"><IconCancel /></span>
-                <span className="sr-only">Cancel download</span>
-              </button>
-            ) : state === "queued" ? (
+              </div>
+            ) : (
               <button
                 type="button"
                 className="queued-badge"
@@ -176,37 +224,9 @@ export default memo(function VideoCard({
                 <span className="queued-dot" aria-hidden="true" />
                 Queued
               </button>
-            ) : (
-              <button
-                type="button"
-                className={`card-btn is-primary${slow ? " is-spinning" : ""}`}
-                title={`${cardActionLabel(action)} — ${video.title}`}
-                disabled={pending}
-                aria-busy={pending || undefined}
-                onClick={press(run)}
-              >
-                {glyph(ACTION_ICON[action])}
-                <span className="sr-only">{cardActionLabel(action)}</span>
-              </button>
             )}
-
-            <button
-              type="button"
-              className="card-btn"
-              title={`${cardActionLabel("open")} — ${video.title}`}
-              // Not held by `pending`: leaving for YouTube changes nothing on
-              // this card, and the view guards it under a key of its own.
-              onClick={(e) => {
-                e.stopPropagation();
-                if (e.detail > 1) return;
-                onAction("open", video);
-              }}
-            >
-              <IconExternal />
-              <span className="sr-only">{cardActionLabel("open")}</span>
-            </button>
           </div>
-        </div>
+        )}
 
         {state === "downloading" && (
           <div className="card-progressbar">
@@ -245,6 +265,77 @@ export default memo(function VideoCard({
             </>
           )}
         </div>
+
+        {/* The hover bar takes the whole body, title and meta both: at the
+            moment you act you need neither, and the card's height never
+            changes, so the grid never shifts. Showing it, its cascade and each
+            tile's word are all CSS (`.card-bar` in App.css). */}
+        <div className="card-bar">
+          {tiles.map((tile, i) => {
+            const held = heldBy(tile.action);
+            const spin = i === 0 && slow;
+            return (
+              <button
+                key={tile.action}
+                type="button"
+                className={`card-tile${i === 0 && tile.action !== "cancel" ? " is-main" : ""}${tile.danger ? " is-danger" : ""}${tile.action === "watched" && video.watched ? " is-on" : ""}${spin ? " is-spinning" : ""}`}
+                aria-label={tile.label}
+                title={`${tile.label} — ${video.title}`}
+                disabled={held && pending}
+                aria-busy={(held && pending) || undefined}
+                onClick={press(() => onAction(tile.action, video), held)}
+              >
+                <span className="card-glyph" aria-hidden="true">
+                  {spin ? <IconBusy /> : tileIcon(tile, video)}
+                </span>
+                <span className="card-tile-word" aria-hidden="true">{tile.word}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* The bar's title is out of sight, so the question names the video. */}
+        {asking && onAnswer && (
+          <div
+            className="card-ask"
+            role="group"
+            aria-label="Delete the downloaded file?"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") onAnswer(video, false);
+            }}
+          >
+            {/* The question first and short, so the smallest card still shows
+                it whole; the note after it may be cut, the question never. */}
+            <div className="card-ask-q">
+              Delete the file?
+              {asking === "watched" ? (
+                <span className="card-ask-note"> Marked watched.</span>
+              ) : !video.watched && (
+                <span className="card-ask-note"> Not watched yet.</span>
+              )}
+            </div>
+            <div className="card-ask-title" title={video.title}>{video.title}</div>
+            <div className="card-ask-row">
+              <button
+                ref={keep}
+                type="button"
+                className="card-ask-keep"
+                onClick={press(() => onAnswer(video, false), false)}
+              >
+                Keep
+              </button>
+              <button
+                type="button"
+                className="card-ask-delete"
+                disabled={pending}
+                onClick={press(() => onAnswer(video, true))}
+              >
+                Delete file
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </article>
   );

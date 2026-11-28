@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   formatDuration, formatTotalRuntime, formatRelative, formatViews, formatBytes, cardAction,
   videoUrl, hasDownloadedFile, seriesRuntime, formatDay, formatCompact, formatLibraryRuntime,
-  percentOf, initials, nameHue,
+  percentOf, initials, nameHue, cardTiles,
 } from "./format";
 
 describe("formatDuration", () => {
@@ -164,6 +164,60 @@ describe("cardAction", () => {
   it("treats a manually added video no differently once downloaded", () =>
     expect(cardAction({ download_state: "done", file_path: "/x.mkv", added_manually: true } as any))
       .toBe("play"));
+});
+
+describe("cardTiles", () => {
+  const row = (over: object) => ({
+    download_state: "none", file_path: null, watched: false, hidden: false, added_manually: false,
+    ...over,
+  }) as any;
+  const actions = (over: object) => cardTiles(row(over)).map((t) => t.action);
+
+  // Only the first and last slots change with the state; the middle two never move.
+  it("keeps watched and YouTube in the middle slots, whatever the state", () => {
+    for (const over of [
+      {}, { download_state: "done", file_path: "/x.mkv" }, { download_state: "queued" },
+      { download_state: "failed" }, { hidden: true }, { added_manually: true },
+    ]) {
+      expect(actions(over).slice(1, 3)).toEqual(["watched", "open"]);
+    }
+  });
+
+  it("leads with what a click on the card does", () => {
+    expect(actions({})[0]).toBe("download");
+    expect(actions({ download_state: "done", file_path: "/x.mkv" })[0]).toBe("play");
+    expect(actions({ download_state: "downloading" })[0]).toBe("cancel");
+    expect(actions({ download_state: "failed" })[0]).toBe("retry");
+  });
+
+  it("ends with the way out that fits the video", () => {
+    expect(actions({})[3]).toBe("hide");
+    expect(actions({ download_state: "done", file_path: "/x.mkv" })[3]).toBe("delete-file");
+    expect(actions({ added_manually: true })[3]).toBe("delete");
+    expect(actions({ added_manually: true, download_state: "done", file_path: "/x.mkv" })[3]).toBe("delete");
+    expect(actions({ hidden: true, download_state: "done", file_path: "/x.mkv" })[3]).toBe("unhide");
+  });
+
+  // Red is kept for what can't be undone; a hide has Un-hide.
+  it("marks only the permanent removals as dangerous", () => {
+    const danger = (over: object) => cardTiles(row(over))[3].danger ?? false;
+    expect(danger({})).toBe(false);
+    expect(danger({ hidden: true })).toBe(false);
+    expect(danger({ download_state: "done", file_path: "/x.mkv" })).toBe(true);
+    expect(danger({ added_manually: true })).toBe(true);
+  });
+
+  it("names the watched tile for what a click would do", () => {
+    expect(cardTiles(row({}))[1]).toMatchObject({ word: "Watched", label: "Mark as watched" });
+    expect(cardTiles(row({ watched: true }))[1]).toMatchObject({ word: "Unwatch", label: "Mark as unwatched" });
+  });
+
+  // Every word has to fit under its icon on the smallest card.
+  it("keeps every word short", () => {
+    for (const over of [{}, { download_state: "done", file_path: "/x.mkv" }, { hidden: true }, { download_state: "failed" }]) {
+      for (const tile of cardTiles(row(over))) expect(tile.word.length).toBeLessThanOrEqual(8);
+    }
+  });
 });
 
 import {

@@ -1178,7 +1178,8 @@ describe("deleting a file when it is marked watched", () => {
     render(<App />);
     fireEvent.click(await markWatchedItem());
 
-    expect(await screen.findByRole("dialog", { name: "Delete the downloaded file?" })).toBeTruthy();
+    // Asked on the card itself, not in a dialog.
+    expect(await screen.findByRole("group", { name: "Delete the downloaded file?" })).toBeTruthy();
     expect(deleteDownload).not.toHaveBeenCalled();
     await settle();
   });

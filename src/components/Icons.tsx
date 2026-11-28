@@ -56,6 +56,7 @@ import { Warning } from "@phosphor-icons/react/dist/icons/Warning";
 import { TerminalWindow } from "@phosphor-icons/react/dist/icons/TerminalWindow";
 import { UploadSimple } from "@phosphor-icons/react/dist/icons/UploadSimple";
 import { Link } from "@phosphor-icons/react/dist/icons/Link";
+import { LinkBreak } from "@phosphor-icons/react/dist/icons/LinkBreak";
 import { Timer } from "@phosphor-icons/react/dist/icons/Timer";
 import { CalendarBlank } from "@phosphor-icons/react/dist/icons/CalendarBlank";
 import { SlidersHorizontal } from "@phosphor-icons/react/dist/icons/SlidersHorizontal";
@@ -166,6 +167,10 @@ export const IconImport = () => <DownloadSimple className="icon" weight="bold" /
 /* The Add dialog. */
 /** The paste box: what goes in it is a link. */
 export const IconLink = () => <Link className="icon" weight="bold" />;
+/** A card's right-click menu: taking a part back out of its series, and a
+ *  channel's own videos. */
+export const IconUnlink = () => <LinkBreak className="icon" weight="bold" />;
+export const IconChannel = () => <User className="icon" weight="bold" />;
 /** Add to the library, without downloading. */
 export const IconAdd = () => <Plus className="icon" weight="bold" />;
 /** Download (custom)…: one video, or a playlist, some other way than Settings says. */

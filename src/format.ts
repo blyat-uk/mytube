@@ -204,6 +204,50 @@ export function cardActionLabel(a: CardAction): string {
   }
 }
 
+/** What a tile on a card's hover bar does: the card's own action, then the
+ *  three every card has. */
+export type TileAction = CardAction | "watched" | "delete-file" | "hide" | "delete" | "unhide";
+
+export interface Tile {
+  action: TileAction;
+  /** The word the tile shows while it is pointed at. One short word: it has to
+   *  fit under the icon on the smallest card. */
+  word: string;
+  /** Its full name, for the tooltip and for screen readers. */
+  label: string;
+  /** Can't be undone, so it turns red when pointed at. Hiding has Un-hide and
+   *  stays neutral: red that also means "reversible" stops meaning anything. */
+  danger?: boolean;
+}
+
+/**
+ * The four tiles of a card's hover bar, in slots that never move: the card's
+ * own action, watched, YouTube, and the way out of the feed. Only the first
+ * and the last change with the state, so the other two are always where the
+ * hand left them.
+ */
+export function cardTiles(v: Video): [Tile, Tile, Tile, Tile] {
+  const main = cardAction(v);
+  return [
+    { action: main, word: cardActionLabel(main), label: main === "cancel" ? "Cancel download" : cardActionLabel(main) },
+    v.watched
+      ? { action: "watched", word: "Unwatch", label: "Mark as unwatched" }
+      : { action: "watched", word: "Watched", label: "Mark as watched" },
+    { action: "open", word: "YouTube", label: cardActionLabel("open") },
+    removeTile(v),
+  ];
+}
+
+function removeTile(v: Video): Tile {
+  if (v.hidden) return { action: "unhide", word: "Un-hide", label: "Un-hide" };
+  // Added by hand: deleted, never hidden, since nothing would bring it back.
+  if (v.added_manually) return { action: "delete", word: "Delete", label: "Delete", danger: true };
+  if (hasDownloadedFile(v)) {
+    return { action: "delete-file", word: "Delete", label: "Delete downloaded file", danger: true };
+  }
+  return { action: "hide", word: "Hide", label: "Hide from feed" };
+}
+
 /**
  * Where this video lives on YouTube. Shorts play from `/watch` too, so one
  * shape covers everything we store.

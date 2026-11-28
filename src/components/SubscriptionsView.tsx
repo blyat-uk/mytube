@@ -2,7 +2,7 @@ import {
   useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject,
 } from "react";
 import VideoGrid from "./VideoGrid";
-import ContextMenu, { type MenuItem } from "./ContextMenu";
+import ContextMenu, { menuGroups, type MenuItem } from "./ContextMenu";
 import ConfirmDialog from "./ConfirmDialog";
 import CustomDownloadDialog from "./CustomDownloadDialog";
 import FeedWaveform from "./stats/FeedWaveform";
@@ -11,7 +11,12 @@ import { useFeedStats } from "./stats/useFeedStats";
 import { useToast } from "./Toast";
 import { api, errText } from "../api";
 import { useDownloadEvents } from "../events";
-import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction } from "../format";
+import { hasDownloadedFile, seriesRuntime, videoUrl, type CardAction, type TileAction } from "../format";
+import type { CardAsk } from "./VideoCard";
+import {
+  IconAutoDownload, IconChannel, IconCustomDownload, IconDelete, IconDownload, IconExternal,
+  IconHidden, IconLink, IconPlay, IconSeries, IconShow, IconUnlink, IconUnwatched, IconWatched,
+} from "./Icons";
 import { useSiblingMarking } from "../marking";
 import { usePending } from "../pending";
 import { createProgressStore } from "../progress";
@@ -235,21 +240,30 @@ export default function SubscriptionsView(p: Props) {
   const [pageEpoch, setPageEpoch] = useState(0);
   const [menu, setMenu] = useState<{ video: Video; x: number; y: number } | null>(null);
   /**
-   * Four dialogs share this slot: "remove" asks how to hide or delete a video
+   * Three dialogs share this slot: "remove" asks how to hide or delete a video
    * with a file (`alone`: one that hides its series, see `removeVideo`),
-   * "file" asks only whether to delete a watched video's download, "series"
-   * asks how to hide a series with a part downloaded, and "scope" asks whether
-   * hiding a part of a series hides that part or the whole series.
+   * "series" asks how to hide a series with a part downloaded, and "scope" asks
+   * whether hiding a part of a series hides that part or the whole series. Each
+   * has three answers. Whether to delete a file has two, and is asked on the
+   * card itself (`ask`).
    */
   const [confirm, setConfirm] = useState<
     | { kind: "remove"; video: Video; alone?: boolean }
-    | { kind: "file"; video: Video }
     | { kind: "series"; group: VideoGroup }
     | { kind: "scope"; video: Video; series: DownloadSeries; group: VideoGroup }
     | null
   >(null);
   /** The video Download (custom)… is choosing formats for. */
   const [custom, setCustom] = useState<Video | null>(null);
+  /**
+   * The card asking whether to delete its file; see `CardAsk`. One at a time:
+   * a second question answers the first as Keep. `drop`: the card is to leave
+   * once answered -- with "hide watched" on, a freshly watched card would have
+   * gone at once, but it stays to be asked. Kept in a ref as well, written with
+   * the state, so a timeout and a mouse-leave landing together answer once.
+   */
+  const [ask, setAsk] = useState<{ video: Video; kind: CardAsk; drop: boolean } | null>(null);
+  const askRef = useRef(ask);
 
   const fetchPage = useCallback(async (from: number) => {
     const id = ++request.current;
@@ -522,6 +536,22 @@ export default function SubscriptionsView(p: Props) {
     });
   }, []);
 
+  const answerAsk = useCallback((video: Video, alsoDeleteFile: boolean) => {
+    const asked = askRef.current;
+    if (!asked || asked.video.id !== video.id) return;
+    askRef.current = null;
+    setAsk(null);
+    // The video as the question had it -- watched, if that is what asked.
+    if (alsoDeleteFile) deleteFile(asked.video);
+    if (asked.drop) drop(asked.video.id);
+  }, [deleteFile, drop]);
+
+  const openAsk = useCallback((next: { video: Video; kind: CardAsk; drop: boolean }) => {
+    if (askRef.current) answerAsk(askRef.current.video, false);
+    askRef.current = next;
+    setAsk(next);
+  }, [answerAsk]);
+
   const onToggleWatched = useCallback((video: Video) => {
     const next = !video.watched;
     const watched = { watched: next, watched_at: next ? Math.floor(Date.now() / 1000) : null };
@@ -533,16 +563,20 @@ export default function SubscriptionsView(p: Props) {
       bump();
       // With "hide watched" on, a freshly watched card no longer belongs here --
       // except in a series, which shows every part whatever the filters say.
-      if (next && hideWatched && !siblingOf) drop(video.id);
+      // One about to ask after its file stays until it has been answered: the
+      // question is on the card, so the card is where it has to be.
+      const leaves = next && hideWatched && !siblingOf;
+      const asks = next && hasDownloadedFile(video) && !deleteWhenWatched;
+      if (leaves && !asks) drop(video.id);
       // Watching something is usually the end of its life on disk — but that is
       // the user's call, and it is a separate step from marking it watched:
       // asked here, or answered once for good in Settings. Either way only
       // after the mark has landed, so a mark that fails never costs the file.
-      // The dialog gets the video as it now is: its copy reads `watched`, and
-      // the argument is the row from before the click.
+      // The card is asked about the video as it now is: its question reads
+      // `watched`, and the argument is the row from before the click.
       if (next && hasDownloadedFile(video)) {
         if (deleteWhenWatched) deleteFile(video, true);
-        else setConfirm({ kind: "file", video: { ...video, ...watched } });
+        else openAsk({ video: { ...video, ...watched }, kind: "watched", drop: leaves });
       }
     }, {
       optimistic: () => {
@@ -550,7 +584,7 @@ export default function SubscriptionsView(p: Props) {
         return () => patch(video.id, { watched: video.watched, watched_at: video.watched_at });
       },
     });
-  }, [patch, drop, hideWatched, siblingOf, run, bump, deleteWhenWatched, deleteFile]);
+  }, [patch, drop, hideWatched, siblingOf, run, bump, deleteWhenWatched, deleteFile, openAsk]);
 
   const unhideVideo = useCallback((video: Video) => {
     void run(video.id, async () => {
@@ -850,11 +884,17 @@ export default function SubscriptionsView(p: Props) {
     });
   }, [autoDownloading, dropCard, fetchPage, mapVideos, run, toast]);
 
+  /**
+   * A card's right-click menu, in groups (`menuGroups`): act on the video --
+   * its own action first, in every state, so the hand learns one place -- then
+   * go somewhere or organise, then remove. Anything that can't be undone is red
+   * and last; a hide has Un-hide, so it is neither.
+   */
   const menuItems = useCallback((video: Video): MenuItem[] => {
     const picked = marking.selected.size;
     const markItem: MenuItem[] =
       picked >= 2 && marking.selected.has(video.id)
-        ? [{ label: `Mark ${picked} videos as siblings`, onSelect: marking.markSelected }]
+        ? [{ label: `Mark ${picked} videos as siblings`, icon: <IconLink />, onSelect: marking.markSelected }]
         : [];
 
     // The card's channel on its own, as picking it in the channel list would
@@ -867,6 +907,7 @@ export default function SubscriptionsView(p: Props) {
       p.pickableChannels.has(video.channel_id) && !alreadyThere
         ? [{
             label: channelName ? `See all videos from ${channelName}` : "See all videos from this channel",
+            icon: <IconChannel />,
             onSelect: () => p.onSeeChannel(video.channel_id),
           }]
         : [];
@@ -877,13 +918,14 @@ export default function SubscriptionsView(p: Props) {
     // on the whole series -- marking too, since it is the card being marked.
     const card = groups.find((g) => g.videos[0].id === video.id);
     if (card && card.videos.length > 1) {
-      const series = [...markItem];
+      const series: MenuItem[] = [];
       // Watched and hidden parts count: downloading a series is asking for all
       // of it. The backend repeats the pick, so this is only the label's count.
       const due = card.videos.filter(downloadable).length;
       if (due > 0) {
         series.push({
           label: `Download ${due} ${due === 1 ? "part" : "parts"}`,
+          icon: <IconDownload />,
           onSelect: () => void downloadSeries(card),
         });
       }
@@ -894,70 +936,54 @@ export default function SubscriptionsView(p: Props) {
       if (card.videos.some((v) => v.series_auto_download)) {
         series.push({
           label: "Stop auto-downloading new parts",
+          icon: <IconAutoDownload on />,
           onSelect: () => setSeriesAutoDownload(card, false),
         });
       } else if (p.pickableChannels.has(video.channel_id)) {
         series.push({
           label: "Auto-download new parts",
+          icon: <IconAutoDownload />,
           onSelect: () => setSeriesAutoDownload(card, true),
         });
       }
-      // Every part comes from one channel -- the walk that built the card is
-      // per channel -- so the leader's is the series'.
-      series.push(...seeChannel);
       // Offered wherever the mark is, even on a part brought back by hand: the
       // mark is what hides the parts still to come, and this is how it goes.
-      if (card.videos.some((v) => v.series_hidden)) {
-        series.push({ label: "Un-hide series", onSelect: () => void unhideSeries(card) });
-      } else {
-        series.push({
-          label: "Hide from feed",
-          danger: true,
-          onSelect: () => requestHideSeries(card),
-        });
-      }
-      return series;
+      const remove: MenuItem[] = card.videos.some((v) => v.series_hidden)
+        ? [{ label: "Un-hide series", icon: <IconShow />, onSelect: () => void unhideSeries(card) }]
+        : [{ label: "Hide from feed", icon: <IconHidden />, onSelect: () => requestHideSeries(card) }];
+      // Every part comes from one channel -- the walk that built the card is
+      // per channel -- so the leader's channel is the series'.
+      return menuGroups(markItem, series, seeChannel, remove);
     }
 
-    const items: MenuItem[] = [
-      ...markItem,
-      {
-        label: video.watched ? "Mark as unwatched" : "Mark as watched",
-        onSelect: () => void onToggleWatched(video),
-      },
-    ];
+    const act: MenuItem[] = [];
     if (hasDownloadedFile(video)) {
-      items.push({ label: "Play", onSelect: () => void onAction("play", video) });
+      act.push({ label: "Play", icon: <IconPlay />, onSelect: () => void onAction("play", video) });
     } else if (downloadable(video)) {
-      items.push({ label: "Download", onSelect: () => void onAction("download", video) });
-      items.push({ label: "Download (custom)…", onSelect: () => setCustom(video) });
+      act.push({ label: "Download", icon: <IconDownload />, onSelect: () => void onAction("download", video) });
+      act.push({ label: "Download (custom)…", icon: <IconCustomDownload />, onSelect: () => setCustom(video) });
     }
-    // Offered for any downloaded file, watched or not: the prompt at
-    // marking-time is easy to dismiss, and a video you decide *not* to watch
-    // leaves a file behind just the same.
-    if (hasDownloadedFile(video)) {
-      items.push({
-        label: "Delete downloaded file",
-        danger: true,
-        onSelect: () => setConfirm({ kind: "file", video }),
-      });
-    }
-    items.push(...seeChannel);
+    act.push({
+      label: video.watched ? "Mark as unwatched" : "Mark as watched",
+      icon: video.watched ? <IconUnwatched /> : <IconWatched />,
+      onSelect: () => void onToggleWatched(video),
+    });
+    act.push({ label: "Open on YouTube", icon: <IconExternal />, onSelect: () => onAction("open", video) });
+
+    const organise: MenuItem[] = [...seeChannel];
     // Grouped, the grid has already gathered every match behind a series
     // card, so a lone card's siblings are by construction only itself: the
     // item could open nothing but a series of one. Inside a series opened from
     // that feed, the series it would open is the one already on screen.
     if (!p.grouped) {
-      items.push({
-        label: "Find siblings",
-        onSelect: () => p.onFindSiblings(video),
-      });
+      organise.push({ label: "Find siblings", icon: <IconSeries />, onSelect: () => p.onFindSiblings(video) });
     }
     // A hand mark, or a description's link: either way the card holds it by
     // something the user can take back, and the backend remembers it.
     if (video.sibling_group || video.part_linked) {
-      items.push({
+      organise.push({
         label: "Unlink from siblings",
+        icon: <IconUnlink />,
         onSelect: () => void unlinkSiblings(video),
       });
     }
@@ -966,25 +992,67 @@ export default function SubscriptionsView(p: Props) {
     // joins it, so it can be stopped from here. Inside a series the bar has
     // it, and on every part it would only be the same switch again.
     if (video.series_auto_download && siblingOf === null) {
-      items.push({
+      organise.push({
         label: "Stop auto-downloading new parts",
+        icon: <IconAutoDownload on />,
         onSelect: () => setSeriesAutoDownload({ videos: [video], stem: null }, false),
       });
     }
+
+    // The hide before anything permanent, so the last line is always the one
+    // thing that can't be undone. A video added by hand is deleted, never
+    // hidden: nothing would bring it back.
+    const remove: MenuItem[] = [];
     if (video.hidden) {
-      items.push({ label: "Un-hide", onSelect: () => void unhideVideo(video) });
-    } else {
-      items.push({
-        label: video.added_manually ? "Delete" : "Hide from feed",
+      remove.push({ label: "Un-hide", icon: <IconShow />, onSelect: () => void unhideVideo(video) });
+    } else if (!video.added_manually) {
+      remove.push({ label: "Hide from feed", icon: <IconHidden />, onSelect: () => requestRemove(video) });
+    }
+    // Offered for any downloaded file, watched or not: a video you decide
+    // *not* to watch leaves a file behind just the same. Asked on the card.
+    if (hasDownloadedFile(video)) {
+      remove.push({
+        label: "Delete downloaded file",
+        icon: <IconDelete />,
         danger: true,
-        onSelect: () => requestRemove(video),
+        onSelect: () => openAsk({ video, kind: "file", drop: false }),
       });
     }
-    return items;
+    if (video.added_manually && !video.hidden) {
+      remove.push({ label: "Delete", icon: <IconDelete />, danger: true, onSelect: () => requestRemove(video) });
+    }
+    return menuGroups(markItem, act, organise, remove);
   }, [onToggleWatched, onAction, unhideVideo, requestRemove, unlinkSiblings, groups,
-      downloadSeries, unhideSeries, requestHideSeries, setSeriesAutoDownload,
+      downloadSeries, unhideSeries, requestHideSeries, setSeriesAutoDownload, openAsk,
       marking.selected, marking.markSelected, p.onFindSiblings, p.grouped,
       p.pickableChannels, p.onSeeChannel, siblingOf, search, channelIds]);
+
+  /** A tile on a card's hover bar: the card's own action, or one of the
+   *  three every card has, routed to what the menu would do. */
+  const onTile = (action: TileAction, video: Video) => {
+    switch (action) {
+      case "watched": return void onToggleWatched(video);
+      case "delete-file": return openAsk({ video, kind: "file", drop: false });
+      case "hide":
+      case "delete": return requestRemove(video);
+      case "unhide": return void unhideVideo(video);
+      default: return onAction(action, video);
+    }
+  };
+  // Handed to the cards through a ref, as `onContextMenu` is below: the
+  // handlers it reaches change with the filters, and the cards' memo must not.
+  const onTileRef = useRef(onTile);
+  onTileRef.current = onTile;
+  const onCardAction = useCallback((action: TileAction, video: Video) => {
+    onTileRef.current(action, video);
+  }, []);
+  const askOnGrid = useMemo(() => ask && { id: ask.video.id, kind: ask.kind }, [ask]);
+
+  // A new list is a new grid; a question left on the old one goes as Keep.
+  useEffect(() => {
+    askRef.current = null;
+    setAsk(null);
+  }, [fetchPage, reloadToken]);
 
   const openMenu = useCallback((video: Video, x: number, y: number) => {
     // Every card has something to offer -- a series at least its Hide or
@@ -1099,8 +1167,10 @@ export default function SubscriptionsView(p: Props) {
       onCardSize={p.onCardSize}
       partsPanel={p.partsPanel}
       onLoadMore={() => fetchPage(offset.current)}
-      onAction={onAction}
+      onAction={onCardAction}
       onContextMenu={onContextMenu}
+      ask={askOnGrid}
+      onAnswer={answerAsk}
       onOpenSeries={p.onFindSiblings}
       marking={marking}
       empty={
@@ -1144,25 +1214,6 @@ export default function SubscriptionsView(p: Props) {
         // state events take over from here.
         onQueued={(v) => patch(v.id, { download_state: "queued", download_error: null })}
         onClose={() => setCustom(null)}
-      />
-    )}
-
-    {confirm?.kind === "file" && (
-      <ConfirmDialog
-        title="Delete the downloaded file?"
-        body={
-          confirm.video.watched
-            ? `“${confirm.video.title}” is marked as watched. Its file is still on disk.`
-            : `“${confirm.video.title}” has not been watched. Deleting only removes the` +
-              ` file — the video stays in your feed.`
-        }
-        choices={[{ label: "Delete file", value: "delete", danger: true }]}
-        onCancel={() => setConfirm(null)}
-        onChoose={() => {
-          const target = confirm.video;
-          setConfirm(null);
-          void deleteFile(target);
-        }}
       />
     )}
 

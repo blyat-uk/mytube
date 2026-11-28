@@ -1,10 +1,27 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 export interface MenuItem {
   label: string;
   onSelect: () => void;
+  /** Can't be undone. Red is kept for that alone, so it keeps meaning it. */
   danger?: boolean;
   disabled?: boolean;
+  /** The glyph the card and the Downloads rows use for the same action. */
+  icon?: ReactNode;
+  /** Starts a new group: a rule is drawn above it. */
+  divider?: boolean;
+}
+
+/**
+ * One menu out of groups of items, a rule between each two that have anything
+ * in them. Menus group by intent -- act on the video, go somewhere or
+ * organise, remove -- so removal always sits behind a line, out of reach of a
+ * slip off the item above it.
+ */
+export function menuGroups(...groups: MenuItem[][]): MenuItem[] {
+  return groups
+    .filter((g) => g.length > 0)
+    .flatMap((g, i) => g.map((item, j) => (i > 0 && j === 0 ? { ...item, divider: true } : item)));
 }
 
 interface Props {
@@ -63,19 +80,22 @@ export default function ContextMenu({ x, y, items, onClose }: Props) {
       onContextMenu={(e) => e.preventDefault()}
     >
       {items.map((item, i) => (
-        <button
-          key={i}
-          type="button"
-          role="menuitem"
-          className={`context-item${item.danger ? " is-danger" : ""}`}
-          disabled={item.disabled}
-          onClick={() => {
-            onClose();
-            item.onSelect();
-          }}
-        >
-          {item.label}
-        </button>
+        <Fragment key={i}>
+          {item.divider && i > 0 && <div className="context-sep" role="separator" />}
+          <button
+            type="button"
+            role="menuitem"
+            className={`context-item${item.danger ? " is-danger" : ""}`}
+            disabled={item.disabled}
+            onClick={() => {
+              onClose();
+              item.onSelect();
+            }}
+          >
+            {item.icon && <span className="context-icon" aria-hidden="true">{item.icon}</span>}
+            {item.label}
+          </button>
+        </Fragment>
       ))}
     </div>
   );

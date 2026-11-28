@@ -49,6 +49,7 @@ function pageIn() {
 
 const setWatched = vi.fn(() => Promise.resolve());
 const deleteDownload = vi.fn(() => Promise.resolve());
+const openExternal = vi.fn((_url: string) => Promise.resolve());
 const markSiblings = vi.fn(() => Promise.resolve(2));
 const unlinkSiblings = vi.fn(() => Promise.resolve());
 const enqueueDownload = vi.fn((_id: string, _q?: unknown) => Promise.resolve());
@@ -73,6 +74,7 @@ vi.mock("../api", () => ({
     listVideoGroups: (filter: VideoFilter) => listVideoGroups(filter),
     setWatched: (...a: unknown[]) => setWatched(...(a as [])),
     deleteDownload: (...a: unknown[]) => deleteDownload(...(a as [])),
+    openExternal: (url: string) => openExternal(url),
     markSiblings: (...a: unknown[]) => markSiblings(...(a as [])),
     unlinkSiblings: (...a: unknown[]) => unlinkSiblings(...(a as [])),
     enqueueDownload: (id: string, q?: unknown) => enqueueDownload(id, q),
@@ -562,17 +564,31 @@ describe("hiding one video", () => {
   });
 });
 
+/** The question a card asks about its file, in place of a dialog. */
+const question = () => screen.findByRole("group", { name: "Delete the downloaded file?" });
+const noQuestion = () => screen.queryByRole("group", { name: "Delete the downloaded file?" });
+
 describe("marking a downloaded video as watched", () => {
-  it("marks it watched and then asks about the file", async () => {
+  it("marks it watched and then asks about the file, on the card", async () => {
     renderView();
     fireEvent.click(within(await openMenu(), "Mark as watched"));
 
     await waitFor(() => expect(setWatched).toHaveBeenCalledWith("vid1", true));
-    expect(await screen.findByText("Delete the downloaded file?")).toBeTruthy();
+    const asked = await question();
+    expect(screen.getByRole("article").contains(asked)).toBe(true);
     // It was watched a moment ago, and the copy has to know that.
-    expect(screen.getByText(/is marked as watched/)).toBeTruthy();
+    expect(asked.textContent).toContain("Delete the file? Marked watched.");
+    expect(screen.queryByRole("dialog")).toBeNull();
     // Asking is not doing: nothing is removed until the choice is made.
     expect(deleteDownload).not.toHaveBeenCalled();
+  });
+
+  it("asks the same from the card's own Watched tile", async () => {
+    renderView();
+    fireEvent.click(await screen.findByRole("button", { name: "Mark as watched" }));
+
+    await waitFor(() => expect(setWatched).toHaveBeenCalledWith("vid1", true));
+    expect(await question()).toBeTruthy();
   });
 
   it("deletes the file on confirm and drops the downloaded styling", async () => {
@@ -586,13 +602,51 @@ describe("marking a downloaded video as watched", () => {
     );
   });
 
-  it("keeps the file when the dialog is dismissed", async () => {
+  it("keeps the file on Keep", async () => {
     renderView();
     fireEvent.click(within(await openMenu(), "Mark as watched"));
-    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep" }));
 
+    expect(noQuestion()).toBeNull();
     expect(deleteDownload).not.toHaveBeenCalled();
     expect(document.querySelector(".card")?.className).toContain("is-downloaded");
+  });
+
+  // The pointer leaving is a question nobody is answering: the safe answer.
+  it("keeps the file when the pointer leaves the card, and on Escape", async () => {
+    renderView();
+    fireEvent.click(within(await openMenu(), "Mark as watched"));
+    await question();
+    fireEvent.mouseLeave(screen.getByRole("article"));
+    expect(noQuestion()).toBeNull();
+
+    fireEvent.click(within(await openMenu(), "Delete downloaded file"));
+    fireEvent.keyDown(await question(), { key: "Escape" });
+    expect(noQuestion()).toBeNull();
+    expect(deleteDownload).not.toHaveBeenCalled();
+  });
+
+  describe("with Unwatched on", () => {
+    it("keeps the card on screen until the question is answered", async () => {
+      renderView({ hideWatched: true });
+      fireEvent.click(within(await openMenu(), "Mark as watched"));
+
+      expect(await question()).toBeTruthy();
+      expect(screen.getByRole("article")).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Delete file" }));
+
+      await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
+      await waitFor(() => expect(screen.queryByRole("article")).toBeNull());
+    });
+
+    it("lets it go on Keep as well, with its file", async () => {
+      renderView({ hideWatched: true });
+      fireEvent.click(within(await openMenu(), "Mark as watched"));
+      fireEvent.click(await screen.findByRole("button", { name: "Keep" }));
+
+      await waitFor(() => expect(screen.queryByRole("article")).toBeNull());
+      expect(deleteDownload).not.toHaveBeenCalled();
+    });
   });
 
   it("never asks when there is no file to delete", async () => {
@@ -601,7 +655,7 @@ describe("marking a downloaded video as watched", () => {
     fireEvent.click(within(await openMenu(), "Mark as watched"));
 
     await waitFor(() => expect(setWatched).toHaveBeenCalled());
-    expect(screen.queryByText("Delete the downloaded file?")).toBeNull();
+    expect(noQuestion()).toBeNull();
   });
 
   it("never asks when un-watching", async () => {
@@ -610,7 +664,7 @@ describe("marking a downloaded video as watched", () => {
     fireEvent.click(within(await openMenu(), "Mark as unwatched"));
 
     await waitFor(() => expect(setWatched).toHaveBeenCalledWith("vid1", false));
-    expect(screen.queryByText("Delete the downloaded file?")).toBeNull();
+    expect(noQuestion()).toBeNull();
   });
 
   describe("with Delete the file when marked watched on", () => {
@@ -623,6 +677,7 @@ describe("marking a downloaded video as watched", () => {
       expect(setWatched.mock.invocationCallOrder[0])
         .toBeLessThan(deleteDownload.mock.invocationCallOrder[0]);
       expect(screen.queryByRole("dialog")).toBeNull();
+      expect(noQuestion()).toBeNull();
       // Nothing asked, so something has to say it happened.
       expect(await screen.findByText("Deleted the file for “Some video”.")).toBeTruthy();
       await waitFor(() =>
@@ -654,7 +709,7 @@ describe("marking a downloaded video as watched", () => {
       renderView({ deleteWhenWatched: true });
       fireEvent.click(within(await openMenu(), "Delete downloaded file"));
 
-      expect(await screen.findByText("Delete the downloaded file?")).toBeTruthy();
+      expect(await question()).toBeTruthy();
       expect(deleteDownload).not.toHaveBeenCalled();
     });
   });
@@ -667,7 +722,11 @@ describe("the right-click menu's delete-file entry", () => {
     const menu = await openMenu();
     fireEvent.click(within(menu, "Delete downloaded file"));
 
-    expect(await screen.findByText(/is marked as watched/)).toBeTruthy();
+    // On the card, naming the video, since the bar has covered its title.
+    const asked = await question();
+    expect(asked.textContent).toContain("Delete the file?");
+    expect(asked.textContent).not.toContain("Not watched yet.");
+    expect(asked.textContent).toContain("Some video");
     fireEvent.click(await screen.findByRole("button", { name: "Delete file" }));
     await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
   });
@@ -679,9 +738,8 @@ describe("the right-click menu's delete-file entry", () => {
     const menu = await openMenu();
     fireEvent.click(within(menu, "Delete downloaded file"));
 
-    // The copy has to stop claiming the video was watched, and say what is
-    // being thrown away.
-    expect(await screen.findByText(/has not been watched/)).toBeTruthy();
+    // The copy has to stop claiming the video was watched.
+    expect((await question()).textContent).toContain("Delete the file? Not watched yet.");
     fireEvent.click(await screen.findByRole("button", { name: "Delete file" }));
     await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
   });
@@ -835,6 +893,7 @@ describe("See all videos from a card's channel", () => {
     const labels = menuLabels(await openMenu());
     expect(labels.slice(labels.indexOf("See all videos from Veritasium"))).toEqual([
       "See all videos from Veritasium", "Find siblings", "Unlink from siblings", "Hide from feed",
+      "Delete downloaded file",
     ]);
   });
 
@@ -857,6 +916,89 @@ describe("See all videos from a card's channel", () => {
       "Download 2 parts", "Auto-download new parts", "See all videos from Veritasium",
       "Un-hide series",
     ]);
+  });
+});
+
+describe("the card menu's groups", () => {
+  it("leads with the card's own action and keeps removal last, each group behind a rule", async () => {
+    renderView({ pickableChannels: new Set(["UC1"]) });
+    const menu = await openMenu();
+    expect(menuLabels(menu)).toEqual([
+      "Play", "Mark as watched", "Open on YouTube",
+      "See all videos from Veritasium", "Find siblings",
+      "Hide from feed", "Delete downloaded file",
+    ]);
+    expect(Array.from(menu.children).map((n) => n.getAttribute("role"))).toEqual([
+      "menuitem", "menuitem", "menuitem", "separator", "menuitem", "menuitem", "separator",
+      "menuitem", "menuitem",
+    ]);
+  });
+
+  it("puts Download where Play was when there is no file", async () => {
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView();
+    expect(menuLabels(await openMenu()).slice(0, 4)).toEqual([
+      "Download", "Download (custom)…", "Mark as watched", "Open on YouTube",
+    ]);
+  });
+
+  // Red means "can't be undone", and a hide has Un-hide.
+  it("keeps red for what can't be undone", async () => {
+    renderView();
+    const menu = await openMenu();
+    expect(within(menu, "Hide from feed").className).not.toContain("is-danger");
+    expect(within(menu, "Delete downloaded file").className).toContain("is-danger");
+  });
+
+  it("opens the video on YouTube", async () => {
+    renderView();
+    fireEvent.click(within(await openMenu(), "Open on YouTube"));
+    await waitFor(() => expect(openExternal).toHaveBeenCalledWith("https://www.youtube.com/watch?v=vid1"));
+  });
+
+  it("gives every item its glyph", async () => {
+    renderView();
+    const menu = await openMenu();
+    for (const item of menu.querySelectorAll("[role=menuitem]")) {
+      expect(item.querySelector(".context-icon svg")).toBeTruthy();
+    }
+  });
+});
+
+describe("the card's hover bar", () => {
+  it("hides a video from its last tile when there is no file", async () => {
+    videos = [video({ download_state: "none", file_path: null })];
+    renderView();
+    fireEvent.click(await screen.findByRole("button", { name: "Hide from feed" }));
+    await waitFor(() => expect(setVideoHidden).toHaveBeenCalledWith("vid1", true));
+  });
+
+  it("asks on the card before its trash tile deletes the file", async () => {
+    renderView();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete downloaded file" }));
+    expect(await question()).toBeTruthy();
+    expect(deleteDownload).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Delete file" }));
+    await waitFor(() => expect(deleteDownload).toHaveBeenCalledWith("vid1"));
+  });
+
+  it("brings a hidden video back from the same tile", async () => {
+    videos = [video({ hidden: true, download_state: "none", file_path: null })];
+    renderView({ showHidden: true });
+    fireEvent.click(await screen.findByRole("button", { name: "Un-hide" }));
+    await waitFor(() => expect(setVideoHidden).toHaveBeenCalledWith("vid1", false));
+  });
+
+  it("answers one question as Keep when another card asks", async () => {
+    videos = [video(), video({ id: "vid2", title: "Other video" })];
+    renderView();
+    const [first, second] = await screen.findAllByRole("button", { name: "Delete downloaded file" });
+    fireEvent.click(first);
+    fireEvent.click(second);
+    const asked = await screen.findAllByRole("group", { name: "Delete the downloaded file?" });
+    expect(asked).toHaveLength(1);
+    expect(asked[0].textContent).toContain("Other video");
+    expect(deleteDownload).not.toHaveBeenCalled();
   });
 });
 
